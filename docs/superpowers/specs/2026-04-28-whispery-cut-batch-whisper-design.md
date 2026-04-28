@@ -984,17 +984,18 @@ Forward-gap tolerance addresses real-world ffmpeg behaviour: container PTS offse
 
 `Transcriber::restart_at(starts_at: Timestamp) -> Result<(), TranscriberError>` is the explicit recovery path. It:
 
-1. Flushes the cut state machine (`Cut::flush()`), emitting any partial `MergedChunk` it was accumulating into the dispatch state machine. This produces a final pre-restart chunk_id.
-2. Clears the live SampleBuffer's `Vec<f32>` (it must be empty for the next push to start a fresh contiguous segment). Pre-restart in-flight chunks already hold their audio in their own `Arc<[f32]>`s extracted at chunk-creation time; resetting buffer state does not affect them.
-3. **Re-anchors with a clean slate.** Sets:
+1. **Drain `cut_pending` before clearing the buffer.** `cut_pending` holds `(chunk_id, MergedChunk)` descriptors whose `SampleRange` indices are still in the old anchor's frame; if those entries survived into the new frame, the next `trim()` would compute a stale low-water and the next promotion attempt would `extract` against indices that no longer exist in the (cleared) buffer — hard panic. So restart_at first promotes every queued entry: for each `(chunk_id, merged_chunk)` in `cut_pending`, extract `samples` from the buffer (still in old-frame indexing), call `samples_to_output_range(merged_chunk.range)` against the **old** anchor to get a correctly-anchored `TimeRange`, build a `ChunkRecord` (phase `AwaitingAsr`), insert into `in_flight`, and enqueue `Command::RunAsr`. The drain-on-restart path is allowed to temporarily exceed `max_in_flight` — restart_at is a one-time event and bounded by however many entries were already queued; the alternative (dropping the chunks) would lose transcription work the caller had already paid for.
+2. Flushes the cut state machine (`Cut::flush()`), emitting any partial `MergedChunk` it was accumulating. The flush goes through the same path as step 1's drain (the partial chunk becomes one more queued entry that gets promoted to `in_flight`).
+3. Clears the live SampleBuffer's `Vec<f32>` (it must be empty for the next push to start a fresh contiguous segment). Pre-restart in-flight chunks already hold their audio in their own `Arc<[f32]>`s — both the chunks that were already in_flight before the call AND the chunks just promoted from `cut_pending` in step 1.
+4. **Re-anchors with a clean slate.** Sets:
    - `base_pts_out_anchor = starts_at.pts()`
    - `absolute_sample_offset = 0`
    - `buffer_drop_offset = 0`
 
    The next `push_samples(starts_at, packet)` call computes `expected_pts_out = starts_at.pts() + rescale(0, …) = starts_at.pts()`, matches the caller's PTS exactly, and proceeds as a fresh contiguous start. Resetting both offsets to 0 (rather than carrying the prior cumulative `absolute_sample_offset` forward) is what makes `delta_pts_out = 0` on the first post-restart push; carrying them forward as the v3 draft did would have triggered `PtsRegression` on every restart.
 
-4. **chunk_id continues monotonically.** `next_chunk_id` is *not* reset. In-flight chunks 5, 6, 7 from before the restart will still emit normally via the in-order path; their stored `range` PTS values were computed against the old anchor at extraction time and are correct as-is. The first chunk produced after restart_at has a chunk_id one larger than the last pre-restart chunk.
-5. **Trim's low-water is computed from `cut_pending` only** (not `in_flight`). Once a chunk is `in_flight`, its audio lives in its own `Arc<[f32]>` and is decoupled from the buffer; the buffer only needs to hold samples for chunks not yet extracted. After restart_at, `cut_pending` is empty (Cut was flushed), so trim's low-water is the new buffer's high-water (zero) — the entire empty buffer is eligible for drop. This eliminates any risk of stale-anchor PTS values poisoning trim's computation across a restart.
+5. **chunk_id continues monotonically.** `next_chunk_id` is *not* reset. In-flight chunks 5, 6, 7 from before the restart will still emit normally via the in-order path; their stored `range` PTS values were computed against the old anchor at extraction time and are correct as-is. The first chunk produced after restart_at has a chunk_id one larger than the last pre-restart chunk (which itself may have been a step-1 drain or a step-2 flush).
+6. **Trim's low-water is computed from `cut_pending` only** (not `in_flight`). Once a chunk is `in_flight`, its audio lives in its own `Arc<[f32]>` and is decoupled from the buffer; the buffer only needs to hold samples for chunks not yet extracted. After restart_at, `cut_pending` is empty (steps 1+2 drained it), so trim's low-water is the new buffer's high-water (zero) — the entire empty buffer is eligible for drop. This eliminates any risk of stale-anchor PTS values poisoning trim's computation across a restart.
 
 `restart_at` is the *only* public API affordance for recovering from a gap; `signal_eof` is one-way and does not reset the buffer.
 
@@ -1152,17 +1153,25 @@ pub struct AsrParams {
     /// -1.0 (WhisperX default).
     /// **Layered-ladder suppression.** whisper.cpp internally
     /// implements its own temperature ladder via
-    /// `temperature_inc` and `max_decoding_failures`. The
-    /// runner explicitly disables that internal ladder
-    /// (`temperature_inc = 0.0` and `max_decoding_failures = 1`
-    /// in `full_params_from`, §5.6) so the runner's outer
-    /// ladder is the sole authority — exactly one decoding
-    /// attempt happens per `state.full()` call, at the
-    /// runner-supplied temperature. The §13.1 verification spike
-    /// confirms the precise setter names in the active whisper-rs
-    /// version; if a future version renames or removes them, the
-    /// implementation falls back to a single attempt per chunk
-    /// and downgrades these temperature fields to advisory.
+    /// `temperature_inc` (loop step) and `max_decoding_failures`
+    /// (secondary safeguard). The runner pins
+    /// `temperature_inc = 0.0` in `full_params_from` (§5.6),
+    /// which alone fully disables the internal ladder — the
+    /// loop `for t = initial; t <= 1.0 + 1e-6; t += inc` iterates
+    /// exactly once. `max_decoding_failures = 1` is set
+    /// best-effort as a secondary safeguard. The runner's outer
+    /// ladder is the sole authority: exactly one decoding attempt
+    /// happens per `state.full()` call, at the runner-supplied
+    /// temperature.
+    ///
+    /// If the active whisper-rs version is found (during the §13.1
+    /// verification) to lack `set_temperature` or
+    /// `set_temperature_inc`, the runner module must be built with
+    /// an explicit alternative implementation that omits those
+    /// calls — this is a compile-time situation, not a runtime
+    /// fallback. In that alternative path the AsrParams temperature
+    /// fields become advisory and whisper.cpp's internal ladder
+    /// runs at its default settings.
     pub log_prob_threshold: f32,
 
     /// Compression-ratio threshold; on a result with compression
@@ -1200,7 +1209,8 @@ pub struct AsrParams {
     /// pool size). Default 1; the runner's parallelism comes from
     /// multiple WhisperStates running concurrently on different
     /// chunks, so over-subscribing in-call threads is wasteful.
-    pub n_threads: i32,
+    /// Type matches whisper-rs's setter parameter (`std::os::raw::c_int`).
+    pub n_threads: std::os::raw::c_int,
 }
 
 pub enum SamplingStrategy {
@@ -1263,23 +1273,27 @@ fn full_params_from(
     p.set_print_timestamps(false);
 
     // Disable whisper.cpp's internal temperature ladder so the
-    // runner's outer ladder is the sole authority. With these two
-    // setters, each state.full() call is one decoding attempt at the
-    // temperature this attempt's `attempt_temperature`; the runner
-    // re-enters with the next temperature on its own retry policy.
+    // runner's outer ladder is the sole authority. With temperature_inc
+    // pinned to 0.0, whisper.cpp's internal loop
+    //   for t = initial; t <= 1.0 + 1e-6; t += temperature_inc
+    // iterates exactly once at the runner-supplied temperature.
     //
-    // **Compatibility note:** these setters exist in whisper.cpp's
-    // C++ struct (whisper_full_params.temperature_inc and
-    // .max_decoding_failures); whisper-rs 0.13.x exposes
-    // set_temperature(...) / set_temperature_inc(...) /
-    // set_max_decoding_failures(...). The §13.1 verification spike
-    // confirms the exact setter names. If a future whisper-rs version
-    // renames or removes these, the runner falls back to a single
-    // attempt per chunk at the default whisper.cpp temperature
-    // schedule, and the AsrParams temperature fields become advisory.
+    // set_temperature(...) and set_temperature_inc(...) are confirmed
+    // present in whisper-rs 0.13.x. set_max_decoding_failures(...) is
+    // a belt-and-braces secondary safeguard: it only matters when
+    // temperature_inc > 0, so even if the active whisper-rs version
+    // does not expose it, temperature_inc = 0.0 alone fully disables
+    // the internal ladder. Implementations should treat the
+    // max_decoding_failures call as best-effort — if the §13.1
+    // verification finds the setter is absent, the runner is built
+    // (cfg-gated or feature-gated) with that line omitted; behaviour
+    // is unchanged. The AsrParams temperature fields become advisory
+    // *only* if both temperature setters disappear from whisper-rs,
+    // which is a compile-time issue requiring an explicit code-path
+    // alternative, not a runtime fallback.
     p.set_temperature(attempt_temperature);
     p.set_temperature_inc(0.0);
-    p.set_max_decoding_failures(1);
+    p.set_max_decoding_failures(1);  // best-effort; primary disable is temperature_inc=0
 
     // Wire worker hang protection. The abort flag is flipped by a
     // separate watchdog thread (or an on-worker check against the
@@ -1750,7 +1764,11 @@ loop {
     }
     let _ = sel.ready_timeout(Duration::from_millis(10));
     // Fall through to the next loop iteration; drive_one_step's
-    // try_recv pulls the now-ready message.
+    // try_recv pulls the now-ready message. crossbeam's
+    // ready_timeout is documented to occasionally return success
+    // spuriously (no actual ready channel); that's harmless here
+    // — the next try_recv just returns Empty and the outer loop
+    // spins one more iteration before re-blocking.
 }
 ```
 
@@ -1979,7 +1997,7 @@ Whisper-rs on Windows requires CMake and a working C compiler; the CI matrix sho
 - **Live captioning latency profile**: shorter `chunk_size` + flush-on-silence cut policy; benchmarked latency vs. quality trade. Out of scope for v1 indexing.
 - **Diarization integration glue.** whispery itself stays speaker-agnostic (§1.6); a future `whispery-diarize` adjacent crate may provide the indexer's join helper.
 - **Metrics / observability hooks.** Per-chunk inference latency, queue depths, alignment failure rate, temperature-fallback hit rate. Likely as a `metrics` feature exporting via the `metrics` crate facade.
-- **Per-call ASR override** beyond the language hint: in v1 we ship `AsrParamsOverride { language_hint, strategy, initial_temperature, initial_prompt }`. Other fields can be added without breaking changes.
+- **Per-call ASR override** beyond the language hint: in v1 we ship `AsrParamsOverride { language_hint, strategy, initial_temperature, initial_prompt }`. The override surface deliberately exposes `initial_temperature` but not `temperature_increment` or `max_attempts` — the per-packet caller can shift the ladder's starting point but not reshape it. Reshaping the ladder requires re-building the runner with `asr_params(...)`. This minimality is intentional; full ladder reshape is rare and can become per-call later as additive fields without breaking changes.
 - **Model integrity verification** (`SHA-256` checking of loaded GGUF / wav2vec2 files at builder-time).
 - **Per-language wav2vec2 default-model registry.** The list of recommended models per language (with licenses) can ship as a separate `whispery-models` crate or as a doc page; v1 leaves this to the caller.
 
