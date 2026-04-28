@@ -1323,7 +1323,15 @@ pub struct AsrParams {
     /// pool size). Default 1; the runner's parallelism comes from
     /// multiple WhisperStates running concurrently on different
     /// chunks, so over-subscribing in-call threads is wasteful.
-    /// Type matches whisper-rs's setter parameter (`std::os::raw::c_int`).
+    /// Type matches whisper-rs's setter parameter
+    /// (`std::os::raw::c_int`).
+    /// **SemVer note:** `c_int` is `i32` on every platform Rust
+    /// currently supports, so this is a no-op alias today. The
+    /// alias exists to track whisper-rs's signature exactly; if
+    /// whisper-rs ever changes its setter parameter type (or if
+    /// `c_int` becomes platform-variant in some future target),
+    /// that propagates as a breaking SemVer change here, and the
+    /// fix is a coordinated whispery major release.
     pub n_threads: std::os::raw::c_int,
 }
 
@@ -2151,7 +2159,7 @@ Whisper-rs on Windows requires CMake and a working C compiler; the CI matrix sho
   - Per-worker ASR decoder workspace: ~10–30 MiB per `WhisperState` (model-dependent; mostly KV cache + intermediate tensors).
   - Per-alignment-job logits buffer: `T × V × 4 bytes`. For 30 s @ 50 Hz frame rate (typical wav2vec2 hop) and a 32-character vocab: 1500 × 32 × 4 ≈ 192 KiB per job. For phoneme vocab (≈80): ~480 KiB. Multiple jobs in flight only if alignment_workers > 1.
   - `cut_pending` queue: O(N descriptor entries × ~200 bytes), negligible.
-  - **Working-memory total at default config (4 ASR workers + 1 alignment worker, alignment on):** roughly 4 + 12 + 4×20 + 1 × 0.5 ≈ **96 MiB**.
+  - **Working-memory total at default config (4 ASR workers + 1 alignment worker, alignment on):** roughly 4 + 12 + 4×20 + 1 × 0.5 ≈ **96 MiB**. Scales roughly linearly with `worker_count` via the per-worker decoder workspace term (≈20 MiB / worker on tiny); e.g., 8 ASR workers → ≈ 176 MiB working memory; 16 → ≈ 336 MiB. Model weights and the alignment-logits buffer are independent of `worker_count`.
 - **Model weights (loaded once):**
   - Whisper: 75 MiB (tiny) up to 3 GiB (large-v3).
   - Per-language wav2vec2: 50–500 MiB each. Multilingual fallback (XLSR / MMS large): up to 2 GiB.
