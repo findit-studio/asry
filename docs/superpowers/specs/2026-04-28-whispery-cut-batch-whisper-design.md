@@ -601,6 +601,12 @@ pub enum TranscriberError {
     AfterEof,
 }
 
+// Derives Clone + Debug. Clone is required because the dispatch
+// state machine moves WorkFailure into Event::Error while runner
+// code may also want to log it; the indexer can match on it
+// without a heavy-clone cost (the contained String is the only
+// non-trivial allocation).
+#[derive(Clone, Debug)]
 pub enum WorkFailure {
     AsrFailed { kind: AsrFailureKind, message: String },
     AlignmentFailed { kind: AlignmentFailureKind, message: String, language: Lang },
@@ -683,6 +689,11 @@ The core is a single struct, `Transcriber`, wrapping the cut state machine, the 
 ### 5.1 Transcriber surface
 
 ```rust
+// Transcriber is `Send` (movable across threads) but `!Sync`
+// (every public mutating method takes `&mut self`). A consumer
+// that wants to drive it from multiple threads must wrap it in
+// `Mutex<Transcriber>` themselves; whispery does not provide
+// internal synchronisation.
 pub struct Transcriber {
     config: TranscriberConfig,
     buffer: SampleBuffer,
@@ -820,7 +831,12 @@ impl Transcriber {
     /// only the most-recently-popped command can be unpolled).
     pub(crate) fn unpoll_command(&mut self, cmd: Command);
 
-    pub fn is_idle(&self) -> bool;       // no pending work, no buffered samples
+    /// True iff every queue is empty: no buffered samples, no
+    /// pending command/event, no in_flight chunks, no cut_pending
+    /// entries. Pre-restart in-flight chunks (those still working
+    /// through whisper or alignment) keep `is_idle()` false until
+    /// they emit; `restart_at` does not synthetically clear them.
+    pub fn is_idle(&self) -> bool;
     pub fn buffered_samples(&self) -> usize;
     pub fn output_timebase(&self) -> Option<mediatime::Timebase>;  // None until first push_samples
 
@@ -1564,6 +1580,11 @@ struct AsrWorkItem {
     chunk_id: ChunkId,
     samples: Arc<[f32]>,
     params: AsrParams,
+    /// Per-job timeout sourced from the runner builder's
+    /// `worker_timeouts(asr, _)` call. Stamped on the AsrWorkItem
+    /// at dispatch time so each in-flight chunk carries its own
+    /// budget; the worker thread feeds this into the abort_flag
+    /// watchdog wired in `full_params_from`.
     asr_timeout: Duration,
 }
 ```
@@ -1635,6 +1656,13 @@ pub struct Aligner {
     normalizer: Box<dyn TextNormalizer>,
     sample_rate: u32,           // wav2vec2's expected rate, typically 16_000
     hop_samples: u32,           // model frame stride, typically 320 (= 20ms @ 16kHz)
+    /// Vocab id of the CTC blank token. Read from the wav2vec2
+    /// tokenizer's special-tokens map at `Aligner::from_paths` time
+    /// (HF tokenizers expose this via `Tokenizer::token_to_id("<pad>")`
+    /// or the model's `tokenizer_config.json::pad_token`). If the
+    /// model uses a non-standard blank token name, the caller can
+    /// override via a future `Aligner::with_blank_token_id` builder
+    /// method; v1 reads the standard `<pad>` / `[PAD]` convention.
     blank_token_id: u32,
 }
 
@@ -1887,6 +1915,15 @@ loop {
     // spuriously (no actual ready channel); that's harmless here
     // — the next try_recv just returns Empty and the outer loop
     // spins one more iteration before re-blocking.
+    //
+    // Disconnected channels: ready_timeout returns Ok when a
+    // channel is closed (not just when a message is available),
+    // so a panicked or shutdown worker thread will wake the
+    // saturation wait via its closed `result_rx`. The next
+    // drive_one_step's try_recv then returns
+    // `Err(TryRecvError::Disconnected)`, which the dispatch loop
+    // surfaces as `Err(RunnerError::WhisperPoolShutdown)`. No
+    // silent stall.
 }
 ```
 
@@ -2084,6 +2121,7 @@ These exercise specific defects caught during the design-review rounds; landing 
 - **`next_expected_starts_at()` correctness (W3).** With output_tb 1/30001 and packet length 1000, push 100 packets using `next_expected_starts_at()` for each subsequent `starts_at`; assert no `PtsRegression`. Then re-run with the caller's own per-packet running sum; assert it eventually trips `PtsRegression` (proving the accessor is necessary).
 - **Layered-ladder suppression (M-κ).** Mock whisper-rs with a recording wrapper around `state.full()`; verify each call's `FullParams` has `temperature_inc == 0.0` and an explicit `set_temperature(t)` value matching the runner's expected ladder step. Two layered ladders would show as multiple internal-loop iterations within a single call.
 - **`unpoll_command` round-trip (M12).** Drive a saturated work_tx; verify `core.poll_command` returns the same command on the second call after `unpoll_command(cmd)` was called (i.e., commands aren't lost or reordered through the park-resume cycle).
+- **Park-and-resume across the wake/select cycle (M12 extended).** Saturate work_tx → drive_one_step parks the front command via `unpoll_command` and returns `Ok(false)` → fire a mocked worker result on `result_rx` → assert `Select::ready_timeout` wakes within `dispatch_idle_poll` → next `drive_one_step` drains the result *and* lands the parked command (i.e., neither phase starves the other).
 - **Empty packet handling.** `push_samples(next_expected_starts_at(), &[])` returns `Ok(())` and does not advance state; `push_vad_segment` after still works.
 - **Zero-duration `VadSegment::new`.** Constructor panics; this is enforced via `#[should_panic]` test.
 - **PtsRegression in output-PTS space, not 16k space (M-δ).** Output_tb 30000/1001 (NTSC), strictly contiguous packet pushes for 100 packets via `next_expected_starts_at()` — assert no spurious `PtsRegression`.
