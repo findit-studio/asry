@@ -436,4 +436,38 @@ mod tests {
             _ => panic!("expected RunAsr"),
         }
     }
+
+    /// Covers the dequeue half of §5.5 invariant 4: when an in-flight
+    /// chunk completes and `after_inject` runs, a chunk that was
+    /// queued in `cut_pending` because `max_in_flight` was full
+    /// must be promoted (audio extracted, RunAsr command queued)
+    /// in the same call.
+    #[test]
+    fn cut_pending_promotes_on_slot_open() {
+        let mut d = Dispatch::new(AsrParams::default(), false, 2);
+        let mut b = make_buffer_with_samples(10_000);
+
+        // Fill in_flight (cap=2) and queue one in cut_pending.
+        d.on_emit(fake_chunk(0, 1_000), ChunkId::from_raw(0), &b);
+        d.on_emit(fake_chunk(1_000, 2_000), ChunkId::from_raw(1), &b);
+        d.on_emit(fake_chunk(2_000, 3_000), ChunkId::from_raw(2), &b);
+        assert_eq!(d.in_flight.len(), 2);
+        assert_eq!(d.cut_pending.len(), 1);
+        assert_eq!(d.pending_commands.len(), 2);
+
+        // Resolve chunk 0; after_inject should both flush its event
+        // AND promote chunk 2 from cut_pending into in_flight,
+        // emitting a third RunAsr command.
+        d.inject_asr_result(ChunkId::from_raw(0), fake_asr_result("c0")).unwrap();
+        d.after_inject(&mut b);
+
+        assert_eq!(d.cut_pending.len(), 0, "cut_pending should be drained");
+        assert_eq!(d.in_flight.len(), 2,
+            "chunk 0 emitted (out), chunk 2 promoted (in) — net stays at 2");
+        assert!(d.in_flight.contains_key(&ChunkId::from_raw(1)));
+        assert!(d.in_flight.contains_key(&ChunkId::from_raw(2)));
+        assert_eq!(d.pending_commands.len(), 3,
+            "third RunAsr was issued for chunk 2 on promotion");
+        assert_eq!(d.pending_events.len(), 1, "chunk 0's Transcript emitted");
+    }
 }
