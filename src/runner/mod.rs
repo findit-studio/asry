@@ -5,5 +5,5 @@ mod managed_transcriber;
 mod whisper_pool;
 
 pub use errors::RunnerError;
-pub use managed_transcriber::ManagedTranscriber;
+pub use managed_transcriber::{ManagedTranscriber, ManagedTranscriberBuilder};
 pub use whisper_pool::WhisperPoolConfig;

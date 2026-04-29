@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crossbeam_channel::TrySendError;
+use whisper_rs::WhisperContext;
 
 use crate::core::{AsrParams, AsrParamsOverride, Command, Event, LanguagePolicy, Transcriber};
 use crate::runner::{RunnerError, WhisperPoolConfig};
@@ -192,5 +193,167 @@ impl ManagedTranscriber {
                 }
             }
         }
+    }
+}
+
+/// Builder for [`ManagedTranscriber`].
+///
+/// All knobs are `with_*` style; defaults match spec §8. Construct
+/// via [`ManagedTranscriber::builder`].
+pub struct ManagedTranscriberBuilder {
+    whisper_ctx: WhisperContext,
+    pool_config: WhisperPoolConfig,
+    chunk_size: Duration,
+    buffer_cap_samples: usize,
+    gap_tolerance_samples: u64,
+    language_policy: LanguagePolicy,
+    asr_params: AsrParams,
+    worker_timeouts_asr: Duration,
+    worker_timeouts_align: Duration,
+    drain_timeout: Option<Duration>,
+}
+
+impl ManagedTranscriberBuilder {
+    /// Internal constructor used by `ManagedTranscriber::builder`.
+    fn new(whisper_ctx: WhisperContext, pool_config: WhisperPoolConfig) -> Self {
+        Self {
+            whisper_ctx,
+            pool_config,
+            chunk_size: Duration::from_secs(30),
+            buffer_cap_samples: 60 * 16_000,
+            gap_tolerance_samples: 200 * 16,
+            language_policy: LanguagePolicy::AutoLockAfter(1),
+            asr_params: AsrParams::new(),
+            worker_timeouts_asr: Duration::from_secs(60),
+            worker_timeouts_align: Duration::from_secs(30),
+            drain_timeout: None,
+        }
+    }
+
+    /// Override [`crate::core::TranscriberConfig::chunk_size`].
+    pub fn chunk_size(mut self, d: Duration) -> Self {
+        self.chunk_size = d;
+        self
+    }
+
+    /// Override [`crate::core::TranscriberConfig::buffer_cap_samples`].
+    pub fn buffer_cap_samples(mut self, n: usize) -> Self {
+        self.buffer_cap_samples = n;
+        self
+    }
+
+    /// Override [`crate::core::TranscriberConfig::gap_tolerance_samples`].
+    pub fn gap_tolerance_samples(mut self, n: u64) -> Self {
+        self.gap_tolerance_samples = n;
+        self
+    }
+
+    /// Override [`crate::core::TranscriberConfig::language_policy`].
+    pub fn language_policy(mut self, p: LanguagePolicy) -> Self {
+        self.language_policy = p;
+        self
+    }
+
+    /// Override the [`WhisperPoolConfig`].
+    pub fn whisper_pool(mut self, cfg: WhisperPoolConfig) -> Self {
+        self.pool_config = cfg;
+        self
+    }
+
+    /// Override the default [`AsrParams`].
+    pub fn asr_params(mut self, p: AsrParams) -> Self {
+        self.asr_params = p;
+        self
+    }
+
+    /// Per-job worker timeouts. Default 60 s for ASR, 30 s for
+    /// alignment.
+    pub fn worker_timeouts(mut self, asr: Duration, align: Duration) -> Self {
+        self.worker_timeouts_asr = asr;
+        self.worker_timeouts_align = align;
+        self
+    }
+
+    /// Cap on `drain()`. Default 10× the longest worker timeout.
+    pub fn drain_timeout(mut self, t: Duration) -> Self {
+        self.drain_timeout = Some(t);
+        self
+    }
+
+    /// Construct the `ManagedTranscriber`. Spawns worker threads and
+    /// wires channels.
+    pub fn build(self) -> Result<ManagedTranscriber, RunnerError> {
+        let drain_timeout = self.drain_timeout.unwrap_or_else(|| {
+            // 10× the longest worker timeout per spec §6.1 / §8.
+            let longest = core::cmp::max(
+                self.worker_timeouts_asr,
+                self.worker_timeouts_align,
+            );
+            longest * 10
+        });
+
+        let core_config = crate::core::TranscriberConfig::new()
+            .with_chunk_size(self.chunk_size)
+            .with_buffer_cap_samples(self.buffer_cap_samples)
+            .with_gap_tolerance_samples(self.gap_tolerance_samples)
+            .with_language_policy(self.language_policy)
+            .with_asr_params(self.asr_params.clone())
+            .with_word_alignment(false)
+            .with_max_in_flight(self.pool_config.worker_count() + 2);
+
+        let whisper_pool = WhisperPool::new(self.whisper_ctx, &self.pool_config)?;
+
+        Ok(ManagedTranscriber {
+            core: Transcriber::new(core_config),
+            whisper_pool,
+            asr_params_default: self.asr_params,
+            asr_timeout: self.worker_timeouts_asr,
+            drain_timeout,
+            block_on_full_queue: self.pool_config.block_on_full_queue(),
+            dispatch_idle_poll: self.pool_config.dispatch_idle_poll(),
+            buffer_cap_samples: self.buffer_cap_samples,
+        })
+    }
+}
+
+impl ManagedTranscriber {
+    /// Begin building a `ManagedTranscriber` from a pre-constructed
+    /// `WhisperContext`. The caller controls flash_attn / DTW / GPU
+    /// device explicitly when constructing the context (spec §5.6,
+    /// §6.2).
+    ///
+    /// `pool_config` carries the runner-side knobs (worker count,
+    /// queue depth, backpressure mode).
+    pub fn builder(
+        whisper_ctx: WhisperContext,
+        pool_config: WhisperPoolConfig,
+    ) -> ManagedTranscriberBuilder {
+        ManagedTranscriberBuilder::new(whisper_ctx, pool_config)
+    }
+
+    /// Convenience: build directly from a `WhisperPoolConfig`'s
+    /// `model_path`, loading the context with the config's GPU
+    /// settings. Intended for callers that don't need to customise
+    /// `WhisperContextParameters` beyond what `WhisperPoolConfig`
+    /// already exposes.
+    pub fn from_config(
+        pool_config: WhisperPoolConfig,
+    ) -> Result<ManagedTranscriberBuilder, RunnerError> {
+        let mut ctx_params = whisper_rs::WhisperContextParameters::default();
+        ctx_params.use_gpu(pool_config.use_gpu());
+        ctx_params.gpu_device(pool_config.gpu_device());
+        ctx_params.flash_attn(pool_config.flash_attn());
+        let path = pool_config.model_path().to_str().ok_or_else(|| {
+            RunnerError::WhisperContextLoad {
+                message: format!(
+                    "model_path is not valid UTF-8: {:?}",
+                    pool_config.model_path()
+                ),
+            }
+        })?;
+        let ctx = WhisperContext::new_with_params(path, ctx_params).map_err(|e| {
+            RunnerError::WhisperContextLoad { message: format!("{e:?}") }
+        })?;
+        Ok(ManagedTranscriberBuilder::new(ctx, pool_config))
     }
 }
