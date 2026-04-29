@@ -63,8 +63,58 @@ pub(crate) struct ChunkRecord {
     pub asr_result: Option<AsrResult>,
 }
 
+/// A chunk whose audio has been extracted from the live buffer and
+/// whose output-timebase ranges have been computed, but which has
+/// not yet been promoted to `in_flight` (no `RunAsr` command issued
+/// yet). `cut_pending` entries are stored as `ExtractedChunk` so
+/// they survive `restart_at`'s buffer reset without needing the old
+/// `draining_for_restart` bypass — and so the AutoLockAfter
+/// observation-window gate is preserved during recovery (Codex
+/// round-7 fix).
+#[derive(Debug)]
+pub(crate) struct ExtractedChunk {
+    pub chunk_id: ChunkId,
+    pub samples: Arc<[f32]>,
+    pub sample_range: SampleRange,
+    pub range: TimeRange,
+    pub sub_segments: Vec<TimeRange>,
+    pub sub_origins: Vec<SubOrigin>,
+}
+
+impl ExtractedChunk {
+    /// Pull a chunk's audio out of the live buffer and compute its
+    /// output-timebase ranges. Crate-private; used by `Dispatch::on_emit`
+    /// at the moment a `MergedChunk` is produced.
+    pub(crate) fn extract_from(
+        chunk_id: ChunkId,
+        chunk: MergedChunk,
+        buffer: &SampleBuffer,
+    ) -> Self {
+        let samples = buffer.extract(chunk.range);
+        let range = buffer.samples_to_output_range(chunk.range);
+        let sub_segments: Vec<TimeRange> = chunk
+            .subs
+            .iter()
+            .map(|s| buffer.samples_to_output_range(s.range))
+            .collect();
+        let sub_origins: Vec<SubOrigin> = chunk.subs.iter().map(|s| s.origin).collect();
+        Self {
+            chunk_id,
+            samples,
+            sample_range: chunk.range,
+            range,
+            sub_segments,
+            sub_origins,
+        }
+    }
+}
+
 pub(crate) struct Dispatch {
-    pub cut_pending: VecDeque<(ChunkId, MergedChunk)>,
+    /// Chunks emitted by Cut that haven't yet been promoted to
+    /// `in_flight`. Stored as `ExtractedChunk` (audio already
+    /// pulled from the live buffer) so they survive `restart_at`'s
+    /// buffer reset without bypassing the AutoLockAfter gate.
+    pub cut_pending: VecDeque<ExtractedChunk>,
     pub in_flight: BTreeMap<ChunkId, ChunkRecord>,
     pub next_emit_chunk_id: ChunkId,
     pub pending_commands: VecDeque<Command>,
@@ -117,11 +167,6 @@ pub(crate) struct Dispatch {
     /// resolution, not on full chunk readiness — a chunk awaiting
     /// alignment has already produced its language signal.
     pub auto_lock_cursor: ChunkId,
-    /// Set true while `restart_at` is draining `cut_pending`. While
-    /// true, the promotion guard `in_flight.len() < max_in_flight`
-    /// is suspended (per §5.5 invariant 4 exception). Reset to
-    /// false at the end of restart_at.
-    pub draining_for_restart: bool,
     /// Single-slot undo for the runner's dispatch loop. Set by
     /// `unpoll_command`, consumed by the next `poll_command` (which
     /// returns the parked command first).
@@ -158,7 +203,6 @@ impl Dispatch {
             auto_lock_observations: alloc::vec::Vec::new(),
             auto_lock_pending: BTreeMap::new(),
             auto_lock_cursor: ChunkId::from_raw(0),
-            draining_for_restart: false,
             parked_command: None,
         }
     }
@@ -187,19 +231,22 @@ impl Dispatch {
     }
 
     /// Called by `Transcriber` whenever the cut state machine emits
-    /// a `MergedChunk`. Either promotes the chunk to `in_flight`
-    /// immediately (and emits a `RunAsr` command) or queues it on
-    /// `cut_pending` if the effective cap is saturated.
+    /// a `MergedChunk`. Always pre-extracts the chunk's audio (so it
+    /// survives later `restart_at` buffer resets), then either
+    /// promotes the chunk to `in_flight` immediately (and emits a
+    /// `RunAsr` command) or queues it on `cut_pending` if the
+    /// effective cap is saturated.
     pub(crate) fn on_emit(
         &mut self,
         chunk: MergedChunk,
         chunk_id: ChunkId,
         buffer: &SampleBuffer,
     ) {
-        if self.draining_for_restart || self.in_flight.len() < self.effective_max_in_flight() {
-            self.promote(chunk_id, chunk, buffer);
+        let extracted = ExtractedChunk::extract_from(chunk_id, chunk, buffer);
+        if self.in_flight.len() < self.effective_max_in_flight() {
+            self.promote_extracted(extracted);
         } else {
-            self.cut_pending.push_back((chunk_id, chunk));
+            self.cut_pending.push_back(extracted);
         }
     }
 
@@ -215,10 +262,12 @@ impl Dispatch {
     /// after the first non-empty chunks". Holding back chunks past
     /// the observation window ensures the lock applies to every
     /// chunk past the window.
+    ///
+    /// Round-7: this gate is now preserved across `restart_at` —
+    /// the old `draining_for_restart` bypass was removed (cut_pending
+    /// entries hold pre-extracted audio, so they no longer need the
+    /// drain to preserve their data).
     fn effective_max_in_flight(&self) -> usize {
-        if self.draining_for_restart {
-            return self.max_in_flight;
-        }
         if let LanguagePolicy::AutoLockAfter(n) = &self.language_policy {
             if self.locked_language.is_none() {
                 return (*n).min(self.max_in_flight);
@@ -227,38 +276,29 @@ impl Dispatch {
         self.max_in_flight
     }
 
-    /// Move a chunk from "just produced by Cut" or "pending" to
-    /// "in_flight" by extracting its samples and queuing a
-    /// `RunAsr` command. Crate-private; the trim path also calls it.
-    fn promote(&mut self, chunk_id: ChunkId, chunk: MergedChunk, buffer: &SampleBuffer) {
-        let samples = buffer.extract(chunk.range);
-        let range = buffer.samples_to_output_range(chunk.range);
-        let sub_segments: Vec<TimeRange> = chunk
-            .subs
-            .iter()
-            .map(|s| buffer.samples_to_output_range(s.range))
-            .collect();
-        let sub_origins: Vec<SubOrigin> = chunk.subs.iter().map(|s| s.origin).collect();
-
-        let record = ChunkRecord {
-            chunk_id,
-            range,
-            samples: samples.clone(),
-            sample_range: chunk.range,
-            sub_segments,
-            sub_origins,
-            phase: ChunkPhase::AwaitingAsr,
-            asr_result: None,
-        };
-        self.in_flight.insert(chunk_id, record);
-
-        // Apply LanguagePolicy at promote time: if a language has
-        // been locked (via Lock pre-fill or AutoLockAfter
-        // observation), set the hint on this chunk's params.
+    /// Move a pre-extracted chunk to `in_flight` and queue its
+    /// `RunAsr` command. Applies the locked language hint if one
+    /// has been established. Crate-private; called by `on_emit` and
+    /// by `after_inject`'s post-resolve promotion loop.
+    fn promote_extracted(&mut self, ext: ExtractedChunk) {
         let mut params = self.asr_params.clone();
         if let Some(locked) = &self.locked_language {
             params.set_language_hint(Some(locked.clone()));
         }
+
+        let chunk_id = ext.chunk_id;
+        let samples = ext.samples; // moved into command + record (clone for command)
+        let record = ChunkRecord {
+            chunk_id,
+            range: ext.range,
+            samples: samples.clone(),
+            sample_range: ext.sample_range,
+            sub_segments: ext.sub_segments,
+            sub_origins: ext.sub_origins,
+            phase: ChunkPhase::AwaitingAsr,
+            asr_result: None,
+        };
+        self.in_flight.insert(chunk_id, record);
 
         self.pending_commands.push_back(Command::RunAsr {
             chunk_id,
@@ -298,29 +338,23 @@ impl Dispatch {
         }
     }
 
-    /// Compute trim's low-water from `cut_pending` only — in-flight
-    /// chunks have their audio in their own Arc<[f32]>s and are
-    /// decoupled from the live buffer. If `cut_pending` is empty,
-    /// the buffer can be trimmed all the way to its high-water
-    /// (caller passes `absolute_sample_offset`).
+    /// Compute trim's low-water. After the round-7 refactor, both
+    /// `in_flight` chunks and `cut_pending` chunks hold their own
+    /// `Arc<[f32]>` audio (extracted at emit time), so neither
+    /// pins the live buffer. The only constraint is the cut
+    /// accumulator: samples back to its start are still referenced
+    /// by an unextracted partial chunk and must survive trim.
     ///
-    /// `cut_accumulator_start` is the start of the chunk currently
-    /// being accumulated in the cut state machine, if any. Samples
-    /// back to that index are still referenced by an unextracted
-    /// partial chunk; trim must not drop them. The caller computes
-    /// this via `Cut::pending_start()` and passes it in (Dispatch
-    /// has no direct handle on Cut).
+    /// `cut_accumulator_start` is `Cut::pending_start()`. If it's
+    /// `None` (no chunk accumulating), the buffer can be trimmed
+    /// all the way to `fallback_high_water` — the caller passes
+    /// `absolute_sample_offset` for that.
     pub(crate) fn low_water_samples(
         &self,
         cut_accumulator_start: Option<u64>,
         fallback_high_water: u64,
     ) -> u64 {
-        let cut_pending_min = self.cut_pending.iter().map(|(_, c)| c.range.start).min();
-        [cut_pending_min, cut_accumulator_start]
-            .into_iter()
-            .flatten()
-            .min()
-            .unwrap_or(fallback_high_water)
+        cut_accumulator_start.unwrap_or(fallback_high_water)
     }
 
     /// After an inject_* path, try to land any newly-eligible
@@ -343,12 +377,11 @@ impl Dispatch {
         buffer.trim_to(low);
         // Promote pending chunks if slots are open under the effective
         // cap (round-6 fix: cap is `n` while AutoLockAfter is unlocked).
-        while !self.draining_for_restart
-            && self.in_flight.len() < self.effective_max_in_flight()
+        while self.in_flight.len() < self.effective_max_in_flight()
             && !self.cut_pending.is_empty()
         {
-            let (chunk_id, chunk) = self.cut_pending.pop_front().expect("just checked non-empty");
-            self.promote(chunk_id, chunk, buffer);
+            let extracted = self.cut_pending.pop_front().expect("just checked non-empty");
+            self.promote_extracted(extracted);
         }
     }
 

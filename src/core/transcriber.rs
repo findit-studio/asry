@@ -272,9 +272,15 @@ impl Transcriber {
             config.max_in_flight > 0,
             "TranscriberConfig::max_in_flight must be > 0 (got 0; would deadlock the dispatch loop)"
         );
-        if let LanguagePolicy::AutoLockAfter(n) = config.language_policy {
+        // Borrow during validation: matching by value would partially
+        // move `config.language_policy`, but since the inner `n: usize`
+        // is Copy, Rust's pattern-matching elides the move and the
+        // code compiles. Borrowing makes the intent explicit and stops
+        // mechanical reviewers from flagging a false-positive
+        // partial-move every round.
+        if let LanguagePolicy::AutoLockAfter(n) = &config.language_policy {
             assert!(
-                n > 0,
+                *n > 0,
                 "LanguagePolicy::AutoLockAfter(n) requires n > 0 (got 0)"
             );
         }
@@ -493,17 +499,16 @@ impl Transcriber {
         self.vad_watermark = sample_index;
 
         // Pre-flush the cut accumulator if a hypothetical segment
-        // arriving at `sample_index` would have forced a flush
-        // (extension would exceed chunk_size_samples). Otherwise
-        // the partial chunk sits forever waiting for a segment
-        // that the caller has now declared isn't coming.
-        if let Some(start) = self.cut.pending_start() {
-            if sample_index.saturating_sub(start) > self.cut.chunk_size_samples() {
-                if let Some(chunk) = self.cut.flush() {
-                    let chunk_id = ChunkId::from_raw(self.next_chunk_id);
-                    self.next_chunk_id += 1;
-                    self.dispatch.on_emit(chunk, chunk_id, &self.buffer);
-                }
+        // arriving at `sample_index` would have forced a flush —
+        // either by exceeding `chunk_size_samples` or by exceeding
+        // the configured `flush_on_silence_gap` threshold. Without
+        // this, a partial chunk would sit until chunk_size or EOF,
+        // defeating utterance-boundary mode (Codex round-7 fix).
+        if self.cut.would_flush_at(sample_index) {
+            if let Some(chunk) = self.cut.flush() {
+                let chunk_id = ChunkId::from_raw(self.next_chunk_id);
+                self.next_chunk_id += 1;
+                self.dispatch.on_emit(chunk, chunk_id, &self.buffer);
             }
         }
 
@@ -585,18 +590,25 @@ impl Transcriber {
     /// Recover from a `GapExceedsTolerance`. See spec §5.4.1.
     ///
     /// Steps:
-    /// 1. Drain `cut_pending` synchronously into `in_flight`
-    ///    (extract samples in old-frame indexing, cache TimeRange
-    ///    via the old anchor). May temporarily exceed
-    ///    `max_in_flight`.
-    /// 2. Flush the cut state machine. Any partial chunk also
-    ///    promotes to `in_flight`.
-    /// 3. Clear the live buffer; reset `absolute_sample_offset` and
+    /// 1. Flush the cut state machine. Any partial chunk goes through
+    ///    `on_emit`, which pre-extracts its audio and either promotes
+    ///    or queues per the AutoLockAfter gate.
+    /// 2. Clear the live buffer; reset `absolute_sample_offset` and
     ///    `buffer_drop_offset` to 0.
-    /// 4. Re-anchor `base_pts_out_anchor` to `starts_at.pts()`.
-    /// 5. `next_chunk_id` continues monotonically.
-    /// 6. Trim's low-water computed from `cut_pending` only — empty
-    ///    after drain — so the new buffer is fully droppable.
+    /// 3. Re-anchor `base_pts_out_anchor` to `starts_at.pts()`.
+    /// 4. `next_chunk_id` continues monotonically.
+    /// 5. Pre-existing `cut_pending` entries already hold their audio
+    ///    in their own `Arc<[f32]>`s (round-7 refactor) — they
+    ///    survive the buffer reset without a special drain pass.
+    ///
+    /// Round-7 fix: previously this method drained `cut_pending` into
+    /// `in_flight` via a `draining_for_restart` bypass that ignored
+    /// the AutoLockAfter observation-window cap. With the cap
+    /// suspended, chunks 1..N could be issued as `RunAsr` without
+    /// the language hint, defeating the round-6 lock contract during
+    /// recovery. The refactored `cut_pending` (stores
+    /// `ExtractedChunk` rather than a sample range into the live
+    /// buffer) makes the drain unnecessary; the gate is preserved.
     ///
     /// Errors:
     /// - `AfterEof` if `signal_eof()` was previously called.
@@ -620,24 +632,17 @@ impl Transcriber {
             }
         }
 
-        // Step 1: drain cut_pending into in_flight before clearing
-        // the buffer. Uses the existing buffer state (still in old
-        // frame).
-        self.dispatch.draining_for_restart = true;
-        while let Some((chunk_id, chunk)) = self.dispatch.cut_pending.pop_front() {
-            // Synthesise the same path as Dispatch::on_emit's
-            // immediate-promote branch.
-            self.dispatch.on_emit(chunk, chunk_id, &self.buffer);
-        }
-
-        // Step 2: flush the cut accumulator (also goes through on_emit).
+        // Step 1: flush the cut accumulator's partial chunk. on_emit
+        // pre-extracts its audio (so it survives the buffer reset
+        // below) and either promotes it (if the gate allows) or
+        // queues it on cut_pending.
         if let Some(chunk) = self.cut.flush() {
             let chunk_id = ChunkId::from_raw(self.next_chunk_id);
             self.next_chunk_id += 1;
             self.dispatch.on_emit(chunk, chunk_id, &self.buffer);
         }
 
-        // Steps 3 + 4: clear buffer and re-anchor.
+        // Steps 2 + 3: clear buffer and re-anchor.
         self.buffer.restart_at(starts_at);
 
         // Reset the cut state machine so its current_end / next_vad_seq
@@ -651,7 +656,6 @@ impl Transcriber {
         // (Codex round-5 corollary).
         self.vad_watermark = 0;
 
-        self.dispatch.draining_for_restart = false;
         Ok(())
     }
 }
@@ -894,6 +898,63 @@ mod tests {
         assert_eq!(t.output_timebase(), Some(tb_48k()));
     }
 
+    /// Codex round-7 finding [high]: restart_at must NOT bypass the
+    /// AutoLockAfter observation-window gate. Pre-fix code routed
+    /// every drained chunk through on_emit with `draining_for_restart`
+    /// flag set, which forced promotion regardless of the round-6
+    /// effective-cap-of-n rule. Net effect: a recovery happening
+    /// before the lock fires would dispatch chunks 1..N as RunAsr
+    /// without the language hint, defeating the lock contract.
+    ///
+    /// Reproduction: AutoLockAfter(1) + max_in_flight = 4. Push
+    /// audio + 4 VAD segments. The round-6 gate caps in_flight at
+    /// 1, so chunks 1, 2, 3 sit in cut_pending. Trigger restart_at
+    /// without injecting chunk 0's result. Pre-fix would have
+    /// promoted chunks 1, 2, 3 (issuing RunAsr without lock).
+    /// Post-fix: chunks 1, 2, 3 stay in cut_pending; only after the
+    /// lock fires (chunk 0 returns) do they promote with the hint.
+    #[test]
+    fn restart_at_preserves_auto_lock_gate() {
+        use crate::core::command::Command;
+
+        let config = TranscriberConfig::default()
+            .with_chunk_size(Duration::from_millis(125)) // 2_000 samples
+            .with_max_in_flight(4)
+            .with_buffer_cap_samples(100_000)
+            .with_language_policy(LanguagePolicy::AutoLockAfter(1));
+        let mut t = Transcriber::new(config);
+
+        // 4 VAD segments emitted; with gate cap = 1, chunk 0 in
+        // flight + chunks 1, 2, 3 in cut_pending.
+        t.push_samples(ts(0), &[0.0; 16_000]).unwrap();
+        t.push_vad_segment(VadSegment::new(0, 2_000)).unwrap();
+        t.push_vad_segment(VadSegment::new(2_000, 4_000)).unwrap();
+        t.push_vad_segment(VadSegment::new(4_000, 6_000)).unwrap();
+        t.push_vad_segment(VadSegment::new(6_000, 8_000)).unwrap();
+
+        // Restart without injecting chunk 0.
+        t.restart_at(ts(50_000_000)).unwrap();
+
+        // Drain commands. There must be exactly ONE RunAsr — chunk 0's
+        // — issued before the restart. Pre-fix would have produced
+        // additional RunAsr commands (without lock) for the drained
+        // chunks 1, 2, 3.
+        let mut run_asr_count = 0;
+        let mut hints = alloc::vec::Vec::new();
+        while let Some(cmd) = t.poll_command() {
+            if let Command::RunAsr { params, chunk_id, .. } = cmd {
+                run_asr_count += 1;
+                hints.push((chunk_id.as_u64(), params.language_hint().cloned()));
+            }
+        }
+        assert_eq!(run_asr_count, 1,
+            "round-7 fix: only chunk 0 issued RunAsr before lock; got hints {:?}",
+            hints);
+        assert_eq!(hints[0].0, 0);
+        assert_eq!(hints[0].1, None,
+            "chunk 0 dispatched without hint — that's expected, it's the observation chunk");
+    }
+
     /// Round-5 corollary: `restart_at` resets the buffer's
     /// `absolute_sample_offset` to 0, so the VAD watermark — which
     /// is in absolute-sample space — must reset too. Without the
@@ -1004,6 +1065,43 @@ mod tests {
 
         // The cut accumulator should have been flushed — chunk 0 is
         // now in_flight awaiting an ASR result.
+        match t.poll_command() {
+            Some(crate::core::command::Command::RunAsr { chunk_id, .. })
+                if chunk_id.as_u64() == 0 => {}
+            other => panic!("expected RunAsr for chunk 0, got {:?}", other),
+        }
+    }
+
+    /// Codex round-7 finding [medium]: signal_no_speech_through
+    /// must pre-flush when the silence gap exceeds
+    /// `flush_on_silence_gap` even if the chunk is far from
+    /// `chunk_size`. Otherwise the utterance-boundary mode is
+    /// defeated for trailing silence — the partial chunk sits in
+    /// the cut state until chunk_size or EOF.
+    #[test]
+    fn signal_no_speech_through_flushes_on_silence_gap_below_chunk_size() {
+        // chunk_size = 30 s (480 000 samples); silence threshold = 500 ms (8 000 samples).
+        let config = TranscriberConfig::default()
+            .with_chunk_size(Duration::from_secs(30))
+            .with_flush_on_silence_gap(Some(Duration::from_millis(500)))
+            .with_language_policy(LanguagePolicy::Auto);
+        let mut t = Transcriber::new(config);
+
+        t.push_samples(ts(0), &[0.0; 200_000]).unwrap();
+        // One short utterance: [0, 16 000) — half a chunk_size.
+        t.push_vad_segment(VadSegment::new(0, 16_000)).unwrap();
+        // No emit yet (chunk_size not crossed).
+        assert!(t.poll_command().is_none());
+
+        // Signal silence through sample 30 000 — gap from the
+        // segment's end (16 000) is 14 000 samples (~875 ms),
+        // greater than the 500 ms (8 000-sample) silence threshold,
+        // but FAR below chunk_size (480 000). Pre-fix code only
+        // pre-flushed on chunk_size; the chunk stayed pending.
+        t.signal_no_speech_through(30_000).unwrap();
+
+        // Post-fix: the silence gap triggers the pre-flush, the
+        // partial chunk emits as a RunAsr command immediately.
         match t.poll_command() {
             Some(crate::core::command::Command::RunAsr { chunk_id, .. })
                 if chunk_id.as_u64() == 0 => {}

@@ -159,6 +159,39 @@ impl Cut {
         self.current_start
     }
 
+    /// Whether a hypothetical sub-range starting at `sample_index`
+    /// would force the current chunk to flush — either because it
+    /// would push the chunk past `chunk_size_samples`, or because
+    /// the silence gap from `current_end` to `sample_index` exceeds
+    /// the configured `flush_on_silence_gap` threshold. Returns
+    /// `false` if no chunk is accumulating yet.
+    ///
+    /// `signal_no_speech_through` calls this to pre-flush whenever a
+    /// hypothetical future segment at `sample_index` would have
+    /// triggered a flush — the caller has already declared that no
+    /// such segment is coming, so the partial chunk can yield now
+    /// instead of sitting until EOF or chunk_size (Codex round-7).
+    pub(crate) fn would_flush_at(&self, sample_index: u64) -> bool {
+        let Some(start) = self.current_start else {
+            return false;
+        };
+        if self.current_end <= start {
+            // No real subs in the current chunk; nothing to flush.
+            return false;
+        }
+        // Chunk-size flush.
+        if sample_index.saturating_sub(start) > self.chunk_size_samples {
+            return true;
+        }
+        // Silence-gap flush.
+        if let Some(threshold) = self.silence_flush_samples {
+            if sample_index.saturating_sub(self.current_end) > threshold {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Push a VAD segment through the cut state machine. Returns
     /// `Some(MergedChunk)` if this push closed an accumulating
     /// chunk; `None` otherwise.
