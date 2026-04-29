@@ -83,6 +83,18 @@ pub enum TranscriberError {
         got: mediatime::Timebase,
     },
 
+    /// Caller passed a `Timestamp` whose timebase has a zero
+    /// numerator. `mediatime::Timebase::new(0, _)` is constructible
+    /// (the type only enforces non-zero denominator), and using it
+    /// as the target of `Timebase::rescale_pts` would panic. The
+    /// public boundary rejects it explicitly so a malformed caller
+    /// timebase surfaces as `Err(_)` instead of an abort.
+    #[error("timebase numerator must be non-zero (got {numerator})")]
+    InvalidTimebase {
+        /// The offending zero (or otherwise rejected) numerator.
+        numerator: u32,
+    },
+
     /// Caller `inject_*`-ed a chunk_id that does not match an in-flight
     /// chunk.
     #[error("unknown or already-resolved chunk_id {0}")]

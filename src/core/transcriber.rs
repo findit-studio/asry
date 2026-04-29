@@ -398,6 +398,13 @@ impl Transcriber {
         if self.eof_signaled {
             return Err(TranscriberError::AfterEof);
         }
+        // Codex round-11 fix: reject malformed timebases at the API
+        // boundary. mediatime::Timebase::new(0, _) is constructible
+        // and would panic later in rescale_pts.
+        let tb = starts_at.timebase();
+        if tb.num() == 0 {
+            return Err(TranscriberError::InvalidTimebase { numerator: tb.num() });
+        }
         // Codex round-8 fix: count cut_pending audio (pre-extracted
         // Arcs, round-7) toward the buffer cap so a slow runner
         // can't accumulate queued audio outside any cap.
@@ -465,10 +472,23 @@ impl Transcriber {
 
         let merged_chunks = self.cut.push_segment(seg);
         self.vad_watermark = seg.end_sample();
+        let emitted_any = !merged_chunks.is_empty();
         for chunk in merged_chunks {
             let chunk_id = ChunkId::from_raw(self.next_chunk_id);
             self.next_chunk_id += 1;
             self.dispatch.on_emit(chunk, chunk_id, &self.buffer);
+        }
+        // Codex round-11 fix: each on_emit pre-extracts a chunk's
+        // audio into an Arc but the same audio is still live in the
+        // buffer. Without trim, total queued = live + cut_pending
+        // briefly exceeds the cap. Run after_inject so trim drops
+        // the duplicated live audio (low-water = cut.pending_start
+        // or vad_watermark). flush_in_order_events is a no-op (no
+        // injects happened); the promote loop is also typically a
+        // no-op (cut_pending was just added; gate state hasn't
+        // changed).
+        if emitted_any {
+            self.dispatch.after_inject(&mut self.buffer, self.cut.pending_start(), self.vad_watermark);
         }
         Ok(())
     }
@@ -664,6 +684,12 @@ impl Transcriber {
     pub fn restart_at(&mut self, starts_at: Timestamp) -> Result<(), TranscriberError> {
         if self.eof_signaled {
             return Err(TranscriberError::AfterEof);
+        }
+        // Round-11: reject malformed (zero-numerator) timebases at
+        // the API boundary; rescale_pts later would panic.
+        let tb = starts_at.timebase();
+        if tb.num() == 0 {
+            return Err(TranscriberError::InvalidTimebase { numerator: tb.num() });
         }
         if let Some(expected_tb) = self.buffer.output_timebase() {
             if starts_at.timebase() != expected_tb {
@@ -938,6 +964,77 @@ mod tests {
         t.push_samples(ts(0), &[0.0; 1000]).unwrap();
         t.restart_at(ts(50_000_000)).unwrap();
         assert_eq!(t.output_timebase(), Some(tb_48k()));
+    }
+
+    /// Codex round-11 finding [high]: VAD-emission used to grow
+    /// cut_pending (pre-extracted Arcs) without dropping the
+    /// duplicated live-buffer audio. After several push_vad_segment
+    /// calls, total queued = live + cut_pending could exceed the
+    /// configured cap, even though push_samples's cap check (round-8)
+    /// would later reject. Fix: push_vad_segment runs after_inject
+    /// at the end so trim drops the live audio that's now in
+    /// cut_pending Arcs. `would_accept(0, 0)` is the predicate for
+    /// "cap is currently respected" — if that returns false right
+    /// after a sequence of push_vad_segment calls, the cap was
+    /// transiently violated.
+    #[test]
+    fn vad_emission_keeps_total_memory_within_cap() {
+        let config = TranscriberConfig::default()
+            .with_buffer_cap_samples(12_000)
+            .with_max_in_flight(1)
+            .with_language_policy(LanguagePolicy::Auto)
+            .with_chunk_size(Duration::from_millis(250)); // 4 000 samples
+        let mut t = Transcriber::new(config);
+
+        // Fill buffer to cap.
+        t.push_samples(ts(0), &[0.0; 12_000]).unwrap();
+        t.push_vad_segment(VadSegment::new(0, 4_000)).unwrap();
+        // Emit chunk 0 (cap=1 → in_flight) and start a new accumulator.
+        t.push_vad_segment(VadSegment::new(4_000, 8_000)).unwrap();
+        // Emit chunk 1 (gated by cap=1 → cut_pending). Pre-fix: live
+        // stayed at 12 000, cut_pending now adds 4 000 — total 16 000
+        // > cap. Post-fix: trim ran, live dropped, total bounded.
+        t.push_vad_segment(VadSegment::new(8_000, 12_000)).unwrap();
+
+        // After VAD-only emission, the cap must still hold:
+        // would_accept(0, 0) = (live + queued ≤ cap). False would
+        // mean we're already over.
+        assert!(
+            t.would_accept(0, 0),
+            "after VAD-only emission, buffered + cut_pending audio must stay within cap; \
+             live={}, cap=12_000",
+            t.buffered_samples()
+        );
+    }
+
+    /// Codex round-11 finding [high]: `mediatime::Timebase::new(0, _)`
+    /// is constructible (the type only enforces non-zero denominator).
+    /// Using such a timebase as the target of `Timebase::rescale_pts`
+    /// panics. push_samples and restart_at reject it explicitly with
+    /// `InvalidTimebase` so a malformed caller timebase surfaces as
+    /// `Err(_)` instead of an abort.
+    #[test]
+    fn push_samples_rejects_zero_numerator_timebase() {
+        let mut t = fresh();
+        let bad_tb = Timebase::new(0, NonZeroU32::new(48_000).unwrap());
+        let r = t.push_samples(Timestamp::new(0, bad_tb), &[0.0; 100]);
+        assert!(
+            matches!(r, Err(TranscriberError::InvalidTimebase { numerator: 0 })),
+            "expected InvalidTimebase, got {:?}", r
+        );
+    }
+
+    /// Round-11 corollary: restart_at also validates the timebase.
+    #[test]
+    fn restart_at_rejects_zero_numerator_timebase() {
+        let mut t = fresh();
+        t.push_samples(ts(0), &[0.0; 100]).unwrap();
+        let bad_tb = Timebase::new(0, NonZeroU32::new(48_000).unwrap());
+        let r = t.restart_at(Timestamp::new(0, bad_tb));
+        assert!(
+            matches!(r, Err(TranscriberError::InvalidTimebase { numerator: 0 })),
+            "expected InvalidTimebase, got {:?}", r
+        );
     }
 
     /// Codex round-9 finding [high]: signal_no_speech_through must
