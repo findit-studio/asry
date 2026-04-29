@@ -1,0 +1,68 @@
+//! Example: drive the Sans-I/O core directly.
+//!
+//! This example uses NO ML backends — every "ASR result" is
+//! synthesised on the fly. It demonstrates the push/poll/inject
+//! contract end-to-end.
+//!
+//! Run with: `cargo run --example core_only`
+
+use core::num::NonZeroU32;
+use core::time::Duration;
+
+use mediatime::{Timebase, Timestamp};
+use whispery::{
+    AsrResult, Command, Event, Lang, Transcriber, TranscriberConfig, VadSegment,
+};
+
+fn main() {
+    // Output timebase: original media at 48 kHz.
+    let output_tb = Timebase::new(1, NonZeroU32::new(48_000).unwrap());
+
+    let mut config = TranscriberConfig::default();
+    config.chunk_size = Duration::from_secs(2);
+    let mut t = Transcriber::new(config);
+
+    // Push 4 seconds of audio at 16 kHz internal = 64_000 samples.
+    let samples = vec![0.0_f32; 64_000];
+    t.push_samples(Timestamp::new(0, output_tb), &samples).unwrap();
+
+    // Two VAD segments, each ~2 s.
+    t.push_vad_segment(VadSegment::new(0, 32_000)).unwrap();
+    t.push_vad_segment(VadSegment::new(32_000, 64_000)).unwrap();
+    t.signal_eof().unwrap();
+
+    // Drain commands, feed mocked results back.
+    while let Some(cmd) = t.poll_command() {
+        match cmd {
+            Command::RunAsr { chunk_id, samples, .. } => {
+                println!("[asr] chunk {} ({} samples)", chunk_id, samples.len());
+                t.inject_asr_result(
+                    chunk_id,
+                    AsrResult {
+                        text: format!("(mock transcript for chunk {})", chunk_id).into(),
+                        language: Lang::En,
+                        avg_logprob: -0.5,
+                        no_speech_prob: 0.05,
+                        temperature: 0.0,
+                    },
+                ).unwrap();
+            }
+            Command::RunAlignment { .. } => {
+                unreachable!("alignment off in this example");
+            }
+        }
+    }
+
+    // Drain events.
+    while let Some(ev) = t.poll_event() {
+        match ev {
+            Event::Transcript(tr) => {
+                println!("[transcript] chunk {} text={:?} range={:?}",
+                    tr.chunk_id(), tr.text(), tr.range());
+            }
+            Event::Error { chunk_id, error } => {
+                println!("[error] chunk {} error={:?}", chunk_id, error);
+            }
+        }
+    }
+}
