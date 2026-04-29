@@ -17,20 +17,20 @@ fn ts(pts: i64) -> Timestamp {
 }
 
 fn happy_asr_result(text: &str) -> AsrResult {
-    AsrResult {
-        text: smol_str::SmolStr::new(text),
-        language: Lang::En,
-        avg_logprob: -0.5,
-        no_speech_prob: 0.05,
-        temperature: 0.0,
-    }
+    AsrResult::new(
+        smol_str::SmolStr::new(text),
+        Lang::En,
+        -0.5,
+        0.05,
+        0.0,
+    )
 }
 
 #[test]
 fn happy_path_three_chunks_emit_in_order() {
-    let mut config = TranscriberConfig::default();
-    config.chunk_size = Duration::from_secs(2);
-    config.max_in_flight = 4;
+    let config = TranscriberConfig::default()
+        .with_chunk_size(Duration::from_secs(2))
+        .with_max_in_flight(4);
 
     let mut t = Transcriber::new(config);
 
@@ -74,8 +74,7 @@ fn happy_path_three_chunks_emit_in_order() {
 
 #[test]
 fn out_of_order_completion_emits_in_chunk_id_order() {
-    let mut config = TranscriberConfig::default();
-    config.chunk_size = Duration::from_secs(1);
+    let config = TranscriberConfig::default().with_chunk_size(Duration::from_secs(1));
     let mut t = Transcriber::new(config);
 
     t.push_samples(ts(0), &vec![0.0_f32; 64_000]).unwrap();

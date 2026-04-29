@@ -42,38 +42,184 @@ impl Default for LanguagePolicy {
 }
 
 /// Configuration for the core state machine.
+///
+/// Fields are private; use [`TranscriberConfig::new`] (or
+/// [`Default::default`]) and the `set_*` / `with_*` accessors to
+/// construct and tweak. The `with_*` methods are consuming
+/// builder-style; `set_*` mutate in place. Most accessors are
+/// `const fn` and can run in const contexts.
 #[derive(Clone, Debug)]
 pub struct TranscriberConfig {
-    /// Maximum duration of a merged chunk. Default 30 s.
-    pub chunk_size: Duration,
-    /// Max samples kept in the internal buffer before push returns
-    /// Backpressure. Default 60 s × 16 kHz = 960 000.
-    pub buffer_cap_samples: usize,
-    /// Maximum forward-gap that is silently zero-filled. Default
-    /// 200 ms × 16 kHz = 3200.
-    pub gap_tolerance_samples: u64,
-    /// Whether to emit `RunAlignment` after each ASR completion.
-    pub word_alignment: bool,
-    /// Maximum chunks in flight. Default `worker_count + 2`; without
-    /// runner context, the core defaults to 6.
-    pub max_in_flight: usize,
-    /// Default ASR params injected into every `RunAsr` command.
-    pub asr_params: AsrParams,
-    /// Language detection / locking strategy.
-    pub language_policy: LanguagePolicy,
+    chunk_size: Duration,
+    buffer_cap_samples: usize,
+    gap_tolerance_samples: u64,
+    word_alignment: bool,
+    max_in_flight: usize,
+    asr_params: AsrParams,
+    language_policy: LanguagePolicy,
+    flush_on_silence_gap: Option<Duration>,
 }
 
-impl Default for TranscriberConfig {
-    fn default() -> Self {
+impl TranscriberConfig {
+    /// Construct a config with all default values. Equivalent to
+    /// [`Default::default`] but `const fn`.
+    pub const fn new() -> Self {
         Self {
             chunk_size: Duration::from_secs(30),
             buffer_cap_samples: 60 * 16_000,
             gap_tolerance_samples: 200 * 16, // 200 ms at 16 kHz
             word_alignment: false,
             max_in_flight: 6,
-            asr_params: AsrParams::default(),
-            language_policy: LanguagePolicy::default(),
+            asr_params: AsrParams::new(),
+            language_policy: LanguagePolicy::AutoLockAfter(1),
+            flush_on_silence_gap: None,
         }
+    }
+
+    /// Maximum duration of a merged chunk. Default 30 s.
+    pub const fn chunk_size(&self) -> Duration {
+        self.chunk_size
+    }
+
+    /// Max samples kept in the internal buffer before push returns
+    /// `Backpressure`. Default 60 s × 16 kHz = 960 000.
+    pub const fn buffer_cap_samples(&self) -> usize {
+        self.buffer_cap_samples
+    }
+
+    /// Maximum forward-gap that is silently zero-filled. Default
+    /// 200 ms × 16 kHz = 3200.
+    pub const fn gap_tolerance_samples(&self) -> u64 {
+        self.gap_tolerance_samples
+    }
+
+    /// Whether to emit `RunAlignment` after each ASR completion.
+    pub const fn word_alignment(&self) -> bool {
+        self.word_alignment
+    }
+
+    /// Maximum chunks in flight. Default 6 (worker_count + 2 for a
+    /// 4-worker runner; whispery's core has no runner context, so
+    /// the default is fixed).
+    pub const fn max_in_flight(&self) -> usize {
+        self.max_in_flight
+    }
+
+    /// Default ASR params injected into every `RunAsr` command.
+    pub const fn asr_params(&self) -> &AsrParams {
+        &self.asr_params
+    }
+
+    /// Language detection / locking strategy.
+    pub const fn language_policy(&self) -> &LanguagePolicy {
+        &self.language_policy
+    }
+
+    /// If `Some(threshold)`, the cut state machine flushes the
+    /// accumulating chunk whenever a new VAD segment arrives after
+    /// a silence gap larger than `threshold`. `None` keeps the
+    /// WhisperX-style continuous batching where small silences are
+    /// merged into a chunk for whisper context. Default `None`.
+    pub const fn flush_on_silence_gap(&self) -> Option<Duration> {
+        self.flush_on_silence_gap
+    }
+
+    // --- Mutating setters ----------------------------------------
+
+    /// Set [`Self::chunk_size`].
+    pub const fn set_chunk_size(&mut self, value: Duration) {
+        self.chunk_size = value;
+    }
+
+    /// Set [`Self::buffer_cap_samples`].
+    pub const fn set_buffer_cap_samples(&mut self, value: usize) {
+        self.buffer_cap_samples = value;
+    }
+
+    /// Set [`Self::gap_tolerance_samples`].
+    pub const fn set_gap_tolerance_samples(&mut self, value: u64) {
+        self.gap_tolerance_samples = value;
+    }
+
+    /// Set [`Self::word_alignment`].
+    pub const fn set_word_alignment(&mut self, value: bool) {
+        self.word_alignment = value;
+    }
+
+    /// Set [`Self::max_in_flight`].
+    pub const fn set_max_in_flight(&mut self, value: usize) {
+        self.max_in_flight = value;
+    }
+
+    /// Set [`Self::asr_params`].
+    pub fn set_asr_params(&mut self, value: AsrParams) {
+        self.asr_params = value;
+    }
+
+    /// Set [`Self::language_policy`].
+    pub fn set_language_policy(&mut self, value: LanguagePolicy) {
+        self.language_policy = value;
+    }
+
+    /// Set [`Self::flush_on_silence_gap`].
+    pub const fn set_flush_on_silence_gap(&mut self, value: Option<Duration>) {
+        self.flush_on_silence_gap = value;
+    }
+
+    // --- Builder-style (consuming) -------------------------------
+
+    /// Builder-style override for [`Self::chunk_size`].
+    pub const fn with_chunk_size(mut self, value: Duration) -> Self {
+        self.chunk_size = value;
+        self
+    }
+
+    /// Builder-style override for [`Self::buffer_cap_samples`].
+    pub const fn with_buffer_cap_samples(mut self, value: usize) -> Self {
+        self.buffer_cap_samples = value;
+        self
+    }
+
+    /// Builder-style override for [`Self::gap_tolerance_samples`].
+    pub const fn with_gap_tolerance_samples(mut self, value: u64) -> Self {
+        self.gap_tolerance_samples = value;
+        self
+    }
+
+    /// Builder-style override for [`Self::word_alignment`].
+    pub const fn with_word_alignment(mut self, value: bool) -> Self {
+        self.word_alignment = value;
+        self
+    }
+
+    /// Builder-style override for [`Self::max_in_flight`].
+    pub const fn with_max_in_flight(mut self, value: usize) -> Self {
+        self.max_in_flight = value;
+        self
+    }
+
+    /// Builder-style override for [`Self::asr_params`].
+    pub fn with_asr_params(mut self, value: AsrParams) -> Self {
+        self.asr_params = value;
+        self
+    }
+
+    /// Builder-style override for [`Self::language_policy`].
+    pub fn with_language_policy(mut self, value: LanguagePolicy) -> Self {
+        self.language_policy = value;
+        self
+    }
+
+    /// Builder-style override for [`Self::flush_on_silence_gap`].
+    pub const fn with_flush_on_silence_gap(mut self, value: Option<Duration>) -> Self {
+        self.flush_on_silence_gap = value;
+        self
+    }
+}
+
+impl Default for TranscriberConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -142,7 +288,7 @@ impl Transcriber {
         );
 
         let buffer = SampleBuffer::new(config.buffer_cap_samples, config.gap_tolerance_samples);
-        let cut = Cut::new(config.chunk_size);
+        let cut = Cut::new(config.chunk_size, config.flush_on_silence_gap);
         let dispatch = Dispatch::new(
             config.asr_params.clone(),
             config.word_alignment,
@@ -483,7 +629,7 @@ impl Transcriber {
 
         // Reset the cut state machine so its current_end / next_vad_seq
         // align with the new frame.
-        self.cut = Cut::new(self.config.chunk_size);
+        self.cut = Cut::new(self.config.chunk_size, self.config.flush_on_silence_gap);
 
         // The VAD watermark lives in absolute-sample space, which
         // restart_at just reset to 0. Reset the watermark too,
@@ -571,10 +717,10 @@ mod tests {
     #[test]
     fn restart_at_drains_cut_pending_into_in_flight() {
         // max_in_flight = 1 forces queueing.
-        let mut config = TranscriberConfig::default();
-        config.max_in_flight = 1;
-        config.chunk_size = Duration::from_millis(125); // 2_000 samples
-        config.buffer_cap_samples = 100_000;
+        let config = TranscriberConfig::default()
+            .with_max_in_flight(1)
+            .with_chunk_size(Duration::from_millis(125)) // 2_000 samples
+            .with_buffer_cap_samples(100_000);
         let mut t = Transcriber::new(config);
 
         // Push enough audio to cover three chunks.
@@ -609,10 +755,10 @@ mod tests {
         use crate::core::command::Command;
         use smol_str::SmolStr;
 
-        let mut config = TranscriberConfig::default();
-        config.chunk_size = Duration::from_secs(2); // 32_000 samples @ 16k
-        config.buffer_cap_samples = 200_000;
-        config.max_in_flight = 4;
+        let config = TranscriberConfig::default()
+            .with_chunk_size(Duration::from_secs(2)) // 32_000 samples @ 16k
+            .with_buffer_cap_samples(200_000)
+            .with_max_in_flight(4);
         let mut t = Transcriber::new(config);
 
         // 4 seconds of 16 kHz audio = 64_000 samples.
@@ -629,13 +775,13 @@ mod tests {
         // cut_pending was empty (chunk 1 wasn't yet emitted by Cut).
         let cmd = t.poll_command().unwrap();
         let Command::RunAsr { chunk_id, .. } = cmd else { panic!("expected RunAsr") };
-        let asr = crate::core::command::AsrResult {
-            text: SmolStr::new("c0"),
-            language: crate::types::Lang::En,
-            avg_logprob: -0.5,
-            no_speech_prob: 0.05,
-            temperature: 0.0,
-        };
+        let asr = crate::core::command::AsrResult::new(
+            SmolStr::new("c0"),
+            crate::types::Lang::En,
+            -0.5,
+            0.05,
+            0.0,
+        );
         t.inject_asr_result(chunk_id, asr).unwrap();
 
         // Drain chunk 0's Transcript event.
@@ -674,8 +820,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "max_in_flight")]
     fn config_with_zero_max_in_flight_panics() {
-        let mut config = TranscriberConfig::default();
-        config.max_in_flight = 0;
+        let config = TranscriberConfig::default().with_max_in_flight(0);
         let _ = Transcriber::new(config);
     }
 
@@ -686,8 +831,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "AutoLockAfter")]
     fn config_with_zero_auto_lock_after_panics() {
-        let mut config = TranscriberConfig::default();
-        config.language_policy = LanguagePolicy::AutoLockAfter(0);
+        let config = TranscriberConfig::default()
+            .with_language_policy(LanguagePolicy::AutoLockAfter(0));
         let _ = Transcriber::new(config);
     }
 
@@ -698,8 +843,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "chunk_size")]
     fn config_with_zero_chunk_size_panics() {
-        let mut config = TranscriberConfig::default();
-        config.chunk_size = Duration::ZERO;
+        let config = TranscriberConfig::default().with_chunk_size(Duration::ZERO);
         let _ = Transcriber::new(config);
     }
 
@@ -755,6 +899,38 @@ mod tests {
         t.push_vad_segment(VadSegment::new(0, 5_000)).unwrap();
     }
 
+    /// User feature: `flush_on_silence_gap = Some(threshold)` makes
+    /// the cut state machine yield a chunk whenever a silence gap
+    /// between consecutive VAD segments exceeds the threshold —
+    /// utterance-boundary chunking instead of WhisperX-style
+    /// continuous batching. With the threshold set, two short VAD
+    /// segments separated by silence longer than the threshold
+    /// produce two chunks instead of one merged chunk.
+    #[test]
+    fn flush_on_silence_gap_yields_at_utterance_boundary() {
+        let config = TranscriberConfig::default()
+            .with_chunk_size(Duration::from_secs(30))
+            .with_flush_on_silence_gap(Some(Duration::from_millis(500)));
+        let mut t = Transcriber::new(config);
+
+        t.push_samples(ts(0), &[0.0; 100_000]).unwrap();
+        // Speech utterance 1: [0, 16 000) — half a second.
+        t.push_vad_segment(VadSegment::new(0, 16_000)).unwrap();
+        // 1 s gap (16 000 samples) > 500 ms threshold (8 000 samples).
+        // Speech utterance 2: [32 000, 48 000).
+        t.push_vad_segment(VadSegment::new(32_000, 48_000)).unwrap();
+        t.signal_eof().unwrap();
+
+        let mut chunk_starts = alloc::vec::Vec::new();
+        while let Some(cmd) = t.poll_command() {
+            if let crate::core::command::Command::RunAsr { chunk_id, .. } = cmd {
+                chunk_starts.push(chunk_id.as_u64());
+            }
+        }
+        assert_eq!(chunk_starts.len(), 2,
+            "silence-flush yielded one chunk per utterance");
+    }
+
     /// Codex round-5 finding [high]: a stream with no VAD activity
     /// for longer than `buffer_cap_samples` would fill the buffer
     /// and trip Backpressure with no recovery path — chunks emit
@@ -764,9 +940,8 @@ mod tests {
     /// audio.
     #[test]
     fn signal_no_speech_through_drains_pure_silence_buffer() {
-        let mut config = TranscriberConfig::default();
         // Tighten cap so test doesn't have to push 60 s of audio.
-        config.buffer_cap_samples = 20_000;
+        let config = TranscriberConfig::default().with_buffer_cap_samples(20_000);
         let mut t = Transcriber::new(config);
         // Push 16 000 samples (close to cap, but under).
         t.push_samples(ts(0), &[0.0; 16_000]).unwrap();
@@ -794,8 +969,7 @@ mod tests {
     /// force the cut to flush anyway.
     #[test]
     fn signal_no_speech_through_flushes_orphaned_partial_chunk() {
-        let mut config = TranscriberConfig::default();
-        config.chunk_size = Duration::from_secs(2); // 32 000 samples
+        let config = TranscriberConfig::default().with_chunk_size(Duration::from_secs(2)); // 32 000 samples
         let mut t = Transcriber::new(config);
         // Push enough audio to cover speech + lots of silence.
         t.push_samples(ts(0), &[0.0; 200_000]).unwrap();

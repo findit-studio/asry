@@ -18,8 +18,7 @@ fn main() {
     // Output timebase: original media at 48 kHz.
     let output_tb = Timebase::new(1, NonZeroU32::new(48_000).unwrap());
 
-    let mut config = TranscriberConfig::default();
-    config.chunk_size = Duration::from_secs(2);
+    let config = TranscriberConfig::default().with_chunk_size(Duration::from_secs(2));
     let mut t = Transcriber::new(config);
 
     // Push 4 seconds of audio at 16 kHz internal = 64_000 samples.
@@ -38,13 +37,13 @@ fn main() {
                 println!("[asr] chunk {} ({} samples)", chunk_id, samples.len());
                 t.inject_asr_result(
                     chunk_id,
-                    AsrResult {
-                        text: format!("(mock transcript for chunk {})", chunk_id).into(),
-                        language: Lang::En,
-                        avg_logprob: -0.5,
-                        no_speech_prob: 0.05,
-                        temperature: 0.0,
-                    },
+                    AsrResult::new(
+                        format!("(mock transcript for chunk {})", chunk_id).into(),
+                        Lang::En,
+                        -0.5,
+                        0.05,
+                        0.0,
+                    ),
                 ).unwrap();
             }
             Command::RunAlignment { .. } => {

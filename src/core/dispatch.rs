@@ -233,7 +233,7 @@ impl Dispatch {
         // observation), set the hint on this chunk's params.
         let mut params = self.asr_params.clone();
         if let Some(locked) = &self.locked_language {
-            params.language_hint = Some(locked.clone());
+            params.set_language_hint(Some(locked.clone()));
         }
 
         self.pending_commands.push_back(Command::RunAsr {
@@ -370,10 +370,10 @@ impl Dispatch {
         // doesn't block auto-lock forever.
         if let LanguagePolicy::AutoLockAfter(n) = &self.language_policy {
             if self.locked_language.is_none() {
-                let entry = if result.text.is_empty() {
+                let entry = if result.text().is_empty() {
                     None
                 } else {
-                    Some(result.language.clone())
+                    Some(result.language().clone())
                 };
                 self.auto_lock_pending.insert(chunk_id, entry);
                 let n = *n;
@@ -382,7 +382,7 @@ impl Dispatch {
         }
 
         let record = self.in_flight.get_mut(&chunk_id).expect("phase-checked above");
-        if self.word_alignment && !result.text.is_empty() {
+        if self.word_alignment && !result.text().is_empty() {
             // Cache only when alignment will consume it. Alignment-off
             // builds the Transcript directly below; caching there
             // would let an unsolicited alignment result later
@@ -393,19 +393,19 @@ impl Dispatch {
                 chunk_id,
                 samples: record.samples.clone(),
                 sub_segments: record.sub_segments.clone(),
-                text: result.text.clone(),
-                language: result.language.clone(),
+                text: result.text().clone(),
+                language: result.language().clone(),
             });
         } else {
             // Build the Transcript with empty words.
             let transcript = Transcript::new(
                 record.range,
-                result.language.clone(),
-                result.text.clone(),
+                result.language().clone(),
+                result.text().clone(),
                 Vec::new(),
-                result.avg_logprob,
-                result.no_speech_prob,
-                result.temperature,
+                result.avg_logprob(),
+                result.no_speech_prob(),
+                result.temperature(),
                 record.sub_segments.clone(),
                 chunk_id,
             );
@@ -433,12 +433,12 @@ impl Dispatch {
         let asr = record.asr_result.take().ok_or(TranscriberError::UnknownChunk(chunk_id))?;
         let transcript = Transcript::new(
             record.range,
-            asr.language.clone(),
-            asr.text.clone(),
-            result.words,
-            asr.avg_logprob,
-            asr.no_speech_prob,
-            asr.temperature,
+            asr.language().clone(),
+            asr.text().clone(),
+            result.into_words(),
+            asr.avg_logprob(),
+            asr.no_speech_prob(),
+            asr.temperature(),
             record.sub_segments.clone(),
             chunk_id,
         );
@@ -564,13 +564,7 @@ mod tests {
     }
 
     fn fake_asr_result(text: &str) -> AsrResult {
-        AsrResult {
-            text: SmolStr::new(text),
-            language: Lang::En,
-            avg_logprob: -0.5,
-            no_speech_prob: 0.05,
-            temperature: 0.0,
-        }
+        AsrResult::new(SmolStr::new(text), Lang::En, -0.5, 0.05, 0.0)
     }
 
     #[test]
@@ -714,7 +708,7 @@ mod tests {
         let cmd = d.poll_command().unwrap();
         match cmd {
             Command::RunAsr { params, .. } => {
-                assert_eq!(params.language_hint, Some(Lang::Zh),
+                assert_eq!(params.language_hint(), Some(&Lang::Zh),
                     "Lock {{ hint: Zh }} must set language_hint on every RunAsr");
             }
             _ => panic!("expected RunAsr"),
@@ -740,7 +734,7 @@ mod tests {
         let cmd = d.poll_command().unwrap();
         match cmd {
             Command::RunAsr { params, .. } => {
-                assert_eq!(params.language_hint, None,
+                assert_eq!(params.language_hint(), None,
                     "first chunk under AutoLockAfter(1) has no hint yet");
             }
             _ => panic!("expected RunAsr"),
@@ -750,13 +744,7 @@ mod tests {
         // the first non-empty observation.
         d.inject_asr_result(
             ChunkId::from_raw(0),
-            AsrResult {
-                text: SmolStr::new("你好"),
-                language: Lang::Zh,
-                avg_logprob: -0.5,
-                no_speech_prob: 0.05,
-                temperature: 0.0,
-            },
+            AsrResult::new(SmolStr::new("你好"), Lang::Zh, -0.5, 0.05, 0.0),
         ).unwrap();
         // Pretend Cut is still accumulating starting at sample 1_000
         // (the start of the second chunk we're about to emit). This
@@ -772,7 +760,7 @@ mod tests {
         match cmd {
             Command::RunAsr { chunk_id, params, .. } => {
                 assert_eq!(chunk_id.as_u64(), 1);
-                assert_eq!(params.language_hint, Some(Lang::Zh),
+                assert_eq!(params.language_hint(), Some(&Lang::Zh),
                     "second chunk hint must be locked to first detection");
             }
             _ => panic!("expected RunAsr"),
@@ -816,7 +804,7 @@ mod tests {
         // Phase is AwaitingAsr.
         let r = d.inject_alignment_result(
             ChunkId::from_raw(0),
-            crate::core::command::AlignmentResult { words: alloc::vec::Vec::new() },
+            crate::core::command::AlignmentResult::new(alloc::vec::Vec::new()),
         );
         assert!(matches!(r, Err(TranscriberError::UnknownChunk(_))));
     }
@@ -864,13 +852,7 @@ mod tests {
             d.on_emit(fake_chunk(s, s + 500), ChunkId::from_raw(i as u64), &b);
             d.inject_asr_result(
                 ChunkId::from_raw(i as u64),
-                AsrResult {
-                    text: SmolStr::new("text"),
-                    language: lang.clone(),
-                    avg_logprob: -0.5,
-                    no_speech_prob: 0.05,
-                    temperature: 0.0,
-                },
+                AsrResult::new(SmolStr::new("text"), lang.clone(), -0.5, 0.05, 0.0),
             ).unwrap();
             // Pretend Cut still has a future chunk accumulating
             // so trim doesn't drop chunk samples we haven't yet
@@ -896,7 +878,7 @@ mod tests {
         match cmd {
             Command::RunAsr { params, chunk_id, .. } => {
                 assert_eq!(chunk_id.as_u64(), 3);
-                assert_eq!(params.language_hint, Some(Lang::En),
+                assert_eq!(params.language_hint(), Some(&Lang::En),
                     "post-lock chunks must carry the locked language");
             }
             _ => panic!("expected RunAsr"),
@@ -929,13 +911,7 @@ mod tests {
         // must NOT advance — chunk 0 is still in flight.
         d.inject_asr_result(
             ChunkId::from_raw(1),
-            AsrResult {
-                text: SmolStr::new("zh"),
-                language: Lang::Zh,
-                avg_logprob: -0.5,
-                no_speech_prob: 0.05,
-                temperature: 0.0,
-            },
+            AsrResult::new(SmolStr::new("zh"), Lang::Zh, -0.5, 0.05, 0.0),
         ).unwrap();
         d.after_inject(&mut b, Some(0));
         assert_eq!(d.locked_language, None,
@@ -947,13 +923,7 @@ mod tests {
         // wins on ties).
         d.inject_asr_result(
             ChunkId::from_raw(0),
-            AsrResult {
-                text: SmolStr::new("en"),
-                language: Lang::En,
-                avg_logprob: -0.5,
-                no_speech_prob: 0.05,
-                temperature: 0.0,
-            },
+            AsrResult::new(SmolStr::new("en"), Lang::En, -0.5, 0.05, 0.0),
         ).unwrap();
         d.after_inject(&mut b, Some(0));
 
@@ -996,24 +966,12 @@ mod tests {
         // locks once observations.len() reaches 2.
         d.inject_asr_result(
             ChunkId::from_raw(1),
-            AsrResult {
-                text: SmolStr::new("hello"),
-                language: Lang::En,
-                avg_logprob: -0.5,
-                no_speech_prob: 0.05,
-                temperature: 0.0,
-            },
+            AsrResult::new(SmolStr::new("hello"), Lang::En, -0.5, 0.05, 0.0),
         ).unwrap();
         d.after_inject(&mut b, Some(0));
         d.inject_asr_result(
             ChunkId::from_raw(2),
-            AsrResult {
-                text: SmolStr::new("world"),
-                language: Lang::En,
-                avg_logprob: -0.5,
-                no_speech_prob: 0.05,
-                temperature: 0.0,
-            },
+            AsrResult::new(SmolStr::new("world"), Lang::En, -0.5, 0.05, 0.0),
         ).unwrap();
         d.after_inject(&mut b, Some(0));
 
@@ -1043,13 +1001,7 @@ mod tests {
         // Chunk 1 (En) lands first (out of order).
         d.inject_asr_result(
             ChunkId::from_raw(1),
-            AsrResult {
-                text: SmolStr::new("hello"),
-                language: Lang::En,
-                avg_logprob: -0.5,
-                no_speech_prob: 0.05,
-                temperature: 0.0,
-            },
+            AsrResult::new(SmolStr::new("hello"), Lang::En, -0.5, 0.05, 0.0),
         ).unwrap();
         d.after_inject(&mut b, Some(0));
         assert_eq!(d.locked_language, None);
@@ -1057,13 +1009,7 @@ mod tests {
         // Chunk 0 (empty) — the cursor advances to 1, picks up En.
         d.inject_asr_result(
             ChunkId::from_raw(0),
-            AsrResult {
-                text: SmolStr::new(""),
-                language: Lang::En,
-                avg_logprob: -1.0,
-                no_speech_prob: 0.95,
-                temperature: 0.0,
-            },
+            AsrResult::new(SmolStr::new(""), Lang::En, -1.0, 0.95, 0.0),
         ).unwrap();
         d.after_inject(&mut b, Some(0));
         assert_eq!(d.locked_language, None,
@@ -1072,13 +1018,7 @@ mod tests {
         // Chunk 2 (En) — second observation lands; lock to En.
         d.inject_asr_result(
             ChunkId::from_raw(2),
-            AsrResult {
-                text: SmolStr::new("world"),
-                language: Lang::En,
-                avg_logprob: -0.5,
-                no_speech_prob: 0.05,
-                temperature: 0.0,
-            },
+            AsrResult::new(SmolStr::new("world"), Lang::En, -0.5, 0.05, 0.0),
         ).unwrap();
         d.after_inject(&mut b, Some(0));
         assert_eq!(d.locked_language, Some(Lang::En));
@@ -1101,13 +1041,7 @@ mod tests {
             d.on_emit(fake_chunk(s, s + 250), ChunkId::from_raw(i as u64), &b);
             d.inject_asr_result(
                 ChunkId::from_raw(i as u64),
-                AsrResult {
-                    text: SmolStr::new("text"),
-                    language: lang.clone(),
-                    avg_logprob: -0.5,
-                    no_speech_prob: 0.05,
-                    temperature: 0.0,
-                },
+                AsrResult::new(SmolStr::new("text"), lang.clone(), -0.5, 0.05, 0.0),
             ).unwrap();
             // Pass Some(0) to pin trim at the buffer start.
             d.after_inject(&mut b, Some(0));

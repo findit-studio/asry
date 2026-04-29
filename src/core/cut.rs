@@ -93,6 +93,12 @@ pub(crate) struct Cut {
     /// `chunk_size` expressed in 16 kHz samples (Duration ×
     /// SAMPLE_RATE_HZ at construction).
     chunk_size_samples: u64,
+    /// If `Some`, flush the current chunk whenever a new sub-range
+    /// arrives after a silence gap (`sub.start - current_end`)
+    /// larger than this threshold. `None` keeps the WhisperX-style
+    /// continuous batching where small silences are merged into a
+    /// chunk for whisper context.
+    silence_flush_samples: Option<u64>,
     /// Monotonic VAD-sequence counter.
     next_vad_seq: u32,
     /// Currently accumulating chunk's start (sample index, inclusive).
@@ -106,15 +112,20 @@ pub(crate) struct Cut {
 }
 
 impl Cut {
-    /// Construct with the given chunk-size duration. The duration is
-    /// converted to 16 kHz samples once.
-    pub(crate) fn new(chunk_size: Duration) -> Self {
+    /// Construct with the given chunk-size duration and optional
+    /// silence-flush threshold. The durations are converted to
+    /// 16 kHz samples once.
+    pub(crate) fn new(chunk_size: Duration, silence_flush_gap: Option<Duration>) -> Self {
         let secs = chunk_size.as_secs_f64();
         // `.round()` is not available in `no_std`; add 0.5 then truncate,
         // which is equivalent for non-negative values.
         let samples = (secs * crate::time::SAMPLE_RATE_HZ as f64 + 0.5) as u64;
+        let silence_flush_samples = silence_flush_gap.map(|d| {
+            (d.as_secs_f64() * crate::time::SAMPLE_RATE_HZ as f64 + 0.5) as u64
+        });
         Self {
             chunk_size_samples: samples,
+            silence_flush_samples,
             next_vad_seq: 0,
             current_start: None,
             current_end: 0,
@@ -214,6 +225,29 @@ impl Cut {
 
     /// Feed one sub-range through the merge logic.
     fn feed_sub(&mut self, sub: SubRange) -> Option<MergedChunk> {
+        let mut emitted = None;
+
+        // Step 0: silence-flush. If a chunk is accumulating and the
+        // gap between the new sub's start and the current chunk's
+        // end exceeds the configured threshold, flush the current
+        // chunk before adding the new sub. This gives utterance-
+        // boundary chunking when callers want it (TranscriberConfig::
+        // flush_on_silence_gap = Some(threshold)). When the threshold
+        // is None (default), small silences stay merged into one
+        // chunk for better whisper context — original WhisperX
+        // semantics.
+        if let (Some(threshold), Some(cs)) = (self.silence_flush_samples, self.current_start) {
+            let gap = sub.range.start.saturating_sub(self.current_end);
+            if gap > threshold && self.current_end > cs {
+                let subs = core::mem::take(&mut self.current_subs);
+                emitted = Some(MergedChunk {
+                    range: SampleRange::new(cs, self.current_end),
+                    subs,
+                });
+                self.current_start = None;
+            }
+        }
+
         // Step 3: initialise current_start AND current_end if absent.
         if self.current_start.is_none() {
             self.current_start = Some(sub.range.start);
@@ -221,11 +255,12 @@ impl Cut {
         }
         let cs = self.current_start.expect("just initialised");
 
-        let mut emitted = None;
-
         // Step 4: emit when adding `sub` would exceed chunk_size, AND
-        // we have at least one segment already in this chunk.
-        if sub.range.end.saturating_sub(cs) > self.chunk_size_samples
+        // we have at least one segment already in this chunk. Skipped
+        // if step 0 already emitted a chunk (a hard-split sub never
+        // alone exceeds chunk_size, so we won't double-emit).
+        if emitted.is_none()
+            && sub.range.end.saturating_sub(cs) > self.chunk_size_samples
             && self.current_end > cs
         {
             let subs = core::mem::take(&mut self.current_subs);
@@ -250,7 +285,7 @@ mod tests {
     use super::*;
 
     fn cut(chunk_size_secs: u64) -> Cut {
-        Cut::new(Duration::from_secs(chunk_size_secs))
+        Cut::new(Duration::from_secs(chunk_size_secs), None)
     }
 
     #[test]
@@ -305,7 +340,7 @@ mod tests {
 
     #[test]
     fn over_long_single_segment_hard_splits_with_per_index_formula() {
-        let mut c = Cut::new(Duration::from_millis(625)); // 10_000 samples @ 16 kHz
+        let mut c = Cut::new(Duration::from_millis(625), None); // 10_000 samples (no silence-flush) @ 16 kHz
         // len = 29_000, chunk_size = 10_000 → n = 3.
         // Per-index: start = [0, 29000/3 = 9666, 2*29000/3 = 19333]
         //            end   = [9666, 19333, 29000]
@@ -342,7 +377,7 @@ mod tests {
     /// must split successfully rather than aborting the process.
     #[test]
     fn hard_split_supports_more_than_255_parts() {
-        let mut c = Cut::new(Duration::from_millis(625)); // 10_000 samples
+        let mut c = Cut::new(Duration::from_millis(625), None); // 10_000 samples
         let parts_wanted: u64 = 300;
         let len = parts_wanted * 10_000;
         let emitted = c.push_segment(VadSegment::new(0, len));
@@ -372,6 +407,62 @@ mod tests {
         }
     }
 
+    /// Silence-flush threshold (`Some(threshold)`) flushes the
+    /// current chunk when the gap to the new sub exceeds it. The
+    /// segments individually stay under chunk_size, so without the
+    /// threshold they would merge into one chunk (WhisperX-style).
+    #[test]
+    fn silence_flush_threshold_separates_chunks_at_gap() {
+        // chunk_size = 30 s, silence threshold = 1 s (16_000 samples).
+        let mut c = Cut::new(Duration::from_secs(30), Some(Duration::from_secs(1)));
+        // First segment ends at 16_000.
+        let r1 = c.push_segment(VadSegment::new(0, 16_000));
+        assert!(r1.is_empty());
+        // Second segment starts at 48_000 — gap of 32_000 (2 s) > 1 s.
+        // Should flush chunk 0 and start chunk 1.
+        let r2 = c.push_segment(VadSegment::new(48_000, 64_000));
+        assert_eq!(r2.len(), 1);
+        assert_eq!(r2[0].range, SampleRange::new(0, 16_000));
+        let final_chunk = c.flush().unwrap();
+        assert_eq!(final_chunk.range, SampleRange::new(48_000, 64_000));
+    }
+
+    /// Silence-flush threshold (`Some(threshold)`) does NOT flush
+    /// when the gap is under the threshold — small silences stay
+    /// merged for whisper context.
+    #[test]
+    fn silence_flush_threshold_keeps_short_gap_merged() {
+        // chunk_size = 30 s, silence threshold = 2 s.
+        let mut c = Cut::new(Duration::from_secs(30), Some(Duration::from_secs(2)));
+        let r1 = c.push_segment(VadSegment::new(0, 16_000));
+        // Gap of 16_000 samples (1 s) — under threshold.
+        let r2 = c.push_segment(VadSegment::new(32_000, 48_000));
+        assert!(r1.is_empty());
+        assert!(r2.is_empty());
+        let final_chunk = c.flush().unwrap();
+        assert_eq!(final_chunk.range, SampleRange::new(0, 48_000),
+            "small gap kept the two segments in one chunk");
+        assert_eq!(final_chunk.subs.len(), 2);
+    }
+
+    /// `None` threshold (default) preserves original WhisperX
+    /// behavior — large silences don't trigger flush, only
+    /// chunk_size does.
+    #[test]
+    fn silence_flush_none_preserves_whisperx_batching() {
+        let mut c = Cut::new(Duration::from_secs(30), None);
+        let r1 = c.push_segment(VadSegment::new(0, 16_000));
+        // 5 s gap — would trip a silence-flush threshold, but None.
+        let r2 = c.push_segment(VadSegment::new(96_000, 112_000));
+        assert!(r1.is_empty());
+        assert!(r2.is_empty());
+        let final_chunk = c.flush().unwrap();
+        // Both segments in one chunk because chunk_size = 30 s
+        // (480_000 samples) wasn't exceeded.
+        assert_eq!(final_chunk.range, SampleRange::new(0, 112_000));
+        assert_eq!(final_chunk.subs.len(), 2);
+    }
+
     #[test]
     fn hard_split_strict_bound_holds_on_pathological_lengths() {
         // The audit's failure case: len=29, chunk=10, n=3 must produce
@@ -379,6 +470,7 @@ mod tests {
         // We need a chunk_size_samples of exactly 10 — build Cut directly.
         let mut c = Cut {
             chunk_size_samples: 10,
+            silence_flush_samples: None,
             next_vad_seq: 0,
             current_start: None,
             current_end: 0,
