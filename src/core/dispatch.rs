@@ -13,6 +13,34 @@ use crate::core::event::Event;
 use crate::core::transcriber::LanguagePolicy;
 use crate::types::{ChunkId, Lang, Transcript, TranscriberError, WorkFailure};
 
+/// Pick the most-frequent language in `observations`, with
+/// first-occurrence tiebreaking among ties.
+///
+/// O(n²) is fine — `observations.len()` equals the
+/// `LanguagePolicy::AutoLockAfter(n)` threshold and is bounded by a
+/// small constant (typically 1–10). Avoids pulling in a HashMap on
+/// no_std for what's essentially a trivial mode computation.
+///
+/// Panics if `observations` is empty (caller guards against that).
+fn mode_with_first_occurrence_tiebreak(observations: &[Lang]) -> Lang {
+    let mut best: Option<(&Lang, usize)> = None;
+    for (idx, lang) in observations.iter().enumerate() {
+        // Skip if we've already counted this language at an earlier
+        // index — first occurrence is the canonical tiebreaker, so
+        // we evaluate each unique language exactly once.
+        if observations[..idx].iter().any(|l| l == lang) {
+            continue;
+        }
+        let count = observations.iter().filter(|l| *l == lang).count();
+        match best {
+            None => best = Some((lang, count)),
+            Some((_, b_count)) if count > b_count => best = Some((lang, count)),
+            _ => {} // count <= b_count: keep the earlier-occurring one
+        }
+    }
+    best.expect("observations must not be empty").0.clone()
+}
+
 #[allow(dead_code)] // alignment fields land in Plan C
 #[derive(Debug)]
 pub(crate) enum ChunkPhase {
@@ -54,10 +82,19 @@ pub(crate) struct Dispatch {
     /// `None` until either (a) `LanguagePolicy::Lock` is in effect or
     /// (b) `LanguagePolicy::AutoLockAfter(n)` reaches its threshold.
     pub locked_language: Option<Lang>,
-    /// Number of non-empty ASR results observed under
-    /// `LanguagePolicy::AutoLockAfter(n)`. When this reaches `n`,
-    /// `locked_language` is set to the most recent observation.
-    pub auto_lock_observations: usize,
+    /// First `n` non-empty observations under
+    /// `LanguagePolicy::AutoLockAfter(n)`. When this reaches `n`
+    /// entries, `locked_language` is set to the most-frequent
+    /// language in the list (with first-occurrence tiebreaking
+    /// among ties — the language that appeared first in the
+    /// observation order wins).
+    ///
+    /// Codex round-2 fix: previously this was a `usize` counter
+    /// that just stored the last-observed language at threshold.
+    /// For `n > 1` that diverged from the spec's "most-frequent"
+    /// contract — a noisy `En, En, Zh` sequence would have
+    /// locked to Zh.
+    pub auto_lock_observations: alloc::vec::Vec<Lang>,
     /// Set true while `restart_at` is draining `cut_pending`. While
     /// true, the promotion guard `in_flight.len() < max_in_flight`
     /// is suspended (per §5.5 invariant 4 exception). Reset to
@@ -96,7 +133,7 @@ impl Dispatch {
             asr_params,
             language_policy,
             locked_language,
-            auto_lock_observations: 0,
+            auto_lock_observations: alloc::vec::Vec::new(),
             draining_for_restart: false,
             parked_command: None,
         }
@@ -267,16 +304,21 @@ impl Dispatch {
             return Err(TranscriberError::UnknownChunk(chunk_id));
         }
 
-        // Update LanguagePolicy::AutoLockAfter observation count.
+        // Update LanguagePolicy::AutoLockAfter observations.
         // Empty-text results don't count (they're typically silent
         // chunks with no language signal). Once `n` non-empty
-        // observations land, lock to the most recent observed
-        // language for all subsequent chunks.
+        // observations land, lock to the most-frequent language
+        // among them, with first-occurrence tiebreaking — the
+        // language that appeared first in the observation order
+        // wins ties. (Codex round-2 fix: previous code locked to
+        // the last observation, which broke `En, En, Zh → Zh`.)
         if let LanguagePolicy::AutoLockAfter(n) = &self.language_policy {
             if self.locked_language.is_none() && !result.text.is_empty() {
-                self.auto_lock_observations += 1;
-                if self.auto_lock_observations >= *n {
-                    self.locked_language = Some(result.language.clone());
+                self.auto_lock_observations.push(result.language.clone());
+                if self.auto_lock_observations.len() >= *n {
+                    self.locked_language = Some(mode_with_first_occurrence_tiebreak(
+                        &self.auto_lock_observations,
+                    ));
                 }
             }
         }
@@ -714,5 +756,102 @@ mod tests {
             },
         );
         assert!(matches!(r, Err(TranscriberError::UnknownChunk(_))));
+    }
+
+    /// Codex round-2 finding [medium]: `AutoLockAfter(n)` must lock
+    /// to the most-frequent observed language, not the last
+    /// observation. With n=3 and observations [En, En, Zh], the
+    /// pre-fix code locked to Zh (last seen); the spec says En
+    /// (most frequent). First-occurrence tiebreaking handles
+    /// equally-frequent languages deterministically.
+    #[test]
+    fn auto_lock_after_three_locks_to_most_frequent() {
+        let mut d = Dispatch::new(
+            AsrParams::default(),
+            false,
+            8,
+            LanguagePolicy::AutoLockAfter(3),
+        );
+        let mut b = make_buffer_with_samples(20_000);
+
+        // Three chunks, observations: En, En, Zh.
+        for (i, lang) in [Lang::En, Lang::En, Lang::Zh].iter().enumerate() {
+            let s = (i as u64) * 1_000;
+            d.on_emit(fake_chunk(s, s + 500), ChunkId::from_raw(i as u64), &b);
+            d.inject_asr_result(
+                ChunkId::from_raw(i as u64),
+                AsrResult {
+                    text: SmolStr::new("text"),
+                    language: lang.clone(),
+                    avg_logprob: -0.5,
+                    no_speech_prob: 0.05,
+                    temperature: 0.0,
+                },
+            ).unwrap();
+            // Pretend Cut still has a future chunk accumulating
+            // so trim doesn't drop chunk samples we haven't yet
+            // emitted.
+            // Pass Some(0) to pin the trim low-water at the buffer
+            // start, keeping all chunks' samples alive for the
+            // duration of the test. This test exercises language
+            // policy, not trim behavior.
+            d.after_inject(&mut b, Some(0));
+        }
+
+        // After 3 observations, locked_language should be En —
+        // the mode of [En, En, Zh].
+        assert_eq!(
+            d.locked_language,
+            Some(Lang::En),
+            "AutoLockAfter(3) must lock to the most-frequent language (En), not the last (Zh)"
+        );
+
+        // Fourth chunk should now have En as its hint.
+        d.on_emit(fake_chunk(3_000, 3_500), ChunkId::from_raw(3), &b);
+        let cmd = d.pending_commands.pop_back().unwrap();
+        match cmd {
+            Command::RunAsr { params, chunk_id, .. } => {
+                assert_eq!(chunk_id.as_u64(), 3);
+                assert_eq!(params.language_hint, Some(Lang::En),
+                    "post-lock chunks must carry the locked language");
+            }
+            _ => panic!("expected RunAsr"),
+        }
+    }
+
+    /// Tiebreaking: with n=2 and [En, Zh] (each observed once), the
+    /// first-occurrence rule picks En.
+    #[test]
+    fn auto_lock_after_two_first_occurrence_tiebreak() {
+        let mut d = Dispatch::new(
+            AsrParams::default(),
+            false,
+            4,
+            LanguagePolicy::AutoLockAfter(2),
+        );
+        let mut b = make_buffer_with_samples(10_000);
+
+        for (i, lang) in [Lang::En, Lang::Zh].iter().enumerate() {
+            let s = (i as u64) * 500;
+            d.on_emit(fake_chunk(s, s + 250), ChunkId::from_raw(i as u64), &b);
+            d.inject_asr_result(
+                ChunkId::from_raw(i as u64),
+                AsrResult {
+                    text: SmolStr::new("text"),
+                    language: lang.clone(),
+                    avg_logprob: -0.5,
+                    no_speech_prob: 0.05,
+                    temperature: 0.0,
+                },
+            ).unwrap();
+            // Pass Some(0) to pin trim at the buffer start.
+            d.after_inject(&mut b, Some(0));
+        }
+
+        assert_eq!(
+            d.locked_language,
+            Some(Lang::En),
+            "first-occurrence tiebreaking picks En over Zh when each appears once"
+        );
     }
 }

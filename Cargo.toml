@@ -29,6 +29,14 @@ tempfile  = "3"
 [features]
 default  = ["std"]
 std      = ["mediatime/std", "smol_str/std", "serde?/std"]
+# Explicit `serde` feature: enables the optional dep AND forwards
+# serde to smol_str + mediatime so derives on public types
+# (Transcript, Word, ChunkId, VadSegment, Lang) actually compile.
+# Codex round-2 finding: previously the implicit "feature from
+# optional=true" form left smol_str/serde and mediatime/serde
+# unactivated, breaking any downstream that enabled
+# `whispery/serde`.
+serde     = ["dep:serde", "smol_str/serde", "mediatime/serde"]
 # Stubs for Plan B / Plan C. Declared here so cfg(feature = "...")
 # branches in Plan A code don't emit `unexpected_cfg` warnings; the
 # features pull no deps and gate no behaviour until Plan B/C land.

@@ -58,6 +58,21 @@ pub enum TranscriberError {
     #[error("push_vad_segment called before any push_samples")]
     OutputTimebaseUnset,
 
+    /// `push_vad_segment` referenced audio that has not been
+    /// buffered yet — `seg.end_sample()` is past the buffer's
+    /// high-water mark. This typically indicates upstream
+    /// VAD/sample skew (the caller pushed VAD ahead of the
+    /// corresponding audio packets). Without this guard, a later
+    /// `signal_eof` flush or chunk emission would `extract` past
+    /// the buffer's tail and panic.
+    #[error("VAD segment end {vad_end} is past buffered samples {buffered}")]
+    VadAheadOfAudio {
+        /// `seg.end_sample()` value the caller passed in.
+        vad_end: u64,
+        /// `buffer.absolute_sample_offset()` at the time of the push.
+        buffered: u64,
+    },
+
     /// `push_samples` was called with a `Timestamp` whose timebase
     /// does not match the timebase recorded from the first push.
     #[error("inconsistent output timebase: expected {expected:?}, got {got:?}")]

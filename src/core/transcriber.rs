@@ -194,6 +194,11 @@ impl Transcriber {
     ///   emits them on silence-edge transitions and rejecting them
     ///   would force callers to add gap-injection logic for the
     ///   same data silero already produced cleanly.
+    /// - `VadAheadOfAudio` if `seg.end_sample()` is past the
+    ///   buffer's current high-water mark. The cut state machine
+    ///   would otherwise accept the segment and emit chunks that
+    ///   later panic in `buffer.extract` once they reach
+    ///   promotion.
     /// - `AfterEof` if `signal_eof()` was called.
     pub fn push_vad_segment(&mut self, seg: VadSegment) -> Result<(), TranscriberError> {
         if self.eof_signaled {
@@ -201,6 +206,18 @@ impl Transcriber {
         }
         if self.buffer.output_timebase().is_none() {
             return Err(TranscriberError::OutputTimebaseUnset);
+        }
+        // Codex round-2 fix: VAD must not reference audio that has
+        // not been buffered. Otherwise the cut state machine would
+        // happily accept the segment, accumulate it, and later
+        // (on a chunk emit or signal_eof flush) trip a panic in
+        // buffer.extract when it tries to slice past the tail.
+        let high_water = self.buffer.absolute_sample_offset();
+        if seg.end_sample() > high_water {
+            return Err(TranscriberError::VadAheadOfAudio {
+                vad_end: seg.end_sample(),
+                buffered: high_water,
+            });
         }
         // Strict-monotonic check against the cut state machine's
         // last accumulated end. Cut tracks current_end internally;
@@ -514,5 +531,28 @@ mod tests {
         assert!(!t.is_idle(), "buffer has 1000 samples; not idle yet");
         t.signal_eof().unwrap();
         assert!(t.is_idle(), "after silent EOF, transcriber should be idle");
+    }
+
+    /// Codex round-2 finding [high]: VAD must not reference audio
+    /// past the buffer's high-water mark. Without the guard, the
+    /// segment is accumulated, signal_eof flushes it, dispatch's
+    /// promote calls buffer.extract on a range that doesn't exist,
+    /// and the program panics.
+    #[test]
+    fn vad_segment_past_buffered_audio_returns_typed_error() {
+        let mut t = fresh();
+        t.push_samples(ts(0), &[0.0; 1000]).unwrap();
+        // VAD segment claims audio out to sample 2000, but buffer
+        // only has 1000 samples.
+        let r = t.push_vad_segment(VadSegment::new(0, 2000));
+        assert!(
+            matches!(r, Err(TranscriberError::VadAheadOfAudio { vad_end: 2000, buffered: 1000 })),
+            "expected VadAheadOfAudio, got {:?}",
+            r
+        );
+        // Critically: signal_eof must now NOT panic — the segment
+        // was rejected, the cut accumulator is empty.
+        t.signal_eof().unwrap();
+        assert!(t.is_idle());
     }
 }

@@ -117,6 +117,22 @@ impl SampleBuffer {
             g as u64
         };
 
+        // Codex round-2 fix: check capacity BEFORE mutating. The
+        // spec doc on TranscriberError::Backpressure says "buffered
+        // samples *would* exceed the cap" — the original code
+        // mutated first then reported, which left the caller in an
+        // un-retryable position (samples committed, retry trips
+        // PtsRegression). With the pre-mutation check, Backpressure
+        // is a true atomic rejection: the input is dropped on the
+        // floor and the caller can retry the same packet later.
+        let final_size = self.samples.len() + delta_samples as usize + packet.len();
+        if final_size > self.cap {
+            return Err(TranscriberError::Backpressure {
+                buffered: final_size,
+                cap: self.cap,
+            });
+        }
+
         // Zero-fill any tolerated gap, then append the packet.
         if delta_samples > 0 {
             self.samples.extend(core::iter::repeat_n(0.0_f32, delta_samples as usize));
@@ -125,12 +141,6 @@ impl SampleBuffer {
         self.samples.extend_from_slice(packet);
         self.absolute_sample_offset += packet.len() as u64;
 
-        if self.samples.len() > self.cap {
-            return Err(TranscriberError::Backpressure {
-                buffered: self.samples.len(),
-                cap: self.cap,
-            });
-        }
         Ok(())
     }
 
@@ -293,6 +303,31 @@ mod tests {
         let mut b = SampleBuffer::new(150, 3200);
         let r = b.append(ts_at_48k(0), &[0.0; 200]);
         assert!(matches!(r, Err(TranscriberError::Backpressure { buffered, cap }) if buffered == 200 && cap == 150));
+        // Codex round-2 fix: Backpressure must NOT mutate state.
+        // The buffer should be empty and absolute_sample_offset
+        // should still be 0 — the caller can retry the same packet
+        // later (e.g., after the runner drains chunks and the cap
+        // has been raised, or with a smaller packet).
+        assert_eq!(b.buffered_samples(), 0, "Backpressure must not commit samples");
+        assert_eq!(b.absolute_sample_offset(), 0, "Backpressure must not advance offset");
+    }
+
+    /// Codex round-2 fix: the rejected packet from a Backpressure
+    /// can be retried after the buffer drains. Without the
+    /// pre-mutation check, the state advanced, retrying the same
+    /// packet would have tripped PtsRegression.
+    #[test]
+    fn backpressure_allows_retry_with_smaller_packet() {
+        let mut b = SampleBuffer::new(150, 3200);
+        // First push at cap is rejected with no state advance.
+        let r = b.append(ts_at_48k(0), &[0.0; 200]);
+        assert!(matches!(r, Err(TranscriberError::Backpressure { .. })));
+        assert_eq!(b.buffered_samples(), 0);
+        assert_eq!(b.absolute_sample_offset(), 0);
+        // Same anchor PTS still works on a smaller packet.
+        b.append(ts_at_48k(0), &[1.0; 100]).unwrap();
+        assert_eq!(b.buffered_samples(), 100);
+        assert_eq!(b.absolute_sample_offset(), 100);
     }
 
     #[test]
