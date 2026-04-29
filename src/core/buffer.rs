@@ -69,6 +69,7 @@ impl SampleBuffer {
         &mut self,
         starts_at: Timestamp,
         packet: &[f32],
+        extra_queued_samples: usize,
     ) -> Result<(), TranscriberError> {
         // Round-3 fix: do NOT commit `output_tb` / `base_pts_out_anchor`
         // until every error path has been cleared. Pre-fix code wrote
@@ -133,10 +134,16 @@ impl SampleBuffer {
         // PtsRegression). With the pre-mutation check, Backpressure
         // is a true atomic rejection: the input is dropped on the
         // floor and the caller can retry the same packet later.
+        //
+        // Codex round-8 fix: include `extra_queued_samples` (audio
+        // already held in cut_pending Arcs from round-7 pre-extraction).
+        // Without this term, a slow runner could let cut_pending
+        // grow unboundedly because trim emptied the live buffer.
         let final_size = self.samples.len() + delta_samples as usize + packet.len();
-        if final_size > self.cap {
+        let total_with_queued = final_size + extra_queued_samples;
+        if total_with_queued > self.cap {
             return Err(TranscriberError::Backpressure {
-                buffered: final_size,
+                buffered: total_with_queued,
                 cap: self.cap,
             });
         }
@@ -264,7 +271,7 @@ mod tests {
     #[test]
     fn first_push_records_anchor_and_timebase() {
         let mut b = SampleBuffer::new(1_000_000, 3200);
-        b.append(ts_at_48k(48_000), &[0.0; 100]).unwrap();
+        b.append(ts_at_48k(48_000), &[0.0; 100], 0).unwrap();
         assert_eq!(b.output_timebase(), Some(tb_48k()));
         assert_eq!(b.absolute_sample_offset(), 100);
         // Next expected: 48_000 + rescale(100, 1/16k, 1/48k) = 48_000 + 300 = 48_300
@@ -274,17 +281,17 @@ mod tests {
     #[test]
     fn contiguous_push_succeeds() {
         let mut b = SampleBuffer::new(1_000_000, 3200);
-        b.append(ts_at_48k(0), &[0.0; 1000]).unwrap();
+        b.append(ts_at_48k(0), &[0.0; 1000], 0).unwrap();
         let next = b.next_expected_starts_at().unwrap();
-        b.append(next, &[0.0; 500]).unwrap();
+        b.append(next, &[0.0; 500], 0).unwrap();
         assert_eq!(b.absolute_sample_offset(), 1500);
     }
 
     #[test]
     fn pts_regression_returns_error() {
         let mut b = SampleBuffer::new(1_000_000, 3200);
-        b.append(ts_at_48k(48_000), &[0.0; 100]).unwrap();
-        let result = b.append(ts_at_48k(47_000), &[0.0; 100]);
+        b.append(ts_at_48k(48_000), &[0.0; 100], 0).unwrap();
+        let result = b.append(ts_at_48k(47_000), &[0.0; 100], 0);
         assert!(matches!(
             result,
             Err(TranscriberError::PtsRegression { kind: crate::types::PushKind::Samples, .. })
@@ -294,9 +301,9 @@ mod tests {
     #[test]
     fn forward_gap_within_tolerance_zero_fills() {
         let mut b = SampleBuffer::new(1_000_000, 3200);
-        b.append(ts_at_48k(0), &[1.0; 100]).unwrap();
+        b.append(ts_at_48k(0), &[1.0; 100], 0).unwrap();
         // Skip 300 PTS at 1/48000 = 100 16 kHz samples (within tolerance).
-        b.append(ts_at_48k(600), &[2.0; 100]).unwrap();
+        b.append(ts_at_48k(600), &[2.0; 100], 0).unwrap();
         // First 100 samples = 1.0; next 100 = zero-fill; next 100 = 2.0.
         assert_eq!(b.absolute_sample_offset(), 300);
     }
@@ -305,16 +312,16 @@ mod tests {
     fn forward_gap_above_tolerance_errors() {
         // gap_tolerance_samples is in 16 kHz.
         let mut b = SampleBuffer::new(1_000_000, 100);
-        b.append(ts_at_48k(0), &[0.0; 100]).unwrap();
+        b.append(ts_at_48k(0), &[0.0; 100], 0).unwrap();
         // 1300 PTS at 1/48000 = 1300 * 16 / 48 ≈ 433 samples > 100.
-        let r = b.append(ts_at_48k(1300), &[0.0; 100]);
+        let r = b.append(ts_at_48k(1300), &[0.0; 100], 0);
         assert!(matches!(r, Err(TranscriberError::GapExceedsTolerance { .. })));
     }
 
     #[test]
     fn backpressure_at_cap() {
         let mut b = SampleBuffer::new(150, 3200);
-        let r = b.append(ts_at_48k(0), &[0.0; 200]);
+        let r = b.append(ts_at_48k(0), &[0.0; 200], 0);
         assert!(matches!(r, Err(TranscriberError::Backpressure { buffered, cap }) if buffered == 200 && cap == 150));
         // Codex round-2 fix: Backpressure must NOT mutate state.
         // The buffer should be empty and absolute_sample_offset
@@ -333,12 +340,12 @@ mod tests {
     fn backpressure_allows_retry_with_smaller_packet() {
         let mut b = SampleBuffer::new(150, 3200);
         // First push at cap is rejected with no state advance.
-        let r = b.append(ts_at_48k(0), &[0.0; 200]);
+        let r = b.append(ts_at_48k(0), &[0.0; 200], 0);
         assert!(matches!(r, Err(TranscriberError::Backpressure { .. })));
         assert_eq!(b.buffered_samples(), 0);
         assert_eq!(b.absolute_sample_offset(), 0);
         // Same anchor PTS still works on a smaller packet.
-        b.append(ts_at_48k(0), &[1.0; 100]).unwrap();
+        b.append(ts_at_48k(0), &[1.0; 100], 0).unwrap();
         assert_eq!(b.buffered_samples(), 100);
         assert_eq!(b.absolute_sample_offset(), 100);
     }
@@ -355,7 +362,7 @@ mod tests {
     fn first_push_backpressure_does_not_commit_timebase() {
         let mut b = SampleBuffer::new(150, 3200);
         // First push fails with Backpressure (200 > 150).
-        let r = b.append(ts_at_48k(48_000), &[0.0; 200]);
+        let r = b.append(ts_at_48k(48_000), &[0.0; 200], 0);
         assert!(matches!(r, Err(TranscriberError::Backpressure { .. })));
         // Timebase and anchor must remain uncommitted.
         assert_eq!(b.output_timebase(), None,
@@ -371,10 +378,10 @@ mod tests {
     #[test]
     fn first_push_backpressure_allows_different_timebase_on_retry() {
         let mut b = SampleBuffer::new(150, 3200);
-        let _ = b.append(ts_at_48k(0), &[0.0; 200]); // rejected
+        let _ = b.append(ts_at_48k(0), &[0.0; 200], 0); // rejected
         let other_tb = Timebase::new(1, NonZeroU32::new(96_000).unwrap());
         // Different timebase + smaller packet must succeed.
-        b.append(Timestamp::new(0, other_tb), &[0.0; 100]).unwrap();
+        b.append(Timestamp::new(0, other_tb), &[0.0; 100], 0).unwrap();
         assert_eq!(b.output_timebase(), Some(other_tb));
         assert_eq!(b.absolute_sample_offset(), 100);
     }
@@ -382,9 +389,9 @@ mod tests {
     #[test]
     fn inconsistent_timebase_errors() {
         let mut b = SampleBuffer::new(1_000_000, 3200);
-        b.append(ts_at_48k(0), &[0.0; 100]).unwrap();
+        b.append(ts_at_48k(0), &[0.0; 100], 0).unwrap();
         let other_tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
-        let r = b.append(Timestamp::new(0, other_tb), &[0.0; 100]);
+        let r = b.append(Timestamp::new(0, other_tb), &[0.0; 100], 0);
         assert!(matches!(r, Err(TranscriberError::InconsistentTimebase { .. })));
     }
 
@@ -396,7 +403,7 @@ mod tests {
         for i in 0..1000 {
             samples.push(i as f32);
         }
-        b.append(ts_at_48k(0), &samples).unwrap();
+        b.append(ts_at_48k(0), &samples, 0).unwrap();
         let arc = b.extract(SampleRange::new(100, 200));
         assert_eq!(arc.len(), 100);
         assert_eq!(arc[0], 100.0);
@@ -407,7 +414,7 @@ mod tests {
     fn samples_to_output_range_drift_free_across_trims() {
         use crate::core::cut::SampleRange;
         let mut b = SampleBuffer::new(1_000_000, 3200);
-        b.append(ts_at_48k(0), &[0.0; 16_000]).unwrap();
+        b.append(ts_at_48k(0), &[0.0; 16_000], 0).unwrap();
         let range_before = b.samples_to_output_range(SampleRange::new(8_000, 12_000));
         b.trim_to(4_000);
         let range_after = b.samples_to_output_range(SampleRange::new(8_000, 12_000));
@@ -418,7 +425,7 @@ mod tests {
     #[test]
     fn trim_to_below_drop_offset_is_noop() {
         let mut b = SampleBuffer::new(1_000_000, 3200);
-        b.append(ts_at_48k(0), &[0.0; 1000]).unwrap();
+        b.append(ts_at_48k(0), &[0.0; 1000], 0).unwrap();
         b.trim_to(500);
         assert_eq!(b.buffer_drop_offset(), 500);
         b.trim_to(300); // below current drop_offset
@@ -428,13 +435,13 @@ mod tests {
     #[test]
     fn restart_at_resets_offsets_and_anchor() {
         let mut b = SampleBuffer::new(1_000_000, 3200);
-        b.append(ts_at_48k(0), &[1.0; 1000]).unwrap();
+        b.append(ts_at_48k(0), &[1.0; 1000], 0).unwrap();
         b.restart_at(ts_at_48k(50_000_000));
         assert_eq!(b.absolute_sample_offset(), 0);
         assert_eq!(b.buffer_drop_offset(), 0);
         assert_eq!(b.buffered_samples(), 0);
         // Next push at 50_000_000 must succeed without PtsRegression
         // — this is the round-4 NB-α regression test.
-        b.append(ts_at_48k(50_000_000), &[2.0; 1000]).unwrap();
+        b.append(ts_at_48k(50_000_000), &[2.0; 1000], 0).unwrap();
     }
 }

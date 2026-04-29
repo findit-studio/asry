@@ -359,9 +359,11 @@ impl Transcriber {
 
     /// Non-mutating predicate: would the next push of `samples_len`
     /// audio samples plus `vad_count` VAD segments fit under the
-    /// configured caps?
+    /// configured caps? Counts cut_pending's pre-extracted audio
+    /// (round-8 fix) alongside the live buffer.
     pub fn would_accept(&self, samples_len: usize, _vad_count: usize) -> bool {
-        self.buffered_samples() + samples_len <= self.config.buffer_cap_samples
+        let queued = self.dispatch.cut_pending_audio_samples();
+        self.buffered_samples() + samples_len + queued <= self.config.buffer_cap_samples
     }
 
     /// Push samples into the buffer. See spec §4.1 / §5.4.
@@ -377,7 +379,11 @@ impl Transcriber {
         if self.eof_signaled {
             return Err(TranscriberError::AfterEof);
         }
-        self.buffer.append(starts_at, samples)
+        // Codex round-8 fix: count cut_pending audio (pre-extracted
+        // Arcs, round-7) toward the buffer cap so a slow runner
+        // can't accumulate queued audio outside any cap.
+        let queued = self.dispatch.cut_pending_audio_samples();
+        self.buffer.append(starts_at, samples, queued)
     }
 
     /// Push a VAD segment into the cut state machine. See spec
@@ -896,6 +902,64 @@ mod tests {
         t.push_samples(ts(0), &[0.0; 1000]).unwrap();
         t.restart_at(ts(50_000_000)).unwrap();
         assert_eq!(t.output_timebase(), Some(tb_48k()));
+    }
+
+    /// Codex round-8 finding [high]: cut_pending audio (round-7's
+    /// pre-extracted ExtractedChunk Arcs) must count toward the
+    /// buffer cap for Backpressure. Pre-fix code only counted the
+    /// live buffer's samples, so a runner slower than ingest could
+    /// build up cut_pending arbitrarily — every trim emptied the
+    /// live buffer and let the caller push more, but cut_pending
+    /// retained the audio. Net effect: unbounded memory growth on
+    /// long indexing jobs.
+    ///
+    /// Reproduction: cap=12 000, max_in_flight=1, chunk_size=0.25 s
+    /// (4 000 samples). Push 12 000 samples + 3 VAD segments: chunks
+    /// 0 and 1 emit. With cap=1, chunk 0 → in_flight, chunk 1 →
+    /// cut_pending (4 000 audio samples in Arc). signal_no_speech_through
+    /// trims the live buffer to 4 000 samples (cut accumulator's
+    /// start is at 8 000, high-water is 12 000). Then push 6 000
+    /// more samples. Pre-fix: live(4 000) + new(6 000) = 10 000 ≤
+    /// cap(12 000), accepted — even though cut_pending adds another
+    /// 4 000 for a real total of 14 000. Post-fix: 14 000 > 12 000
+    /// → Backpressure.
+    #[test]
+    fn cut_pending_audio_counts_against_buffer_cap() {
+        let config = TranscriberConfig::default()
+            .with_buffer_cap_samples(12_000)
+            .with_max_in_flight(1)
+            .with_language_policy(LanguagePolicy::Auto)
+            .with_chunk_size(Duration::from_millis(250)); // 4 000 samples
+        let mut t = Transcriber::new(config);
+
+        t.push_samples(ts(0), &[0.0; 12_000]).unwrap();
+        t.push_vad_segment(VadSegment::new(0, 4_000)).unwrap(); // accumulates
+        t.push_vad_segment(VadSegment::new(4_000, 8_000)).unwrap(); // chunk 0 emits
+        t.push_vad_segment(VadSegment::new(8_000, 12_000)).unwrap(); // chunk 1 emits
+
+        // After: chunk 0 in_flight (cap=1); chunk 1 in cut_pending
+        // (4 000 audio samples in Arc); cut accumulator = [8 000, 12 000).
+        // Live buffer still holds 12 000 samples (no trim ran yet).
+
+        // signal_no_speech_through(12 000) trims via after_inject.
+        // low_water = cut.pending_start() = 8 000 → buffer drops
+        // [0, 8 000), now holds [8 000, 12 000) = 4 000 samples.
+        t.signal_no_speech_through(12_000).unwrap();
+        assert_eq!(t.buffered_samples(), 4_000,
+            "trim drops up to cut accumulator's start");
+
+        // Push 6 000 more samples. Without the round-8 fix,
+        // buffer.append's check is live(4 000) + new(6 000) = 10 000
+        // ≤ cap(12 000) — accepted. With the fix, queued(4 000) is
+        // included → 14 000 > 12 000 → Backpressure.
+        let next = t.next_expected_starts_at().unwrap();
+        let r = t.push_samples(next, &[0.0; 6_000]);
+        assert!(
+            matches!(r, Err(TranscriberError::Backpressure { buffered, cap })
+                if buffered == 14_000 && cap == 12_000),
+            "expected Backpressure {{ buffered: 14_000, cap: 12_000 }}, got {:?}",
+            r
+        );
     }
 
     /// Codex round-7 finding [high]: restart_at must NOT bypass the

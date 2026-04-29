@@ -250,6 +250,18 @@ impl Dispatch {
         }
     }
 
+    /// Total audio samples currently held in `cut_pending`'s
+    /// pre-extracted `Arc<[f32]>`s. Used by `Transcriber` to count
+    /// queued audio toward `buffer_cap_samples` (Codex round-8 fix:
+    /// post-round-7 pre-extraction moved cut_pending audio out of
+    /// the live buffer; without including this in the Backpressure
+    /// check, a slow runner could let cut_pending grow unboundedly
+    /// every time the live buffer trimmed and the caller pushed
+    /// more samples).
+    pub(crate) fn cut_pending_audio_samples(&self) -> usize {
+        self.cut_pending.iter().map(|c| c.samples.len()).sum()
+    }
+
     /// Effective parallel-dispatch cap. Normally `max_in_flight`,
     /// but capped to `n` while `LanguagePolicy::AutoLockAfter(n)` is
     /// still unlocked.
@@ -603,7 +615,7 @@ mod tests {
     fn make_buffer_with_samples(n_samples: usize) -> SampleBuffer {
         let mut b = SampleBuffer::new(1_000_000, 3200);
         let samples: Vec<f32> = (0..n_samples).map(|i| i as f32).collect();
-        b.append(Timestamp::new(0, tb()), &samples).unwrap();
+        b.append(Timestamp::new(0, tb()), &samples, 0).unwrap();
         b
     }
 
