@@ -47,11 +47,17 @@ impl ManagedTranscriber {
     ) -> DispatchOutcome {
         let item = match cmd {
             Command::RunAsr { chunk_id, samples, params, sample_rate: _ } => {
+                // Honor the runner's per-packet override (set via
+                // swap_asr_default). The core's emitted `params` came
+                // from its own default; for the runner we always use
+                // the current `asr_params_default` which already has
+                // any active override merged in.
+                let _ = params; // ignored; runner's authoritative copy wins
                 let abort_flag = Arc::new(AtomicBool::new(false));
                 AsrWorkItem {
                     chunk_id,
                     samples,
-                    params,
+                    params: self.asr_params_default.clone(),
                     asr_timeout,
                     abort_flag,
                 }
@@ -355,5 +361,174 @@ impl ManagedTranscriber {
             RunnerError::WhisperContextLoad { message: format!("{e:?}") }
         })?;
         Ok(ManagedTranscriberBuilder::new(ctx, pool_config))
+    }
+}
+
+impl ManagedTranscriber {
+    /// Push one packet of audio + the VAD segments newly closed
+    /// within or before that packet's range.
+    ///
+    /// **Empty packet** (`samples.is_empty()`): accepted as a no-op
+    /// when `delta_pts_out == 0` — VAD segments in the same call are
+    /// still pushed.
+    ///
+    /// **VAD segment ordering contract:** segments must be strictly
+    /// monotonic and non-overlapping; violations are surfaced as
+    /// `RunnerError::Transcriber(TranscriberError::PtsRegression {
+    /// kind: PushKind::VadSegment, .. })`.
+    ///
+    /// **Backpressure contract** (spec §6.4.2): when this returns
+    /// `Err(RunnerError::Backpressure { .. })`, inputs were already
+    /// consumed; the caller must drain via `poll_transcript` /
+    /// `poll_error` before pushing again.
+    pub fn process_packet(
+        &mut self,
+        starts_at: Timestamp,
+        samples: &[f32],
+        vad_segments: &[VadSegment],
+        params_override: Option<AsrParamsOverride>,
+    ) -> Result<(), RunnerError> {
+        // Step 1: apply per-call AsrParams override on top of the
+        // runner's defaults. Restore at end-of-call regardless of
+        // outcome — the override is per-packet, not sticky.
+        let saved_default = if params_override.is_some() {
+            Some(self.swap_asr_default(params_override.as_ref().unwrap()))
+        } else {
+            None
+        };
+
+        // Step 2: push samples (may return Backpressure / PtsRegression / etc.)
+        let push_result = self.push_samples_internal(starts_at, samples);
+
+        // Step 3: push VAD segments (only if step 2 succeeded; otherwise
+        // we propagate the push error before mutating cut state).
+        let result = push_result.and_then(|()| self.push_vads_internal(vad_segments));
+
+        // Step 4: pump the dispatch loop until idle or saturation.
+        let drive_result = result.and_then(|()| self.pump_until_idle_or_progress());
+
+        // Step 5: restore default AsrParams.
+        if let Some(saved) = saved_default {
+            self.restore_asr_default(saved);
+        }
+
+        drive_result
+    }
+
+    /// Push samples, mapping core errors into `RunnerError::Transcriber`.
+    fn push_samples_internal(
+        &mut self,
+        starts_at: Timestamp,
+        samples: &[f32],
+    ) -> Result<(), RunnerError> {
+        if samples.is_empty() {
+            // Plan A's push_samples accepts empty packets when
+            // delta_pts_out == 0; the underlying buffer call returns
+            // Ok(()). We still call through so the timebase / EOF
+            // checks fire normally.
+            self.core.push_samples(starts_at, samples)?;
+            return Ok(());
+        }
+        self.core.push_samples(starts_at, samples)?;
+        Ok(())
+    }
+
+    /// Push VAD segments in order.
+    fn push_vads_internal(
+        &mut self,
+        vad_segments: &[VadSegment],
+    ) -> Result<(), RunnerError> {
+        for seg in vad_segments {
+            self.core.push_vad_segment(*seg)?;
+        }
+        Ok(())
+    }
+
+    /// Apply a per-call override on top of the runner default; return
+    /// the original to be restored at end-of-call.
+    fn swap_asr_default(&mut self, ovr: &AsrParamsOverride) -> AsrParams {
+        // Temporarily replace the core's default with the merged
+        // params. The core uses its default AsrParams when it issues
+        // a RunAsr command; for v1, that's the only injection point.
+        let merged = merge_overrides(&self.asr_params_default, ovr);
+        let prior = core::mem::replace(&mut self.asr_params_default, merged);
+        // Plan A's TranscriberConfig defaults are baked into the core
+        // at construction; the runtime override path is via the
+        // Command's `params` field. Plan A does NOT expose a runtime
+        // setter for the dispatch's default AsrParams; this is OK
+        // because the runner's own default lives on
+        // `asr_params_default` and the runner is the one that emits
+        // RunAsr commands' `params`. We override at dispatch time in
+        // `try_dispatch`'s `params` consumption — that path is not
+        // currently used because Plan A's poll_command pre-fills
+        // `params` from the core's config.
+        //
+        // To honor the runner's override semantics, we substitute the
+        // params on the issued command in dispatch. The simplest
+        // correct approach: keep `asr_params_default` updated; have
+        // try_dispatch overwrite the Command's `params` with our own
+        // before sending. (See try_dispatch's note in Task 11; if
+        // that override hook isn't already in place, add it now.)
+        prior
+    }
+
+    fn restore_asr_default(&mut self, prior: AsrParams) {
+        self.asr_params_default = prior;
+    }
+}
+
+/// Merge a sparse `AsrParamsOverride` onto `base`, producing the
+/// final `AsrParams` that will ship in any RunAsr emitted from the
+/// current packet's chunks.
+fn merge_overrides(base: &AsrParams, ovr: &AsrParamsOverride) -> AsrParams {
+    let mut out = base.clone();
+    if let Some(opt_lang) = ovr.language_hint() {
+        out.set_language_hint(opt_lang.clone());
+    }
+    if let Some(strategy) = ovr.strategy() {
+        out.set_strategy(strategy);
+    }
+    if let Some(t) = ovr.initial_temperature() {
+        out.set_initial_temperature(t);
+    }
+    if let Some(prompt) = ovr.initial_prompt() {
+        out.set_initial_prompt(prompt.clone());
+    }
+    out
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use crate::types::Lang;
+
+    #[test]
+    fn empty_override_is_identity() {
+        let base = AsrParams::default();
+        let ovr = AsrParamsOverride::new();
+        let out = merge_overrides(&base, &ovr);
+        assert_eq!(out.initial_temperature(), base.initial_temperature());
+        assert_eq!(out.max_attempts(), base.max_attempts());
+    }
+
+    #[test]
+    fn override_replaces_only_specified_fields() {
+        let base = AsrParams::default();
+        let ovr = AsrParamsOverride::new()
+            .with_language_hint(Some(Some(Lang::En)))
+            .with_initial_temperature(Some(0.7));
+        let out = merge_overrides(&base, &ovr);
+        assert_eq!(out.language_hint().cloned(), Some(Lang::En));
+        assert!((out.initial_temperature() - 0.7).abs() < 1e-9);
+        assert_eq!(out.max_attempts(), base.max_attempts());
+    }
+
+    #[test]
+    fn override_can_clear_language_hint() {
+        let base = AsrParams::default().with_language_hint(Some(Lang::En));
+        let ovr = AsrParamsOverride::new()
+            .with_language_hint(Some(None));
+        let out = merge_overrides(&base, &ovr);
+        assert!(out.language_hint().is_none());
     }
 }
