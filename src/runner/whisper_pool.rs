@@ -8,8 +8,10 @@ use std::sync::atomic::AtomicBool;
 
 use whisper_rs::{FullParams, SamplingStrategy as WhisperStrategy, WhisperState};
 
-use crate::core::{AsrParams, SamplingStrategy};
-use crate::types::ChunkId;
+use smol_str::SmolStr;
+
+use crate::core::{AsrParams, AsrResult, SamplingStrategy};
+use crate::types::{AsrFailureKind, ChunkId, Lang, WorkFailure, WorkerKind};
 
 /// Configuration for the runner's whisper worker pool.
 ///
@@ -437,6 +439,136 @@ pub(super) fn compute_compression_ratio(state: &WhisperState) -> f32 {
     raw as f32 / unique as f32
 }
 
+/// Run one chunk's ASR through the runner's temperature retry ladder.
+///
+/// Each attempt is exactly one `state.full()` call. The runner — not
+/// whisper.cpp's internal loop — picks the temperature for each
+/// attempt; `full_params_from` pins `temperature_inc=0.0` so
+/// whisper.cpp's internal `for t = initial; t <= 1.0; t += inc` loop
+/// runs exactly once at the runner-supplied temperature.
+///
+/// Success criteria (spec §5.6):
+/// - `avg_logprob >= params.log_prob_threshold` (default −1.0)
+/// - `compression_ratio <= params.compression_ratio_threshold` (default 2.4)
+///
+/// Failure: `WorkFailure::AsrFailed { kind: AllTemperaturesFailed, .. }`
+/// after all `max_attempts` failed; `WorkFailure::AsrFailed { kind:
+/// BackendError, .. }` if `state.full()` itself returned an error;
+/// `WorkFailure::WorkerHangTimeout { kind: Asr, .. }` if the abort
+/// flag was flipped (the watchdog detected timeout).
+pub(super) fn run_with_temperature_ladder(
+    state: &mut WhisperState,
+    job: &AsrWorkItem,
+    started_at: std::time::Instant,
+) -> Result<AsrResult, WorkFailure> {
+    let p = &job.params;
+    let mut temperature = p.initial_temperature();
+    let max = p.max_attempts() as usize;
+
+    for _attempt in 0..max {
+        let full = full_params_from(p, temperature, job.abort_flag.clone());
+        let outcome = state.full(full, job.samples.as_ref());
+        if let Err(e) = outcome {
+            // Distinguish abort (watchdog timeout) from a real backend
+            // error. whisper-rs returns `Err(_)` from full() when the
+            // abort callback flipped to true, but the error variant is
+            // not always distinct; we double-check via abort_flag.
+            if job.abort_flag.load(Ordering::Relaxed) {
+                return Err(WorkFailure::WorkerHangTimeout {
+                    kind: WorkerKind::Asr,
+                    elapsed: started_at.elapsed(),
+                });
+            }
+            return Err(WorkFailure::AsrFailed {
+                kind: AsrFailureKind::BackendError,
+                message: format!("{e:?}"),
+            });
+        }
+
+        let logprob = compute_avg_logprob(state);
+        let cratio = compute_compression_ratio(state);
+
+        let logprob_ok = logprob >= p.log_prob_threshold();
+        let cratio_ok = cratio <= p.compression_ratio_threshold();
+
+        if logprob_ok && cratio_ok {
+            return build_asr_result(state, temperature, p);
+        }
+        temperature += p.temperature_increment();
+    }
+
+    Err(WorkFailure::AsrFailed {
+        kind: AsrFailureKind::AllTemperaturesFailed,
+        message: format!(
+            "all {} temperature attempts failed for chunk {:?}",
+            max, job.chunk_id,
+        ),
+    })
+}
+
+/// Compose an [`AsrResult`] from a successful `WhisperState::full` call.
+///
+/// Two whisper-rs 0.13.2 API points deviate from the plan's literal
+/// snippet:
+///
+/// - The accessor for the auto-detected language is
+///   `WhisperState::full_lang_id_from_state` (not `full_lang_id`); it
+///   returns `Result<c_int, WhisperError>` rather than a bare `c_int`.
+///   We treat any `Err` and any negative id as "no detection" and
+///   fall back to the language hint (or `Lang::Other("")`) — the same
+///   behaviour the plan prescribed for `id < 0`.
+///
+/// - whisper-rs 0.13.2 (which depends on whisper-rs-sys 0.11.1, whose
+///   bundled whisper.cpp predates `whisper_full_get_segment_no_speech_prob`)
+///   does not expose a per-segment `no_speech_prob` accessor on
+///   `WhisperState`. We default to `0.0` (the same fallback the plan's
+///   literal `.unwrap_or(0.0)` produced when the segment was missing);
+///   downstream `AsrResult::no_speech_prob` consumers tolerate `0.0`,
+///   and the runner's retry ladder gates on `avg_logprob` /
+///   `compression_ratio` rather than `no_speech_prob`. Once we move to
+///   whisper-rs ≥ 0.15 (sys ≥ 0.14, whisper.cpp v1.7+) we can wire the
+///   real value.
+fn build_asr_result(
+    state: &WhisperState,
+    final_temperature: f32,
+    params: &AsrParams,
+) -> Result<AsrResult, WorkFailure> {
+    let n = state.full_n_segments().unwrap_or(0);
+    let mut text = String::new();
+    for i in 0..n {
+        if let Ok(s) = state.full_get_segment_text(i) {
+            text.push_str(&s);
+        }
+    }
+
+    let avg_logprob = compute_avg_logprob(state);
+    // See doc comment: whisper-rs 0.13.2 has no per-segment
+    // no_speech_prob accessor. Default to 0.0.
+    let no_speech_prob: f32 = 0.0;
+
+    let language = match state.full_lang_id_from_state() {
+        Ok(id) if id >= 0 => match whisper_rs::get_lang_str(id) {
+            Some(code) => Lang::from_iso639_1(code),
+            None => params
+                .language_hint()
+                .cloned()
+                .unwrap_or(Lang::Other(SmolStr::new(""))),
+        },
+        _ => params
+            .language_hint()
+            .cloned()
+            .unwrap_or(Lang::Other(SmolStr::new(""))),
+    };
+
+    Ok(AsrResult::new(
+        SmolStr::new(text.trim()),
+        language,
+        avg_logprob,
+        no_speech_prob,
+        final_temperature,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,5 +687,23 @@ mod tests {
     fn compression_ratio_short_input_returns_zero() {
         assert_eq!(compression_ratio_of_text(""), 0.0);
         assert_eq!(compression_ratio_of_text("ab"), 0.0);
+    }
+
+    /// Sanity check: confirm `run_with_temperature_ladder` is callable
+    /// with the expected signature (and is pinned as `Send` so it can
+    /// run on a worker thread). The end-to-end ladder behaviour test
+    /// lives in Task 19; the mock-state test for layered-ladder
+    /// suppression goes in Task 18. Here we only assert the type
+    /// signature compiles.
+    #[test]
+    fn run_with_temperature_ladder_signature_compiles() {
+        // Coerce the function to its expected signature; if the actual
+        // signature drifts, this fails to compile.
+        let _f: fn(
+            &mut WhisperState,
+            &AsrWorkItem,
+            std::time::Instant,
+        ) -> Result<crate::core::AsrResult, crate::types::WorkFailure> =
+            run_with_temperature_ladder;
     }
 }
