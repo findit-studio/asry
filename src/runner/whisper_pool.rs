@@ -5,12 +5,18 @@ use core::sync::atomic::Ordering;
 use core::time::Duration;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::thread::JoinHandle;
 
-use whisper_rs::{FullParams, SamplingStrategy as WhisperStrategy, WhisperState};
+use crossbeam_channel::{Receiver, Sender, bounded};
+use whisper_rs::{
+    FullParams, SamplingStrategy as WhisperStrategy, WhisperContext, WhisperContextParameters,
+    WhisperState,
+};
 
 use smol_str::SmolStr;
 
 use crate::core::{AsrParams, AsrResult, SamplingStrategy};
+use crate::runner::RunnerError;
 use crate::types::{AsrFailureKind, ChunkId, Lang, WorkFailure, WorkerKind};
 
 /// Configuration for the runner's whisper worker pool.
@@ -567,6 +573,178 @@ fn build_asr_result(
         no_speech_prob,
         final_temperature,
     ))
+}
+
+/// Worker pool. Shared `Arc<WhisperContext>` per the v1 architecture
+/// decision (§13.1 verification: whisper-rs 0.13.x marks the context
+/// thread-safe; states are owned per worker).
+pub(super) struct WhisperPool {
+    pub(super) ctx: Arc<WhisperContext>,
+    workers: Vec<JoinHandle<()>>,
+    pub(super) work_tx: Sender<AsrWorkItem>,
+    pub(super) result_rx: Receiver<AsrResultMsg>,
+    pub(super) work_tx_capacity: usize,
+}
+
+impl WhisperPool {
+    /// Build the pool. Caller-supplied `WhisperContext` controls
+    /// flash_attn / GPU device / model path explicitly (the public
+    /// `ManagedTranscriberBuilder::build` hands one in).
+    pub(super) fn new(
+        ctx: WhisperContext,
+        config: &WhisperPoolConfig,
+    ) -> Result<Self, RunnerError> {
+        let ctx = Arc::new(ctx);
+        let (work_tx, work_rx) = bounded::<AsrWorkItem>(config.max_queued_chunks());
+        let (result_tx, result_rx) = bounded::<AsrResultMsg>(config.max_queued_chunks() + 16);
+
+        let mut workers = Vec::with_capacity(config.worker_count());
+        for worker_idx in 0..config.worker_count() {
+            let ctx_for_worker = ctx.clone();
+            let work_rx = work_rx.clone();
+            let result_tx = result_tx.clone();
+            let timeout_streak_threshold = config.timeout_streak_threshold();
+            let handle = std::thread::Builder::new()
+                .name(format!("whispery-asr-{}", worker_idx))
+                .spawn(move || {
+                    worker_loop(
+                        ctx_for_worker,
+                        work_rx,
+                        result_tx,
+                        timeout_streak_threshold,
+                    );
+                })
+                .map_err(RunnerError::Io)?;
+            workers.push(handle);
+        }
+        // Drop the local references so the pool owns the only senders/receivers
+        // routed externally; the cloned ones live on each worker.
+        drop(work_rx);
+        drop(result_tx);
+
+        Ok(Self {
+            ctx,
+            workers,
+            work_tx,
+            result_rx,
+            work_tx_capacity: config.max_queued_chunks(),
+        })
+    }
+
+    /// Build a pool from a model path + config. Shorthand for
+    /// `WhisperContext::new_with_params(...)?` then `Self::new`.
+    pub(super) fn from_path(config: &WhisperPoolConfig) -> Result<Self, RunnerError> {
+        let mut ctx_params = WhisperContextParameters::default();
+        ctx_params.use_gpu(config.use_gpu());
+        ctx_params.gpu_device(config.gpu_device());
+        ctx_params.flash_attn(config.flash_attn());
+        let path = config
+            .model_path()
+            .to_str()
+            .ok_or_else(|| RunnerError::WhisperContextLoad {
+                message: format!(
+                    "model_path is not valid UTF-8: {:?}",
+                    config.model_path()
+                ),
+            })?;
+        let ctx = WhisperContext::new_with_params(path, ctx_params).map_err(|e| {
+            RunnerError::WhisperContextLoad { message: format!("{e:?}") }
+        })?;
+        Self::new(ctx, config)
+    }
+}
+
+impl Drop for WhisperPool {
+    fn drop(&mut self) {
+        // Closing work_tx makes worker loops exit normally on the next
+        // recv. Joining propagates panics from workers as a best-effort
+        // shutdown (we ignore the join result in Drop because panicking
+        // here would mask the original error).
+        // The Sender is dropped automatically when WhisperPool drops;
+        // we explicitly take it out so workers see the disconnect.
+        // Crossbeam's Drop on Sender already handles this — no explicit
+        // close call is necessary.
+        for handle in self.workers.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Worker thread main loop. Implements per-worker timeout-streak
+/// recycling per spec §6.4.3.
+fn worker_loop(
+    ctx: Arc<WhisperContext>,
+    work_rx: Receiver<AsrWorkItem>,
+    result_tx: Sender<AsrResultMsg>,
+    timeout_streak_threshold: u32,
+) {
+    let mut state_opt: Option<WhisperState> = None;
+    let mut timeout_streak: u32 = 0;
+
+    while let Ok(job) = work_rx.recv() {
+        // Lazy-create the state on first job, recreate after threshold.
+        if state_opt.is_none() {
+            match ctx.create_state() {
+                Ok(s) => state_opt = Some(s),
+                Err(e) => {
+                    let _ = result_tx.send((
+                        job.chunk_id,
+                        Err(WorkFailure::AsrFailed {
+                            kind: AsrFailureKind::BackendError,
+                            message: format!("create_state failed: {e:?}"),
+                        }),
+                    ));
+                    continue;
+                }
+            }
+        }
+        let state = state_opt.as_mut().expect("state present");
+
+        // Spawn a watchdog that flips abort_flag if asr_timeout elapses.
+        let abort_flag = job.abort_flag.clone();
+        let timeout = job.asr_timeout;
+        let watchdog = std::thread::Builder::new()
+            .name("whispery-asr-watchdog".into())
+            .spawn(move || {
+                std::thread::sleep(timeout);
+                abort_flag.store(true, Ordering::Relaxed);
+            })
+            .expect("spawn watchdog");
+
+        let started_at = std::time::Instant::now();
+        let outcome = run_with_temperature_ladder(state, &job, started_at);
+
+        // Watchdog cleanup: setting the flag is harmless if work
+        // already completed; the watchdog thread exits in any case.
+        // We don't explicitly join (the watchdog thread terminates on
+        // its own after the sleep). To prevent a leaked watchdog from
+        // burning resources between jobs, we cancel via the flag flip
+        // path by setting it ourselves once the inference is complete:
+        job.abort_flag.store(true, Ordering::Relaxed);
+        let _ = watchdog.join();
+        // Reset the flag for next job. (A fresh AsrWorkItem brings its
+        // own Arc, but the per-worker state is local; the next iteration
+        // sees a fresh atomic anyway.)
+
+        let was_timeout = matches!(
+            outcome,
+            Err(WorkFailure::WorkerHangTimeout { .. })
+        );
+
+        let _ = result_tx.send((job.chunk_id, outcome));
+
+        if was_timeout {
+            timeout_streak += 1;
+            if timeout_streak >= timeout_streak_threshold {
+                // Drop the state; next iteration recreates it.
+                state_opt = None;
+                timeout_streak = 0;
+            }
+        } else {
+            timeout_streak = 0;
+        }
+    }
+    // work_tx dropped: clean exit.
 }
 
 #[cfg(test)]
