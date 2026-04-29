@@ -189,18 +189,42 @@ impl Dispatch {
     /// Called by `Transcriber` whenever the cut state machine emits
     /// a `MergedChunk`. Either promotes the chunk to `in_flight`
     /// immediately (and emits a `RunAsr` command) or queues it on
-    /// `cut_pending` if `max_in_flight` is saturated.
+    /// `cut_pending` if the effective cap is saturated.
     pub(crate) fn on_emit(
         &mut self,
         chunk: MergedChunk,
         chunk_id: ChunkId,
         buffer: &SampleBuffer,
     ) {
-        if self.draining_for_restart || self.in_flight.len() < self.max_in_flight {
+        if self.draining_for_restart || self.in_flight.len() < self.effective_max_in_flight() {
             self.promote(chunk_id, chunk, buffer);
         } else {
             self.cut_pending.push_back((chunk_id, chunk));
         }
+    }
+
+    /// Effective parallel-dispatch cap. Normally `max_in_flight`,
+    /// but capped to `n` while `LanguagePolicy::AutoLockAfter(n)` is
+    /// still unlocked.
+    ///
+    /// Codex round-6 fix: pre-fix code dispatched all chunks up to
+    /// `max_in_flight` immediately, so chunks 1..N were issued with
+    /// `language_hint = None` before chunk 0's ASR result came back.
+    /// Each could independently auto-detect a different language,
+    /// breaking the auto-lock contract that says "lock detection
+    /// after the first non-empty chunks". Holding back chunks past
+    /// the observation window ensures the lock applies to every
+    /// chunk past the window.
+    fn effective_max_in_flight(&self) -> usize {
+        if self.draining_for_restart {
+            return self.max_in_flight;
+        }
+        if let LanguagePolicy::AutoLockAfter(n) = &self.language_policy {
+            if self.locked_language.is_none() {
+                return (*n).min(self.max_in_flight);
+            }
+        }
+        self.max_in_flight
     }
 
     /// Move a chunk from "just produced by Cut" or "pending" to
@@ -317,9 +341,10 @@ impl Dispatch {
         // start across cut_pending + the cut accumulator, if any).
         let low = self.low_water_samples(cut_accumulator_start, buffer.absolute_sample_offset());
         buffer.trim_to(low);
-        // Promote pending chunks if slots are open.
+        // Promote pending chunks if slots are open under the effective
+        // cap (round-6 fix: cap is `n` while AutoLockAfter is unlocked).
         while !self.draining_for_restart
-            && self.in_flight.len() < self.max_in_flight
+            && self.in_flight.len() < self.effective_max_in_flight()
             && !self.cut_pending.is_empty()
         {
             let (chunk_id, chunk) = self.cut_pending.pop_front().expect("just checked non-empty");
@@ -550,7 +575,11 @@ mod tests {
     }
 
     fn dispatch_default() -> Dispatch {
-        Dispatch::new(AsrParams::default(), /* word_alignment = */ false, /* max_in_flight = */ 4, LanguagePolicy::default())
+        // Tests using this helper exercise dispatch ordering / phase
+        // checks / commands without language-policy involvement;
+        // LanguagePolicy::Auto avoids the round-6 gate that holds
+        // back chunks under unlocked AutoLockAfter.
+        Dispatch::new(AsrParams::default(), /* word_alignment = */ false, /* max_in_flight = */ 4, LanguagePolicy::Auto)
     }
 
     fn fake_chunk(start: u64, end: u64) -> MergedChunk {
@@ -633,7 +662,9 @@ mod tests {
 
     #[test]
     fn cut_pending_holds_chunks_when_max_in_flight_reached() {
-        let mut d = Dispatch::new(AsrParams::default(), false, 2, LanguagePolicy::default());
+        // Auto policy: tests pure max_in_flight gating without the
+        // round-6 unlocked-AutoLockAfter restriction.
+        let mut d = Dispatch::new(AsrParams::default(), false, 2, LanguagePolicy::Auto);
         let mut b = make_buffer_with_samples(10_000);
         d.on_emit(fake_chunk(0, 1_000), ChunkId::from_raw(0), &b);
         d.on_emit(fake_chunk(1_000, 2_000), ChunkId::from_raw(1), &b);
@@ -666,7 +697,9 @@ mod tests {
     /// in the same call.
     #[test]
     fn cut_pending_promotes_on_slot_open() {
-        let mut d = Dispatch::new(AsrParams::default(), false, 2, LanguagePolicy::default());
+        // Auto policy: tests pure max_in_flight gating without the
+        // round-6 unlocked-AutoLockAfter restriction.
+        let mut d = Dispatch::new(AsrParams::default(), false, 2, LanguagePolicy::Auto);
         let mut b = make_buffer_with_samples(10_000);
 
         // Fill in_flight (cap=2) and queue one in cut_pending.
@@ -1022,6 +1055,79 @@ mod tests {
         ).unwrap();
         d.after_inject(&mut b, Some(0));
         assert_eq!(d.locked_language, Some(Lang::En));
+    }
+
+    /// Codex round-6 finding [high]: under unlocked
+    /// `AutoLockAfter(n)`, dispatch must hold back chunks past the
+    /// observation window — otherwise chunks 1..N get RunAsr with
+    /// `language_hint = None` and may auto-detect different
+    /// languages, defeating the lock contract. Reproduction:
+    /// `AutoLockAfter(1)` + `max_in_flight = 4`. Emit 3 chunks
+    /// without injecting. Pre-fix code promoted all three with no
+    /// hint. Post-fix code keeps only 1 in flight; the rest wait.
+    #[test]
+    fn unlocked_auto_lock_after_caps_in_flight_to_observation_window() {
+        let mut d = Dispatch::new(
+            AsrParams::default(),
+            false,
+            4,
+            LanguagePolicy::AutoLockAfter(1),
+        );
+        let b = make_buffer_with_samples(10_000);
+
+        d.on_emit(fake_chunk(0, 1_000), ChunkId::from_raw(0), &b);
+        d.on_emit(fake_chunk(1_000, 2_000), ChunkId::from_raw(1), &b);
+        d.on_emit(fake_chunk(2_000, 3_000), ChunkId::from_raw(2), &b);
+
+        assert_eq!(d.in_flight.len(), 1,
+            "under unlocked AutoLockAfter(1), only n=1 chunk runs in parallel");
+        assert_eq!(d.cut_pending.len(), 2,
+            "chunks beyond the observation window wait in cut_pending");
+        assert_eq!(d.pending_commands.len(), 1,
+            "only chunk 0 issued a RunAsr — chunks 1, 2 wait for the lock");
+    }
+
+    /// Round-6 corollary: once the lock is established, the gate
+    /// lifts and the held-back chunks promote with the locked hint.
+    #[test]
+    fn unlocked_auto_lock_after_releases_pending_with_hint_after_lock() {
+        let mut d = Dispatch::new(
+            AsrParams::default(),
+            false,
+            4,
+            LanguagePolicy::AutoLockAfter(1),
+        );
+        let mut b = make_buffer_with_samples(10_000);
+
+        d.on_emit(fake_chunk(0, 1_000), ChunkId::from_raw(0), &b);
+        d.on_emit(fake_chunk(1_000, 2_000), ChunkId::from_raw(1), &b);
+        d.on_emit(fake_chunk(2_000, 3_000), ChunkId::from_raw(2), &b);
+        // Drain chunk 0's RunAsr from pending_commands so we can see
+        // chunks 1 and 2's commands when they get emitted post-lock.
+        let _ = d.pending_commands.pop_front();
+
+        // Inject chunk 0's Zh — the lock fires.
+        d.inject_asr_result(
+            ChunkId::from_raw(0),
+            AsrResult::new(SmolStr::new("zh"), Lang::Zh, -0.5, 0.05, 0.0),
+        ).unwrap();
+        d.after_inject(&mut b, Some(0));
+
+        assert_eq!(d.locked_language, Some(Lang::Zh));
+        // Chunks 1 and 2 must now be in flight (cap reverted to 4).
+        assert_eq!(d.in_flight.len(), 2);
+        assert_eq!(d.cut_pending.len(), 0);
+        // Their RunAsr commands must carry the locked hint.
+        assert_eq!(d.pending_commands.len(), 2);
+        for cmd in d.pending_commands.iter() {
+            match cmd {
+                Command::RunAsr { params, .. } => {
+                    assert_eq!(params.language_hint(), Some(&Lang::Zh),
+                        "post-lock chunks must carry the locked hint");
+                }
+                _ => panic!("expected RunAsr"),
+            }
+        }
     }
 
     /// Tiebreaking: with n=2 and [En, Zh] (each observed once), the

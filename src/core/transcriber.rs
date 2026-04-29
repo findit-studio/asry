@@ -471,6 +471,19 @@ impl Transcriber {
         if self.buffer.output_timebase().is_none() {
             return Err(TranscriberError::OutputTimebaseUnset);
         }
+        // Codex round-6 fix: like push_vad_segment, signal_no_speech
+        // must not advance the watermark past audio the buffer hasn't
+        // seen. Without the guard, a future-sample signal would
+        // poison the watermark and later valid VAD inside the
+        // (eventually-buffered) interval would be rejected as
+        // PtsRegression. Atomic rejection: vad_watermark stays put.
+        let high_water = self.buffer.absolute_sample_offset();
+        if sample_index > high_water {
+            return Err(TranscriberError::VadAheadOfAudio {
+                vad_end: sample_index,
+                buffered: high_water,
+            });
+        }
         if sample_index < self.vad_watermark {
             return Err(TranscriberError::PtsRegression {
                 kind: crate::types::PushKind::VadSegment,
@@ -908,9 +921,14 @@ mod tests {
     /// produce two chunks instead of one merged chunk.
     #[test]
     fn flush_on_silence_gap_yields_at_utterance_boundary() {
+        // Auto policy: this test exercises silence-flush behavior;
+        // default AutoLockAfter(1) would gate the second chunk
+        // (round-6 fix) until chunk 0's ASR result lands, hiding
+        // the silence-flush effect we're trying to verify.
         let config = TranscriberConfig::default()
             .with_chunk_size(Duration::from_secs(30))
-            .with_flush_on_silence_gap(Some(Duration::from_millis(500)));
+            .with_flush_on_silence_gap(Some(Duration::from_millis(500)))
+            .with_language_policy(LanguagePolicy::Auto);
         let mut t = Transcriber::new(config);
 
         t.push_samples(ts(0), &[0.0; 100_000]).unwrap();
@@ -1037,6 +1055,40 @@ mod tests {
         let mut t = fresh();
         let r = t.signal_no_speech_through(1000);
         assert!(matches!(r, Err(TranscriberError::OutputTimebaseUnset)));
+    }
+
+    /// Codex round-6 finding [high]: signal_no_speech_through must
+    /// not advance the watermark past audio the buffer hasn't seen
+    /// yet. Without the guard, a caller that mistakenly signals a
+    /// future sample index would poison the watermark — later valid
+    /// VAD inside the not-yet-buffered interval would get rejected
+    /// as PtsRegression even though the audio eventually arrives.
+    /// Symmetric with `push_vad_segment`'s VadAheadOfAudio guard.
+    #[test]
+    fn signal_no_speech_through_past_buffered_audio_returns_typed_error() {
+        let mut t = fresh();
+        t.push_samples(ts(0), &[0.0; 1000]).unwrap();
+        // Signal silence through sample 5_000, but only 1_000 samples
+        // are buffered. Must reject; watermark must stay unchanged.
+        let r = t.signal_no_speech_through(5_000);
+        assert!(
+            matches!(
+                r,
+                Err(TranscriberError::VadAheadOfAudio { vad_end: 5_000, buffered: 1_000 })
+            ),
+            "expected VadAheadOfAudio, got {:?}",
+            r
+        );
+        // Subsequent VAD inside the rejected interval (which we
+        // didn't actually push) succeeds — i.e., watermark wasn't
+        // poisoned.
+        t.push_samples(ts(0).clone() , &[]).ok(); // no-op
+        // Push more audio so VAD in the original interval is buffered.
+        let next = t.next_expected_starts_at().unwrap();
+        t.push_samples(next, &[0.0; 5_000]).unwrap();
+        // VAD start = 2_000 < the rejected sample_index = 5_000 must
+        // STILL succeed, proving the watermark wasn't moved.
+        t.push_vad_segment(VadSegment::new(2_000, 4_000)).unwrap();
     }
 
     /// Round-5 corollary: signal_no_speech_through after signal_eof

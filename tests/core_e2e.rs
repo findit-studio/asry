@@ -5,7 +5,7 @@ use core::time::Duration;
 
 use mediatime::{Timebase, Timestamp};
 use whispery::{
-    AsrResult, Command, Event, Lang, Transcriber, TranscriberConfig, VadSegment,
+    AsrResult, Command, Event, Lang, LanguagePolicy, Transcriber, TranscriberConfig, VadSegment,
 };
 
 fn tb_48k() -> Timebase {
@@ -74,7 +74,13 @@ fn happy_path_three_chunks_emit_in_order() {
 
 #[test]
 fn out_of_order_completion_emits_in_chunk_id_order() {
-    let config = TranscriberConfig::default().with_chunk_size(Duration::from_secs(1));
+    // Auto policy: this test exercises out-of-order completion, not
+    // language locking. Default AutoLockAfter(1) would gate chunks
+    // 1, 2 (round-6 fix) until chunk 0 resolves, defeating the
+    // out-of-order scenario.
+    let config = TranscriberConfig::default()
+        .with_chunk_size(Duration::from_secs(1))
+        .with_language_policy(LanguagePolicy::Auto);
     let mut t = Transcriber::new(config);
 
     t.push_samples(ts(0), &vec![0.0_f32; 64_000]).unwrap();
