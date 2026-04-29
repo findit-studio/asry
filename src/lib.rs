@@ -36,3 +36,9 @@ pub use core::{
     AlignmentResult, AsrParams, AsrParamsOverride, AsrResult, Command, Event,
     LanguagePolicy, SamplingStrategy, Transcriber, TranscriberConfig,
 };
+
+#[cfg(feature = "runner")]
+pub mod runner;
+
+#[cfg(feature = "runner")]
+pub use runner::RunnerError;
