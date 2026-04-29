@@ -73,8 +73,101 @@ impl Lang {
     }
 }
 
+impl Lang {
+    /// Total-function constructor: every `&str` produces a `Lang`.
+    /// Known whisper.cpp codes canonicalise to their named variant;
+    /// unknown codes go to `Lang::Other`. Never produces
+    /// `Lang::Other("en")` for an enum-known code "en" — see the
+    /// canonicalisation invariant on the type doc.
+    pub fn from_iso639_1(s: &str) -> Self {
+        match s {
+            "en" => Self::En, "zh" => Self::Zh, "de" => Self::De, "es" => Self::Es,
+            "ru" => Self::Ru, "ko" => Self::Ko, "fr" => Self::Fr, "ja" => Self::Ja,
+            "pt" => Self::Pt, "tr" => Self::Tr, "pl" => Self::Pl, "ca" => Self::Ca,
+            "nl" => Self::Nl, "ar" => Self::Ar, "sv" => Self::Sv, "it" => Self::It,
+            "id" => Self::Id, "hi" => Self::Hi, "fi" => Self::Fi, "vi" => Self::Vi,
+            "he" => Self::He, "uk" => Self::Uk, "el" => Self::El, "ms" => Self::Ms,
+            "cs" => Self::Cs, "ro" => Self::Ro, "da" => Self::Da, "hu" => Self::Hu,
+            "ta" => Self::Ta, "no" => Self::No, "th" => Self::Th, "ur" => Self::Ur,
+            "hr" => Self::Hr, "bg" => Self::Bg, "lt" => Self::Lt, "la" => Self::La,
+            "mi" => Self::Mi, "ml" => Self::Ml, "cy" => Self::Cy, "sk" => Self::Sk,
+            "te" => Self::Te, "fa" => Self::Fa, "lv" => Self::Lv, "bn" => Self::Bn,
+            "sr" => Self::Sr, "az" => Self::Az, "sl" => Self::Sl, "kn" => Self::Kn,
+            "et" => Self::Et, "mk" => Self::Mk, "br" => Self::Br, "eu" => Self::Eu,
+            "is" => Self::Is, "hy" => Self::Hy, "ne" => Self::Ne, "mn" => Self::Mn,
+            "bs" => Self::Bs, "kk" => Self::Kk, "sq" => Self::Sq, "sw" => Self::Sw,
+            "gl" => Self::Gl, "mr" => Self::Mr, "pa" => Self::Pa, "si" => Self::Si,
+            "km" => Self::Km, "sn" => Self::Sn, "yo" => Self::Yo, "so" => Self::So,
+            "af" => Self::Af, "oc" => Self::Oc, "ka" => Self::Ka, "be" => Self::Be,
+            "tg" => Self::Tg, "sd" => Self::Sd, "gu" => Self::Gu, "am" => Self::Am,
+            "yi" => Self::Yi, "lo" => Self::Lo, "uz" => Self::Uz, "fo" => Self::Fo,
+            "ht" => Self::Ht, "ps" => Self::Ps, "tk" => Self::Tk, "nn" => Self::Nn,
+            "mt" => Self::Mt, "sa" => Self::Sa, "lb" => Self::Lb, "my" => Self::My,
+            "bo" => Self::Bo, "tl" => Self::Tl, "mg" => Self::Mg, "as" => Self::As,
+            "tt" => Self::Tt, "haw" => Self::Haw, "ln" => Self::Ln, "ha" => Self::Ha,
+            "ba" => Self::Ba, "jw" => Self::Jw, "su" => Self::Su, "yue" => Self::Yue,
+            other => Self::Other(SmolStr::new(other)),
+        }
+    }
+}
+
 impl core::fmt::Display for Lang {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every named variant round-trips through `from_iso639_1(as_str())`
+    /// AND does not match `Lang::Other(_)`. This is the
+    /// canonicalisation invariant from spec §4.4.
+    #[test]
+    fn named_variants_canonicalise() {
+        let known = [
+            Lang::En, Lang::Zh, Lang::De, Lang::Es, Lang::Ru, Lang::Ko,
+            Lang::Fr, Lang::Ja, Lang::Pt, Lang::Tr, Lang::Pl, Lang::Ca,
+            Lang::Nl, Lang::Ar, Lang::Sv, Lang::It, Lang::Id, Lang::Hi,
+            Lang::Fi, Lang::Vi, Lang::He, Lang::Uk, Lang::El, Lang::Ms,
+            Lang::Cs, Lang::Ro, Lang::Da, Lang::Hu, Lang::Ta, Lang::No,
+            Lang::Th, Lang::Ur, Lang::Hr, Lang::Bg, Lang::Lt, Lang::La,
+            Lang::Mi, Lang::Ml, Lang::Cy, Lang::Sk, Lang::Te, Lang::Fa,
+            Lang::Lv, Lang::Bn, Lang::Sr, Lang::Az, Lang::Sl, Lang::Kn,
+            Lang::Et, Lang::Mk, Lang::Br, Lang::Eu, Lang::Is, Lang::Hy,
+            Lang::Ne, Lang::Mn, Lang::Bs, Lang::Kk, Lang::Sq, Lang::Sw,
+            Lang::Gl, Lang::Mr, Lang::Pa, Lang::Si, Lang::Km, Lang::Sn,
+            Lang::Yo, Lang::So, Lang::Af, Lang::Oc, Lang::Ka, Lang::Be,
+            Lang::Tg, Lang::Sd, Lang::Gu, Lang::Am, Lang::Yi, Lang::Lo,
+            Lang::Uz, Lang::Fo, Lang::Ht, Lang::Ps, Lang::Tk, Lang::Nn,
+            Lang::Mt, Lang::Sa, Lang::Lb, Lang::My, Lang::Bo, Lang::Tl,
+            Lang::Mg, Lang::As, Lang::Tt, Lang::Haw, Lang::Ln, Lang::Ha,
+            Lang::Ba, Lang::Jw, Lang::Su, Lang::Yue,
+        ];
+        assert_eq!(known.len(), 100, "must keep the 100-variant Appendix C list in sync");
+        for v in known.iter() {
+            let round = Lang::from_iso639_1(v.as_str());
+            assert_eq!(&round, v, "round-trip failed for {:?}", v);
+            assert!(
+                !matches!(round, Lang::Other(_)),
+                "{:?} canonicalised to Other; this breaks Eq/Hash",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_codes_land_in_other() {
+        let r = Lang::from_iso639_1("zzz");
+        assert_eq!(r, Lang::Other(SmolStr::new("zzz")));
+        assert_eq!(r.as_str(), "zzz");
+    }
+
+    #[test]
+    fn other_round_trips_via_as_str() {
+        let r = Lang::Other(SmolStr::new("xx"));
+        assert_eq!(r.as_str(), "xx");
+        assert_eq!(Lang::from_iso639_1(r.as_str()), r);
     }
 }
