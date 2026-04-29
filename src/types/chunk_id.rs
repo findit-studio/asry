@@ -9,39 +9,39 @@
 pub struct ChunkId(u64);
 
 impl ChunkId {
-    /// Construct from a raw `u64`. Crate-private; the dispatch state
-    /// machine is the only legitimate constructor.
-    pub(crate) const fn from_raw(n: u64) -> Self {
-        Self(n)
-    }
+  /// Construct from a raw `u64`. Crate-private; the dispatch state
+  /// machine is the only legitimate constructor.
+  pub(crate) const fn from_raw(n: u64) -> Self {
+    Self(n)
+  }
 
-    /// Raw underlying value.
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
+  /// Raw underlying value.
+  pub const fn as_u64(self) -> u64 {
+    self.0
+  }
 }
 
 impl core::fmt::Display for ChunkId {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.0)
-    }
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(f, "{}", self.0)
+  }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+  use super::*;
 
-    #[test]
-    fn round_trip_through_raw() {
-        let c = ChunkId::from_raw(42);
-        assert_eq!(c.as_u64(), 42);
-    }
+  #[test]
+  fn round_trip_through_raw() {
+    let c = ChunkId::from_raw(42);
+    assert_eq!(c.as_u64(), 42);
+  }
 
-    #[test]
-    fn ordering_is_total_and_numeric() {
-        let a = ChunkId::from_raw(1);
-        let b = ChunkId::from_raw(2);
-        assert!(a < b);
-        assert_eq!(a, ChunkId::from_raw(1));
-    }
+  #[test]
+  fn ordering_is_total_and_numeric() {
+    let a = ChunkId::from_raw(1);
+    let b = ChunkId::from_raw(2);
+    assert!(a < b);
+    assert_eq!(a, ChunkId::from_raw(1));
+  }
 }

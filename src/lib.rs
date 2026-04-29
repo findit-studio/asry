@@ -12,9 +12,9 @@
 
 extern crate alloc;
 
+pub mod core;
 pub mod time;
 pub mod types;
-pub mod core;
 
 // Re-exports of mediatime types that appear in whispery's public API
 // (so consumers don't need to add a separate `mediatime` dependency
@@ -25,14 +25,14 @@ pub mod core;
 // API to mediatime's. A breaking change in mediatime (major-version
 // bump) is automatically a breaking change for whispery, so the
 // `mediatime` dependency is pinned to a single major in Cargo.toml.
-pub use mediatime::{Timebase, TimeRange, Timestamp};
+pub use mediatime::{TimeRange, Timebase, Timestamp};
 
 pub use types::{
-    AlignmentFailureKind, AsrFailureKind, ChunkId, Lang, PushKind, Transcript,
-    TranscriberError, VadSegment, Word, WorkFailure, WorkerKind,
+  AlignmentFailureKind, AsrFailureKind, ChunkId, Lang, PushKind, TranscriberError, Transcript,
+  VadSegment, Word, WorkFailure, WorkerKind,
 };
 
 pub use core::{
-    AlignmentResult, AsrParams, AsrParamsOverride, AsrResult, Command, Event,
-    LanguagePolicy, SamplingStrategy, Transcriber, TranscriberConfig,
+  AlignmentResult, AsrParams, AsrParamsOverride, AsrResult, Command, Event, LanguagePolicy,
+  SamplingStrategy, Transcriber, TranscriberConfig,
 };

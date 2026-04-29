@@ -22,10 +22,10 @@ pub const SAMPLE_RATE_HZ: u32 = 16_000;
 /// so the panic is unreachable in practice. Avoids depending on
 /// `Option::unwrap` const stability.
 const fn nz(n: u32) -> NonZeroU32 {
-    match NonZeroU32::new(n) {
-        Some(n) => n,
-        None => panic!("expected nonzero u32"),
-    }
+  match NonZeroU32::new(n) {
+    Some(n) => n,
+    None => panic!("expected nonzero u32"),
+  }
 }
 
 const SAMPLE_RATE_NZ: NonZeroU32 = nz(SAMPLE_RATE_HZ);
@@ -34,21 +34,20 @@ const SAMPLE_RATE_NZ: NonZeroU32 = nz(SAMPLE_RATE_HZ);
 /// machine, the sample buffer, and the alignment pipeline. Not part
 /// of whispery's public output surface — every emitted `TimeRange`
 /// is in the caller's external timebase.
-pub const ANALYSIS_TIMEBASE: mediatime::Timebase =
-    mediatime::Timebase::new(1, SAMPLE_RATE_NZ);
+pub const ANALYSIS_TIMEBASE: mediatime::Timebase = mediatime::Timebase::new(1, SAMPLE_RATE_NZ);
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+  use super::*;
 
-    #[test]
-    fn analysis_timebase_is_one_over_16k() {
-        assert_eq!(ANALYSIS_TIMEBASE.num(), 1);
-        assert_eq!(ANALYSIS_TIMEBASE.den().get(), 16_000);
-    }
+  #[test]
+  fn analysis_timebase_is_one_over_16k() {
+    assert_eq!(ANALYSIS_TIMEBASE.num(), 1);
+    assert_eq!(ANALYSIS_TIMEBASE.den().get(), 16_000);
+  }
 
-    #[test]
-    fn sample_rate_constant_matches_timebase() {
-        assert_eq!(SAMPLE_RATE_HZ, ANALYSIS_TIMEBASE.den().get());
-    }
+  #[test]
+  fn sample_rate_constant_matches_timebase() {
+    assert_eq!(SAMPLE_RATE_HZ, ANALYSIS_TIMEBASE.den().get());
+  }
 }
