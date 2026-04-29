@@ -102,6 +102,7 @@ impl Transcriber {
             config.asr_params.clone(),
             config.word_alignment,
             config.max_in_flight,
+            config.language_policy.clone(),
         );
         Self {
             config,
@@ -238,6 +239,12 @@ impl Transcriber {
                 self.next_chunk_id += 1;
                 self.dispatch.on_emit(chunk, chunk_id, &self.buffer);
             }
+            // Run after_inject so trim drops any audio not referenced
+            // by either cut_pending or the cut accumulator. Without
+            // this, a silent stream (samples pushed but no VAD) would
+            // leave the buffer non-empty forever and `is_idle()`
+            // would never become true.
+            self.dispatch.after_inject(&mut self.buffer, self.cut.pending_start());
         }
         Ok(())
     }
@@ -245,14 +252,15 @@ impl Transcriber {
     /// Inject the result of a `Command::RunAsr`.
     ///
     /// Errors:
-    /// - `UnknownChunk(chunk_id)` if `chunk_id` is not in flight.
+    /// - `UnknownChunk(chunk_id)` if `chunk_id` is not in flight or
+    ///   is in flight but not awaiting an ASR result.
     pub fn inject_asr_result(
         &mut self,
         chunk_id: ChunkId,
         result: AsrResult,
     ) -> Result<(), TranscriberError> {
         self.dispatch.inject_asr_result(chunk_id, result)?;
-        self.dispatch.after_inject(&mut self.buffer);
+        self.dispatch.after_inject(&mut self.buffer, self.cut.pending_start());
         Ok(())
     }
 
@@ -266,21 +274,22 @@ impl Transcriber {
         result: AlignmentResult,
     ) -> Result<(), TranscriberError> {
         self.dispatch.inject_alignment_result(chunk_id, result)?;
-        self.dispatch.after_inject(&mut self.buffer);
+        self.dispatch.after_inject(&mut self.buffer, self.cut.pending_start());
         Ok(())
     }
 
     /// Inject a per-chunk failure.
     ///
     /// Errors:
-    /// - `UnknownChunk(chunk_id)` if `chunk_id` is not in flight.
+    /// - `UnknownChunk(chunk_id)` if `chunk_id` is not in flight or
+    ///   is in flight but not awaiting any worker result.
     pub fn inject_failure(
         &mut self,
         chunk_id: ChunkId,
         failure: WorkFailure,
     ) -> Result<(), TranscriberError> {
         self.dispatch.inject_failure(chunk_id, failure)?;
-        self.dispatch.after_inject(&mut self.buffer);
+        self.dispatch.after_inject(&mut self.buffer, self.cut.pending_start());
         Ok(())
     }
 
@@ -433,5 +442,77 @@ mod tests {
         // own Arc<[f32]>s and will emit normally.
         // (Spec §5.4.1 + §5.5 invariant 4 exception: drain is
         // allowed to exceed max_in_flight transiently.)
+    }
+
+    /// Codex round-1 finding [high]: trim must NOT drop audio still
+    /// referenced by the cut accumulator. Reproduction: chunk 0
+    /// emitted, chunk 1 accumulating in Cut without being emitted,
+    /// chunk 0 ASR completes → after_inject runs trim. Without the
+    /// fix, trim's low-water defaulted to absolute_sample_offset
+    /// when cut_pending was empty and dropped the in-buffer audio
+    /// that chunk 1 would later need; the next push_vad_segment
+    /// that closed chunk 1 would then panic in buffer.extract.
+    #[test]
+    fn trim_keeps_samples_for_unextracted_cut_accumulator() {
+        use crate::core::command::Command;
+        use smol_str::SmolStr;
+
+        let mut config = TranscriberConfig::default();
+        config.chunk_size = Duration::from_secs(2); // 32_000 samples @ 16k
+        config.buffer_cap_samples = 200_000;
+        config.max_in_flight = 4;
+        let mut t = Transcriber::new(config);
+
+        // 4 seconds of 16 kHz audio = 64_000 samples.
+        t.push_samples(ts(0), &vec![0.0_f32; 64_000]).unwrap();
+
+        // Two VAD segments. The second pushes the merge past the
+        // 32_000-sample chunk_size, so chunk 0 emits with range
+        // [0, 24_000) and chunk 1 starts accumulating at 25_600.
+        t.push_vad_segment(VadSegment::new(0, 24_000)).unwrap();
+        t.push_vad_segment(VadSegment::new(25_600, 48_000)).unwrap();
+
+        // Resolve chunk 0 — this is where the bug used to fire trim
+        // with low_water = absolute_sample_offset = 64_000 because
+        // cut_pending was empty (chunk 1 wasn't yet emitted by Cut).
+        let cmd = t.poll_command().unwrap();
+        let Command::RunAsr { chunk_id, .. } = cmd else { panic!("expected RunAsr") };
+        let asr = crate::core::command::AsrResult {
+            text: SmolStr::new("c0"),
+            language: crate::types::Lang::En,
+            avg_logprob: -0.5,
+            no_speech_prob: 0.05,
+            temperature: 0.0,
+        };
+        t.inject_asr_result(chunk_id, asr).unwrap();
+
+        // Drain chunk 0's Transcript event.
+        let _ = t.poll_event().expect("chunk 0 transcript");
+
+        // Now close chunk 1. With the fix, the buffer still has
+        // samples back to 25_600, so this extract succeeds. Without
+        // the fix, the buffer was cleared past 64_000 and this
+        // panics inside buffer.extract.
+        t.push_vad_segment(VadSegment::new(50_000, 60_000)).unwrap();
+
+        // The third VAD push triggered chunk 1's emission with
+        // range [25_600, 48_000) — its RunAsr is queued.
+        let cmd = t.poll_command().unwrap();
+        let Command::RunAsr { chunk_id, .. } = cmd else { panic!("expected RunAsr") };
+        assert_eq!(chunk_id.as_u64(), 1, "chunk 1 ran without panic");
+    }
+
+    /// Codex round-1 finding [medium]: silent EOF (samples pushed,
+    /// no VAD ever pushed) must leave the transcriber idle.
+    /// Without the fix, signal_eof returned without trimming the
+    /// buffer; is_idle()'s `buffered_samples() == 0` check stayed
+    /// false forever.
+    #[test]
+    fn silent_eof_makes_transcriber_idle() {
+        let mut t = fresh();
+        t.push_samples(ts(0), &[0.0; 1000]).unwrap();
+        assert!(!t.is_idle(), "buffer has 1000 samples; not idle yet");
+        t.signal_eof().unwrap();
+        assert!(t.is_idle(), "after silent EOF, transcriber should be idle");
     }
 }

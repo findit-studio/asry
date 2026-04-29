@@ -130,6 +130,15 @@ impl Cut {
         }
     }
 
+    /// Start sample of the chunk currently accumulating in the cut
+    /// state machine, if any. `None` between chunks. Used by trim's
+    /// low-water computation: samples back to this index are still
+    /// referenced by the unextracted partial chunk and must not be
+    /// dropped before that chunk emits via push_segment or flush.
+    pub(crate) fn pending_start(&self) -> Option<u64> {
+        self.current_start
+    }
+
     /// Push a VAD segment through the cut state machine. Returns
     /// `Some(MergedChunk)` if this push closed an accumulating
     /// chunk; `None` otherwise.
