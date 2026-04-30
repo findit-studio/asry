@@ -4,6 +4,8 @@
 //! supported set. Future versions add more languages by adding
 //! files here and re-exporting from `runner::aligner`.
 
+mod chinese;
 mod english;
 
+pub use chinese::ChineseNormalizer;
 pub use english::EnglishNormalizer;
