@@ -36,3 +36,21 @@ pub use core::{
   AlignmentResult, AsrParams, AsrParamsOverride, AsrResult, Command, Event, LanguagePolicy,
   SamplingStrategy, Transcriber, TranscriberConfig,
 };
+
+#[cfg(feature = "runner")]
+pub mod runner;
+
+#[cfg(feature = "runner")]
+pub use runner::{
+    ManagedTranscriber, ManagedTranscriberBuilder, RunnerError, WhisperPoolConfig,
+};
+
+// Re-export whisper-rs types that appear on the runner's public
+// API (so consumers don't need a direct whisper-rs dep just to name
+// them; they may still add it to call non-re-exported methods).
+//
+// SemVer note: identical to the mediatime situation — re-exporting
+// pins whispery's public API to whisper-rs's semver. We pin to a
+// single major in Cargo.toml.
+#[cfg(feature = "runner")]
+pub use whisper_rs::{WhisperContext, WhisperContextParameters};
