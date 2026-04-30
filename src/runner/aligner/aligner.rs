@@ -178,14 +178,106 @@ impl Aligner {
     where
         F: Fn(u64, u64) -> TimeRange,
     {
-        // Will dispatch to the algorithm pipeline once Tasks 10-14
-        // land. Stub returns EmptyText so the caller path compiles.
-        let _ = (samples, sub_segments, text, chunk_first_sample_in_stream, samples_to_output_range);
-        Err(WorkFailure::AlignmentFailed {
-            kind: crate::types::AlignmentFailureKind::EmptyText,
-            message: alloc::string::String::from("aligner pipeline stub: implemented in Tasks 10-14"),
-            language: self.language.clone(),
-        })
+        use crate::runner::aligner::algorithm::{
+            compose::compose_words,
+            encode::encode_log_softmax,
+            silence_mask::build_masked_samples,
+            tokenize::tokenize_with_word_map,
+            viterbi::ctc_viterbi,
+        };
+        use crate::types::AlignmentFailureKind;
+
+        // Step 0: silence-mask non-speech regions.
+        // The output_range_to_chunk_local closure converts an
+        // output-timebase TimeRange to chunk-local 16 kHz indices.
+        // We use samples_to_output_range as our bridge: invert it
+        // by converting (range.start_pts, range.end_pts) back to
+        // chunk-local sample offsets via the chunk_first_sample
+        // offset.
+        //
+        // Actually: the worker stage already converts sub_segment
+        // TimeRanges into the output timebase from Plan A's
+        // ExtractedChunk; the inversion at this layer is identical
+        // to the conversion the worker did. We accept TimeRanges
+        // here and the worker passes a closure that does the
+        // chunk-local conversion (Task 21 wires this).
+        //
+        // For the v1 pipeline, the closure is constructed by the
+        // alignment worker (run_one_alignment in Task 18); the
+        // signature here takes a Fn(TimeRange) -> (u64, u64) but
+        // we don't have it as a parameter. The pragmatic approach:
+        // the worker pre-converts sub_segments to chunk-local
+        // (start_sample, end_sample) pairs and passes those in
+        // place of TimeRanges. We change the signature to take
+        // pre-converted ranges to avoid a redundant closure.
+        //
+        // Rather than introducing a fourth closure parameter, we
+        // build the mask directly from sub_segments expressed in
+        // sample space. Caller (worker) is responsible for
+        // expressing sub_segments in chunk-local 16 kHz indices.
+        // To keep the public Aligner::align contract honest,
+        // sub_segments is documented as "chunk-local sample
+        // ranges, not output-timebase TimeRanges" — see the
+        // worker's run_one_alignment (Task 18) for the conversion.
+        let masked = build_masked_samples(samples, sub_segments, |seg| {
+            // `seg` is documented as carrying chunk-local 16 kHz
+            // sample indices in its PTS units. Caller builds the
+            // ranges with a tb of (1/16000) so PTS == sample idx.
+            (seg.start_pts() as u64, seg.end_pts() as u64)
+        });
+
+        // Step 1: normalise.
+        let normalized = self
+            .normalizer
+            .normalize(text)
+            .map_err(|e| match e {
+                crate::runner::aligner::normalizer::NormalizationError::EmptyText => {
+                    WorkFailure::AlignmentFailed {
+                        kind: AlignmentFailureKind::EmptyText,
+                        message: alloc::format!("empty text after normalisation"),
+                        language: self.language.clone(),
+                    }
+                }
+                crate::runner::aligner::normalizer::NormalizationError::RuleFailed { detail } => {
+                    WorkFailure::AlignmentFailed {
+                        kind: AlignmentFailureKind::NormalizationFailed,
+                        message: detail,
+                        language: self.language.clone(),
+                    }
+                }
+            })?;
+
+        let n_words = normalized.original_words().len();
+
+        // Step 2: tokenise with word index map.
+        let tokenized = tokenize_with_word_map(
+            &self.tokenizer,
+            normalized.normalized(),
+            n_words,
+            &self.language,
+        )?;
+
+        // Steps 3-4: encode + log-softmax.
+        let log_probs = encode_log_softmax(&mut self.session, &masked, &self.language)?;
+
+        // Steps 5-6: CTC lattice + Viterbi.
+        let path = ctc_viterbi(
+            &log_probs,
+            &tokenized.token_ids,
+            self.blank_token_id,
+            &self.language,
+        )?;
+
+        // Steps 7-9: per-word state + surface-form recovery.
+        Ok(compose_words(
+            &path,
+            &log_probs,
+            &tokenized.word_idx_per_token,
+            normalized.original_words(),
+            chunk_first_sample_in_stream,
+            self.hop_samples,
+            samples_to_output_range,
+        ))
     }
 }
 
