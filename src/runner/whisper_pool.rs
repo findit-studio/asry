@@ -656,14 +656,20 @@ impl WhisperPool {
 
 impl Drop for WhisperPool {
     fn drop(&mut self) {
-        // Closing work_tx makes worker loops exit normally on the next
-        // recv. Joining propagates panics from workers as a best-effort
-        // shutdown (we ignore the join result in Drop because panicking
-        // here would mask the original error).
-        // The Sender is dropped automatically when WhisperPool drops;
-        // we explicitly take it out so workers see the disconnect.
-        // Crossbeam's Drop on Sender already handles this — no explicit
-        // close call is necessary.
+        // Closing work_tx is what makes worker loops exit (their
+        // `recv()` returns `Err(_)` once the last Sender is dropped).
+        // The naive "drop the field automatically" approach is wrong:
+        // Drop calls below run BEFORE struct fields are dropped, so
+        // `handle.join()` would block forever — workers still see a
+        // live `work_tx` in `self`. Replace it with a dummy channel
+        // up front so the original drops here, signaling disconnect.
+        //
+        // Joining propagates panics from workers as a best-effort
+        // shutdown (we ignore the join result because panicking
+        // inside Drop would mask the original error).
+        let (dummy_tx, _dummy_rx) = bounded::<AsrWorkItem>(1);
+        let _live_tx = core::mem::replace(&mut self.work_tx, dummy_tx);
+        drop(_live_tx);
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
