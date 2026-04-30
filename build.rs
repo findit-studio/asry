@@ -15,6 +15,14 @@ const MODEL_FILENAME: &str = "ggml-tiny.en.bin";
 const MODEL_SHA256: &str =
   "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f";
 
+const WAV_URL: &str =
+  "https://github.com/ggerganov/whisper.cpp/raw/master/samples/jfk.wav";
+const WAV_FILENAME: &str = "jfk.wav";
+// 11-second JFK quote, mono, 16 kHz. SHA-256 of the upstream file at
+// the time of writing.
+const WAV_SHA256: &str =
+  "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e";
+
 fn main() {
   println!("cargo:rerun-if-changed=build.rs");
   println!("cargo:rerun-if-env-changed=WHISPERY_OFFLINE");
@@ -53,6 +61,7 @@ fn main() {
         "cargo:rustc-env=WHISPERY_TINY_EN_MODEL={}",
         model_path.display()
       );
+      fetch_jfk_wav(&fixture_dir);
       return;
     } else {
       eprintln!(
@@ -78,6 +87,7 @@ fn main() {
         "cargo:rustc-env=WHISPERY_TINY_EN_MODEL={}",
         model_path.display()
       );
+      fetch_jfk_wav(&fixture_dir);
     }
     Ok(false) => {
       eprintln!("[whispery build.rs] downloaded model has wrong checksum; aborting");
@@ -86,6 +96,34 @@ fn main() {
     Err(e) => {
       eprintln!("[whispery build.rs] sha256 verification I/O error: {}", e);
     }
+  }
+}
+
+fn fetch_jfk_wav(fixture_dir: &std::path::Path) {
+  let wav_path = fixture_dir.join(WAV_FILENAME);
+  if wav_path.exists() {
+    if let Ok(true) = verify_sha256(&wav_path, WAV_SHA256) {
+      println!(
+        "cargo:rustc-env=WHISPERY_JFK_WAV={}",
+        wav_path.display()
+      );
+      return;
+    }
+    let _ = fs::remove_file(&wav_path);
+  }
+  eprintln!(
+    "[whispery build.rs] downloading {} ({})",
+    WAV_FILENAME, WAV_URL
+  );
+  if download(WAV_URL, &wav_path).is_err() {
+    let _ = fs::remove_file(&wav_path);
+    return;
+  }
+  if let Ok(true) = verify_sha256(&wav_path, WAV_SHA256) {
+    println!(
+      "cargo:rustc-env=WHISPERY_JFK_WAV={}",
+      wav_path.display()
+    );
   }
 }
 
