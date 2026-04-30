@@ -5,8 +5,10 @@ mod algorithm;
 mod key;
 mod normalizer;
 mod normalizers;
+mod set;
 
 pub use aligner::Aligner;
 pub use key::{AlignerKey, AlignmentFallback};
 pub use normalizer::{DynTextNormalizer, NormalizationError, NormalizedText, TextNormalizer};
 pub use normalizers::{ChineseNormalizer, EnglishNormalizer, JapaneseNormalizer};
+pub use set::{AlignmentLookup, AlignmentSet};
