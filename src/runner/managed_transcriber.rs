@@ -45,6 +45,17 @@ pub struct ManagedTranscriber {
     buffer_cap_samples: usize,
     pending_transcripts: VecDeque<Transcript>,
     pending_errors: VecDeque<(ChunkId, WorkFailure)>,
+
+    /// Plan C: alignment pool (single worker per spec §6.3.3).
+    /// `None` when `with_alignment` was not called or the supplied
+    /// set was empty.
+    #[cfg(feature = "alignment")]
+    alignment_pool: Option<crate::runner::alignment_pool::AlignmentPool>,
+
+    /// Per-job alignment timeout. Stamped on each
+    /// `AlignWorkItem`.
+    #[cfg(feature = "alignment")]
+    align_timeout: Duration,
 }
 
 impl ManagedTranscriber {
@@ -235,6 +246,17 @@ pub struct ManagedTranscriberBuilder {
     worker_timeouts_asr: Duration,
     worker_timeouts_align: Duration,
     drain_timeout: Option<Duration>,
+
+    /// Plan C: optional alignment registry. When `Some(set)` and
+    /// `set.is_empty() == false`, `build()` spawns an alignment
+    /// worker and emits `Command::RunAlignment` per chunk.
+    #[cfg(feature = "alignment")]
+    alignment_set: Option<crate::runner::aligner::AlignmentSet>,
+
+    /// Plan C: queue depth for the alignment work channel. Default
+    /// = whisper pool's `max_queued_chunks` (mirrors §6.3.3).
+    #[cfg(feature = "alignment")]
+    alignment_max_queued_chunks: Option<usize>,
 }
 
 impl ManagedTranscriberBuilder {
@@ -251,6 +273,10 @@ impl ManagedTranscriberBuilder {
             worker_timeouts_asr: Duration::from_secs(60),
             worker_timeouts_align: Duration::from_secs(30),
             drain_timeout: None,
+            #[cfg(feature = "alignment")]
+            alignment_set: None,
+            #[cfg(feature = "alignment")]
+            alignment_max_queued_chunks: None,
         }
     }
 
@@ -304,6 +330,35 @@ impl ManagedTranscriberBuilder {
         self
     }
 
+    /// Wire word-level forced alignment using the supplied
+    /// [`crate::runner::aligner::AlignmentSet`]. The alignment
+    /// worker is spawned at `build()` time; chunks emit
+    /// `Command::RunAlignment` after their ASR result lands.
+    ///
+    /// An empty `set` is accepted: `build()` will not spawn an
+    /// alignment worker and the runner behaves identically to a
+    /// no-alignment build. This lets callers conditionally
+    /// configure alignment without branching at the call site.
+    ///
+    /// Gated on `feature = "alignment"`.
+    #[cfg(feature = "alignment")]
+    pub fn with_alignment(mut self, set: crate::runner::aligner::AlignmentSet) -> Self {
+        self.alignment_set = Some(set);
+        self
+    }
+
+    /// Override the alignment work-channel capacity. Default =
+    /// whisper pool's `max_queued_chunks`. Higher values smooth
+    /// over alignment-worker stalls; lower values bound memory
+    /// when alignment is the bottleneck.
+    ///
+    /// Gated on `feature = "alignment"`.
+    #[cfg(feature = "alignment")]
+    pub const fn alignment_max_queued_chunks(mut self, value: usize) -> Self {
+        self.alignment_max_queued_chunks = Some(value);
+        self
+    }
+
     /// Construct the `ManagedTranscriber`. Spawns worker threads and
     /// wires channels.
     pub fn build(self) -> Result<ManagedTranscriber, RunnerError> {
@@ -316,13 +371,41 @@ impl ManagedTranscriberBuilder {
             longest * 10
         });
 
+        // Plan C: build the alignment pool only when a non-empty
+        // AlignmentSet was supplied. An empty set is silently
+        // accepted (callers can conditionally configure alignment
+        // without branching at the call site) and produces a build
+        // that behaves identically to a no-alignment build.
+        #[cfg(feature = "alignment")]
+        let alignment_pool = match self.alignment_set {
+            Some(set) if !set.is_empty() => {
+                let cap = self
+                    .alignment_max_queued_chunks
+                    .unwrap_or_else(|| self.pool_config.max_queued_chunks());
+                let arc_set = alloc::sync::Arc::new(set);
+                Some(crate::runner::alignment_pool::AlignmentPool::new(
+                    arc_set, cap,
+                )?)
+            }
+            _ => None,
+        };
+
+        // The core's `word_alignment` flag follows the alignment
+        // pool's presence — if no pool, no `Command::RunAlignment`
+        // should be emitted; the core respects this via
+        // `TranscriberConfig::with_word_alignment`.
+        #[cfg(feature = "alignment")]
+        let word_alignment_flag = alignment_pool.is_some();
+        #[cfg(not(feature = "alignment"))]
+        let word_alignment_flag = false;
+
         let core_config = crate::core::TranscriberConfig::new()
             .with_chunk_size(self.chunk_size)
             .with_buffer_cap_samples(self.buffer_cap_samples)
             .with_gap_tolerance_samples(self.gap_tolerance_samples)
             .with_language_policy(self.language_policy)
             .with_asr_params(self.asr_params.clone())
-            .with_word_alignment(false)
+            .with_word_alignment(word_alignment_flag)
             .with_max_in_flight(self.pool_config.worker_count() + 2);
 
         let whisper_pool = WhisperPool::new(self.whisper_ctx, &self.pool_config)?;
@@ -339,6 +422,10 @@ impl ManagedTranscriberBuilder {
             buffer_cap_samples: self.buffer_cap_samples,
             pending_transcripts: VecDeque::new(),
             pending_errors: VecDeque::new(),
+            #[cfg(feature = "alignment")]
+            alignment_pool,
+            #[cfg(feature = "alignment")]
+            align_timeout: self.worker_timeouts_align,
         })
     }
 }
