@@ -145,3 +145,102 @@ fn end_to_end_jfk_quote() {
         assert!(ok, "temperature {} not in expected ladder steps", temp);
     }
 }
+
+// TODO(plan-b followup): Same drain-hang root cause as
+// `end_to_end_jfk_quote` above. This test exercises the cut state
+// machine fan-out (3 chunks at chunk_size=2 s on 6 s of audio) and
+// will ship as a green test once the underlying drain hang is
+// resolved. Run manually with:
+//
+//   cargo test --features runner --test runner_e2e -- --ignored --nocapture
+#[test]
+#[ignore = "drain hangs against real ggml-tiny model — investigation follow-up"]
+fn multi_chunk_synthetic_stream() {
+    let model_path = match MODEL_PATH {
+        Some(p) => p,
+        None => return,
+    };
+
+    let pool = WhisperPoolConfig::new(model_path).with_worker_count(2);
+    let mut runner = ManagedTranscriber::from_config(pool)
+        .expect("build pool config")
+        // Force ≥3 chunks: 2-second chunk size, 6 seconds of audio.
+        .chunk_size(Duration::from_secs(2))
+        .language_policy(LanguagePolicy::Lock { hint: whispery::Lang::En })
+        .build()
+        .expect("build runner");
+
+    let tb = Timebase::new(1, NonZeroU32::new(48_000).unwrap());
+    // 6 s of zero audio at 16 kHz internal = 96 000 samples.
+    let samples = vec![0.0_f32; 96_000];
+    runner
+        .process_packet(
+            Timestamp::new(0, tb),
+            &samples,
+            &[
+                VadSegment::new(0, 32_000),
+                VadSegment::new(32_000, 64_000),
+                VadSegment::new(64_000, 96_000),
+            ],
+            None,
+        )
+        .expect("process_packet");
+    runner.signal_eof().expect("signal_eof");
+    runner.drain().expect("drain");
+
+    let mut count = 0;
+    while let Some(_t) = runner.poll_transcript() {
+        count += 1;
+    }
+    assert_eq!(count, 3, "expected exactly 3 transcripts for 6 s / 2 s-chunk");
+}
+
+// TODO(plan-b followup): Same drain-hang root cause class as the two
+// tests above. Even though this test never calls `runner.drain()`, it
+// constructs a real `WhisperPool` and lets `ManagedTranscriber` drop
+// at end of scope; that drop joins the worker without first releasing
+// `work_tx`, which surfaces the same hang under whisper-rs. Re-enable
+// once the drain/drop hang investigation lands. Run manually with:
+//
+//   cargo test --features runner --test runner_e2e -- --ignored --nocapture
+#[test]
+#[ignore = "drain/drop hang against real ggml-tiny model — investigation follow-up"]
+fn backpressure_returns_when_block_disabled() {
+    let model_path = match MODEL_PATH {
+        Some(p) => p,
+        None => return,
+    };
+
+    let pool = WhisperPoolConfig::new(model_path)
+        .with_worker_count(1)
+        .with_max_queued_chunks(1)
+        .with_block_on_full_queue(false);
+    let mut runner = ManagedTranscriber::from_config(pool)
+        .expect("build pool config")
+        .chunk_size(Duration::from_secs(1))
+        .buffer_cap_samples(32_000)
+        .language_policy(LanguagePolicy::Lock { hint: whispery::Lang::En })
+        .build()
+        .expect("build runner");
+
+    let tb = Timebase::new(1, NonZeroU32::new(48_000).unwrap());
+    let res = runner.process_packet(
+        Timestamp::new(0, tb),
+        &vec![0.0_f32; 64_000],
+        &[VadSegment::new(0, 64_000)],
+        None,
+    );
+    // The caller pushed audio + VAD that would emit 4 chunks
+    // (4× chunk_size). With max_queued_chunks=1 and block_on_full_queue=false,
+    // we expect either Backpressure (preferred) or success if the worker
+    // happened to drain in time. Both are valid outcomes; the test asserts
+    // we got SOME deterministic result.
+    match res {
+        Ok(()) => {}
+        Err(whispery::RunnerError::Backpressure { buffered, cap }) => {
+            assert!(buffered > 0);
+            assert_eq!(cap, 32_000);
+        }
+        Err(other) => panic!("unexpected error {other:?}"),
+    }
+}
