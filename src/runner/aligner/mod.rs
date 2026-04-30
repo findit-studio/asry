@@ -2,6 +2,8 @@
 
 mod key;
 mod normalizer;
+mod normalizers;
 
 pub use key::{AlignerKey, AlignmentFallback};
 pub use normalizer::{DynTextNormalizer, NormalizationError, NormalizedText, TextNormalizer};
+pub use normalizers::EnglishNormalizer;
