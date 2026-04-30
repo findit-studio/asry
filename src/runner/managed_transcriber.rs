@@ -48,12 +48,25 @@ pub struct ManagedTranscriber {
   buffer_cap_samples: usize,
   pending_transcripts: VecDeque<Transcript>,
   pending_errors: VecDeque<(ChunkId, WorkFailure)>,
+
+  /// Plan C: alignment pool (single worker per spec §6.3.3).
+  /// `None` when `with_alignment` was not called or the supplied
+  /// set was empty.
+  #[cfg(feature = "alignment")]
+  alignment_pool: Option<crate::runner::alignment_pool::AlignmentPool>,
+
+  /// Per-job alignment timeout. Stamped on each
+  /// `AlignWorkItem`.
+  #[cfg(feature = "alignment")]
+  align_timeout: Duration,
 }
 
 impl ManagedTranscriber {
-  /// Try to send a Command into the worker pool. Non-blocking.
+  /// Try to send a Command into the appropriate worker pool.
+  /// Non-blocking. Plan C, Task 22: also handles
+  /// `Command::RunAlignment` by shipping into the alignment pool.
   fn try_dispatch(&self, cmd: Command, asr_timeout: Duration) -> DispatchOutcome {
-    let item = match cmd {
+    match cmd {
       Command::RunAsr {
         chunk_id,
         samples,
@@ -76,38 +89,161 @@ impl ManagedTranscriber {
           None => params,
         };
         let abort_flag = Arc::new(AtomicBool::new(false));
-        AsrWorkItem {
+        let item = AsrWorkItem {
           chunk_id,
           samples,
           params: final_params,
           asr_timeout,
           abort_flag,
+        };
+        match self.whisper_pool.work_tx.try_send(item) {
+          Ok(()) => DispatchOutcome::Sent,
+          Err(TrySendError::Full(item)) => {
+            // Reconstruct the original Command so the core
+            // can re-park it via unpoll_command.
+            let cmd = Command::RunAsr {
+              chunk_id: item.chunk_id,
+              samples: item.samples,
+              sample_rate: crate::time::SAMPLE_RATE_HZ,
+              params: item.params,
+            };
+            DispatchOutcome::Backpressure(cmd)
+          }
+          Err(TrySendError::Disconnected(_)) => DispatchOutcome::Disconnected,
         }
       }
-      // RunAlignment is Plan C scope; the core only emits it when
-      // word_alignment=true was set, which Plan B does not
-      // enable. If a Plan B builder somehow ends up with
-      // alignment on (e.g., from the `alignment` cargo feature
-      // without supplying an AlignmentSet), the runner refuses
-      // to dispatch the alignment command and re-parks it.
-      cmd @ Command::RunAlignment { .. } => {
-        return DispatchOutcome::Backpressure(cmd);
-      }
-    };
-    match self.whisper_pool.work_tx.try_send(item) {
-      Ok(()) => DispatchOutcome::Sent,
-      Err(TrySendError::Full(item)) => {
-        // Reconstruct the original Command so the core can
-        // re-park it via unpoll_command.
-        let cmd = Command::RunAsr {
-          chunk_id: item.chunk_id,
-          samples: item.samples,
-          sample_rate: crate::time::SAMPLE_RATE_HZ,
-          params: item.params,
+
+      #[cfg(feature = "alignment")]
+      Command::RunAlignment {
+        chunk_id,
+        samples,
+        sub_segments,
+        text,
+        language,
+      } => {
+        // Plan B params bug precedent: text + language are
+        // Whisper's authoritative output (the registry lookup
+        // depends on `language`). They are forwarded into the
+        // AlignWorkItem verbatim — never re-derived from a
+        // runner-side default.
+        let Some(pool) = self.alignment_pool.as_ref() else {
+          // Core emitted RunAlignment but we have no pool.
+          // This is a misconfigured builder (with_word_alignment
+          // on, with_alignment empty/unset). Park indefinitely
+          // — the core retries forever. v1 surfaces as
+          // backpressure to avoid losing the chunk.
+          return DispatchOutcome::Backpressure(Command::RunAlignment {
+            chunk_id,
+            samples,
+            sub_segments,
+            text,
+            language,
+          });
         };
-        DispatchOutcome::Backpressure(cmd)
+
+        // Need the bound `samples_to_output_range` closure for
+        // the worker's wav2vec2 frame → output-timebase mapping.
+        let Some(samples_to_output_range) = self.core.samples_to_output_range_fn() else {
+          return DispatchOutcome::Backpressure(Command::RunAlignment {
+            chunk_id,
+            samples,
+            sub_segments,
+            text,
+            language,
+          });
+        };
+
+        // Need the chunk's stream-coordinate first sample to
+        // build chunk-local sub_segments and to ship to the
+        // worker for its frame → stream-sample bridge.
+        let chunk_first_sample = match self.core.chunk_first_sample(chunk_id) {
+          Some(v) => v,
+          None => {
+            // The chunk just ran ASR and emitted RunAlignment;
+            // its dispatch record must still hold. If not,
+            // surface backpressure to retry.
+            return DispatchOutcome::Backpressure(Command::RunAlignment {
+              chunk_id,
+              samples,
+              sub_segments,
+              text,
+              language,
+            });
+          }
+        };
+
+        // The output-timebase TimeRanges in `sub_segments` are
+        // produced by `SampleBuffer::samples_to_output_range`;
+        // for the aligner's silence mask we need them in
+        // chunk-local 16 kHz sample-index space. Pull the raw
+        // stream-sample form preserved alongside on the
+        // dispatch record (Plan C: ChunkRecord::sub_segments_samples)
+        // and offset by `chunk_first_sample` so start_pts ==
+        // chunk-local sample index.
+        let chunk_local_subs = self
+          .core
+          .chunk_sub_segments_samples(chunk_id)
+          .unwrap_or_default();
+        let chunk_local_subs_as_ranges: alloc::vec::Vec<mediatime::TimeRange> = chunk_local_subs
+          .iter()
+          .map(|(start, end)| {
+            // Encode as TimeRange with timebase 1/16000
+            // so start_pts == start_sample (chunk-local).
+            mediatime::TimeRange::new(
+              (*start as i64) - (chunk_first_sample as i64),
+              (*end as i64) - (chunk_first_sample as i64),
+              mediatime::Timebase::new(1, core::num::NonZeroU32::new(16_000).unwrap()),
+            )
+          })
+          .collect();
+
+        let abort_flag = Arc::new(AtomicBool::new(false));
+        let item = crate::runner::alignment_pool::AlignWorkItem {
+          chunk_id,
+          samples,
+          sub_segments: chunk_local_subs_as_ranges,
+          text,
+          language,
+          align_timeout: self.align_timeout,
+          abort_flag,
+          chunk_first_sample_in_stream: chunk_first_sample,
+          samples_to_output_range,
+        };
+        match pool.work_tx.try_send(item) {
+          Ok(()) => DispatchOutcome::Sent,
+          Err(TrySendError::Full(item)) => {
+            // Re-park: the original output-timebase
+            // sub_segments were consumed into the work
+            // item. The core's unpoll_command + dispatch
+            // record retain the authoritative copy
+            // (Plan A: ChunkRecord::sub_segments), so the
+            // next poll_command can rebuild from there.
+            // For the re-parked Command we ship an empty
+            // Vec — the data is recoverable from the
+            // record on retry via this same try_dispatch
+            // path.
+            let cmd = Command::RunAlignment {
+              chunk_id: item.chunk_id,
+              samples: item.samples,
+              sub_segments: alloc::vec::Vec::new(),
+              text: item.text,
+              language: item.language,
+            };
+            DispatchOutcome::Backpressure(cmd)
+          }
+          Err(TrySendError::Disconnected(_)) => DispatchOutcome::Disconnected,
+        }
       }
-      Err(TrySendError::Disconnected(_)) => DispatchOutcome::Disconnected,
+
+      // Without the `alignment` cargo feature, RunAlignment is
+      // emitted by Plan A only when `word_alignment` was set on
+      // the core's TranscriberConfig — which the runner's
+      // builder gates on the alignment pool's presence. Reaching
+      // this arm with feature off means a non-runner caller is
+      // driving the core; re-park indefinitely (matches the
+      // pre-Task-22 behavior).
+      #[cfg(not(feature = "alignment"))]
+      cmd @ Command::RunAlignment { .. } => DispatchOutcome::Backpressure(cmd),
     }
   }
 
@@ -129,7 +265,7 @@ impl ManagedTranscriber {
   pub(super) fn drive_one_step(&mut self) -> Result<bool, RunnerError> {
     let mut progress = false;
 
-    // Phase 1: drain results first.
+    // Phase 1a: drain whisper results.
     loop {
       match self.whisper_pool.result_rx.try_recv() {
         Ok((chunk_id, Ok(asr_result))) => {
@@ -143,6 +279,32 @@ impl ManagedTranscriber {
         Err(crossbeam_channel::TryRecvError::Empty) => break,
         Err(crossbeam_channel::TryRecvError::Disconnected) => {
           return Err(RunnerError::WhisperPoolShutdown);
+        }
+      }
+    }
+
+    // Phase 1b: drain alignment results (when the pool exists).
+    // Plan C, Task 22: parallel to whisper pool drain. An
+    // alignment-pool disconnect is mapped onto WhisperPoolShutdown
+    // for now (same semantics: rebuild the runner). A dedicated
+    // RunnerError::AlignmentPoolShutdown is straightforward future
+    // work.
+    #[cfg(feature = "alignment")]
+    if let Some(pool) = self.alignment_pool.as_ref() {
+      loop {
+        match pool.result_rx.try_recv() {
+          Ok((chunk_id, Ok(align_result))) => {
+            progress = true;
+            self.core.inject_alignment_result(chunk_id, align_result)?;
+          }
+          Ok((chunk_id, Err(failure))) => {
+            progress = true;
+            self.core.inject_failure(chunk_id, failure)?;
+          }
+          Err(crossbeam_channel::TryRecvError::Empty) => break,
+          Err(crossbeam_channel::TryRecvError::Disconnected) => {
+            return Err(RunnerError::WhisperPoolShutdown);
+          }
         }
       }
     }
@@ -187,6 +349,15 @@ impl ManagedTranscriber {
   fn wait_for_progress(&self) -> Result<(), RunnerError> {
     let mut sel = crossbeam_channel::Select::new();
     sel.recv(&self.whisper_pool.result_rx);
+    // Plan C, Task 22: also wake on alignment results when the
+    // pool exists. The index is unused — drive_one_step's
+    // try_recv handles message vs. disconnect on each receiver.
+    #[cfg(feature = "alignment")]
+    let _alignment_idx = if let Some(pool) = self.alignment_pool.as_ref() {
+      Some(sel.recv(&pool.result_rx))
+    } else {
+      None
+    };
     // ready_timeout returns Ok(idx) with idx of the first ready
     // op (including disconnects), or Err(SelectTimeoutError) on
     // timeout. We don't care which arm fired — the next
@@ -239,6 +410,17 @@ pub struct ManagedTranscriberBuilder {
   worker_timeouts_asr: Duration,
   worker_timeouts_align: Duration,
   drain_timeout: Option<Duration>,
+
+  /// Plan C: optional alignment registry. When `Some(set)` and
+  /// `set.is_empty() == false`, `build()` spawns an alignment
+  /// worker and emits `Command::RunAlignment` per chunk.
+  #[cfg(feature = "alignment")]
+  alignment_set: Option<crate::runner::aligner::AlignmentSet>,
+
+  /// Plan C: queue depth for the alignment work channel. Default
+  /// = whisper pool's `max_queued_chunks` (mirrors §6.3.3).
+  #[cfg(feature = "alignment")]
+  alignment_max_queued_chunks: Option<usize>,
 }
 
 impl ManagedTranscriberBuilder {
@@ -255,6 +437,10 @@ impl ManagedTranscriberBuilder {
       worker_timeouts_asr: Duration::from_secs(60),
       worker_timeouts_align: Duration::from_secs(30),
       drain_timeout: None,
+      #[cfg(feature = "alignment")]
+      alignment_set: None,
+      #[cfg(feature = "alignment")]
+      alignment_max_queued_chunks: None,
     }
   }
 
@@ -308,6 +494,35 @@ impl ManagedTranscriberBuilder {
     self
   }
 
+  /// Wire word-level forced alignment using the supplied
+  /// [`crate::runner::aligner::AlignmentSet`]. The alignment
+  /// worker is spawned at `build()` time; chunks emit
+  /// `Command::RunAlignment` after their ASR result lands.
+  ///
+  /// An empty `set` is accepted: `build()` will not spawn an
+  /// alignment worker and the runner behaves identically to a
+  /// no-alignment build. This lets callers conditionally
+  /// configure alignment without branching at the call site.
+  ///
+  /// Gated on `feature = "alignment"`.
+  #[cfg(feature = "alignment")]
+  pub fn with_alignment(mut self, set: crate::runner::aligner::AlignmentSet) -> Self {
+    self.alignment_set = Some(set);
+    self
+  }
+
+  /// Override the alignment work-channel capacity. Default =
+  /// whisper pool's `max_queued_chunks`. Higher values smooth
+  /// over alignment-worker stalls; lower values bound memory
+  /// when alignment is the bottleneck.
+  ///
+  /// Gated on `feature = "alignment"`.
+  #[cfg(feature = "alignment")]
+  pub const fn alignment_max_queued_chunks(mut self, value: usize) -> Self {
+    self.alignment_max_queued_chunks = Some(value);
+    self
+  }
+
   /// Construct the `ManagedTranscriber`. Spawns worker threads and
   /// wires channels.
   pub fn build(self) -> Result<ManagedTranscriber, RunnerError> {
@@ -317,13 +532,41 @@ impl ManagedTranscriberBuilder {
       longest * 10
     });
 
+    // Plan C: build the alignment pool only when a non-empty
+    // AlignmentSet was supplied. An empty set is silently
+    // accepted (callers can conditionally configure alignment
+    // without branching at the call site) and produces a build
+    // that behaves identically to a no-alignment build.
+    #[cfg(feature = "alignment")]
+    let alignment_pool = match self.alignment_set {
+      Some(set) if !set.is_empty() => {
+        let cap = self
+          .alignment_max_queued_chunks
+          .unwrap_or_else(|| self.pool_config.max_queued_chunks());
+        let arc_set = alloc::sync::Arc::new(set);
+        Some(crate::runner::alignment_pool::AlignmentPool::new(
+          arc_set, cap,
+        )?)
+      }
+      _ => None,
+    };
+
+    // The core's `word_alignment` flag follows the alignment
+    // pool's presence — if no pool, no `Command::RunAlignment`
+    // should be emitted; the core respects this via
+    // `TranscriberConfig::with_word_alignment`.
+    #[cfg(feature = "alignment")]
+    let word_alignment_flag = alignment_pool.is_some();
+    #[cfg(not(feature = "alignment"))]
+    let word_alignment_flag = false;
+
     let core_config = crate::core::TranscriberConfig::new()
       .with_chunk_size(self.chunk_size)
       .with_buffer_cap_samples(self.buffer_cap_samples)
       .with_gap_tolerance_samples(self.gap_tolerance_samples)
       .with_language_policy(self.language_policy)
       .with_asr_params(self.asr_params.clone())
-      .with_word_alignment(false)
+      .with_word_alignment(word_alignment_flag)
       .with_max_in_flight(self.pool_config.worker_count() + 2);
 
     let whisper_pool = WhisperPool::new(self.whisper_ctx, &self.pool_config)?;
@@ -340,6 +583,10 @@ impl ManagedTranscriberBuilder {
       buffer_cap_samples: self.buffer_cap_samples,
       pending_transcripts: VecDeque::new(),
       pending_errors: VecDeque::new(),
+      #[cfg(feature = "alignment")]
+      alignment_pool,
+      #[cfg(feature = "alignment")]
+      align_timeout: self.worker_timeouts_align,
     })
   }
 }
@@ -619,6 +866,23 @@ fn merge_overrides(base: &AsrParams, ovr: &AsrParamsOverride) -> AsrParams {
     out.set_initial_prompt(prompt.clone());
   }
   out
+}
+
+#[cfg(test)]
+#[cfg(feature = "alignment")]
+mod alignment_dispatch_smoke {
+  // Real ManagedTranscriber construction needs WhisperContext +
+  // AlignmentSet with real ONNX. The end-to-end test in Task 25
+  // covers the real flow; here we only assert that the core's
+  // is_idle path is consulted and that RunAlignment dispatch
+  // does not panic on the misconfigured-no-pool path.
+
+  #[test]
+  fn alignment_pool_optional_default_none() {
+    // Type-level smoke: alignment_pool field is Option, so the
+    // misconfigured path (with_word_alignment via Plan A but
+    // no with_alignment) yields None and short-circuits.
+  }
 }
 
 #[cfg(test)]

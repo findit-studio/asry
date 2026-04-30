@@ -63,6 +63,14 @@ pub(crate) struct ChunkRecord {
   pub samples: Arc<[f32]>,
   pub sample_range: SampleRange,
   pub sub_segments: Vec<TimeRange>,
+  /// Sub-VAD-segments in stream-coordinate 16 kHz sample indices,
+  /// preserved alongside the output-timebase form so the alignment
+  /// worker can build the silence mask in chunk-local space (Plan
+  /// C, Task 22). Each `(start, end)` is half-open in 16 kHz
+  /// stream samples.
+  #[cfg(feature = "alignment")]
+  #[allow(dead_code)] // exposed via Dispatch::chunk_sub_segments_samples
+  pub sub_segments_samples: Vec<(u64, u64)>,
   #[allow(dead_code)] // used by alignment in Plan C
   pub sub_origins: Vec<SubOrigin>,
   pub phase: ChunkPhase,
@@ -84,6 +92,12 @@ pub(crate) struct ExtractedChunk {
   pub sample_range: SampleRange,
   pub range: TimeRange,
   pub sub_segments: Vec<TimeRange>,
+  /// Sub-VAD-segments in stream-coordinate 16 kHz sample indices.
+  /// Preserved alongside the output-timebase `sub_segments` so the
+  /// runner's alignment dispatch can rebuild chunk-local sample
+  /// indices for the aligner's silence mask (Plan C, Task 22).
+  #[cfg(feature = "alignment")]
+  pub sub_segments_samples: Vec<(u64, u64)>,
   pub sub_origins: Vec<SubOrigin>,
 }
 
@@ -99,6 +113,12 @@ impl ExtractedChunk {
       .iter()
       .map(|s| buffer.samples_to_output_range(s.range))
       .collect();
+    #[cfg(feature = "alignment")]
+    let sub_segments_samples: Vec<(u64, u64)> = chunk
+      .subs
+      .iter()
+      .map(|s| (s.range.start, s.range.end))
+      .collect();
     let sub_origins: Vec<SubOrigin> = chunk.subs.iter().map(|s| s.origin).collect();
     Self {
       chunk_id,
@@ -106,8 +126,22 @@ impl ExtractedChunk {
       sample_range: chunk.range,
       range,
       sub_segments,
+      #[cfg(feature = "alignment")]
+      sub_segments_samples,
       sub_origins,
     }
+  }
+
+  /// Stream-coordinate first 16 kHz sample index of this chunk's
+  /// audio. Used by the alignment worker (Plan C) to map wav2vec2
+  /// frame indices back to stream sample positions.
+  ///
+  /// Plan A's `SampleRange` is half-open and stream-relative, so
+  /// `sample_range.start` is exactly the chunk's first sample
+  /// index since stream zero.
+  #[cfg(feature = "alignment")]
+  pub(crate) fn chunk_first_sample_in_stream(&self) -> u64 {
+    self.sample_range.start
   }
 }
 
@@ -317,6 +351,8 @@ impl Dispatch {
       samples: samples.clone(),
       sample_range: ext.sample_range,
       sub_segments: ext.sub_segments,
+      #[cfg(feature = "alignment")]
+      sub_segments_samples: ext.sub_segments_samples,
       sub_origins: ext.sub_origins,
       phase: ChunkPhase::AwaitingAsr,
       asr_result: None,
@@ -621,6 +657,31 @@ impl Dispatch {
   /// Pop the front event for the caller.
   pub(crate) fn poll_event(&mut self) -> Option<Event> {
     self.pending_events.pop_front()
+  }
+
+  /// Stream-coordinate first 16 kHz sample index of the chunk
+  /// `chunk_id`, or `None` if the chunk is not in flight. Used by
+  /// the runner's alignment dispatch (Plan C, Task 22) to convert
+  /// stream-sample sub_segments into chunk-local space before
+  /// shipping them to the alignment worker.
+  #[cfg(feature = "alignment")]
+  pub(crate) fn chunk_first_sample(&self, chunk_id: ChunkId) -> Option<u64> {
+    let record = self.in_flight.get(&chunk_id)?;
+    Some(record.sample_range.start)
+  }
+
+  /// Sub-VAD-segments of the chunk `chunk_id` in stream-coordinate
+  /// 16 kHz sample indices, as `(start, end)` pairs. Used by the
+  /// runner's alignment dispatch (Plan C, Task 22) to build the
+  /// chunk-local sample-indexed sub_segments the alignment worker
+  /// consumes for its silence mask.
+  #[cfg(feature = "alignment")]
+  pub(crate) fn chunk_sub_segments_samples(
+    &self,
+    chunk_id: ChunkId,
+  ) -> Option<alloc::vec::Vec<(u64, u64)>> {
+    let record = self.in_flight.get(&chunk_id)?;
+    Some(record.sub_segments_samples.clone())
   }
 
   /// True iff every queue is empty: no buffered samples (caller

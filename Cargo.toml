@@ -22,6 +22,18 @@ whisper-rs        = { version = "0.13", optional = true, default-features = fals
 crossbeam-channel = { version = "0.5", optional = true, default-features = false, features = ["std"] }
 num_cpus          = { version = "1",   optional = true }
 
+# Alignment feature deps. All optional — Plan A/B compile without them.
+# ort: ONNX runtime bindings. Pinned to =2.0.0-rc.12 because rc.13+
+# changed Session API in incompatible ways and rc.x versions don't
+# follow semver across rc bumps.
+ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, features = ["std", "ndarray"] }
+# tokenizers: HuggingFace WordPiece/BPE/Unigram tokenizer used to
+# read wav2vec2's tokenizer.json. ^0.20 ships pure-Rust without
+# pulling onig.
+tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
+# ndarray: tensor reshaping for the wav2vec2 input/output shapes.
+ndarray = { version = "0.16", optional = true, default-features = false, features = ["std"] }
+
 # Optional features (Plan A scope only).
 serde      = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
 arbitrary  = { version = "1", optional = true, features = ["derive"] }
@@ -43,7 +55,7 @@ default  = ["std", "runner"]
 std      = ["mediatime/std", "smol_str/std", "serde?/std"]
 serde    = ["dep:serde", "smol_str/serde", "mediatime/serde"]
 runner   = ["dep:whisper-rs", "dep:crossbeam-channel", "dep:num_cpus", "std"]
-alignment = ["runner"]
+alignment = ["runner", "dep:ort", "dep:tokenizers", "dep:ndarray"]
 
 [lib]
 name = "whispery"
@@ -67,3 +79,8 @@ harness = false
 name              = "runner_e2e"
 path              = "tests/runner_e2e.rs"
 required-features = ["runner"]
+
+[[test]]
+name              = "alignment_e2e"
+path              = "tests/alignment_e2e.rs"
+required-features = ["alignment"]

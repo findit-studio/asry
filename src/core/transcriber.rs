@@ -379,6 +379,54 @@ impl Transcriber {
     self.buffer.next_expected_starts_at()
   }
 
+  /// Pre-bind a closure mapping `(start_sample, end_sample)` (in
+  /// stream coordinates) to an output-timebase `TimeRange`.
+  ///
+  /// Used by the alignment worker (Plan C) to convert wav2vec2
+  /// frame indices back into the caller's output timebase. The
+  /// closure captures snapshots of the buffer's timebase and
+  /// pts-anchor so it can outlive borrows of `Transcriber`; the
+  /// alignment worker keeps it alive across thread boundaries via
+  /// `Arc<dyn Fn>`.
+  ///
+  /// Returns `None` before the first `push_samples` (the timebase
+  /// is not yet established).
+  ///
+  /// The closure operates in *stream coordinates*: the sample
+  /// indices it accepts are absolute positions in the input audio
+  /// stream. The aligner has the chunk's
+  /// `chunk_first_sample_in_stream` offset and adds `frame * hop`
+  /// to land in the same coordinate system.
+  #[cfg(feature = "alignment")]
+  pub(crate) fn samples_to_output_range_fn(
+    &self,
+  ) -> Option<alloc::sync::Arc<dyn Fn(u64, u64) -> mediatime::TimeRange + Send + Sync>> {
+    self.buffer.output_timebase()?;
+    Some(self.buffer.samples_to_output_range_fn())
+  }
+
+  /// Stream-coordinate first 16 kHz sample index of the chunk
+  /// `chunk_id`, or `None` if the chunk is not in flight. Used by
+  /// the runner's alignment dispatch (Plan C, Task 22) to convert
+  /// stream-sample sub_segments into chunk-local space before
+  /// shipping them to the alignment worker.
+  #[cfg(feature = "alignment")]
+  pub(crate) fn chunk_first_sample(&self, chunk_id: ChunkId) -> Option<u64> {
+    self.dispatch.chunk_first_sample(chunk_id)
+  }
+
+  /// Sub-VAD-segments of the chunk `chunk_id`, in stream-coordinate
+  /// 16 kHz sample indices, as `(start, end)` pairs. Used by the
+  /// alignment worker to build the silence mask in chunk-local
+  /// space (Plan C, Task 22).
+  #[cfg(feature = "alignment")]
+  pub(crate) fn chunk_sub_segments_samples(
+    &self,
+    chunk_id: ChunkId,
+  ) -> Option<alloc::vec::Vec<(u64, u64)>> {
+    self.dispatch.chunk_sub_segments_samples(chunk_id)
+  }
+
   /// Non-mutating predicate: would the next push of `samples_len`
   /// audio samples plus `vad_count` VAD segments fit under the
   /// configured caps? Counts cut_pending's pre-extracted audio
