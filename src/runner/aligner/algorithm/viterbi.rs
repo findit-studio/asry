@@ -117,6 +117,53 @@ pub fn ctc_viterbi(
     });
   }
 
+  // Lattice budget: bound the backpointer allocation before we
+  // touch the allocator. The backpointer table costs
+  // `t * n_states * sizeof(usize)` bytes; a hallucinated long
+  // token sequence against a long chunk could otherwise allocate
+  // gigabytes and OOM the worker before the per-row abort check
+  // ever fires. 32 M cells = 256 MB at 8 bytes/cell — generous
+  // enough to never reject realistic chunks (T ≤ 1500 frames at
+  // 50 fps × 30 s, m typically ≤ 1 k characters → ≤ 3 M cells)
+  // while turning pathological inputs into an in-band
+  // `NoAlignmentPath` failure that the runner can drain past.
+  //
+  // Codex round-11 [high]: pre-fix this allocation happened
+  // before any abort check, so the watchdog couldn't intervene.
+  const LATTICE_CELL_BUDGET: usize = 32_000_000;
+  let lattice_cells = match t.checked_mul(n_states) {
+    Some(v) => v,
+    None => {
+      return Err(WorkFailure::AlignmentFailed {
+        kind: AlignmentFailureKind::NoAlignmentPath,
+        message: alloc::format!("lattice size overflows usize: t={t} * n_states={n_states}"),
+        language: language.clone(),
+      });
+    }
+  };
+  if lattice_cells > LATTICE_CELL_BUDGET {
+    return Err(WorkFailure::AlignmentFailed {
+      kind: AlignmentFailureKind::NoAlignmentPath,
+      message: alloc::format!(
+        "lattice exceeds {} cells (t={} × n_states={} = {})",
+        LATTICE_CELL_BUDGET,
+        t,
+        n_states,
+        lattice_cells
+      ),
+      language: language.clone(),
+    });
+  }
+  // Final abort check before the (potentially large) lattice
+  // allocation so a watchdog signal still wins the race against
+  // the allocator.
+  if abort_flag.load(Ordering::Relaxed) {
+    return Err(WorkFailure::WorkerHangTimeout {
+      kind: WorkerKind::Alignment,
+      elapsed: core::time::Duration::ZERO,
+    });
+  }
+
   // Lattice DP. dp[state] = best log-prob to reach `state` at
   // current `t`; back[t][state] = predecessor state at t-1.
   let mut dp_prev = alloc::vec![f32::NEG_INFINITY; n_states];
@@ -391,6 +438,80 @@ mod tests {
     let abort = AtomicBool::new(false);
     let path = ctc_viterbi(&log_probs, &tokens, 0, &abort, &Lang::En).expect("path");
     assert_eq!(path.state_per_frame.len(), t);
+  }
+
+  /// Codex round-11 [high]: pathological (T × m) lattice must
+  /// be rejected up-front, BEFORE the multi-gigabyte
+  /// backpointer allocation, with an in-band `NoAlignmentPath`
+  /// rather than an OOM the runner can't recover from.
+  ///
+  /// Sized just past the 32 M-cell budget: T = 8 k frames,
+  /// m = 4 k tokens, n_states = 8 001 → 64 M cells (~512 MB
+  /// would be allocated pre-fix). Distinct alternating tokens
+  /// pass the min-T-vs-m and bounds checks so we exercise the
+  /// budget guard specifically.
+  #[test]
+  fn budget_exceeded_returns_no_alignment_path_before_oom() {
+    let t = 8_000;
+    let v = 8;
+    let m = 4_000;
+
+    // Avoid actually allocating t * v floats either: the bench
+    // ratio LogProbsTV is fine with a small data buffer because
+    // the budget check fires before we read any of it.
+    let log_probs = LogProbsTV {
+      t,
+      v,
+      data: alloc::vec![0.0_f32; 1], // intentionally undersized
+    };
+    // Distinct adjacent tokens so the min_t guard accepts.
+    let tokens: Vec<u32> = (0..m as u32).map(|i| 1 + i % (v as u32 - 1)).collect();
+    let abort = AtomicBool::new(false);
+
+    let err = ctc_viterbi(&log_probs, &tokens, 0, &abort, &Lang::En).unwrap_err();
+    assert!(
+      matches!(
+        err,
+        WorkFailure::AlignmentFailed {
+          kind: AlignmentFailureKind::NoAlignmentPath,
+          ..
+        }
+      ),
+      "expected NoAlignmentPath (budget exceeded); got {err:?}"
+    );
+    if let WorkFailure::AlignmentFailed { message, .. } = err {
+      assert!(
+        message.contains("lattice exceeds"),
+        "message must call out the budget; got {message:?}"
+      );
+    }
+  }
+
+  /// Pre-allocation abort still fires `WorkerHangTimeout`: we
+  /// flip the flag on a non-pathological lattice (within the
+  /// budget) so the test reaches the abort check rather than
+  /// the budget guard.
+  #[test]
+  fn abort_flag_short_circuits_before_lattice_allocation() {
+    let t = 100;
+    let v = 4;
+    let m = 5;
+    let mut data = alloc::vec![-100.0_f32; t * v];
+    for ti in 0..t {
+      data[ti * v + 1] = -0.1;
+    }
+    let log_probs = lp(t, v, data);
+    let tokens: Vec<u32> = alloc::vec![1; m];
+    let abort = AtomicBool::new(true);
+
+    let err = ctc_viterbi(&log_probs, &tokens, 0, &abort, &Lang::En).unwrap_err();
+    assert!(matches!(
+      err,
+      WorkFailure::WorkerHangTimeout {
+        kind: WorkerKind::Alignment,
+        ..
+      }
+    ));
   }
 
   #[test]

@@ -79,12 +79,61 @@ fn reconcile_var_sum(simd_var_sum: f64, samples: &[f32], mean: f64) -> f64 {
   }
 }
 
+/// Magnitude threshold above which the SIMD backends' f32-lane
+/// reductions diverge measurably from the scalar f64 reference.
+///
+/// f32 has ~24 bits of mantissa; ULP at magnitude `M` is
+/// `M * 2^-23 ≈ M * 1.2e-7`. Each SIMD pass collapses lanes via
+/// an f32 horizontal-add before widening to the f64 accumulator,
+/// so for input magnitude `M` and `N` samples the accumulated
+/// error in the sum scales like `N * M * 2^-23`. At `M = 1e4`
+/// over a 480 k-sample chunk that's ~6 in the sum (mean error
+/// ~1.2e-5) — visible in the variance and in the normalised
+/// output. Real audio fed by the runner sits in `[-1, 1]` and is
+/// orders of magnitude below the threshold; pathological f32
+/// values fall through to the scalar f64 reference, which is
+/// correct by construction.
+const SIMD_SAFE_MAX_ABS: f32 = 1.0e4;
+
+/// Pre-dispatch precision guard. Returns `true` when the SIMD
+/// backends are safe — i.e., every sample is finite and below
+/// the magnitude threshold. The scan adds one f32 reduction over
+/// the input (LLVM autovectorises it on every supported target);
+/// for typical `[-1, 1]` audio the cost is well under 5% of the
+/// SIMD savings the dispatcher captures.
+#[inline]
+fn samples_within_simd_safe_range(samples: &[f32]) -> bool {
+  let mut max_abs = 0.0_f32;
+  for &s in samples {
+    if !s.is_finite() {
+      return false;
+    }
+    let a = s.abs();
+    if a > max_abs {
+      max_abs = a;
+    }
+  }
+  max_abs <= SIMD_SAFE_MAX_ABS
+}
+
 /// Public entry point — picks the best implementation available at
 /// runtime (under `feature = "std"`) or compile time (without).
 /// `pub` for the `feature = "bench-internals"` re-export; consumers
 /// who don't enable that feature can't reach this path.
 #[inline]
 pub fn zero_mean_unit_var_normalize(samples: &[f32]) -> Vec<f32> {
+  // Codex round-11 [medium] precision guard: SIMD backends
+  // reduce in f32 before widening to f64, so finite f32 inputs
+  // beyond ~1e4 in magnitude can lose precision relative to the
+  // scalar f64 reference *without* tripping the inf/NaN
+  // recovery in `reconcile_*`. Detect that case at the dispatch
+  // boundary and route to scalar f64 directly. Real audio is
+  // `[-1, 1]` and never trips this; pathological f32 inputs go
+  // down the slow path with full precision instead of producing
+  // backend-skewed output.
+  if !samples_within_simd_safe_range(samples) {
+    return scalar::zero_mean_unit_var_normalize(samples);
+  }
   #[cfg(target_arch = "aarch64")]
   {
     // SAFETY: NEON is part of the aarch64 base ISA; the kernel's
