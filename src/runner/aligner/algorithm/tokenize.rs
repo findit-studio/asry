@@ -1,13 +1,14 @@
 //! Step 1-2 of the alignment algorithm: tokenisation + per-token
 //! word-index map.
 
-use alloc::{string::String, vec::Vec};
+use alloc::{borrow::Cow, string::String, vec::Vec};
 
 use tokenizers::Tokenizer;
 
 use crate::types::{AlignmentFailureKind, Lang, WorkFailure};
 
 /// Result of tokenising the normalised text.
+#[derive(Debug)]
 pub(crate) struct TokenizedText {
   /// Vocab indices in tokenisation order (Y in spec terms).
   pub token_ids: Vec<u32>,
@@ -38,13 +39,30 @@ pub(crate) struct TokenizedText {
 /// Japanese) where whitespace is an indexing artefact only and must
 /// not introduce CTC-graph delimiters that were never spoken.
 ///
+/// `uppercase_input` projects ASCII to uppercase before encoding;
+/// set when the vocab covers `A`-`Z` only (the case for
+/// `wav2vec2-base-960h`). Without this projection a lowercase
+/// normaliser would feed every English letter through `<unk>`,
+/// producing a CTC graph that cannot meaningfully align word
+/// boundaries — the bug that motivated this parameter.
+///
+/// `unk_token_id`, when supplied, is checked against every encoded
+/// word token. A real word ID matching `<unk>` means the source
+/// text contained characters outside the vocab; rather than feed
+/// `<unk>`s into the lattice we surface
+/// [`AlignmentFailureKind::TokenizationFailed`] with a diagnostic
+/// pointing at the offending word.
+///
 /// Returns `WorkFailure::AlignmentFailed { kind: TokenizationFailed,
-/// .. }` if the tokeniser's `encode` call errors.
+/// .. }` if the tokeniser's `encode` call errors or any word
+/// produced an `<unk>` id.
 pub(crate) fn tokenize_with_word_map(
   tokenizer: &Tokenizer,
   normalized: &str,
   word_count: usize,
   use_word_delimiter: bool,
+  uppercase_input: bool,
+  unk_token_id: Option<u32>,
   language: &Lang,
 ) -> Result<TokenizedText, WorkFailure> {
   let mut token_ids: Vec<u32> = Vec::with_capacity(normalized.len() + word_count * 2);
@@ -67,14 +85,38 @@ pub(crate) fn tokenize_with_word_map(
   }
 
   for (word_idx, word) in words.iter().enumerate() {
+    // ASCII case projection when the vocab covers only one case.
+    // We avoid `to_uppercase()` (Unicode-aware, allocates per
+    // call even on ASCII) and use the cheap ASCII-only variant
+    // since this projection is intended for English-style
+    // single-byte alphabets — the same kind of vocab the check
+    // detects.
+    let encode_input: Cow<'_, str> = if uppercase_input {
+      Cow::Owned(word.to_ascii_uppercase())
+    } else {
+      Cow::Borrowed(*word)
+    };
     let encoding = tokenizer
-      .encode(*word, /* add_special_tokens = */ false)
+      .encode(encode_input.as_ref(), /* add_special_tokens = */ false)
       .map_err(|e| WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::TokenizationFailed,
         message: alloc::format!("encode({:?}) failed: {e:?}", word),
         language: language.clone(),
       })?;
     for &id in encoding.get_ids() {
+      if let Some(unk) = unk_token_id
+        && id == unk
+      {
+        return Err(WorkFailure::AlignmentFailed {
+          kind: AlignmentFailureKind::TokenizationFailed,
+          message: alloc::format!(
+            "tokeniser produced <unk> for word {:?} (encoded as {:?}) — vocab does not cover this text",
+            word,
+            encoding.get_ids()
+          ),
+          language: language.clone(),
+        });
+      }
       token_ids.push(id);
       word_idx_per_token.push(Some(word_idx));
     }
@@ -108,16 +150,122 @@ pub(crate) fn tokenize_with_word_map(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::types::Lang;
 
-  // The `Tokenizer` API requires a real tokenizer.json; we only
-  // exercise the word-count mismatch path in unit tests.
-  // End-to-end tests in Tasks 25-28 cover the real-vocab path.
+  /// Inline WordLevel tokenizer matching the wav2vec2-base-960h
+  /// shape (uppercase-only ASCII alphabet plus `<unk>`, `<pad>`,
+  /// `|`). We construct the tokenizer in-memory rather than
+  /// loading the build.rs-fetched fixture: the upstream
+  /// `wav2vec2-base-960h/tokenizer.json` ships in an older
+  /// HuggingFace format that the `tokenizers 0.20` crate's
+  /// `ModelUntagged` deserializer rejects. The case-projection
+  /// behaviour we are testing lives in [`tokenize_with_word_map`]
+  /// itself and is independent of any specific on-disk file
+  /// format, so the inline tokenizer gives us the same coverage
+  /// without depending on a fixture that the runtime crate can't
+  /// read anyway.
+  const UPPERCASE_TOKENIZER_JSON: &str = r#"{
+    "version": "1.0",
+    "truncation": null,
+    "padding": null,
+    "added_tokens": [],
+    "normalizer": null,
+    "pre_tokenizer": {
+      "type": "Split",
+      "pattern": {"Regex": ""},
+      "behavior": "Isolated",
+      "invert": false
+    },
+    "post_processor": null,
+    "decoder": null,
+    "model": {
+      "type": "WordLevel",
+      "vocab": {
+        "<unk>": 0,
+        "<pad>": 1,
+        "|": 2,
+        "A": 3, "B": 4, "C": 5, "D": 6, "E": 7, "F": 8, "G": 9,
+        "H": 10, "I": 11, "J": 12, "K": 13, "L": 14, "M": 15,
+        "N": 16, "O": 17, "P": 18, "Q": 19, "R": 20, "S": 21,
+        "T": 22, "U": 23, "V": 24, "W": 25, "X": 26, "Y": 27, "Z": 28
+      },
+      "unk_token": "<unk>"
+    }
+  }"#;
 
+  fn uppercase_tokenizer() -> Tokenizer {
+    Tokenizer::from_bytes(UPPERCASE_TOKENIZER_JSON.as_bytes())
+      .expect("inline WordLevel tokenizer must parse")
+  }
+
+  /// Adversarial regression for the case-projection bug: an
+  /// uppercase-only vocab (the wav2vec2-base-960h shape) plus a
+  /// lowercase normaliser would force every English word through
+  /// `<unk>` ids, producing a CTC graph that aligns garbage. With
+  /// `uppercase_input=true`, the same word encodes to its
+  /// uppercase letter ids and the `<unk>` rejection never fires.
   #[test]
-  fn word_count_mismatch_rejects() {
-    // We construct a stub tokenizer via the From<&str> path —
-    // tokenizers crate doesn't expose a trivial test ctor.
-    // Skip if no fixture available; the e2e test covers the
-    // happy path.
+  fn english_lowercase_word_uppercases_for_uppercase_only_vocab() {
+    let tok = uppercase_tokenizer();
+    let unk = tok.token_to_id("<unk>");
+
+    // Sanity: vocab orientation matches the bug report.
+    assert!(tok.token_to_id("A").is_some());
+    assert!(tok.token_to_id("a").is_none());
+    assert!(unk.is_some());
+
+    let result = tokenize_with_word_map(
+      &tok,
+      "hello",
+      /* word_count: */ 1,
+      /* use_word_delimiter: */ true,
+      /* uppercase_input: */ true,
+      /* unk_token_id: */ unk,
+      &Lang::En,
+    )
+    .expect("tokenisation must succeed with uppercase projection");
+
+    // 5 letters, no inter-word `|` (single word), no <unk>.
+    assert_eq!(result.token_ids.len(), 5);
+    assert!(
+      result.token_ids.iter().all(|&id| Some(id) != unk),
+      "no <unk> ids; got {:?}",
+      result.token_ids
+    );
+    let expected = ['H', 'E', 'L', 'L', 'O'].map(|c| {
+      tok
+        .token_to_id(&c.to_string())
+        .expect("uppercase letter in vocab")
+    });
+    assert_eq!(result.token_ids, expected.to_vec());
+  }
+
+  /// The other half of the fix: when `uppercase_input` is false,
+  /// the `<unk>` rejection still catches out-of-vocab words
+  /// instead of silently feeding `<unk>` into the CTC lattice.
+  #[test]
+  fn unk_token_in_word_rejects_with_tokenization_failed() {
+    let tok = uppercase_tokenizer();
+    let unk = tok.token_to_id("<unk>");
+
+    // Lowercase input + uppercase_input=false: every char hits
+    // <unk>. The function must reject before producing tokens.
+    let err = tokenize_with_word_map(
+      &tok,
+      "hello",
+      /* word_count: */ 1,
+      /* use_word_delimiter: */ true,
+      /* uppercase_input: */ false,
+      /* unk_token_id: */ unk,
+      &Lang::En,
+    )
+    .expect_err("must reject <unk>-bearing tokenisation");
+    assert!(matches!(
+      err,
+      WorkFailure::AlignmentFailed {
+        kind: AlignmentFailureKind::TokenizationFailed,
+        ..
+      }
+    ));
   }
 }

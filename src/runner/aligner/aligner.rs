@@ -37,6 +37,17 @@ pub struct Aligner {
   sample_rate: u32,
   hop_samples: u32,
   blank_token_id: u32,
+  /// `<unk>` / `[UNK]` token id, when the tokenizer exposes one.
+  /// `tokenize_with_word_map` uses this to reject out-of-vocab
+  /// word tokens up-front rather than feeding `<unk>` ids into the
+  /// CTC graph and silently producing garbage alignments.
+  unk_token_id: Option<u32>,
+  /// Whether the tokenizer's vocab covers ASCII uppercase but not
+  /// lowercase (e.g., `wav2vec2-base-960h`). When true,
+  /// tokenisation uppercases ASCII before encoding so the
+  /// (lowercase-emitting) [`crate::EnglishNormalizer`] doesn't
+  /// produce a stream of `<unk>`s on every English word.
+  vocab_uppercase_only: bool,
 }
 
 impl Aligner {
@@ -87,6 +98,16 @@ impl Aligner {
           "tokenizer has no <pad> / [PAD] entry; cannot determine CTC blank token",
         ),
       })?;
+    let unk_token_id = tokenizer
+      .token_to_id("<unk>")
+      .or_else(|| tokenizer.token_to_id("[UNK]"));
+    // wav2vec2-base-960h's vocab is uppercase-only; en/de/fr CTC
+    // checkpoints typically follow the same convention. Detect by
+    // probing a single ASCII letter pair — sufficient because the
+    // vocab either has both cases (mixed-case alphabet) or one
+    // (case-folded alphabet).
+    let vocab_uppercase_only =
+      tokenizer.token_to_id("A").is_some() && tokenizer.token_to_id("a").is_none();
 
     Ok(Self {
       session,
@@ -96,6 +117,8 @@ impl Aligner {
       sample_rate: 16_000,
       hop_samples: 320,
       blank_token_id,
+      unk_token_id,
+      vocab_uppercase_only,
     })
   }
 
@@ -276,11 +299,17 @@ impl Aligner {
     // `use_word_delimiter` policy gates inter-word `|` insertion
     // (true for word-segmented English; false for char-segmented
     // Chinese/Japanese where whitespace is an indexing artefact).
+    // `vocab_uppercase_only` triggers ASCII case projection so a
+    // lowercase normaliser doesn't feed <unk>s into a vocab like
+    // wav2vec2-base-960h's. `unk_token_id` lets the tokeniser
+    // reject any word that would have aligned to <unk>.
     let tokenized = tokenize_with_word_map(
       &self.tokenizer,
       normalized.normalized(),
       n_words,
       self.normalizer.use_word_delimiter(),
+      self.vocab_uppercase_only,
+      self.unk_token_id,
       &self.language,
     )?;
 
