@@ -46,16 +46,23 @@ pub(crate) struct TokenizedText {
 /// producing a CTC graph that cannot meaningfully align word
 /// boundaries — the bug that motivated this parameter.
 ///
-/// `unk_token_id`, when supplied, is checked against every encoded
-/// word token. A real word ID matching `<unk>` means the source
-/// text contained characters outside the vocab; rather than feed
-/// `<unk>`s into the lattice we surface
-/// [`AlignmentFailureKind::TokenizationFailed`] with a diagnostic
-/// pointing at the offending word.
+/// `unk_token_id`, when supplied, is used to **skip individual
+/// out-of-vocab characters** rather than fail the whole chunk.
+/// Real-world Whisper output regularly contains punctuation the
+/// CTC vocab can't cover (`U.S.A.`, `1,000`, emojis, smart
+/// quotes). Per-character skipping means `U.S.A.` encodes to the
+/// three letter ids and aligns USA correctly while the original
+/// surface form `U.S.A.` is preserved on the emitted `Word`. A
+/// word whose every character maps to `<unk>` (digits inside an
+/// uppercase-only English vocab, say) contributes zero tokens —
+/// it has no entry in `word_idx_per_token`, so `compose_words`
+/// later drops it from the output without a `Word` rather than
+/// failing the whole chunk's alignment.
 ///
 /// Returns `WorkFailure::AlignmentFailed { kind: TokenizationFailed,
-/// .. }` if the tokeniser's `encode` call errors or any word
-/// produced an `<unk>` id.
+/// .. }` if the tokeniser's `encode` call errors or *every* word
+/// reduced to zero in-vocab tokens (the `token_ids.is_empty()`
+/// check below).
 pub(crate) fn tokenize_with_word_map(
   tokenizer: &Tokenizer,
   normalized: &str,
@@ -104,18 +111,18 @@ pub(crate) fn tokenize_with_word_map(
         language: language.clone(),
       })?;
     for &id in encoding.get_ids() {
+      // Per-character <unk>-skip. Individual chars that fall
+      // outside the vocab (an internal `.` in `U.S.A.`, a digit
+      // in a letters-only model, an emoji) are dropped here so
+      // the rest of the word still aligns. A word whose every
+      // char is <unk> contributes zero tokens, leaves no entry
+      // in word_idx_per_token, and is dropped at compose time
+      // without a `Word`. The chunk-level guard at the end of
+      // this function still catches all-words-empty cases.
       if let Some(unk) = unk_token_id
         && id == unk
       {
-        return Err(WorkFailure::AlignmentFailed {
-          kind: AlignmentFailureKind::TokenizationFailed,
-          message: alloc::format!(
-            "tokeniser produced <unk> for word {:?} (encoded as {:?}) — vocab does not cover this text",
-            word,
-            encoding.get_ids()
-          ),
-          language: language.clone(),
-        });
+        continue;
       }
       token_ids.push(id);
       word_idx_per_token.push(Some(word_idx));
@@ -240,16 +247,17 @@ mod tests {
     assert_eq!(result.token_ids, expected.to_vec());
   }
 
-  /// The other half of the fix: when `uppercase_input` is false,
-  /// the `<unk>` rejection still catches out-of-vocab words
-  /// instead of silently feeding `<unk>` into the CTC lattice.
+  /// All-`<unk>` chunk still rejects — but now via the
+  /// chunk-level `token_ids.is_empty()` guard, not per-word
+  /// failure. Lowercase input + `uppercase_input=false`: every
+  /// char hits `<unk>`, all chars get skipped, the resulting
+  /// token list is empty, and the function reports
+  /// `TokenizationFailed` for the chunk.
   #[test]
-  fn unk_token_in_word_rejects_with_tokenization_failed() {
+  fn all_unk_chunk_rejects_with_tokenization_failed() {
     let tok = uppercase_tokenizer();
     let unk = tok.token_to_id("<unk>");
 
-    // Lowercase input + uppercase_input=false: every char hits
-    // <unk>. The function must reject before producing tokens.
     let err = tokenize_with_word_map(
       &tok,
       "hello",
@@ -259,7 +267,7 @@ mod tests {
       /* unk_token_id: */ unk,
       &Lang::En,
     )
-    .expect_err("must reject <unk>-bearing tokenisation");
+    .expect_err("all-<unk> chunk must reject");
     assert!(matches!(
       err,
       WorkFailure::AlignmentFailed {
@@ -267,5 +275,80 @@ mod tests {
         ..
       }
     ));
+  }
+
+  /// The new per-char skip: `U.S.A.` (three letters separated by
+  /// internal periods, with a trailing period that the
+  /// boundary-strip already removes) tokenises to just the three
+  /// uppercase letter ids — no `<unk>` survives, no chunk-level
+  /// failure, and word_idx_per_token tags every emitted id with
+  /// word 0 so compose attributes them to the original surface
+  /// form `U.S.A.`.
+  #[test]
+  fn internal_periods_in_abbreviation_skip_unks() {
+    let tok = uppercase_tokenizer();
+    let unk = tok.token_to_id("<unk>");
+
+    // Caller would already have stripped the trailing `.` via
+    // the normaliser's boundary-strip, so the input is `U.S.A`
+    // — i.e., 5 chars: U, ., S, ., A.
+    let result = tokenize_with_word_map(
+      &tok,
+      "U.S.A",
+      /* word_count: */ 1,
+      /* use_word_delimiter: */ true,
+      /* uppercase_input: */ true,
+      /* unk_token_id: */ unk,
+      &Lang::En,
+    )
+    .expect("U.S.A. must tokenise via per-char unk-skip");
+
+    // 3 letter ids, no `<unk>`.
+    assert_eq!(result.token_ids.len(), 3);
+    assert!(result.token_ids.iter().all(|&id| Some(id) != unk));
+    let expected = ['U', 'S', 'A'].map(|c| tok.token_to_id(&c.to_string()).unwrap());
+    assert_eq!(result.token_ids, expected.to_vec());
+    // All three letters tag word 0 (the abbreviation).
+    assert_eq!(result.word_idx_per_token, alloc::vec![Some(0); 3]);
+  }
+
+  /// Mixed alignable + all-`<unk>` words: the `<unk>` word
+  /// emits zero tokens and gets no `word_idx_per_token` entry.
+  /// `compose_words` will see its `per_word[i]` slot stay
+  /// `None` and drop it from the output. The remaining word
+  /// aligns normally.
+  #[test]
+  fn all_unk_word_contributes_zero_tokens_and_drops_at_compose() {
+    let tok = uppercase_tokenizer();
+    let unk = tok.token_to_id("<unk>");
+
+    // "1000 hello" — first word is all-digits (none in vocab),
+    // second word aligns. Per-char skipping makes the digit
+    // word produce zero tokens; the second word produces 5.
+    // The inter-word `|` between them remains because both
+    // words exist in the input even if one contributes nothing.
+    let result = tokenize_with_word_map(
+      &tok,
+      "1000 hello",
+      /* word_count: */ 2,
+      /* use_word_delimiter: */ true,
+      /* uppercase_input: */ true,
+      /* unk_token_id: */ unk,
+      &Lang::En,
+    )
+    .expect("mixed-<unk> chunk must succeed via per-char skip");
+
+    // Five letter ids tagged with word_idx=1 (the second word
+    // is "hello"). The first word contributes zero tokens; the
+    // delimiter between the two whitespace-bounded words is
+    // emitted with `None` (no word index).
+    let letter_count = result
+      .word_idx_per_token
+      .iter()
+      .filter(|w| **w == Some(1))
+      .count();
+    assert_eq!(letter_count, 5);
+    let no_word0 = result.word_idx_per_token.iter().all(|w| *w != Some(0));
+    assert!(no_word0, "all-<unk> word 0 must contribute zero tokens");
   }
 }

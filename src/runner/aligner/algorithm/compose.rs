@@ -21,6 +21,52 @@ struct WordAccum {
   frame_count: u32,
 }
 
+/// Build a per-frame speech mask of length `n_frames`, marking
+/// `true` exactly for frames whose audio sample range overlaps any
+/// of the supplied chunk-local sub-segments. Used by
+/// [`compose_words`] to drop CTC-forced word assignments that fall
+/// entirely inside silence-masked audio.
+///
+/// Frame `t` represents samples `[t * hop_samples, (t + 1) *
+/// hop_samples)` (an approximation of wav2vec2's effective stride);
+/// any overlap with a sub-segment marks the frame as speech. The
+/// silence_mask step has already zeroed those samples for non-speech,
+/// so this mirrors the same boundary the audio carries.
+///
+/// `sub_segments` must be in chunk-local sample-index space — the
+/// caller (alignment worker) wraps the segment range PTS in a
+/// 1/16000 timebase so `start_pts` == `start_sample`.
+pub(crate) fn build_speech_frames(
+  n_frames: usize,
+  hop_samples: u32,
+  sub_segments: &[mediatime::TimeRange],
+) -> alloc::vec::Vec<bool> {
+  let mut mask = alloc::vec![false; n_frames];
+  if hop_samples == 0 {
+    return mask;
+  }
+  let hop = hop_samples as i64;
+  for seg in sub_segments {
+    let seg_start = seg.start_pts().max(0);
+    let seg_end = seg.end_pts().max(0);
+    if seg_end <= seg_start {
+      continue;
+    }
+    // Frame is "speech" if its sample range [f*hop, (f+1)*hop)
+    // overlaps the segment [seg_start, seg_end).
+    let frame_start = (seg_start / hop) as usize;
+    let frame_end = ((seg_end + hop - 1) / hop) as usize;
+    let upper = frame_end.min(n_frames);
+    if frame_start >= upper {
+      continue;
+    }
+    for f in frame_start..upper {
+      mask[f] = true;
+    }
+  }
+  mask
+}
+
 /// Walk the Viterbi path and accumulate per-word `(start_frame,
 /// end_frame, logprob_sum, frame_count)` into a `Vec<Option<...>>`
 /// indexed by normalised-word position.
@@ -29,22 +75,37 @@ struct WordAccum {
 /// - Skip frames whose state is a blank (`state % 2 == 0`).
 /// - Skip frames whose mapped token's `word_idx_per_token == None`
 ///   (delimiters / `<unk>` / specials).
-/// - For non-blank, mapped frames: open the entry on first sight,
-///   extend `end_frame`, accumulate logprob.
+/// - **Skip frames over silence-masked audio** (`!speech_frames[t]`).
+///   The CTC lattice is forced to visit every non-blank state to
+///   reach the end, so words sitting entirely inside masked
+///   silence would otherwise still get fabricated frame ranges
+///   from whichever frames the path consumed them at. Filtering
+///   to speech-supported frames here is what makes the silence
+///   mask actually drop unsupported words from the output.
+/// - For non-blank, mapped, speech-supported frames: open the
+///   entry on first sight, extend `end_frame`, accumulate logprob.
 ///
-/// Words that received no emitting frames stay `None`. They are
-/// dropped by `compose_words` (step 8/9), not added to `Word`s.
+/// Words that received no speech-supported emitting frames stay
+/// `None`. They are dropped by `compose_words` (step 8/9), not
+/// added to `Word`s.
 fn accumulate_per_word(
   path: &ViterbiPath,
   log_probs: &LogProbsTV,
   word_idx_per_token: &[Option<usize>],
   n_words: usize,
+  speech_frames: &[bool],
 ) -> Vec<Option<WordAccum>> {
   let mut per_word: Vec<Option<WordAccum>> = alloc::vec![None; n_words];
 
   for (t_idx, &state) in path.state_per_frame.iter().enumerate() {
     if state % 2 == 0 {
       continue; // blank
+    }
+    // Drop frames that fall inside silence-masked audio. Without
+    // this guard, words assigned to silence regions by the CTC
+    // forced-alignment would emit fabricated timestamps.
+    if !speech_frames.get(t_idx).copied().unwrap_or(true) {
+      continue;
     }
     let token_idx = state / 2;
     let Some(word_idx) = word_idx_per_token.get(token_idx).copied().flatten() else {
@@ -84,18 +145,25 @@ fn accumulate_per_word(
 /// Compose the final `AlignmentResult` from per-word accumulators
 /// and original-word surface forms.
 ///
+/// `speech_frames` is a length-`T` vector marking which encoder
+/// output frames overlap real speech (true) versus silence-masked
+/// audio (false). Words whose entire CTC-assigned span sits in
+/// silence drop from the output.
+///
 /// Step 8/9: for each `(i, slot)`:
 /// - `Some` => build `Word { text: original_words[i].into(), range:
 ///   frames_to_output_range(start_frame, end_frame), score:
 ///   exp(logprob_sum / frame_count) }`.
-/// - `None` => skip; the word had no audio support (typically
-///   silence-masked). It is *not* added to `words`. The total chunk
-///   text on `Transcript.text` still contains the word.
+/// - `None` => skip; the word had no speech-supported audio
+///   (typically silence-masked or all-`<unk>`). It is *not* added
+///   to `words`. The total chunk text on `Transcript.text` still
+///   contains the word.
 pub(crate) fn compose_words<F>(
   path: &ViterbiPath,
   log_probs: &LogProbsTV,
   word_idx_per_token: &[Option<usize>],
   original_words: &[Cow<'_, str>],
+  speech_frames: &[bool],
   chunk_first_sample_in_stream: u64,
   hop_samples: u32,
   samples_to_output_range: F,
@@ -104,7 +172,7 @@ where
   F: Fn(u64, u64) -> TimeRange,
 {
   let n_words = original_words.len();
-  let per_word = accumulate_per_word(path, log_probs, word_idx_per_token, n_words);
+  let per_word = accumulate_per_word(path, log_probs, word_idx_per_token, n_words, speech_frames);
 
   let mut words: Vec<Word> = Vec::with_capacity(n_words);
   for (i, slot) in per_word.iter().enumerate() {
@@ -159,11 +227,13 @@ mod tests {
     let word_idx_per_token = alloc::vec![Some(0), Some(1)];
     let original = alloc::vec![Cow::Borrowed("hello"), Cow::Borrowed("world")];
 
+    let speech_frames = alloc::vec![true; log_probs.t];
     let result = compose_words(
       &path,
       &log_probs,
       &word_idx_per_token,
       &original,
+      &speech_frames,
       0,
       320,
       fake_samples_to_output_range,
@@ -188,11 +258,13 @@ mod tests {
     let word_idx_per_token = alloc::vec![Some(0), None, Some(1)];
     let original = alloc::vec![Cow::Borrowed("hello"), Cow::Borrowed("world")];
 
+    let speech_frames = alloc::vec![true; log_probs.t];
     let result = compose_words(
       &path,
       &log_probs,
       &word_idx_per_token,
       &original,
+      &speech_frames,
       0,
       320,
       fake_samples_to_output_range,
@@ -216,11 +288,13 @@ mod tests {
     // Original surface form has casing + punctuation.
     let original = alloc::vec![Cow::Borrowed("Hello!")];
 
+    let speech_frames = alloc::vec![true; log_probs.t];
     let result = compose_words(
       &path,
       &log_probs,
       &word_idx_per_token,
       &original,
+      &speech_frames,
       0,
       320,
       fake_samples_to_output_range,
@@ -243,11 +317,13 @@ mod tests {
     let word_idx_per_token = alloc::vec![Some(0)];
     let original = alloc::vec![Cow::Borrowed("hi")];
 
+    let speech_frames = alloc::vec![true; log_probs.t];
     let result = compose_words(
       &path,
       &log_probs,
       &word_idx_per_token,
       &original,
+      &speech_frames,
       8_000,
       320,
       fake_samples_to_output_range,
@@ -260,6 +336,87 @@ mod tests {
   }
 
   #[test]
+  fn all_silence_frames_drop_every_word() {
+    // The CTC lattice forces a successful path to visit every
+    // non-blank state, so even a real Viterbi run would assign
+    // every word to *some* frame. With every frame marked
+    // non-speech, those force-emitted assignments must drop —
+    // otherwise zero-masking silence would still produce
+    // fabricated word timings.
+    let path = ViterbiPath {
+      // states: [blank, y_0, blank, y_1, blank]
+      state_per_frame: alloc::vec![0, 1, 2, 3, 4],
+      tokens: alloc::vec![10, 20],
+    };
+    let log_probs = lp_const(5, 30, -1.0);
+    let word_idx_per_token = alloc::vec![Some(0), Some(1)];
+    let original = alloc::vec![Cow::Borrowed("hello"), Cow::Borrowed("world")];
+    let speech_frames = alloc::vec![false; log_probs.t]; // all silence
+
+    let result = compose_words(
+      &path,
+      &log_probs,
+      &word_idx_per_token,
+      &original,
+      &speech_frames,
+      0,
+      320,
+      fake_samples_to_output_range,
+    );
+    assert!(
+      result.words().is_empty(),
+      "no words may emit when every frame is silence-masked; got {:?}",
+      result.words()
+    );
+  }
+
+  #[test]
+  fn partial_silence_drops_only_the_silent_word() {
+    // Word 0 is assigned frame 1 (speech), word 1 is assigned
+    // frame 3 (silence). Only word 0 must emit.
+    let path = ViterbiPath {
+      state_per_frame: alloc::vec![0, 1, 2, 3, 4],
+      tokens: alloc::vec![10, 20],
+    };
+    let log_probs = lp_const(5, 30, -1.0);
+    let word_idx_per_token = alloc::vec![Some(0), Some(1)];
+    let original = alloc::vec![Cow::Borrowed("hello"), Cow::Borrowed("world")];
+    let speech_frames = alloc::vec![false, true, false, false, false];
+
+    let result = compose_words(
+      &path,
+      &log_probs,
+      &word_idx_per_token,
+      &original,
+      &speech_frames,
+      0,
+      320,
+      fake_samples_to_output_range,
+    );
+    assert_eq!(result.words().len(), 1);
+    assert_eq!(result.words()[0].text(), "hello");
+  }
+
+  #[test]
+  fn build_speech_frames_marks_overlapping_segments() {
+    use core::num::NonZeroU32;
+    use mediatime::{TimeRange, Timebase};
+
+    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    // Sub-segment from sample 320 to 960 (frames 1..3 at
+    // hop_samples = 320). Frames 0 and 3+ are silence.
+    let segs = alloc::vec![TimeRange::new(320, 960, tb_16k)];
+    let mask = build_speech_frames(/* n_frames: */ 5, /* hop_samples: */ 320, &segs);
+    assert_eq!(mask, alloc::vec![false, true, true, false, false]);
+  }
+
+  #[test]
+  fn build_speech_frames_handles_no_segments() {
+    let mask = build_speech_frames(4, 320, &[]);
+    assert_eq!(mask, alloc::vec![false; 4]);
+  }
+
+  #[test]
   fn score_in_unit_interval() {
     let path = ViterbiPath {
       state_per_frame: alloc::vec![0, 1, 2],
@@ -268,11 +425,13 @@ mod tests {
     let log_probs = lp_const(3, 30, 0.0); // logprob 0.0 => score = exp(0) = 1.0
     let word_idx_per_token = alloc::vec![Some(0)];
     let original = alloc::vec![Cow::Borrowed("hi")];
+    let speech_frames = alloc::vec![true; log_probs.t];
     let result = compose_words(
       &path,
       &log_probs,
       &word_idx_per_token,
       &original,
+      &speech_frames,
       0,
       320,
       fake_samples_to_output_range,

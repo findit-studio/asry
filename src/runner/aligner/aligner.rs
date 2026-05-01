@@ -202,8 +202,11 @@ impl Aligner {
 
     use crate::{
       runner::aligner::algorithm::{
-        compose::compose_words, encode::encode_log_softmax, silence_mask::build_masked_samples,
-        tokenize::tokenize_with_word_map, viterbi::ctc_viterbi,
+        compose::{build_speech_frames, compose_words},
+        encode::encode_log_softmax,
+        silence_mask::build_masked_samples,
+        tokenize::tokenize_with_word_map,
+        viterbi::ctc_viterbi,
       },
       types::AlignmentFailureKind,
     };
@@ -343,12 +346,18 @@ impl Aligner {
       return Err(timed_out());
     }
 
-    // Steps 7-9: per-word state + surface-form recovery.
+    // Steps 7-9: per-word state + surface-form recovery. The
+    // speech-frame mask comes from the same `sub_segments` the
+    // silence-mask step zeroed, so words whose CTC-forced
+    // assignment lands entirely inside masked silence drop from
+    // the result rather than emit fabricated timings.
+    let speech_frames = build_speech_frames(log_probs.t, self.hop_samples, sub_segments);
     Ok(compose_words(
       &path,
       &log_probs,
       &tokenized.word_idx_per_token,
       normalized.original_words(),
+      &speech_frames,
       chunk_first_sample_in_stream,
       self.hop_samples,
       samples_to_output_range,
