@@ -9,7 +9,7 @@ use crate::{
 
 /// Result of CTC Viterbi alignment.
 #[derive(Debug)]
-pub(crate) struct ViterbiPath {
+pub struct ViterbiPath {
   /// Length-T vector of state indices in the (2|Y|+1)-wide lattice.
   /// State `2k` is the blank between y_{k-1} and y_k (k=0 is the
   /// leading blank); state `2k+1` is symbol y_k itself.
@@ -33,7 +33,7 @@ pub(crate) struct ViterbiPath {
 /// Returns `WorkFailure::AlignmentFailed { kind: NoAlignmentPath,
 /// .. }` if the lattice is empty (T < 2|Y|+1, i.e., the audio is
 /// too short to fit the symbol sequence even with no repeats).
-pub(crate) fn ctc_viterbi(
+pub fn ctc_viterbi(
   log_probs: &LogProbsTV,
   tokens: &[u32],
   blank_id: u32,

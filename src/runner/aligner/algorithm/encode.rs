@@ -21,8 +21,11 @@ use crate::types::{AlignmentFailureKind, Lang, WorkFailure};
 // keeps the (1, T) reshape semantically identical without forcing a
 // cross-version ndarray bridge.
 
-/// Output of `encode_log_softmax`.
-pub(crate) struct LogProbsTV {
+/// Output of `encode_log_softmax`. `pub` for the
+/// `feature = "bench-internals"` re-export at the crate root —
+/// the only way external code can reach this type. Out-of-tree
+/// consumers do not see it.
+pub struct LogProbsTV {
   /// Time dimension (number of wav2vec2 output frames).
   pub t: usize,
   /// Vocab dimension.
@@ -39,37 +42,11 @@ impl LogProbsTV {
   }
 }
 
-/// HuggingFace wav2vec2 feature-extractor parity: subtract the
-/// utterance mean, divide by `sqrt(var + 1e-7)`. Implements
-/// `Wav2Vec2FeatureExtractor.zero_mean_unit_var_norm` for the
-/// no-attention-mask case (we already silence-masked non-speech
-/// regions to 0 upstream, so they contribute equally to mean and
-/// variance — a small bias vs. HF's `attention_mask`-aware
-/// computation but a vast improvement over feeding raw audio).
-fn zero_mean_unit_var_normalize(samples: &[f32]) -> Vec<f32> {
-  if samples.is_empty() {
-    return Vec::new();
-  }
-  let n = samples.len() as f64;
-  let mut sum = 0.0_f64;
-  for &s in samples {
-    sum += s as f64;
-  }
-  let mean = sum / n;
-  let mut var_sum = 0.0_f64;
-  for &s in samples {
-    let d = s as f64 - mean;
-    var_sum += d * d;
-  }
-  let var = var_sum / n;
-  // The constant matches HF's `np.sqrt(input_values.var() + 1e-7)`.
-  let inv_std = 1.0_f64 / (var + 1e-7_f64).sqrt();
-  let mut out = Vec::with_capacity(samples.len());
-  for &s in samples {
-    out.push(((s as f64 - mean) * inv_std) as f32);
-  }
-  out
-}
+// Per-utterance zero-mean unit-variance normalisation lives in
+// `super::normalize` so the bench can pit the scalar and NEON
+// backends against each other directly. The dispatcher there picks
+// the NEON path on aarch64 and the scalar path elsewhere.
+use super::normalize::zero_mean_unit_var_normalize;
 
 /// Run wav2vec2 over `samples_for_aligner` and return per-frame
 /// log-probabilities.

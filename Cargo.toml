@@ -56,6 +56,12 @@ std      = ["mediatime/std", "smol_str/std", "serde?/std"]
 serde    = ["dep:serde", "smol_str/serde", "mediatime/serde"]
 runner   = ["dep:whisper-rs", "dep:crossbeam-channel", "dep:num_cpus", "std"]
 alignment = ["runner", "dep:ort", "dep:tokenizers", "dep:ndarray"]
+# Re-exports `pub(crate)` alignment internals (scalar/NEON normaliser
+# variants, raw `ctc_viterbi`, `LogProbsTV`) under `whispery::__bench`
+# so the SIMD baseline bench can call them directly. Doc-hidden;
+# never enable in shipping builds. Requires `alignment` for the
+# wav2vec2-pipeline symbols it exposes.
+bench-internals = ["alignment"]
 
 [lib]
 name = "whispery"
@@ -74,6 +80,12 @@ harness = false
 name    = "dispatch"
 path    = "benches/dispatch.rs"
 harness = false
+
+[[bench]]
+name              = "aligner_simd_baseline"
+path              = "benches/aligner_simd_baseline.rs"
+harness           = false
+required-features = ["bench-internals"]
 
 [[test]]
 name              = "runner_e2e"

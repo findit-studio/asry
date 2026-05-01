@@ -1,6 +1,10 @@
 //! Aligner subsystem — wav2vec2 forced alignment via ort.
 
-mod algorithm;
+// `pub(crate)` so the bench-internals re-export at the crate
+// root can reach the SIMD/scalar normalise variants and the
+// raw `ctc_viterbi` kernel through
+// `crate::runner::aligner::algorithm::*`.
+pub(crate) mod algorithm;
 mod aligner;
 mod builder;
 mod key;

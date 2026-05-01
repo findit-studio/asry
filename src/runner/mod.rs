@@ -5,8 +5,13 @@ mod errors;
 mod managed_transcriber;
 mod whisper_pool;
 
+// `pub(crate)` (rather than `mod`) so the crate-root
+// `#[cfg(feature = "bench-internals")] pub mod __bench` can
+// re-export this module's `pub(crate)` SIMD/scalar kernels.
+// Outside the bench gate the module's items are only visible
+// through the curated `pub use` re-exports below.
 #[cfg(feature = "alignment")]
-mod aligner;
+pub(crate) mod aligner;
 #[cfg(feature = "alignment")]
 mod alignment_pool;
 

@@ -1,0 +1,145 @@
+//! `core::arch` baseline for the alignment hot paths.
+//!
+//! Each bench either pits two backends head-to-head (`scalar` vs.
+//! `neon`) on adjacent lines so the speed-up is readable directly
+//! from the Criterion report, or — for stages that don't have a
+//! viable SIMD restructuring — captures the scalar number alone as
+//! a baseline for future work.
+//!
+//! Bench inputs target the production envelope: 30 s of 16 kHz
+//! mono audio (480 000 samples) for the per-utterance normaliser
+//! and the wav2vec2-base-960h output dimensions (T = 1500 frames,
+//! V = 32 vocab) for `ctc_viterbi`.
+//!
+//! Run with:
+//!
+//! ```sh
+//! cargo bench --features bench-internals --bench aligner_simd_baseline
+//! ```
+
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+
+#[cfg(target_arch = "aarch64")]
+use whispery::__bench::neon;
+use whispery::{
+  __bench::{LogProbsTV, ctc_viterbi, scalar, zero_mean_unit_var_normalize},
+  Lang,
+};
+
+/// Deterministic synthetic audio with gain + DC offset so the
+/// normaliser actually has work to do (a constant-zero signal would
+/// have mean = 0, var = 0 and short-circuit through the scalar
+/// path's `0/sqrt(eps) = 0` branch, hiding any SIMD-backed gain).
+fn synth_audio(n: usize, seed: u32) -> Vec<f32> {
+  let mut state = seed;
+  let mut out = Vec::with_capacity(n);
+  for i in 0..n {
+    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    let noise = ((state >> 8) as i32) as f32 / 16_777_216.0;
+    let t = i as f32 / 16_000.0;
+    out.push(2.7 * (2.0 * core::f32::consts::PI * 220.0 * t).sin() + 0.13 + noise);
+  }
+  out
+}
+
+fn bench_normalize(c: &mut Criterion) {
+  // 10 s, 30 s @ 16 kHz. Larger sizes amplify the SIMD gain;
+  // 30 s is the production chunk size in the spec.
+  const SIZES: &[usize] = &[160_000, 480_000];
+
+  let mut group = c.benchmark_group("zero_mean_unit_var_normalize");
+
+  for &n in SIZES {
+    let samples = synth_audio(n, 0xc0ffee);
+
+    // Throughput in input bytes (f32 = 4 bytes/sample) so the
+    // Criterion `MB/s` line is comparable across sizes.
+    group.throughput(Throughput::Bytes((n * 4) as u64));
+
+    // Scalar reference — always-compiled f64-accumulator path.
+    group.bench_with_input(BenchmarkId::new("scalar", n), &n, |b, &_n| {
+      b.iter(|| {
+        let out = scalar::zero_mean_unit_var_normalize(black_box(&samples));
+        black_box(out);
+      });
+    });
+
+    // aarch64 NEON — `core::arch::aarch64::*`. Same f64
+    // accumulator semantics for the long-sequence stability guard.
+    #[cfg(target_arch = "aarch64")]
+    group.bench_with_input(BenchmarkId::new("neon", n), &n, |b, &_n| {
+      b.iter(|| {
+        // SAFETY: NEON is part of the aarch64 base ISA.
+        let out = unsafe { neon::zero_mean_unit_var_normalize(black_box(&samples)) };
+        black_box(out);
+      });
+    });
+
+    // Public dispatcher — what production hits. On aarch64 this
+    // is identical to `neon` above; we still bench it so a future
+    // dispatcher change (runtime feature detection, x86 SIMD)
+    // shows up here.
+    group.bench_with_input(BenchmarkId::new("dispatched", n), &n, |b, &_n| {
+      b.iter(|| {
+        let out = zero_mean_unit_var_normalize(black_box(&samples));
+        black_box(out);
+      });
+    });
+  }
+  group.finish();
+}
+
+/// Synthesise a `(T, V)` log-probability lattice with one strong
+/// peak per frame at the assigned token. Mirrors the structure of
+/// real wav2vec2 output well enough to exercise the DP without
+/// needing ORT.
+fn synth_log_probs(t: usize, v: usize) -> LogProbsTV {
+  let mut data = vec![-100.0_f32; t * v];
+  for ti in 0..t {
+    let target = ti % v;
+    data[ti * v + target] = -0.1;
+  }
+  LogProbsTV { t, v, data }
+}
+
+fn bench_ctc_viterbi(c: &mut Criterion) {
+  // wav2vec2-base-960h's typical output: ~50 frames/sec, V = 32
+  // (vocab size including specials). 30 s ≈ 1500 frames.
+  // Tokens for 30 s of speech: roughly 100-300 chars depending on
+  // language and density. Bench at the lower end (100, distinct
+  // ids cycling through V-1 to keep adjacent-equal rare).
+  const T_FRAMES: usize = 1500;
+  const VOCAB: usize = 32;
+  const TOKENS_LEN: usize = 100;
+
+  let log_probs = synth_log_probs(T_FRAMES, VOCAB);
+  let tokens: Vec<u32> = (0..TOKENS_LEN as u32)
+    .map(|i| 1 + i % (VOCAB as u32 - 1))
+    .collect();
+
+  let mut group = c.benchmark_group("ctc_viterbi");
+  // Throughput: report as "frames per second" via the `Elements`
+  // dimension so we can compare future SIMD-restructured Viterbi
+  // attempts directly.
+  group.throughput(Throughput::Elements(T_FRAMES as u64));
+  group.bench_function(
+    BenchmarkId::new("scalar", format!("T={T_FRAMES}_M={TOKENS_LEN}_V={VOCAB}")),
+    |b| {
+      b.iter(|| {
+        // Discard through `black_box` so the optimiser can't
+        // elide the call — we don't care about the result, just
+        // that the DP runs.
+        let _ = black_box(ctc_viterbi(
+          black_box(&log_probs),
+          black_box(&tokens),
+          /* blank_id: */ 0,
+          black_box(&Lang::En),
+        ));
+      });
+    },
+  );
+  group.finish();
+}
+
+criterion_group!(benches, bench_normalize, bench_ctc_viterbi);
+criterion_main!(benches);

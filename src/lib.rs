@@ -8,7 +8,12 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
 #![deny(missing_docs)]
-#![forbid(unsafe_code)]
+// Crate default: no unsafe. Modules that need `core::arch` SIMD
+// intrinsics opt in locally via `#![allow(unsafe_code)]`. This is
+// `deny` rather than `forbid` so an explicit per-module override is
+// possible — the only such opt-in today is the aarch64 NEON kernel
+// in `runner::aligner::algorithm::normalize::neon`.
+#![deny(unsafe_code)]
 
 extern crate alloc;
 
@@ -67,3 +72,24 @@ pub use runner::{
 // a matching whispery-major bump.
 #[cfg(feature = "alignment")]
 pub use ort;
+
+/// **Internal use only — gated on `feature = "bench-internals"`.**
+///
+/// Re-exports the alignment pipeline's `pub(crate)` SIMD/scalar
+/// kernels and the `LogProbsTV` lattice-input struct so the
+/// `aligner_simd_baseline` Criterion bench (an external binary)
+/// can compare backends head-to-head. Not part of any
+/// stability contract — symbols here can move or disappear
+/// between commits without notice.
+#[cfg(all(feature = "bench-internals", feature = "alignment"))]
+#[doc(hidden)]
+pub mod __bench {
+  pub use crate::runner::aligner::algorithm::{
+    encode::LogProbsTV,
+    normalize::{scalar, zero_mean_unit_var_normalize},
+    viterbi::ctc_viterbi,
+  };
+
+  #[cfg(target_arch = "aarch64")]
+  pub use crate::runner::aligner::algorithm::normalize::neon;
+}
