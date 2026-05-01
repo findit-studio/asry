@@ -115,17 +115,27 @@ impl AlignmentPool {
 
 impl Drop for AlignmentPool {
   fn drop(&mut self) {
-    // Plan B's drop-hang fix, applied from the start: replace
-    // work_tx with a dummy bounded(1) sender and drop the
-    // original. The worker's recv() then returns Err
-    // immediately, exiting the loop. Joining is fast.
+    // Replace work_tx with a dummy bounded(1) sender and drop
+    // the original; idle workers' recv() then returns Err and
+    // they exit cleanly. Critical to do this BEFORE joining /
+    // detaching — Drop runs before field destructors, so the
+    // worker would otherwise see the live `work_tx` here and
+    // block on recv forever.
     let (dummy_tx, _) = bounded::<AlignWorkItem>(1);
     let original = core::mem::replace(&mut self.work_tx, dummy_tx);
     drop(original);
 
-    for handle in self.workers.drain(..) {
-      let _ = handle.join();
-    }
+    // **Detach** rather than join. Even though the watchdog
+    // calls `RunOptions::terminate()` on timeout — which lets
+    // ORT itself exit `Session::run` cleanly — Drop fires
+    // *before* any per-job watchdog timer is up. Joining here
+    // would block Drop on whatever inference is currently in
+    // flight. Detaching mirrors `WhisperPool::Drop` for the
+    // same reason: hung Drop blocks unrelated cleanup
+    // (process shutdown, test teardown). Workers finish
+    // naturally on the next recv() once the in-flight job
+    // completes; the OS reclaims them at process exit.
+    self.workers.clear();
   }
 }
 

@@ -501,6 +501,19 @@ pub(super) fn run_with_temperature_ladder(
       });
     }
 
+    // Zero-segment short-circuit: whisper.cpp's contract is that
+    // an utterance with no speech (silent input, VAD false
+    // positives, very quiet chunks) returns 0 segments, NOT an
+    // error. `compute_avg_logprob` returns `f32::MIN` in that
+    // case, which would fail the threshold gate and force a
+    // temperature retry — every retry would yield the same 0
+    // segments, the loop would exhaust, and the chunk would
+    // surface as `AllTemperaturesFailed`. Detect the empty
+    // outcome here and return an empty `AsrResult` instead.
+    if state.full_n_segments().unwrap_or(0) == 0 {
+      return build_asr_result(state, temperature, p);
+    }
+
     let logprob = compute_avg_logprob(state);
     let cratio = compute_compression_ratio(state);
 
@@ -657,23 +670,36 @@ impl WhisperPool {
 
 impl Drop for WhisperPool {
   fn drop(&mut self) {
-    // Closing work_tx is what makes worker loops exit (their
-    // `recv()` returns `Err(_)` once the last Sender is dropped).
-    // The naive "drop the field automatically" approach is wrong:
-    // Drop calls below run BEFORE struct fields are dropped, so
-    // `handle.join()` would block forever — workers still see a
-    // live `work_tx` in `self`. Replace it with a dummy channel
-    // up front so the original drops here, signaling disconnect.
-    //
-    // Joining propagates panics from workers as a best-effort
-    // shutdown (we ignore the join result because panicking
-    // inside Drop would mask the original error).
+    // Closing work_tx is what lets idle workers exit — their
+    // `recv()` returns `Err(_)` once the last Sender is dropped.
+    // The naive "drop the field automatically" approach is
+    // wrong: Drop runs BEFORE struct fields are dropped, so a
+    // join() call below would block forever on an idle worker
+    // because it still saw a live `work_tx` in `self`. Replace
+    // it with a dummy channel up front so the original drops
+    // here, signaling disconnect.
     let (dummy_tx, _dummy_rx) = bounded::<AsrWorkItem>(1);
     let _live_tx = core::mem::replace(&mut self.work_tx, dummy_tx);
     drop(_live_tx);
-    for handle in self.workers.drain(..) {
-      let _ = handle.join();
-    }
+
+    // **Detach** rather than join. whisper.cpp's `state.full`
+    // is uninterruptible from outside the worker thread once it
+    // has started (the abort_callback is checked inside the C
+    // loop only at coarse boundaries; for a long chunk it can
+    // run for many seconds with no abort opportunity). Joining
+    // here would block Drop indefinitely on an in-flight call,
+    // which the existing `#[ignore]`'d real-model regression
+    // tests document. Dropping the JoinHandles detaches the
+    // workers; they continue running until the in-flight job
+    // finishes (and pick up the dummy_tx disconnect at the
+    // top of the next loop iteration), the `Arc<WhisperContext>`
+    // they carry keeps model memory alive until they exit, and
+    // the OS reclaims everything at process termination. The
+    // trade-off is "Drop is fast" vs. "transient thread leak
+    // until the stuck call finishes naturally" — the right
+    // call for v1, since hung Drop blocks unrelated cleanup
+    // (test teardown, daemon shutdown, etc.).
+    self.workers.clear();
   }
 }
 
