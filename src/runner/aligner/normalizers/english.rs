@@ -122,6 +122,28 @@ fn strip_word_punct(s: &str) -> &str {
   trimmed_left.trim_end_matches(is_word_punct)
 }
 
+/// True for characters that join two real words inside a single
+/// whitespace-bounded token but are themselves never spoken, e.g.
+/// `hello-world`, `two—three`, `and/or`. The wav2vec2 vocab
+/// doesn't cover these glyphs, and CJK-style "preserve the
+/// punctuation" makes no sense here, so the normaliser treats
+/// them as word boundaries: each side becomes its own normalised
+/// word, both pointing back to the same original surface slice.
+///
+/// We deliberately do *not* split on apostrophes (they can be
+/// part of real surface forms like contractions) or on periods
+/// (`U.S.A.` would explode into noise) — those need targeted
+/// handling rather than a generic split rule.
+fn is_internal_separator(c: char) -> bool {
+  matches!(
+    c,
+    '-' | '/' | '\u{2010}' // hyphen
+                | '\u{2013}' // en-dash
+                | '\u{2014}' // em-dash
+                | '\u{2015}' // horizontal bar
+  )
+}
+
 fn lowercase_for_match(s: &str) -> String {
   s.to_lowercase()
 }
@@ -164,11 +186,21 @@ impl TextNormalizer for EnglishNormalizer {
           original_words.push(Cow::Borrowed(original_slice));
         }
       } else {
-        if !normalized.is_empty() {
-          normalized.push(' ');
+        // Split on internal separators (`hello-world` →
+        // `["hello", "world"]`). Each piece is a real word the
+        // wav2vec2 vocab can encode; without this the literal
+        // `-` would survive into the normalised text and the
+        // tokeniser's `<unk>` rejection would fail the whole
+        // chunk on a single hyphen. Each piece points back to
+        // the same original surface slice — same pattern as
+        // contraction expansion above.
+        for piece in lower.split(is_internal_separator).filter(|p| !p.is_empty()) {
+          if !normalized.is_empty() {
+            normalized.push(' ');
+          }
+          normalized.push_str(piece);
+          original_words.push(Cow::Borrowed(original_slice));
         }
-        normalized.push_str(&lower);
-        original_words.push(Cow::Borrowed(original_slice));
       }
     }
 
@@ -276,5 +308,53 @@ mod tests {
     // CTC graph aligns the same way the model was trained.
     let n = EnglishNormalizer::new();
     assert!(n.use_word_delimiter());
+  }
+
+  #[test]
+  fn hyphenated_word_splits_into_pieces() {
+    // Adversarial regression: before this fix, `hello-world` kept
+    // the literal `-` in the normalised text, the tokeniser
+    // produced `<unk>` for the hyphen, and the new <unk>
+    // rejection failed the whole chunk on a single internal
+    // separator.
+    let n = EnglishNormalizer::new();
+    let nt = n.normalize("Hello-World").unwrap();
+    assert_eq!(nt.normalized(), "hello world");
+    // Both halves preserve the original surface form.
+    assert_eq!(nt.original_words().len(), 2);
+    assert_eq!(nt.original_words()[0], "Hello-World");
+    assert_eq!(nt.original_words()[1], "Hello-World");
+  }
+
+  #[test]
+  fn em_dash_and_slash_split() {
+    let n = EnglishNormalizer::new();
+    // em-dash, en-dash, slash all behave the same.
+    let nt = n
+      .normalize("two\u{2014}three and/or four\u{2013}five")
+      .unwrap();
+    assert_eq!(nt.normalized(), "two three and or four five");
+    assert_eq!(nt.original_words().len(), 6);
+  }
+
+  #[test]
+  fn pure_separator_token_is_dropped() {
+    // A whitespace-bounded token that's only separators
+    // produces no words (matches the pre-existing
+    // strip-only-punct behaviour).
+    let n = EnglishNormalizer::new();
+    let nt = n.normalize("hello --- world").unwrap();
+    assert_eq!(nt.normalized(), "hello world");
+    assert_eq!(nt.original_words().len(), 2);
+  }
+
+  #[test]
+  fn collapses_consecutive_internal_separators() {
+    // Em-dash + slash + hyphen back-to-back inside a single
+    // token still splits into the two real words.
+    let n = EnglishNormalizer::new();
+    let nt = n.normalize("foo\u{2014}/-bar").unwrap();
+    assert_eq!(nt.normalized(), "foo bar");
+    assert_eq!(nt.original_words().len(), 2);
   }
 }

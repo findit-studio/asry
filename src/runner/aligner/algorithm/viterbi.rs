@@ -50,6 +50,34 @@ pub(crate) fn ctc_viterbi(
   }
   let n_states = 2 * m + 1;
 
+  // Vocab-bound validation. `LogProbsTV::at` is a raw vector
+  // index; a model/tokenizer skew where a token id or the blank
+  // id exceeds the model's output vocab dim would either panic
+  // the worker thread or silently read into the next frame's row
+  // and produce garbage timings. Validate up front and surface a
+  // typed error so the failure stays in-band.
+  let v = log_probs.v;
+  if (blank_id as usize) >= v {
+    return Err(WorkFailure::AlignmentFailed {
+      kind: AlignmentFailureKind::ModelInferenceFailed,
+      message: alloc::format!(
+        "blank token id {blank_id} >= model output vocab dim {v}; tokenizer/model mismatch?"
+      ),
+      language: language.clone(),
+    });
+  }
+  for (i, &tok) in tokens.iter().enumerate() {
+    if (tok as usize) >= v {
+      return Err(WorkFailure::AlignmentFailed {
+        kind: AlignmentFailureKind::TokenizationFailed,
+        message: alloc::format!(
+          "token id {tok} at position {i} >= model output vocab dim {v}; tokenizer/model mismatch?"
+        ),
+        language: language.clone(),
+      });
+    }
+  }
+
   // CTC needs one frame per token, plus one extra frame for each
   // adjacent repeated-token pair (which forces an inter-token blank
   // because the lattice's two-step transition is illegal between
@@ -235,6 +263,38 @@ mod tests {
     // Visit both token states.
     assert!(path.state_per_frame.contains(&1));
     assert!(path.state_per_frame.contains(&3));
+  }
+
+  #[test]
+  fn blank_id_out_of_vocab_returns_failure() {
+    // Model dim V=3 but blank id = 5 (e.g., model exports a
+    // smaller projection than the tokenizer expects). Must
+    // surface ModelInferenceFailed, not panic.
+    let log_probs = lp(2, 3, alloc::vec![0.0; 6]);
+    let err = ctc_viterbi(&log_probs, &[1], 5, &Lang::En).unwrap_err();
+    assert!(matches!(
+      err,
+      WorkFailure::AlignmentFailed {
+        kind: AlignmentFailureKind::ModelInferenceFailed,
+        ..
+      }
+    ));
+  }
+
+  #[test]
+  fn token_id_out_of_vocab_returns_failure() {
+    // Tokenizer says token id 99 but model V=3. Must surface
+    // TokenizationFailed (mismatch points at the tokenizer side),
+    // not panic.
+    let log_probs = lp(2, 3, alloc::vec![0.0; 6]);
+    let err = ctc_viterbi(&log_probs, &[1, 99], 0, &Lang::En).unwrap_err();
+    assert!(matches!(
+      err,
+      WorkFailure::AlignmentFailed {
+        kind: AlignmentFailureKind::TokenizationFailed,
+        ..
+      }
+    ));
   }
 
   #[test]
