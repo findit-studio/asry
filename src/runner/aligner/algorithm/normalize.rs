@@ -97,23 +97,29 @@ const SIMD_SAFE_MAX_ABS: f32 = 1.0e4;
 
 /// Pre-dispatch precision guard. Returns `true` when the SIMD
 /// backends are safe — i.e., every sample is finite and below
-/// the magnitude threshold. The scan adds one f32 reduction over
-/// the input (LLVM autovectorises it on every supported target);
-/// for typical `[-1, 1]` audio the cost is well under 5% of the
-/// SIMD savings the dispatcher captures.
+/// the magnitude threshold.
+///
+/// Implemented as a `u32`-bits max-reduce over `bits & 0x7FFF_FFFF`
+/// (the f32 sign bit cleared). For non-negative f32 the integer
+/// bit ordering matches the floating-point ordering, so the
+/// integer max gives the max-abs sample's bit pattern. NaN bits
+/// are strictly above `+inf` bits (`0x7F800000`) and `inf` bits
+/// equal it, so a single `max_bits < inf_bits` check rejects both.
+/// LLVM autovectorises this `u32` reduction on every supported
+/// target (`vmaxvq_u32` on NEON, `_mm_max_epu32` on SSE4.1, etc.)
+/// where the f32 path would have stalled on f32::max's
+/// non-associative-NaN semantics.
 #[inline]
 fn samples_within_simd_safe_range(samples: &[f32]) -> bool {
-  let mut max_abs = 0.0_f32;
-  for &s in samples {
-    if !s.is_finite() {
-      return false;
-    }
-    let a = s.abs();
-    if a > max_abs {
-      max_abs = a;
-    }
-  }
-  max_abs <= SIMD_SAFE_MAX_ABS
+  const SIGN_MASK: u32 = 0x7FFF_FFFF;
+  let threshold_bits = SIMD_SAFE_MAX_ABS.to_bits();
+  let inf_bits = f32::INFINITY.to_bits(); // 0x7F800000
+  let max_abs_bits = samples
+    .iter()
+    .copied()
+    .map(|s| s.to_bits() & SIGN_MASK)
+    .fold(0_u32, u32::max);
+  max_abs_bits < inf_bits && max_abs_bits <= threshold_bits
 }
 
 /// Public entry point — picks the best implementation available at
@@ -763,5 +769,57 @@ mod tests {
     let v = unsafe { x86_avx512::zero_mean_unit_var_normalize(&xs) };
     assert_matches_scalar(&v, &s);
     assert!(v.iter().all(|x| x.is_finite()));
+  }
+
+  /// Codex round-11 [medium]: finite f32 inputs at magnitudes
+  /// where ULP exceeds ~1 (i.e. ~1e7+) lose precision in the
+  /// f32 horizontal-add before widening to f64, so the SIMD
+  /// reduction silently drifts from the scalar f64 reference
+  /// without producing inf/NaN. The dispatch-side
+  /// `samples_within_simd_safe_range` guard routes such inputs
+  /// to the scalar path so the output is always scalar-equivalent.
+  ///
+  /// Constructs a 1024-sample buffer at magnitudes around 1e8
+  /// where consecutive f32 increments are below ULP — the
+  /// canonical "f32 cancellation" shape Codex called out.
+  fn finite_high_magnitude_input() -> Vec<f32> {
+    let base = 1.0e8_f32;
+    let mut xs = alloc::vec::Vec::with_capacity(1024);
+    for i in 0..1024 {
+      xs.push(if i % 2 == 0 { base } else { -base });
+      // Add tiny finite jitter that f32 cannot represent at this
+      // magnitude — the scalar f64 path keeps it; SIMD f32 lanes
+      // would lose it. Forces the dispatch guard to route to
+      // scalar.
+      xs.push(if i % 3 == 0 { base + 0.5 } else { -base + 0.25 });
+    }
+    xs
+  }
+
+  /// The dispatched normalise must produce scalar-equivalent
+  /// output even for finite high-magnitude input. Verified by
+  /// matching against the scalar reference call directly —
+  /// pre-fix the SIMD path took over and silently drifted.
+  #[test]
+  fn dispatched_finite_high_magnitude_matches_scalar() {
+    let xs = finite_high_magnitude_input();
+    let s = scalar::zero_mean_unit_var_normalize(&xs);
+    let d = zero_mean_unit_var_normalize(&xs);
+    assert_matches_scalar(&d, &s);
+    assert!(s.iter().all(|x| x.is_finite()));
+  }
+
+  /// The guard check itself: well-bounded audio passes; HDR
+  /// audio fails. Two-line sanity to prevent threshold drift
+  /// from going unnoticed.
+  #[test]
+  fn precision_guard_recognises_safe_and_unsafe_inputs() {
+    assert!(samples_within_simd_safe_range(&[
+      0.5, -0.7, 1e3, -1e3, 9999.0
+    ]));
+    assert!(!samples_within_simd_safe_range(&[1.0, 1e5]));
+    assert!(!samples_within_simd_safe_range(&[1.0, f32::NAN]));
+    assert!(!samples_within_simd_safe_range(&[1.0, f32::INFINITY]));
+    assert!(samples_within_simd_safe_range(&[]));
   }
 }
