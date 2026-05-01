@@ -71,6 +71,27 @@ pub trait TextNormalizer: Send {
   /// entry gives the original surface form for the i-th word in
   /// the normalised text.
   fn normalize<'a>(&self, text: &'a str) -> Result<NormalizedText<'a>, NormalizationError>;
+
+  /// Whether whitespace in the normaliser's output represents real
+  /// word boundaries that the wav2vec2 CTC graph should align
+  /// against (via the tokeniser's `|` word-delimiter token).
+  ///
+  /// Returns `true` for word-segmented languages (English): the
+  /// tokeniser inserts `|` between every pair of normalised words,
+  /// matching how the model was trained.
+  ///
+  /// Returns `false` for character-segmented normalisers (Chinese,
+  /// Japanese) that emit whitespace between every character as an
+  /// indexing device only — those characters were never separated
+  /// by a delimiter in speech, so forcing the CTC graph to align
+  /// `|` between every Han/kana glyph would systematically corrupt
+  /// the alignment. The character-level model is expected to align
+  /// directly across glyphs without an inter-glyph delimiter.
+  ///
+  /// Default: `true`.
+  fn use_word_delimiter(&self) -> bool {
+    true
+  }
 }
 
 /// Boxed `dyn TextNormalizer` for the [`crate::Aligner`]'s

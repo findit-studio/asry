@@ -5,7 +5,7 @@ use core::time::Duration;
 use std::path::Path;
 
 use mediatime::TimeRange;
-use ort::session::Session;
+use ort::session::{RunOptions, Session};
 use tokenizers::Tokenizer;
 
 use crate::{
@@ -170,6 +170,7 @@ impl Aligner {
     chunk_first_sample_in_stream: u64,
     samples_to_output_range: F,
     abort_flag: &core::sync::atomic::AtomicBool,
+    run_options: &RunOptions,
   ) -> Result<AlignmentResult, WorkFailure>
   where
     F: Fn(u64, u64) -> TimeRange,
@@ -271,11 +272,15 @@ impl Aligner {
       return Err(timed_out());
     }
 
-    // Step 2: tokenise with word index map.
+    // Step 2: tokenise with word index map. The normaliser's
+    // `use_word_delimiter` policy gates inter-word `|` insertion
+    // (true for word-segmented English; false for char-segmented
+    // Chinese/Japanese where whitespace is an indexing artefact).
     let tokenized = tokenize_with_word_map(
       &self.tokenizer,
       normalized.normalized(),
       n_words,
+      self.normalizer.use_word_delimiter(),
       &self.language,
     )?;
 
@@ -283,11 +288,15 @@ impl Aligner {
       return Err(timed_out());
     }
 
-    // Steps 3-4: encode + log-softmax. ort::Session::run is
-    // uninterruptible in v1 — this can run for ~1 s on 30 s of
-    // audio. The watchdog may flip abort_flag mid-run; we surface
-    // the timeout at the *next* boundary check immediately below.
-    let log_probs = encode_log_softmax(&mut self.session, &masked, &self.language)?;
+    // Steps 3-4: encode + log-softmax. The alignment worker's
+    // watchdog calls `RunOptions::terminate()` on
+    // [`crate::runner::alignment_pool::AlignWorkItem::align_timeout`];
+    // ORT then returns from `Session::run_with_options` with an
+    // error rather than blocking the worker indefinitely. The
+    // post-encode `abort_flag` check below catches the watchdog's
+    // race-window cases (terminate fired, run already returning
+    // success).
+    let log_probs = encode_log_softmax(&mut self.session, &masked, run_options, &self.language)?;
 
     if abort_flag.load(Ordering::Relaxed) {
       return Err(timed_out());

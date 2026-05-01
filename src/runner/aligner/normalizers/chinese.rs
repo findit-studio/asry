@@ -80,6 +80,15 @@ fn is_han(c: char) -> bool {
 }
 
 impl TextNormalizer for ChineseNormalizer {
+  /// Chinese is character-segmented: the whitespace this normaliser
+  /// emits between every Han glyph is purely an indexing device,
+  /// not a real word boundary. Returning `false` here keeps the
+  /// tokeniser from forcing `|` between every glyph in the CTC
+  /// alignment graph.
+  fn use_word_delimiter(&self) -> bool {
+    false
+  }
+
   fn normalize<'a>(&self, text: &'a str) -> Result<NormalizedText<'a>, NormalizationError> {
     let mut normalized = String::with_capacity(text.len());
     let mut original_words: Vec<Cow<'a, str>> = Vec::new();
@@ -197,5 +206,14 @@ mod tests {
     let n = ChineseNormalizer::new();
     let nt = n.normalize("龜").unwrap(); // Traditional turtle
     assert_eq!(nt.original_words()[0], "龜");
+  }
+
+  #[test]
+  fn does_not_use_word_delimiter() {
+    // Char-segmented: whitespace between glyphs is an indexing
+    // device, not a real word boundary. Tokenisation must NOT
+    // insert `|` between every Han glyph.
+    let n = ChineseNormalizer::new();
+    assert!(!n.use_word_delimiter());
   }
 }

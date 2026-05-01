@@ -75,6 +75,15 @@ fn is_jp_punct(c: char) -> bool {
 }
 
 impl TextNormalizer for JapaneseNormalizer {
+  /// Japanese is character-segmented across kanji / hiragana /
+  /// katakana: the whitespace this normaliser emits between every
+  /// glyph is purely an indexing device. Returning `false` here
+  /// keeps the tokeniser from forcing `|` between every glyph in
+  /// the CTC alignment graph.
+  fn use_word_delimiter(&self) -> bool {
+    false
+  }
+
   fn normalize<'a>(&self, text: &'a str) -> Result<NormalizedText<'a>, NormalizationError> {
     let mut normalized = String::with_capacity(text.len());
     let mut original_words: Vec<Cow<'a, str>> = Vec::new();
@@ -191,5 +200,14 @@ mod tests {
     let n = JapaneseNormalizer::new();
     let err = n.normalize("。、！？").unwrap_err();
     assert!(matches!(err, NormalizationError::EmptyText));
+  }
+
+  #[test]
+  fn does_not_use_word_delimiter() {
+    // Char-segmented across kanji/hiragana/katakana: whitespace
+    // between glyphs is an indexing artefact and must NOT trigger
+    // `|` insertion in CTC tokenisation.
+    let n = JapaneseNormalizer::new();
+    assert!(!n.use_word_delimiter());
   }
 }

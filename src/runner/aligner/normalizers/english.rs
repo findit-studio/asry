@@ -268,4 +268,13 @@ mod tests {
     // preserves the apostrophe in the normalised form.
     assert_eq!(nt.normalized(), "o'brien rocks");
   }
+
+  #[test]
+  fn uses_word_delimiter() {
+    // Word-segmented English: whitespace separates real spoken
+    // words. Tokenisation must insert `|` between them so the
+    // CTC graph aligns the same way the model was trained.
+    let n = EnglishNormalizer::new();
+    assert!(n.use_word_delimiter());
+  }
 }

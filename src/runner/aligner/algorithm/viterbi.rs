@@ -50,17 +50,27 @@ pub(crate) fn ctc_viterbi(
   }
   let n_states = 2 * m + 1;
 
-  // CTC requires at least one frame per (token + blank gap).
-  // Conservative lower bound: T >= 2*m + 1 (one frame per state).
-  // In practice models emit ~50 frames/sec @ 16 kHz, so audio of
-  // length << m * 20 ms is too short.
-  if t < n_states {
+  // CTC needs one frame per token, plus one extra frame for each
+  // adjacent repeated-token pair (which forces an inter-token blank
+  // because the lattice's two-step transition is illegal between
+  // identical labels). Distinct adjacent labels can transition in a
+  // single frame via the s-2 -> s edge, so the often-quoted
+  // T >= 2|Y|+1 lower bound (one frame per lattice state) is
+  // overly strict.
+  let mut min_t = m;
+  for i in 1..m {
+    if tokens[i] == tokens[i - 1] {
+      min_t += 1;
+    }
+  }
+  if t < min_t {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::NoAlignmentPath,
       message: alloc::format!(
-        "audio too short: T={} frames < required {} states",
+        "audio too short: T={} frames < required {} frames for {}-token sequence",
         t,
-        n_states
+        min_t,
+        m
       ),
       language: language.clone(),
     });
@@ -199,9 +209,10 @@ mod tests {
 
   #[test]
   fn audio_too_short_errors() {
-    // 1 token => need 2*1+1 = 3 states; T=2 is too short.
+    // tokens=[1, 1] (repeated) => need 2 + 1 = 3 frames minimum
+    // (one per token + one blank between them). T=2 is too short.
     let log_probs = lp(2, 3, alloc::vec![0.0; 6]);
-    let err = ctc_viterbi(&log_probs, &[1], 0, &Lang::En).unwrap_err();
+    let err = ctc_viterbi(&log_probs, &[1, 1], 0, &Lang::En).unwrap_err();
     assert!(matches!(
       err,
       WorkFailure::AlignmentFailed {
@@ -209,6 +220,34 @@ mod tests {
         ..
       }
     ));
+  }
+
+  #[test]
+  fn t_eq_m_distinct_tokens_aligns() {
+    // Adversarial regression for the old T >= 2m+1 guard:
+    // tokens=[1, 2] (distinct) at T=2 must align via the
+    // two-step lattice transition state 1 -> state 3.
+    let mut data = alloc::vec![-100.0_f32; 2 * 3];
+    data[0 * 3 + 1] = -0.1; // frame 0: token 1
+    data[1 * 3 + 2] = -0.1; // frame 1: token 2
+    let log_probs = lp(2, 3, data);
+    let path = ctc_viterbi(&log_probs, &[1, 2], 0, &Lang::En).expect("path");
+    // Visit both token states.
+    assert!(path.state_per_frame.contains(&1));
+    assert!(path.state_per_frame.contains(&3));
+  }
+
+  #[test]
+  fn t_eq_3_repeated_tokens_aligns() {
+    // tokens=[1, 1] at T=3: minimum legal length. Path must be
+    // [token1, blank, token1] = states [1, 2, 3].
+    let mut data = alloc::vec![-100.0_f32; 3 * 3];
+    data[0 * 3 + 1] = -0.1; // frame 0: token 1
+    data[1 * 3 + 0] = -0.1; // frame 1: blank
+    data[2 * 3 + 1] = -0.1; // frame 2: token 1 again
+    let log_probs = lp(3, 3, data);
+    let path = ctc_viterbi(&log_probs, &[1, 1], 0, &Lang::En).expect("path");
+    assert_eq!(path.state_per_frame, alloc::vec![1, 2, 3]);
   }
 
   #[test]

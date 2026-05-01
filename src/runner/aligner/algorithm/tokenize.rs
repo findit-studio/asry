@@ -22,13 +22,21 @@ pub(crate) struct TokenizedText {
 ///
 /// The wav2vec2 vocab uses a single character per token (one of:
 /// letter, digit, apostrophe, the word-delimiter `|`, or a special
-/// like `<s>`, `<pad>`, `<unk>`, `</s>`). Word boundaries are
-/// signalled by the `|` token in the encoded stream.
+/// like `<s>`, `<pad>`, `<unk>`, `</s>`). For word-segmented
+/// languages the model is trained to align `|` between every pair
+/// of spoken words.
 ///
 /// We tokenise word-by-word (not the whole sentence at once) to
 /// trivially get the word index — each word's encoded tokens map
 /// to the word's index, and the inter-word `|` is appended with
-/// `None` between words.
+/// `None` between words **only when the source normaliser declared
+/// that whitespace represents real word boundaries**.
+///
+/// `use_word_delimiter` is the [`crate::TextNormalizer::use_word_delimiter`]
+/// signal: `true` for English (whitespace = real word break, insert
+/// `|`); `false` for character-segmented languages (Chinese,
+/// Japanese) where whitespace is an indexing artefact only and must
+/// not introduce CTC-graph delimiters that were never spoken.
 ///
 /// Returns `WorkFailure::AlignmentFailed { kind: TokenizationFailed,
 /// .. }` if the tokeniser's `encode` call errors.
@@ -36,14 +44,11 @@ pub(crate) fn tokenize_with_word_map(
   tokenizer: &Tokenizer,
   normalized: &str,
   word_count: usize,
+  use_word_delimiter: bool,
   language: &Lang,
 ) -> Result<TokenizedText, WorkFailure> {
   let mut token_ids: Vec<u32> = Vec::with_capacity(normalized.len() + word_count * 2);
   let mut word_idx_per_token: Vec<Option<usize>> = Vec::with_capacity(token_ids.capacity());
-
-  // wav2vec2 tokenisers use `|` as the word delimiter. We want the
-  // model to see a `|` between every pair of normalised words,
-  // and we want each non-`|` token to carry its word index.
 
   let words: Vec<&str> = normalized.split_whitespace().collect();
   if words.len() != word_count {
@@ -74,9 +79,11 @@ pub(crate) fn tokenize_with_word_map(
       word_idx_per_token.push(Some(word_idx));
     }
 
-    // Append the inter-word delimiter, if not the last word and
-    // the tokeniser has a `|` token.
-    if word_idx + 1 < words.len()
+    // Append the inter-word delimiter, if the normaliser opted in
+    // (true for English, false for char-segmented CJK), it is not
+    // the last word, and the tokeniser actually has a `|` token.
+    if use_word_delimiter
+      && word_idx + 1 < words.len()
       && let Some(delim_id) = tokenizer.token_to_id("|")
     {
       token_ids.push(delim_id);

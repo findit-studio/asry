@@ -70,6 +70,8 @@ use std::{sync::Mutex, thread::JoinHandle, time::Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 
+use ort::session::RunOptions;
+
 use crate::{
   runner::{
     RunnerError,
@@ -158,6 +160,25 @@ fn run_one_alignment(
   set: &AlignmentSet,
   job: &AlignWorkItem,
 ) -> Result<AlignmentResult, WorkFailure> {
+  // Per-call ORT termination handle. The watchdog calls
+  // `RunOptions::terminate()` on timeout, which forces
+  // `Session::run_with_options` (inside `encode_log_softmax`)
+  // to return an error from inside the graph rather than
+  // blocking the worker until the model finishes naturally.
+  // Without this, a stuck or pathologically slow inference would
+  // strand the worker, and `drain` / `Drop` would wait
+  // indefinitely.
+  let run_options = match RunOptions::new() {
+    Ok(opts) => Arc::new(opts),
+    Err(e) => {
+      return Err(WorkFailure::AlignmentFailed {
+        kind: AlignmentFailureKind::ModelInferenceFailed,
+        message: alloc::format!("RunOptions::new failed: {e:?}"),
+        language: job.language.clone(),
+      });
+    }
+  };
+
   // Spawn the cancellable watchdog. Uses recv_timeout on a
   // one-shot oneshot channel so the worker can cancel it by
   // dropping the sender once inference completes (Plan B's
@@ -165,11 +186,17 @@ fn run_one_alignment(
   let (cancel_tx, cancel_rx) = bounded::<()>(1);
   let abort_flag = job.abort_flag.clone();
   let timeout = job.align_timeout;
+  let run_options_for_watchdog = run_options.clone();
   let watchdog = std::thread::Builder::new()
     .name("whispery-align-watchdog".into())
     .spawn(move || match cancel_rx.recv_timeout(timeout) {
       Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
         abort_flag.store(true, Ordering::Relaxed);
+        // Tell ORT to bail out of any in-flight `Session::run`
+        // for this job; the failure surfaces as
+        // `Session::run_with_options` returning an error, which
+        // the worker maps to `WorkerHangTimeout` below.
+        let _ = run_options_for_watchdog.terminate();
       }
       Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
         // Cancelled by the worker — clean exit.
@@ -183,11 +210,11 @@ fn run_one_alignment(
   let outcome = match set.lookup(&job.language) {
     AlignmentLookup::Hit { aligner, .. } => {
       // Registered aligner; failure does NOT consult Any.
-      run_under_lock(aligner, job)
+      run_under_lock(aligner, job, &run_options)
     }
     AlignmentLookup::AnyFallback { aligner } => {
       // Multilingual fallback; same call shape.
-      run_under_lock(aligner, job)
+      run_under_lock(aligner, job, &run_options)
     }
     AlignmentLookup::Miss { fallback } => match fallback {
       AlignmentFallback::SkipChunk => {
@@ -224,6 +251,7 @@ fn run_one_alignment(
 fn run_under_lock(
   aligner: &Mutex<Aligner>,
   job: &AlignWorkItem,
+  run_options: &RunOptions,
 ) -> Result<AlignmentResult, WorkFailure> {
   let mut guard = match aligner.lock() {
     Ok(g) => g,
@@ -246,6 +274,7 @@ fn run_under_lock(
     job.chunk_first_sample_in_stream,
     move |a, b| (bound)(a, b),
     &job.abort_flag,
+    run_options,
   )
 }
 

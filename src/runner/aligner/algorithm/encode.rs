@@ -3,7 +3,7 @@
 use alloc::{string::String, vec::Vec};
 
 use ort::{
-  session::Session,
+  session::{RunOptions, Session},
   value::{Shape, Tensor},
 };
 
@@ -48,11 +48,22 @@ impl LogProbsTV {
 /// variant uses a different I/O name, parameterise via
 /// `Aligner::with_input_name(...)` (not in v1 scope).
 ///
+/// `run_options` carries ONNX Runtime's per-call termination flag;
+/// the alignment worker's watchdog calls `RunOptions::terminate()`
+/// on timeout, which causes `Session::run_with_options` to surface
+/// an error from inside the graph rather than blocking until the
+/// model finishes naturally. This is the only way to interrupt a
+/// stuck or pathological inference; the `abort_flag` checked at
+/// stage boundaries can't help once we are inside `run`.
+///
 /// Returns `WorkFailure::AlignmentFailed { kind:
-/// ModelInferenceFailed, .. }` on any ort error.
+/// ModelInferenceFailed, .. }` on any ort error (including a
+/// terminate-induced one — the watchdog's
+/// `WorkerHangTimeout` is surfaced by the alignment pool wrapper).
 pub(crate) fn encode_log_softmax(
   session: &mut Session,
   samples_for_aligner: &[f32],
+  run_options: &RunOptions,
   language: &Lang,
 ) -> Result<LogProbsTV, WorkFailure> {
   let t_samples = samples_for_aligner.len();
@@ -79,14 +90,16 @@ pub(crate) fn encode_log_softmax(
 
   // Most wav2vec2 ONNX exports use the input name "input_values".
   // If the export uses a different name, surface a clear error.
-  let outputs =
-    session
-      .run(ort::inputs![input_tensor])
-      .map_err(|e| WorkFailure::AlignmentFailed {
-        kind: AlignmentFailureKind::ModelInferenceFailed,
-        message: alloc::format!("Session::run failed: {e:?}"),
-        language: language.clone(),
-      })?;
+  // `run_with_options` is identical to `run` except it observes
+  // the per-call termination flag in `run_options`, so the
+  // alignment worker's watchdog can interrupt a stuck graph.
+  let outputs = session
+    .run_with_options(ort::inputs![input_tensor], run_options)
+    .map_err(|e| WorkFailure::AlignmentFailed {
+      kind: AlignmentFailureKind::ModelInferenceFailed,
+      message: alloc::format!("Session::run_with_options failed: {e:?}"),
+      language: language.clone(),
+    })?;
 
   // Take the first (only) output. wav2vec2 has a single logits
   // output; we pull index 0 by name-agnostic iteration.
