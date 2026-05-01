@@ -13,7 +13,7 @@ use mediatime::{Timebase, Timestamp};
 use crate::{
   core::{
     buffer::SampleBuffer,
-    command::{AlignmentResult, AsrParams, AsrResult, Command},
+    command::{AlignmentResult, AsrParams, AsrParamsOverride, AsrResult, Command},
     cut::Cut,
     dispatch::Dispatch,
     event::Event,
@@ -351,6 +351,18 @@ impl Transcriber {
   /// themselves do not need this affordance.
   pub(crate) fn unpoll_command(&mut self, cmd: Command) {
     self.dispatch.unpoll_command(cmd);
+  }
+
+  /// Stamp a per-packet `AsrParamsOverride` on the dispatch.
+  /// Chunks extracted from the live buffer while this is `Some`
+  /// snapshot the override into their `ExtractedChunk`; promote
+  /// time then layers the snapshot on top of `asr_params` /
+  /// `locked_language` to produce the final `RunAsr.params`.
+  /// **Visibility: `pub(crate)`** — the runner sets and clears
+  /// this around `process_packet`; out-of-tree consumers don't
+  /// touch it.
+  pub(crate) fn set_runtime_override(&mut self, ovr: Option<AsrParamsOverride>) {
+    self.dispatch.current_override = ovr;
   }
 
   /// True iff every queue is empty: no buffered samples, no

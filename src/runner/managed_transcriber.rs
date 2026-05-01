@@ -35,12 +35,6 @@ pub struct ManagedTranscriber {
   core: Transcriber,
   whisper_pool: WhisperPool,
   asr_params_default: AsrParams,
-  /// Per-packet override active during the current `process_packet`
-  /// call. Set on entry, cleared on exit. `try_dispatch` merges it
-  /// on top of the core's emitted params (which carry the locked
-  /// language from `LanguagePolicy`). Sparse layering preserves
-  /// fields the override doesn't set.
-  pending_override: Option<AsrParamsOverride>,
   asr_timeout: Duration,
   drain_timeout: Duration,
   block_on_full_queue: bool,
@@ -73,26 +67,19 @@ impl ManagedTranscriber {
         params,
         sample_rate: _,
       } => {
-        // Use the core's emitted params (which already include
-        // the locked language from LanguagePolicy::Lock /
-        // AutoLockAfter). If a per-packet override is active
-        // for this process_packet call, merge it on top —
-        // sparse override fields layer cleanly without
-        // clobbering the language lock the core just set.
-        //
-        // Pre-fix code substituted `self.asr_params_default`
-        // here, which discarded the locked language and made
-        // whisper auto-detect every chunk → temperature ladder
-        // exhausted on every chunk → drain hangs.
-        let final_params = match &self.pending_override {
-          Some(ovr) => merge_overrides(&params, ovr),
-          None => params,
-        };
+        // The core's emitted params already include locked
+        // language AND the per-packet override that was active
+        // when this chunk was *extracted* (see
+        // `ExtractedChunk::override_at_creation` and
+        // `Transcriber::set_runtime_override`). Don't merge any
+        // current `pending_override` here — that would corrupt
+        // parked / cut-pending-promoted commands with the wrong
+        // packet's params. Use `params` verbatim.
         let abort_flag = Arc::new(AtomicBool::new(false));
         let item = AsrWorkItem {
           chunk_id,
           samples,
-          params: final_params,
+          params,
           asr_timeout,
           abort_flag,
         };
@@ -575,7 +562,6 @@ impl ManagedTranscriberBuilder {
       core: Transcriber::new(core_config),
       whisper_pool,
       asr_params_default: self.asr_params,
-      pending_override: None,
       asr_timeout: self.worker_timeouts_asr,
       drain_timeout,
       block_on_full_queue: self.pool_config.block_on_full_queue(),
@@ -661,11 +647,15 @@ impl ManagedTranscriber {
     vad_segments: &[VadSegment],
     params_override: Option<AsrParamsOverride>,
   ) -> Result<(), RunnerError> {
-    // Step 1: stash the per-call override. `try_dispatch` reads
-    // it and merges on top of the core's emitted params (which
-    // carry the locked language). Cleared on exit regardless of
-    // outcome — the override is per-packet, not sticky.
-    self.pending_override = params_override;
+    // Step 1: stamp the override on the dispatch. Chunks
+    // extracted from the buffer during this call snapshot the
+    // override into their `ExtractedChunk::override_at_creation`,
+    // so the params that promote_extracted later emits with
+    // `RunAsr` are tied to *this* packet's audio — even if a
+    // chunk is held in `cut_pending` past the end of this
+    // process_packet and promoted during a later call. Cleared
+    // on exit regardless of outcome.
+    self.core.set_runtime_override(params_override);
 
     // Step 2: push samples (may return Backpressure / PtsRegression / etc.)
     let push_result = self.push_samples_internal(starts_at, samples);
@@ -677,8 +667,11 @@ impl ManagedTranscriber {
     // Step 4: pump the dispatch loop until idle or saturation.
     let drive_result = result.and_then(|()| self.pump_until_idle_or_progress());
 
-    // Step 5: clear the override.
-    self.pending_override = None;
+    // Step 5: clear the override stamp. Chunks already in
+    // `cut_pending` keep the override they captured at extract
+    // time — only newly-extracted chunks (in future packets)
+    // see `None` here.
+    self.core.set_runtime_override(None);
 
     drive_result
   }

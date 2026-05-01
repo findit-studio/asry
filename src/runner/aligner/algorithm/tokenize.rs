@@ -91,13 +91,16 @@ pub(crate) fn tokenize_with_word_map(
     });
   }
 
-  for (word_idx, word) in words.iter().enumerate() {
-    // ASCII case projection when the vocab covers only one case.
-    // We avoid `to_uppercase()` (Unicode-aware, allocates per
-    // call even on ASCII) and use the cheap ASCII-only variant
-    // since this projection is intended for English-style
-    // single-byte alphabets — the same kind of vocab the check
-    // detects.
+  // Pass 1: encode each word into its own token group, with
+  // per-character <unk>-skipping. We can't insert delimiters yet
+  // because we don't know which adjacent groups will end up
+  // empty (digit-only words against an A-Z vocab, emoji-only
+  // words, etc.). Inserting `|` for an all-OOV word would leave
+  // an unspoken delimiter state in the CTC graph — Viterbi would
+  // burn frames on it and shift the timing of neighbouring real
+  // words.
+  let mut per_word_tokens: Vec<Vec<u32>> = Vec::with_capacity(words.len());
+  for word in &words {
     let encode_input: Cow<'_, str> = if uppercase_input {
       Cow::Owned(word.to_ascii_uppercase())
     } else {
@@ -110,34 +113,50 @@ pub(crate) fn tokenize_with_word_map(
         message: alloc::format!("encode({:?}) failed: {e:?}", word),
         language: language.clone(),
       })?;
+    let mut group: Vec<u32> = Vec::with_capacity(encoding.get_ids().len());
     for &id in encoding.get_ids() {
       // Per-character <unk>-skip. Individual chars that fall
       // outside the vocab (an internal `.` in `U.S.A.`, a digit
       // in a letters-only model, an emoji) are dropped here so
-      // the rest of the word still aligns. A word whose every
-      // char is <unk> contributes zero tokens, leaves no entry
-      // in word_idx_per_token, and is dropped at compose time
-      // without a `Word`. The chunk-level guard at the end of
-      // this function still catches all-words-empty cases.
+      // the rest of the word still aligns.
       if let Some(unk) = unk_token_id
         && id == unk
       {
         continue;
       }
+      group.push(id);
+    }
+    per_word_tokens.push(group);
+  }
+
+  // Pass 2: flatten into the final token stream, inserting the
+  // `|` delimiter only between adjacent NON-EMPTY groups when
+  // the normaliser opted in. This is the orphan-delimiter fix:
+  // empty groups (all-OOV words) no longer leave a stray `|`
+  // for Viterbi to attribute frames to. Empty groups still
+  // count toward `word_idx` so compose can drop them via their
+  // `None` accumulator.
+  let delim_id = if use_word_delimiter {
+    tokenizer.token_to_id("|")
+  } else {
+    None
+  };
+  let mut last_emitted_word: Option<usize> = None;
+  for (word_idx, group) in per_word_tokens.iter().enumerate() {
+    if group.is_empty() {
+      continue; // word contributes no real tokens; no delimiter
+    }
+    if last_emitted_word.is_some()
+      && let Some(d) = delim_id
+    {
+      token_ids.push(d);
+      word_idx_per_token.push(None);
+    }
+    for &id in group {
       token_ids.push(id);
       word_idx_per_token.push(Some(word_idx));
     }
-
-    // Append the inter-word delimiter, if the normaliser opted in
-    // (true for English, false for char-segmented CJK), it is not
-    // the last word, and the tokeniser actually has a `|` token.
-    if use_word_delimiter
-      && word_idx + 1 < words.len()
-      && let Some(delim_id) = tokenizer.token_to_id("|")
-    {
-      token_ids.push(delim_id);
-      word_idx_per_token.push(None);
-    }
+    last_emitted_word = Some(word_idx);
   }
 
   if token_ids.is_empty() {
@@ -312,43 +331,92 @@ mod tests {
     assert_eq!(result.word_idx_per_token, alloc::vec![Some(0); 3]);
   }
 
-  /// Mixed alignable + all-`<unk>` words: the `<unk>` word
-  /// emits zero tokens and gets no `word_idx_per_token` entry.
-  /// `compose_words` will see its `per_word[i]` slot stay
-  /// `None` and drop it from the output. The remaining word
-  /// aligns normally.
+  /// Leading all-OOV word: the orphan-delimiter fix makes sure
+  /// the leading `1000` (zero in-vocab chars) does NOT leave a
+  /// stray `|` token in the CTC stream. Pre-fix, that orphan
+  /// delimiter made Viterbi burn a frame on an unspoken word
+  /// boundary, shifting `hello`'s timestamps left.
   #[test]
-  fn all_unk_word_contributes_zero_tokens_and_drops_at_compose() {
+  fn leading_all_unk_word_emits_no_orphan_delimiter() {
     let tok = uppercase_tokenizer();
     let unk = tok.token_to_id("<unk>");
+    let pipe = tok.token_to_id("|").unwrap();
 
-    // "1000 hello" — first word is all-digits (none in vocab),
-    // second word aligns. Per-char skipping makes the digit
-    // word produce zero tokens; the second word produces 5.
-    // The inter-word `|` between them remains because both
-    // words exist in the input even if one contributes nothing.
+    let result =
+      tokenize_with_word_map(&tok, "1000 hello", 2, true, true, unk, &Lang::En).expect("ok");
+
+    // Five letter ids tagged with word_idx=1 ("hello"); zero
+    // tokens for word 0; **no `|` token in the stream** because
+    // there's no preceding non-empty group to separate from.
+    assert_eq!(result.token_ids.len(), 5);
+    assert!(
+      !result.token_ids.contains(&pipe),
+      "no orphan `|` for leading all-OOV word; got {:?}",
+      result.token_ids
+    );
+    assert!(
+      result.word_idx_per_token.iter().all(|w| *w != Some(0)),
+      "all-<unk> word 0 must contribute zero tokens"
+    );
+  }
+
+  /// Trailing all-OOV word: same invariant — no trailing `|`.
+  #[test]
+  fn trailing_all_unk_word_emits_no_orphan_delimiter() {
+    let tok = uppercase_tokenizer();
+    let unk = tok.token_to_id("<unk>");
+    let pipe = tok.token_to_id("|").unwrap();
+
+    let result =
+      tokenize_with_word_map(&tok, "hello 1000", 2, true, true, unk, &Lang::En).expect("ok");
+
+    assert_eq!(result.token_ids.len(), 5);
+    assert!(!result.token_ids.contains(&pipe));
+  }
+
+  /// Middle all-OOV word: `hello 1000 world` → letters of
+  /// `hello`, single `|`, letters of `world`. Pre-fix there
+  /// would have been TWO `|` tokens around the OOV middle
+  /// word, doubling the unspoken delimiter mass.
+  #[test]
+  fn middle_all_unk_word_emits_single_delimiter() {
+    let tok = uppercase_tokenizer();
+    let unk = tok.token_to_id("<unk>");
+    let pipe = tok.token_to_id("|").unwrap();
+
+    let result =
+      tokenize_with_word_map(&tok, "hello 1000 world", 3, true, true, unk, &Lang::En).expect("ok");
+
+    let pipe_count = result.token_ids.iter().filter(|&&id| id == pipe).count();
+    assert_eq!(
+      pipe_count, 1,
+      "exactly one `|` between the two real words; got {:?}",
+      result.token_ids
+    );
+    // hello(5) + `|`(1) + world(5) = 11
+    assert_eq!(result.token_ids.len(), 11);
+  }
+
+  /// Real word sandwiched by all-OOV words on both sides:
+  /// only the real word's letters survive, no delimiters.
+  #[test]
+  fn all_unk_words_around_real_word_emit_no_delimiters() {
+    let tok = uppercase_tokenizer();
+    let unk = tok.token_to_id("<unk>");
+    let pipe = tok.token_to_id("|").unwrap();
+
     let result = tokenize_with_word_map(
       &tok,
-      "1000 hello",
-      /* word_count: */ 2,
-      /* use_word_delimiter: */ true,
-      /* uppercase_input: */ true,
-      /* unk_token_id: */ unk,
+      "1000 2000 hello 3000 4000",
+      5,
+      true,
+      true,
+      unk,
       &Lang::En,
     )
-    .expect("mixed-<unk> chunk must succeed via per-char skip");
+    .expect("ok");
 
-    // Five letter ids tagged with word_idx=1 (the second word
-    // is "hello"). The first word contributes zero tokens; the
-    // delimiter between the two whitespace-bounded words is
-    // emitted with `None` (no word index).
-    let letter_count = result
-      .word_idx_per_token
-      .iter()
-      .filter(|w| **w == Some(1))
-      .count();
-    assert_eq!(letter_count, 5);
-    let no_word0 = result.word_idx_per_token.iter().all(|w| *w != Some(0));
-    assert!(no_word0, "all-<unk> word 0 must contribute zero tokens");
+    assert_eq!(result.token_ids.len(), 5);
+    assert!(!result.token_ids.contains(&pipe));
   }
 }

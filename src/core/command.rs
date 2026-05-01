@@ -480,6 +480,28 @@ impl AsrParamsOverride {
     }
   }
 
+  /// Apply this sparse override on top of `base`, returning the
+  /// merged `AsrParams`. `Some` fields on the override replace
+  /// `base`'s; `None` fields leave `base` unchanged. Used at
+  /// promote time by the dispatch (with the per-chunk
+  /// `override_at_creation`) and by the runner's tests.
+  pub fn apply_to(&self, base: &AsrParams) -> AsrParams {
+    let mut out = base.clone();
+    if let Some(opt_lang) = &self.language_hint {
+      out.set_language_hint(opt_lang.clone());
+    }
+    if let Some(strategy) = self.strategy {
+      out.set_strategy(strategy);
+    }
+    if let Some(t) = self.initial_temperature {
+      out.set_initial_temperature(t);
+    }
+    if let Some(prompt) = &self.initial_prompt {
+      out.set_initial_prompt(prompt.clone());
+    }
+    out
+  }
+
   /// Override for [`AsrParams::language_hint`].
   pub const fn language_hint(&self) -> Option<&Option<Lang>> {
     self.language_hint.as_ref()

@@ -99,13 +99,32 @@ pub(crate) struct ExtractedChunk {
   #[cfg(feature = "alignment")]
   pub sub_segments_samples: Vec<(u64, u64)>,
   pub sub_origins: Vec<SubOrigin>,
+  /// Per-packet `AsrParamsOverride` snapshot captured at the
+  /// moment this chunk was extracted from the live buffer. The
+  /// runner stamps the dispatch's `current_override` here so a
+  /// `RunAsr` command emitted at promote time (which can happen
+  /// in a different `process_packet` call than the one that
+  /// pushed the audio) carries the override that was active at
+  /// chunk-creation time. Without this snapshot the runner used
+  /// to merge the *current* override into every dispatched
+  /// command, which corrupted parked/deferred commands with the
+  /// wrong packet's params.
+  pub override_at_creation: Option<crate::core::AsrParamsOverride>,
 }
 
 impl ExtractedChunk {
   /// Pull a chunk's audio out of the live buffer and compute its
   /// output-timebase ranges. Crate-private; used by `Dispatch::on_emit`
   /// at the moment a `MergedChunk` is produced.
-  pub(crate) fn extract_from(chunk_id: ChunkId, chunk: MergedChunk, buffer: &SampleBuffer) -> Self {
+  ///
+  /// `asr_params_override` is the dispatch's `current_override`
+  /// snapshot at extract time — see `override_at_creation`.
+  pub(crate) fn extract_from(
+    chunk_id: ChunkId,
+    chunk: MergedChunk,
+    buffer: &SampleBuffer,
+    asr_params_override: Option<crate::core::AsrParamsOverride>,
+  ) -> Self {
     let samples = buffer.extract(chunk.range);
     let range = buffer.samples_to_output_range(chunk.range);
     let sub_segments: Vec<TimeRange> = chunk
@@ -129,6 +148,7 @@ impl ExtractedChunk {
       #[cfg(feature = "alignment")]
       sub_segments_samples,
       sub_origins,
+      override_at_creation: asr_params_override,
     }
   }
 
@@ -207,6 +227,16 @@ pub(crate) struct Dispatch {
   /// `unpoll_command`, consumed by the next `poll_command` (which
   /// returns the parked command first).
   pub parked_command: Option<Command>,
+  /// Per-packet `AsrParamsOverride` the runner has stamped on
+  /// the dispatch for the duration of the current
+  /// `process_packet` call. `extract_from` reads this and
+  /// snapshots it onto each newly-created `ExtractedChunk` —
+  /// chunks queued in `cut_pending` therefore remember the
+  /// override that was active when their audio was pushed, even
+  /// if they are promoted during a later `process_packet`. The
+  /// runner sets this before pushing audio and clears it on
+  /// exit; the dispatch never reads it after extract_from.
+  pub current_override: Option<crate::core::AsrParamsOverride>,
 }
 
 impl Dispatch {
@@ -240,6 +270,7 @@ impl Dispatch {
       auto_lock_pending: BTreeMap::new(),
       auto_lock_cursor: ChunkId::from_raw(0),
       parked_command: None,
+      current_override: None,
     }
   }
 
@@ -273,7 +304,13 @@ impl Dispatch {
   /// `RunAsr` command) or queues it on `cut_pending` if the
   /// effective cap is saturated.
   pub(crate) fn on_emit(&mut self, chunk: MergedChunk, chunk_id: ChunkId, buffer: &SampleBuffer) {
-    let extracted = ExtractedChunk::extract_from(chunk_id, chunk, buffer);
+    // Snapshot the override active for the current
+    // `process_packet` call. Chunks queued here in `cut_pending`
+    // and promoted later (a different packet's pump) will use
+    // this snapshot, not whatever override is current at promote
+    // time.
+    let extracted =
+      ExtractedChunk::extract_from(chunk_id, chunk, buffer, self.current_override.clone());
     if self.can_promote(chunk_id) {
       self.promote_extracted(extracted);
     } else {
@@ -335,12 +372,25 @@ impl Dispatch {
 
   /// Move a pre-extracted chunk to `in_flight` and queue its
   /// `RunAsr` command. Applies the locked language hint if one
-  /// has been established. Crate-private; called by `on_emit` and
-  /// by `after_inject`'s post-resolve promotion loop.
+  /// has been established, then layers the per-packet override
+  /// captured on the chunk at extract time. Crate-private; called
+  /// by `on_emit` and by `after_inject`'s post-resolve promotion
+  /// loop.
+  ///
+  /// Param precedence (default → locked → override) matches the
+  /// pre-Codex-fix behaviour where `try_dispatch` merged the
+  /// runtime override last. The crucial difference is that
+  /// `ext.override_at_creation` is the override that was active
+  /// when *this chunk* was extracted, so a chunk parked or held
+  /// in `cut_pending` always carries its own override — it can't
+  /// inherit a later packet's override.
   fn promote_extracted(&mut self, ext: ExtractedChunk) {
     let mut params = self.asr_params.clone();
     if let Some(locked) = &self.locked_language {
       params.set_language_hint(Some(locked.clone()));
+    }
+    if let Some(ovr) = &ext.override_at_creation {
+      params = ovr.apply_to(&params);
     }
 
     let chunk_id = ext.chunk_id;
@@ -702,6 +752,7 @@ mod tests {
   use super::*;
   use crate::{
     core::{
+      AsrParamsOverride,
       buffer::SampleBuffer,
       cut::{Cut, MergedChunk, SampleRange, SubOrigin, SubRange},
     },
@@ -791,6 +842,70 @@ mod tests {
       })
       .collect();
     assert_eq!(ids, alloc::vec![0, 1, 2]);
+  }
+
+  /// Adversarial regression for the per-packet override binding
+  /// fix: a chunk extracted under override O1, but promoted in a
+  /// later "process_packet" with override O2 set, must still
+  /// emit RunAsr with O1's params. Stamping the override on
+  /// `ExtractedChunk::override_at_creation` is what makes this
+  /// hold.
+  #[test]
+  fn extracted_chunk_keeps_override_through_deferred_promote() {
+    let mut d = Dispatch::new(
+      AsrParams::default(),
+      false,
+      // max_in_flight = 1 forces chunk 1 to wait in cut_pending.
+      /* max_in_flight = */
+      1,
+      LanguagePolicy::Auto,
+    );
+    let b = make_buffer_with_samples(20_000);
+
+    // "Packet 1" — override O1 sets initial_temperature = 0.7.
+    let o1 = AsrParamsOverride::new().with_initial_temperature(Some(0.7));
+    d.current_override = Some(o1.clone());
+    d.on_emit(fake_chunk(0, 4_000), ChunkId::from_raw(0), &b);
+    d.on_emit(fake_chunk(4_000, 8_000), ChunkId::from_raw(1), &b);
+
+    // Chunk 0 promoted (max_in_flight=1); chunk 1 in cut_pending.
+    assert_eq!(d.in_flight.len(), 1);
+    assert_eq!(d.cut_pending.len(), 1);
+    // Chunk 1's snapshot must record O1, not whatever override
+    // is current at promote time later.
+    let snap = d
+      .cut_pending
+      .front()
+      .unwrap()
+      .override_at_creation
+      .as_ref()
+      .expect("chunk 1 must carry an override snapshot");
+    assert_eq!(snap.initial_temperature(), Some(0.7));
+    let _ = o1; // captured semantically via initial_temperature() above
+
+    // Drain chunk 0's command, free the slot.
+    let _cmd0 = d.pending_commands.pop_front().unwrap();
+
+    // "Packet 2" — different override, O2 sets temperature = 0.3.
+    // Chunk 1 will be promoted from cut_pending below; it must
+    // *not* pick up O2.
+    let o2 = AsrParamsOverride::new().with_initial_temperature(Some(0.3));
+    d.current_override = Some(o2);
+    let mut buf_mut = make_buffer_with_samples(20_000);
+    d.inject_asr_result(ChunkId::from_raw(0), fake_asr_result("ok"))
+      .unwrap();
+    d.after_inject(&mut buf_mut, None, u64::MAX);
+
+    // Chunk 1's RunAsr should have temperature = 0.7 (O1), not 0.3 (O2).
+    let cmd1 = d.pending_commands.pop_front().expect("chunk 1 RunAsr");
+    let Command::RunAsr { params, .. } = &cmd1 else {
+      panic!("expected RunAsr; got {cmd1:?}");
+    };
+    assert!(
+      (params.initial_temperature() - 0.7).abs() < 1e-6,
+      "chunk 1 must keep packet 1's override; got temp={}",
+      params.initial_temperature()
+    );
   }
 
   #[test]
