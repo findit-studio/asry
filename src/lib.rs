@@ -92,4 +92,7 @@ pub mod __bench {
 
   #[cfg(target_arch = "aarch64")]
   pub use crate::runner::aligner::algorithm::normalize::neon;
+
+  #[cfg(target_arch = "x86_64")]
+  pub use crate::runner::aligner::algorithm::normalize::{x86_avx2, x86_avx512, x86_sse41};
 }

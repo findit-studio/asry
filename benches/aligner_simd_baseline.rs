@@ -21,6 +21,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, 
 
 #[cfg(target_arch = "aarch64")]
 use whispery::__bench::neon;
+#[cfg(target_arch = "x86_64")]
+use whispery::__bench::{x86_avx2, x86_avx512, x86_sse41};
 use whispery::{
   __bench::{LogProbsTV, ctc_viterbi, scalar, zero_mean_unit_var_normalize},
   Lang,
@@ -74,6 +76,40 @@ fn bench_normalize(c: &mut Criterion) {
         black_box(out);
       });
     });
+
+    // x86_64 backends. Each is gated on a runtime feature check
+    // so a host without that ISA quietly skips its bench rather
+    // than crashing with SIGILL. The host's `is_x86_feature_detected!`
+    // result is constant for the run, so the runtime check
+    // amortises to zero across Criterion's iterations.
+    #[cfg(target_arch = "x86_64")]
+    {
+      if std::is_x86_feature_detected!("sse4.1") {
+        group.bench_with_input(BenchmarkId::new("x86_sse41", n), &n, |b, &_n| {
+          b.iter(|| {
+            // SAFETY: feature checked above.
+            let out = unsafe { x86_sse41::zero_mean_unit_var_normalize(black_box(&samples)) };
+            black_box(out);
+          });
+        });
+      }
+      if std::is_x86_feature_detected!("avx2") {
+        group.bench_with_input(BenchmarkId::new("x86_avx2", n), &n, |b, &_n| {
+          b.iter(|| {
+            let out = unsafe { x86_avx2::zero_mean_unit_var_normalize(black_box(&samples)) };
+            black_box(out);
+          });
+        });
+      }
+      if std::is_x86_feature_detected!("avx512f") {
+        group.bench_with_input(BenchmarkId::new("x86_avx512", n), &n, |b, &_n| {
+          b.iter(|| {
+            let out = unsafe { x86_avx512::zero_mean_unit_var_normalize(black_box(&samples)) };
+            black_box(out);
+          });
+        });
+      }
+    }
 
     // Public dispatcher — what production hits. On aarch64 this
     // is identical to `neon` above; we still bench it so a future

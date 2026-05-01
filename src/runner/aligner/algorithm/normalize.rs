@@ -1,5 +1,5 @@
-// Crate-level `deny(unsafe_code)` is on; the NEON backend below is
-// the only place we deliberately reach for `core::arch` intrinsics.
+// Crate-level `deny(unsafe_code)` is on; the SIMD backends below are
+// the only places we deliberately reach for `core::arch` intrinsics.
 // Allow `unsafe_code` for this module exclusively so the choice is
 // auditable.
 #![allow(unsafe_code)]
@@ -9,30 +9,51 @@
 //! `Wav2Vec2FeatureExtractor.zero_mean_unit_var_norm` for the
 //! no-attention-mask case.
 //!
-//! **Backends.** A scalar reference is always compiled; an aarch64
-//! NEON variant ships when the target supports it. NEON is part of
-//! the aarch64 base ISA so no runtime detection is needed —
-//! `cfg!(target_arch = "aarch64")` is the gate. Other targets fall
-//! back to the scalar path. Both variants compute identical results
-//! to within f32 ULP (the bench-side test in `tests` enforces ≤ 1e-5
-//! abs error on a representative input).
+//! **Backends.** A scalar reference is always compiled. SIMD
+//! backends:
+//!
+//! - `neon` — aarch64 base ISA (4-lane f32). Always selected on
+//!   aarch64 — no runtime detection because NEON is mandatory.
+//! - `x86_sse41` — x86_64 with SSE4.1 (4-lane f32). The minimal
+//!   SIMD floor for x86_64 since 2008. We use SSE4.1 (not 4.2)
+//!   because 4.2 only adds CRC32 / string-search ops that don't
+//!   matter here.
+//! - `x86_avx2` — x86_64 with AVX2 (8-lane f32). Mainstream from
+//!   Haswell (2013) onwards.
+//! - `x86_avx512` — x86_64 with AVX-512F (16-lane f32). Premium
+//!   server CPUs (Skylake-X+, Ice Lake-SP, AMD Zen 4). Some chips
+//!   downclock under sustained AVX-512 use, so the dispatcher
+//!   only takes this path when the feature is detected — never
+//!   speculatively.
+//!
+//! `wasm32` simd128 is intentionally absent: the `alignment`
+//! feature requires `whisper-rs` and `ort`, neither of which
+//! supports `wasm32`. The kernel would compile but never run from
+//! a real consumer.
+//!
+//! **Dispatch.** `feature = "std"` enables runtime CPU-feature
+//! detection via `is_x86_feature_detected!` (cached in a static
+//! atomic, so per-call cost is one relaxed load + branch). Without
+//! `std` we fall back to compile-time `cfg!(target_feature)`
+//! (matching the same-named features the user enabled at build
+//! time). Every backend computes identical results to the scalar
+//! reference within f32 tolerance — per-target tests in `tests`
+//! enforce a ≤ 1e-4 abs-error contract on a 480 k-sample synthetic
+//! input.
 //!
 //! **Why not autovectorise.** The two-pass mean / variance reduction
 //! mixes f64 accumulation with f32 inputs to avoid catastrophic
 //! cancellation on long sequences. LLVM is reluctant to vectorise
 //! reductions across precision boundaries, so the f32-accumulating
-//! NEON path comes out measurably faster on real chunks (480 k
-//! samples for 30 s @ 16 kHz). The scalar path keeps the f64
-//! accumulator.
+//! SIMD paths come out measurably faster on real chunks (480 k
+//! samples for 30 s @ 16 kHz). All backends keep the f64 accumulator.
 
 use alloc::vec::Vec;
 
 /// Public entry point — picks the best implementation available at
-/// compile time. Equivalent to the prior `encode::zero_mean_unit_var_normalize`
-/// inline helper; kept module-public so the benches and unit tests
-/// can call into specific backends to measure their delta. `pub` for
-/// the `feature = "bench-internals"` re-export; consumers who don't
-/// enable that feature can't reach this path.
+/// runtime (under `feature = "std"`) or compile time (without).
+/// `pub` for the `feature = "bench-internals"` re-export; consumers
+/// who don't enable that feature can't reach this path.
 #[inline]
 pub fn zero_mean_unit_var_normalize(samples: &[f32]) -> Vec<f32> {
   #[cfg(target_arch = "aarch64")]
@@ -42,10 +63,48 @@ pub fn zero_mean_unit_var_normalize(samples: &[f32]) -> Vec<f32> {
     // intrinsics in an explicitly-enabled context.
     return unsafe { neon::zero_mean_unit_var_normalize(samples) };
   }
-  #[cfg(not(target_arch = "aarch64"))]
+  #[cfg(target_arch = "x86_64")]
   {
-    scalar::zero_mean_unit_var_normalize(samples)
+    // Runtime feature detection. `is_x86_feature_detected!`
+    // caches its result in a static atomic, so per-call cost is
+    // one relaxed load + branch.
+    #[cfg(feature = "std")]
+    {
+      if std::is_x86_feature_detected!("avx512f") {
+        // SAFETY: feature checked.
+        return unsafe { x86_avx512::zero_mean_unit_var_normalize(samples) };
+      }
+      if std::is_x86_feature_detected!("avx2") {
+        return unsafe { x86_avx2::zero_mean_unit_var_normalize(samples) };
+      }
+      if std::is_x86_feature_detected!("sse4.1") {
+        return unsafe { x86_sse41::zero_mean_unit_var_normalize(samples) };
+      }
+    }
+    // No-std compile-time fallback.
+    #[cfg(all(not(feature = "std"), target_feature = "avx512f"))]
+    {
+      return unsafe { x86_avx512::zero_mean_unit_var_normalize(samples) };
+    }
+    #[cfg(all(
+      not(feature = "std"),
+      target_feature = "avx2",
+      not(target_feature = "avx512f")
+    ))]
+    {
+      return unsafe { x86_avx2::zero_mean_unit_var_normalize(samples) };
+    }
+    #[cfg(all(
+      not(feature = "std"),
+      target_feature = "sse4.1",
+      not(target_feature = "avx2"),
+      not(target_feature = "avx512f")
+    ))]
+    {
+      return unsafe { x86_sse41::zero_mean_unit_var_normalize(samples) };
+    }
   }
+  scalar::zero_mean_unit_var_normalize(samples)
 }
 
 /// Scalar reference implementation. Always compiled; used directly
@@ -167,30 +226,300 @@ pub mod neon {
   }
 }
 
+/// x86_64 SSE4.1 backend. 4-lane f32 — same lane count as NEON,
+/// so the speed-up profile mirrors the aarch64 path.
+#[cfg(target_arch = "x86_64")]
+pub mod x86_sse41 {
+  use super::Vec;
+  use core::arch::x86_64::*;
+
+  /// Reduce a 4-lane `__m128` to its f32 horizontal sum.
+  /// SSE4.1 has no single-instruction reduce, so we shuffle-add
+  /// twice. Returns a scalar `f32` for the caller to widen to f64.
+  #[inline]
+  #[target_feature(enable = "sse4.1")]
+  unsafe fn hsum_ps(v: __m128) -> f32 {
+    unsafe {
+      let shuf = _mm_movehdup_ps(v); // [b, b, d, d]
+      let sums = _mm_add_ps(v, shuf); // [a+b, _, c+d, _]
+      let shuf2 = _mm_movehl_ps(sums, sums); // [c+d, _, _, _]
+      let sums = _mm_add_ss(sums, shuf2); // a+b+c+d in lane 0
+      _mm_cvtss_f32(sums)
+    }
+  }
+
+  /// SAFETY: caller must run on x86_64 with SSE4.1 available.
+  #[inline]
+  #[target_feature(enable = "sse4.1")]
+  pub unsafe fn zero_mean_unit_var_normalize(samples: &[f32]) -> Vec<f32> {
+    if samples.is_empty() {
+      return Vec::new();
+    }
+    let n = samples.len();
+    let nf = n as f64;
+
+    // Pass 1: horizontal sum into f64 accumulator.
+    let mut sum = 0.0_f64;
+    let mut i = 0usize;
+    unsafe {
+      while i + 4 <= n {
+        let v = _mm_loadu_ps(samples.as_ptr().add(i));
+        sum += hsum_ps(v) as f64;
+        i += 4;
+      }
+    }
+    while i < n {
+      sum += samples[i] as f64;
+      i += 1;
+    }
+    let mean = sum / nf;
+
+    // Pass 2: variance.
+    let mean_f32 = mean as f32;
+    let mean_v = unsafe { _mm_set1_ps(mean_f32) };
+    let mut var_sum = 0.0_f64;
+    let mut i = 0usize;
+    unsafe {
+      while i + 4 <= n {
+        let v = _mm_loadu_ps(samples.as_ptr().add(i));
+        let d = _mm_sub_ps(v, mean_v);
+        let sq = _mm_mul_ps(d, d);
+        var_sum += hsum_ps(sq) as f64;
+        i += 4;
+      }
+    }
+    while i < n {
+      let d = samples[i] as f64 - mean;
+      var_sum += d * d;
+      i += 1;
+    }
+    let var = var_sum / nf;
+    let inv_std = 1.0_f64 / (var + 1e-7_f64).sqrt();
+
+    // Pass 3: write-out.
+    let inv_std_f32 = inv_std as f32;
+    let inv_v = unsafe { _mm_set1_ps(inv_std_f32) };
+    let mut out: Vec<f32> = Vec::with_capacity(n);
+    let out_ptr = out.as_mut_ptr();
+    let mut i = 0usize;
+    unsafe {
+      while i + 4 <= n {
+        let v = _mm_loadu_ps(samples.as_ptr().add(i));
+        let normed = _mm_mul_ps(_mm_sub_ps(v, mean_v), inv_v);
+        _mm_storeu_ps(out_ptr.add(i), normed);
+        i += 4;
+      }
+      while i < n {
+        let s = *samples.as_ptr().add(i);
+        *out_ptr.add(i) = (s - mean_f32) * inv_std_f32;
+        i += 1;
+      }
+      out.set_len(n);
+    }
+    out
+  }
+}
+
+/// x86_64 AVX2 backend. 8-lane f32. Available on Haswell+ (2013).
+#[cfg(target_arch = "x86_64")]
+pub mod x86_avx2 {
+  use super::Vec;
+  use core::arch::x86_64::*;
+
+  /// Reduce a 256-bit `__m256` to its f32 horizontal sum: collapse
+  /// to a 128-bit lane-sum, then SSE4.1-style shuffle-add.
+  #[inline]
+  #[target_feature(enable = "avx2")]
+  unsafe fn hsum_ps(v: __m256) -> f32 {
+    unsafe {
+      let lo = _mm256_castps256_ps128(v);
+      let hi = _mm256_extractf128_ps(v, 1);
+      let s = _mm_add_ps(lo, hi);
+      let shuf = _mm_movehdup_ps(s);
+      let sums = _mm_add_ps(s, shuf);
+      let shuf2 = _mm_movehl_ps(sums, sums);
+      let sums = _mm_add_ss(sums, shuf2);
+      _mm_cvtss_f32(sums)
+    }
+  }
+
+  /// SAFETY: caller must run on x86_64 with AVX2 available.
+  #[inline]
+  #[target_feature(enable = "avx2")]
+  pub unsafe fn zero_mean_unit_var_normalize(samples: &[f32]) -> Vec<f32> {
+    if samples.is_empty() {
+      return Vec::new();
+    }
+    let n = samples.len();
+    let nf = n as f64;
+
+    // Pass 1: horizontal sum.
+    let mut sum = 0.0_f64;
+    let mut i = 0usize;
+    unsafe {
+      while i + 8 <= n {
+        let v = _mm256_loadu_ps(samples.as_ptr().add(i));
+        sum += hsum_ps(v) as f64;
+        i += 8;
+      }
+    }
+    while i < n {
+      sum += samples[i] as f64;
+      i += 1;
+    }
+    let mean = sum / nf;
+
+    // Pass 2: variance.
+    let mean_f32 = mean as f32;
+    let mean_v = unsafe { _mm256_set1_ps(mean_f32) };
+    let mut var_sum = 0.0_f64;
+    let mut i = 0usize;
+    unsafe {
+      while i + 8 <= n {
+        let v = _mm256_loadu_ps(samples.as_ptr().add(i));
+        let d = _mm256_sub_ps(v, mean_v);
+        let sq = _mm256_mul_ps(d, d);
+        var_sum += hsum_ps(sq) as f64;
+        i += 8;
+      }
+    }
+    while i < n {
+      let d = samples[i] as f64 - mean;
+      var_sum += d * d;
+      i += 1;
+    }
+    let var = var_sum / nf;
+    let inv_std = 1.0_f64 / (var + 1e-7_f64).sqrt();
+
+    // Pass 3: write-out.
+    let inv_std_f32 = inv_std as f32;
+    let inv_v = unsafe { _mm256_set1_ps(inv_std_f32) };
+    let mut out: Vec<f32> = Vec::with_capacity(n);
+    let out_ptr = out.as_mut_ptr();
+    let mut i = 0usize;
+    unsafe {
+      while i + 8 <= n {
+        let v = _mm256_loadu_ps(samples.as_ptr().add(i));
+        let normed = _mm256_mul_ps(_mm256_sub_ps(v, mean_v), inv_v);
+        _mm256_storeu_ps(out_ptr.add(i), normed);
+        i += 8;
+      }
+      while i < n {
+        let s = *samples.as_ptr().add(i);
+        *out_ptr.add(i) = (s - mean_f32) * inv_std_f32;
+        i += 1;
+      }
+      out.set_len(n);
+    }
+    out
+  }
+}
+
+/// x86_64 AVX-512F backend. 16-lane f32. Premium-server only.
+/// Some Skylake-X / Ice Lake chips downclock under sustained
+/// AVX-512 use, so the dispatcher only takes this path when the
+/// runtime feature is actually present.
+#[cfg(target_arch = "x86_64")]
+pub mod x86_avx512 {
+  use super::Vec;
+  use core::arch::x86_64::*;
+
+  /// SAFETY: caller must run on x86_64 with AVX-512F available.
+  #[inline]
+  #[target_feature(enable = "avx512f")]
+  pub unsafe fn zero_mean_unit_var_normalize(samples: &[f32]) -> Vec<f32> {
+    if samples.is_empty() {
+      return Vec::new();
+    }
+    let n = samples.len();
+    let nf = n as f64;
+
+    // Pass 1: horizontal sum. AVX-512 has a single-instruction
+    // 16-lane reduce.
+    let mut sum = 0.0_f64;
+    let mut i = 0usize;
+    unsafe {
+      while i + 16 <= n {
+        let v = _mm512_loadu_ps(samples.as_ptr().add(i));
+        sum += _mm512_reduce_add_ps(v) as f64;
+        i += 16;
+      }
+    }
+    while i < n {
+      sum += samples[i] as f64;
+      i += 1;
+    }
+    let mean = sum / nf;
+
+    // Pass 2: variance.
+    let mean_f32 = mean as f32;
+    let mean_v = unsafe { _mm512_set1_ps(mean_f32) };
+    let mut var_sum = 0.0_f64;
+    let mut i = 0usize;
+    unsafe {
+      while i + 16 <= n {
+        let v = _mm512_loadu_ps(samples.as_ptr().add(i));
+        let d = _mm512_sub_ps(v, mean_v);
+        let sq = _mm512_mul_ps(d, d);
+        var_sum += _mm512_reduce_add_ps(sq) as f64;
+        i += 16;
+      }
+    }
+    while i < n {
+      let d = samples[i] as f64 - mean;
+      var_sum += d * d;
+      i += 1;
+    }
+    let var = var_sum / nf;
+    let inv_std = 1.0_f64 / (var + 1e-7_f64).sqrt();
+
+    // Pass 3: write-out.
+    let inv_std_f32 = inv_std as f32;
+    let inv_v = unsafe { _mm512_set1_ps(inv_std_f32) };
+    let mut out: Vec<f32> = Vec::with_capacity(n);
+    let out_ptr = out.as_mut_ptr();
+    let mut i = 0usize;
+    unsafe {
+      while i + 16 <= n {
+        let v = _mm512_loadu_ps(samples.as_ptr().add(i));
+        let normed = _mm512_mul_ps(_mm512_sub_ps(v, mean_v), inv_v);
+        _mm512_storeu_ps(out_ptr.add(i), normed);
+        i += 16;
+      }
+      while i < n {
+        let s = *samples.as_ptr().add(i);
+        *out_ptr.add(i) = (s - mean_f32) * inv_std_f32;
+        i += 1;
+      }
+      out.set_len(n);
+    }
+    out
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
 
-  /// The scalar and NEON paths must agree to within f32 ULP on a
-  /// representative chunk. Anything bigger is a bug in the SIMD
-  /// kernel.
-  #[cfg(target_arch = "aarch64")]
-  #[test]
-  fn neon_matches_scalar() {
-    // 30 s @ 16 kHz mock audio with gain + offset, chosen to
-    // exercise both the vector body and the scalar tail
-    // (480_001 forces a 1-sample tail).
-    let n = 480_001;
+  /// 30 s @ 16 kHz with gain + DC offset, length chosen to force
+  /// a non-zero scalar tail in every backend (480_001 = 30000 *
+  /// 16 + 1).
+  fn synth_input(n: usize) -> Vec<f32> {
     let mut samples: Vec<f32> = Vec::with_capacity(n);
     for i in 0..n {
       let t = i as f32 / 16_000.0;
       samples.push(2.7 * (2.0 * core::f32::consts::PI * 220.0 * t).sin() + 0.13);
     }
-    let s = scalar::zero_mean_unit_var_normalize(&samples);
-    let v = unsafe { neon::zero_mean_unit_var_normalize(&samples) };
-    assert_eq!(s.len(), v.len());
+    samples
+  }
+
+  /// Asserts a SIMD result agrees with the scalar reference to
+  /// within `1e-4` absolute on every sample. Centralises the
+  /// per-backend match-test pattern.
+  fn assert_matches_scalar(simd: &[f32], scalar: &[f32]) {
+    assert_eq!(simd.len(), scalar.len(), "SIMD length mismatch");
     let mut max_abs = 0.0_f32;
-    for (a, b) in s.iter().zip(v.iter()) {
+    for (a, b) in simd.iter().zip(scalar.iter()) {
       let d = (a - b).abs();
       if d > max_abs {
         max_abs = d;
@@ -198,8 +527,53 @@ mod tests {
     }
     assert!(
       max_abs < 1e-4,
-      "NEON deviates from scalar: max abs error = {max_abs}",
+      "SIMD deviates from scalar: max abs error = {max_abs}",
     );
+  }
+
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  fn neon_matches_scalar() {
+    let samples = synth_input(480_001);
+    let s = scalar::zero_mean_unit_var_normalize(&samples);
+    let v = unsafe { neon::zero_mean_unit_var_normalize(&samples) };
+    assert_matches_scalar(&v, &s);
+  }
+
+  #[cfg(target_arch = "x86_64")]
+  #[test]
+  fn x86_sse41_matches_scalar() {
+    if !std::is_x86_feature_detected!("sse4.1") {
+      return; // skip on machines without SSE4.1
+    }
+    let samples = synth_input(480_001);
+    let s = scalar::zero_mean_unit_var_normalize(&samples);
+    let v = unsafe { x86_sse41::zero_mean_unit_var_normalize(&samples) };
+    assert_matches_scalar(&v, &s);
+  }
+
+  #[cfg(target_arch = "x86_64")]
+  #[test]
+  fn x86_avx2_matches_scalar() {
+    if !std::is_x86_feature_detected!("avx2") {
+      return;
+    }
+    let samples = synth_input(480_001);
+    let s = scalar::zero_mean_unit_var_normalize(&samples);
+    let v = unsafe { x86_avx2::zero_mean_unit_var_normalize(&samples) };
+    assert_matches_scalar(&v, &s);
+  }
+
+  #[cfg(target_arch = "x86_64")]
+  #[test]
+  fn x86_avx512_matches_scalar() {
+    if !std::is_x86_feature_detected!("avx512f") {
+      return;
+    }
+    let samples = synth_input(480_001);
+    let s = scalar::zero_mean_unit_var_normalize(&samples);
+    let v = unsafe { x86_avx512::zero_mean_unit_var_normalize(&samples) };
+    assert_matches_scalar(&v, &s);
   }
 
   #[test]
