@@ -270,6 +270,51 @@ impl Aligner {
     self
   }
 
+  /// Public alignment entrypoint for parity / benchmarking
+  /// tooling that drives the pipeline without
+  /// [`crate::ManagedTranscriber`]. Constructs default
+  /// [`RunOptions`] + abort flag internally and delegates to the
+  /// crate-private [`Self::align`].
+  ///
+  /// Inputs match [`Self::align`] minus the
+  /// `abort_flag` / `run_options` infrastructure. See that
+  /// method's doc-comment for argument semantics.
+  ///
+  /// Returns [`WorkFailure::AlignmentFailed`] with kind
+  /// [`crate::types::AlignmentFailureKind::ModelInferenceFailed`]
+  /// if [`RunOptions::new`] fails (rare; ORT initialisation
+  /// hiccup) — same shape as the worker's internal mapping so
+  /// downstream error handling stays uniform across entrypoints.
+  pub fn align_chunk<F>(
+    &mut self,
+    samples: &[f32],
+    sub_segments: &[TimeRange],
+    text: &str,
+    chunk_first_sample_in_stream: u64,
+    samples_to_output_range: F,
+  ) -> Result<AlignmentResult, WorkFailure>
+  where
+    F: Fn(u64, u64) -> TimeRange,
+  {
+    use crate::types::AlignmentFailureKind;
+
+    let abort_flag = core::sync::atomic::AtomicBool::new(false);
+    let run_options = RunOptions::new().map_err(|e| WorkFailure::AlignmentFailed {
+      kind: AlignmentFailureKind::ModelInferenceFailed,
+      message: alloc::format!("RunOptions::new failed: {e:?}"),
+      language: self.language.clone(),
+    })?;
+    self.align(
+      samples,
+      sub_segments,
+      text,
+      chunk_first_sample_in_stream,
+      samples_to_output_range,
+      &abort_flag,
+      &run_options,
+    )
+  }
+
   /// Crate-private alignment entrypoint.
   ///
   /// Inputs:

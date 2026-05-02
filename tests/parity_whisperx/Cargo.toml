@@ -1,0 +1,24 @@
+[workspace]
+
+[package]
+name        = "whispery-parity-runner"
+version     = "0.0.0"
+edition     = "2024"
+publish     = false
+description = "Manual parity harness: dump whispery alignment output to JSON for side-by-side comparison with WhisperX."
+
+[dependencies]
+# `whispery` carries the `runner` + `alignment` features that this binary
+# exercises. Pinned by path because this is in-tree tooling, not a
+# downstream consumer.
+whispery     = { path = "../..", default-features = false, features = ["runner", "alignment"] }
+whisper-rs   = { version = "0.13", default-features = false }
+hound        = "3"
+serde_json   = "1"
+clap         = { version = "4", features = ["derive"] }
+sha2         = "0.10"
+anyhow       = "1"
+
+[[bin]]
+name = "whispery-parity-runner"
+path = "src/main.rs"

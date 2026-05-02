@@ -1,0 +1,6 @@
+out/
+python/.venv/
+python/uv.lock
+python/*.egg-info/
+target/
+Cargo.lock
