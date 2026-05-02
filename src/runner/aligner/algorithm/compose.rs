@@ -276,6 +276,14 @@ pub(crate) fn compose_words<F>(
   speech_frames: &[bool],
   chunk_first_sample_in_stream: u64,
   hop_samples: u32,
+  // `n_samples` is the chunk's input audio length in 16 kHz
+  // samples. Word ranges are clamped to
+  // `[chunk_first_sample, chunk_first_sample + n_samples]` so
+  // the stride validator's 2-frame overshoot tolerance can't
+  // leak into emitted word timestamps. Pass `u64::MAX` to
+  // disable clamping (only meaningful for unit tests with
+  // synthetic frame counts).
+  n_samples: u64,
   samples_to_output_range: F,
   min_speech_coverage: f32,
   max_intra_silent_run: Duration,
@@ -302,6 +310,14 @@ where
     max_silent_run_frames,
   );
 
+  // Clamp ceiling: word ranges must not extend past the
+  // chunk's audio. The stride validator allows up to two
+  // frames of overshoot for CNN edge effects, which would
+  // otherwise leak into emitted word timestamps —
+  // user-visible overlap with later audio. `saturating_add`
+  // is a safety net for the `u64::MAX` test sentinel.
+  let chunk_end_sample = chunk_first_sample_in_stream.saturating_add(n_samples);
+
   let mut words: Vec<Word> = Vec::with_capacity(n_words);
   for (i, slot) in per_word.iter().enumerate() {
     let Some(accum) = slot else {
@@ -310,7 +326,20 @@ where
     let start_sample =
       chunk_first_sample_in_stream + (accum.start_frame as u64) * (hop_samples as u64);
     let end_sample = chunk_first_sample_in_stream + (accum.end_frame as u64) * (hop_samples as u64);
-    let range = samples_to_output_range(start_sample, end_sample);
+
+    // If the word's first speech-supported frame is already
+    // past the chunk's audio, drop the word — there's no
+    // honest range to emit (the model placed every emission
+    // in the overshoot region). This is rare but possible
+    // when the encoder returns the maximum tolerated
+    // overshoot.
+    if start_sample >= chunk_end_sample {
+      continue;
+    }
+    // Otherwise clamp the end so no Word range claims audio
+    // past the chunk boundary.
+    let clamped_end = end_sample.min(chunk_end_sample);
+    let range = samples_to_output_range(start_sample, clamped_end);
 
     let mean_lp = accum.logprob_sum / (accum.speech_emissions.max(1) as f32);
     let score = mean_lp.exp().clamp(0.0, 1.0);
@@ -364,6 +393,7 @@ mod tests {
       &speech_frames,
       0,
       320,
+      u64::MAX,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -397,6 +427,7 @@ mod tests {
       &speech_frames,
       0,
       320,
+      u64::MAX,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -429,6 +460,7 @@ mod tests {
       &speech_frames,
       0,
       320,
+      u64::MAX,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -460,6 +492,7 @@ mod tests {
       &speech_frames,
       8_000,
       320,
+      u64::MAX,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -497,6 +530,7 @@ mod tests {
       &speech_frames,
       0,
       320,
+      u64::MAX,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -529,6 +563,7 @@ mod tests {
       &speech_frames,
       0,
       320,
+      u64::MAX,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -569,6 +604,7 @@ mod tests {
       &speech_frames,
       0,
       320,
+      u64::MAX,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -621,6 +657,7 @@ mod tests {
       &speech_frames,
       0,
       320,
+      u64::MAX,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -668,6 +705,7 @@ mod tests {
       &speech_frames,
       0,
       320,
+      u64::MAX,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -675,6 +713,91 @@ mod tests {
     assert!(
       result.words().is_empty(),
       "word with 19-frame intra-silent run must drop; got {:?}",
+      result.words()
+    );
+  }
+
+  /// Clamping word ranges to chunk bounds: when the encoder
+  /// returns up to its 2-frame overshoot tolerance, raw
+  /// `frame * hop` math would put the last word's end past
+  /// the chunk's audio. The clamp at the compose boundary
+  /// stops that leaking into emitted timestamps.
+  #[test]
+  fn word_ranges_are_clamped_to_chunk_bounds() {
+    // 4 frames; word emits at every frame including the
+    // overshoot frame 3.
+    let path = ViterbiPath {
+      state_per_frame: alloc::vec![1, 1, 1, 1],
+      tokens: alloc::vec![10],
+    };
+    let log_probs = lp_const(4, 30, -1.0);
+    let word_idx_per_token = alloc::vec![Some(0)];
+    let original = alloc::vec![Cow::Borrowed("ok")];
+    let speech_frames = alloc::vec![true; 4];
+
+    // Chunk's actual audio length is 1000 samples (3 full
+    // frames + 40 samples). Frame 3's [3*320, 4*320) =
+    // [960, 1280) extends 280 samples past the chunk.
+    let result = compose_words(
+      &path,
+      &log_probs,
+      &word_idx_per_token,
+      &original,
+      &speech_frames,
+      0,
+      320,
+      /* n_samples: */ 1000,
+      fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
+    );
+    assert_eq!(result.words().len(), 1);
+    let r = result.words()[0].range();
+    // start_frame=0 → 0 (well within chunk).
+    assert_eq!(r.start_pts(), 0);
+    // end_frame=4 → raw 4*320=1280, clamped to chunk_end=1000.
+    assert_eq!(
+      r.end_pts(),
+      1000,
+      "end must clamp to chunk bound (1000), not raw 1280; got {}",
+      r.end_pts()
+    );
+  }
+
+  /// If the word's first speech-supported frame is past the
+  /// chunk boundary entirely (every emission lands in the
+  /// overshoot tail), the word drops — there's no honest
+  /// range to report.
+  #[test]
+  fn word_entirely_in_overshoot_drops() {
+    // 4 frames; word emits ONLY at frame 3 (the overshoot).
+    let path = ViterbiPath {
+      state_per_frame: alloc::vec![0, 0, 0, 1],
+      tokens: alloc::vec![10],
+    };
+    let log_probs = lp_const(4, 30, -1.0);
+    let word_idx_per_token = alloc::vec![Some(0)];
+    let original = alloc::vec![Cow::Borrowed("late")];
+    let speech_frames = alloc::vec![true; 4];
+
+    // n_samples=900 — frames 0,1,2 fit ([0,960)≈960 samples)
+    // and frame 3 starts at 960 which is past chunk_end=900.
+    let result = compose_words(
+      &path,
+      &log_probs,
+      &word_idx_per_token,
+      &original,
+      &speech_frames,
+      0,
+      320,
+      /* n_samples: */ 900,
+      fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
+    );
+    assert!(
+      result.words().is_empty(),
+      "word emitting only in the overshoot tail must drop; got {:?}",
       result.words()
     );
   }
@@ -707,6 +830,7 @@ mod tests {
       &speech_frames,
       0,
       320,
+      u64::MAX,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -748,6 +872,7 @@ mod tests {
       &speech_frames,
       0,
       320,
+      u64::MAX,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -766,6 +891,7 @@ mod tests {
       &speech_frames,
       0,
       320,
+      u64::MAX,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       Duration::from_millis(100),
@@ -804,6 +930,7 @@ mod tests {
       &speech_frames,
       0,
       320,
+      u64::MAX,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -824,6 +951,7 @@ mod tests {
       &speech_frames,
       0,
       320,
+      u64::MAX,
       fake_samples_to_output_range,
       0.9,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -863,6 +991,7 @@ mod tests {
       &speech_frames,
       0,
       320,
+      u64::MAX,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -902,6 +1031,7 @@ mod tests {
       &speech_frames,
       0,
       320,
+      u64::MAX,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -1013,6 +1143,7 @@ mod tests {
       &speech_frames,
       0,
       320,
+      u64::MAX,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,

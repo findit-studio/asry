@@ -511,6 +511,11 @@ impl Aligner {
       &speech_frames,
       chunk_first_sample_in_stream,
       self.hop_samples,
+      // Pass the chunk's input audio length so word ranges
+      // get clamped to the chunk boundary (the stride
+      // validator's 2-frame overshoot tolerance can't leak
+      // into emitted word timestamps).
+      samples.len() as u64,
       samples_to_output_range,
       self.min_speech_coverage,
       self.max_intra_silent_run,

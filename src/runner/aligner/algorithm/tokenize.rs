@@ -47,24 +47,30 @@ pub(crate) struct TokenizedText {
 /// boundaries — the bug that motivated this parameter.
 ///
 /// `unk_token_id`, when supplied, is used to **detect
-/// out-of-vocab characters and drop the whole word** rather
-/// than fail the whole chunk. Whitelisted unspoken punctuation
-/// (currently just internal `.`) is pre-stripped from the word
-/// before encoding — `U.S.A.` becomes `USA` and aligns
-/// correctly with the original surface form preserved on the
-/// emitted `Word`. *After* that strip, any remaining `<unk>`
-/// in the encoded ids represents a *semantic* OOV character
-/// the model can't align (a digit in a letters-only vocab, an
-/// `&` in `AT&T`, an accented letter against an ASCII-only
-/// vocab). The whole word's group is set to empty in that
-/// case, so the word never appears in `word_idx_per_token` and
-/// `compose_words` drops it from the output. Pre-fix the
-/// tokenizer dropped `<unk>` ids one by one, keeping the
-/// in-vocab subset and emitting a `Word` whose `text` was the
-/// full original surface (`A1` / `B2B` / `AT&T` / `café`)
-/// while the timing range covered only the in-vocab letters
-/// — search/highlighting consumers would land on the wrong
-/// audio.
+/// out-of-vocab characters and drop the whole chunk's
+/// alignment** rather than fail the chunk outright.
+/// Whitelisted unspoken punctuation (currently just internal
+/// `.`) is pre-stripped from the word before encoding —
+/// `U.S.A.` becomes `USA` and aligns correctly with the
+/// original surface form preserved on the emitted `Word`.
+/// *After* that strip, any remaining `<unk>` in the encoded
+/// ids represents a *semantic* OOV character the model can't
+/// align (a digit in a letters-only vocab, an `&` in `AT&T`,
+/// an accented letter against an ASCII-only vocab). When any
+/// word produces a semantic OOV the function returns an empty
+/// [`TokenizedText`] — `Aligner::align` short-circuits to an
+/// empty `AlignmentResult` and the chunk surfaces with
+/// `Transcript { text, words: [] }`.
+///
+/// The fail-closed-on-chunk policy avoids "bridging" across
+/// the OOV word in the CTC lattice. If we kept neighbors and
+/// dropped just the OOV word's tokens, Viterbi would have to
+/// absorb the skipped word's audio into blank/self-loop
+/// transitions on the neighboring words — silently shifting
+/// their timestamp ranges into frames where they weren't
+/// actually pronounced. Returning empty for the chunk lets
+/// the caller see the OOV-tainted text without trusting any
+/// of its per-word timings.
 ///
 /// **Empty result is `Ok`, not `Err`.** A chunk like `"1000"`
 /// against an A-Z vocab maps every character to `<unk>` and
@@ -128,6 +134,15 @@ pub(crate) fn tokenize_with_word_map(
   // an unspoken delimiter state in the CTC graph — Viterbi would
   // burn frames on it and shift the timing of neighbouring real
   // words.
+  // First pass: encode every word, watching for semantic OOV.
+  // If any word has a non-whitelisted OOV character, drop the
+  // whole chunk's alignment by returning an empty
+  // `TokenizedText` — bridging across the OOV word in the CTC
+  // lattice would let Viterbi absorb the skipped audio into
+  // blank/self-loop transitions and silently shift neighbor
+  // word timings. Failing closed at chunk granularity is the
+  // honest answer; the chunk's `Transcript.text` still carries
+  // the full surface form, just without per-word timestamps.
   let mut per_word_tokens: Vec<Vec<u32>> = Vec::with_capacity(words.len());
   for word in &words {
     // Pre-strip whitelisted internal punctuation that's never
@@ -135,7 +150,8 @@ pub(crate) fn tokenize_with_word_map(
     // `U.S.A.`). Anything not on the whitelist either belongs
     // in the vocab (apostrophe in contractions) or is a
     // semantic character the model legitimately can't align —
-    // those go through the encoder as-is.
+    // those go through the encoder as-is and trigger the
+    // chunk-level drop below.
     let needs_strip = word.contains(is_skippable_internal_punct);
     let stripped: Cow<'_, str> = if needs_strip {
       Cow::Owned(
@@ -159,23 +175,24 @@ pub(crate) fn tokenize_with_word_map(
         message: alloc::format!("encode({:?}) failed: {e:?}", word),
         language: language.clone(),
       })?;
-    // Semantic-OOV check: if any encoded id is `<unk>` after
-    // the whitelist strip, the word has at least one character
-    // the model can't align. Dropping the *entire* word's
-    // group (rather than dropping individual `<unk>` ids and
-    // keeping the partial alignment) prevents emitting a
-    // `Word` whose `text` is the full surface form but whose
-    // timing range covers only the in-vocab subset.
+    // Semantic-OOV check: any `<unk>` after the whitelist
+    // strip means at least one character the model can't
+    // align. We can't safely keep this word's neighbors —
+    // bridging the OOV in the CTC lattice would let Viterbi
+    // absorb the skipped audio into blanks and shift the
+    // neighboring word ranges into frames where they weren't
+    // actually pronounced. Drop the whole chunk.
     let has_semantic_oov = match unk_token_id {
       Some(unk) => encoding.get_ids().iter().any(|&id| id == unk),
       None => false,
     };
-    let group: Vec<u32> = if has_semantic_oov {
-      Vec::new()
-    } else {
-      encoding.get_ids().to_vec()
-    };
-    per_word_tokens.push(group);
+    if has_semantic_oov {
+      return Ok(TokenizedText {
+        token_ids: Vec::new(),
+        word_idx_per_token: Vec::new(),
+      });
+    }
+    per_word_tokens.push(encoding.get_ids().to_vec());
   }
 
   // Pass 2: flatten into the final token stream, inserting the
@@ -453,112 +470,107 @@ mod tests {
     );
   }
 
-  /// Mixed sentence: a partial-OOV word in the middle drops,
-  /// but the surrounding all-in-vocab words keep their
-  /// alignment and the inter-word `|` separates them
-  /// correctly (no orphan delimiter for the dropped word's
-  /// position).
+  /// A partial-OOV word in the middle of a sentence forces the
+  /// **entire chunk's** alignment to drop. Pre-fix this test
+  /// asserted the OOV word was skipped while neighbors stayed
+  /// aligned and a single `|` bridged them. That bridging let
+  /// the CTC lattice absorb the skipped word's audio into
+  /// blank transitions on the surrounding words, silently
+  /// shifting their timestamp ranges. The new contract: any
+  /// semantic OOV → empty TokenizedText for the whole chunk,
+  /// and `Aligner::align` surfaces the chunk's transcript
+  /// with `words: []`.
   #[test]
-  fn partial_oov_word_in_middle_doesnt_corrupt_neighbors() {
+  fn partial_oov_word_in_middle_drops_whole_chunk_alignment() {
     let tok = uppercase_tokenizer();
     let unk = tok.token_to_id("<unk>");
-    let pipe = tok.token_to_id("|").unwrap();
 
     let result =
       tokenize_with_word_map(&tok, "hi B2B end", 3, true, true, unk, &Lang::En).expect("ok");
 
-    // word 0 = "hi" → [H, I]
-    // word 1 = "B2B" → empty (semantic OOV)
-    // word 2 = "end" → [E, N, D]
-    // Separator: only one `|` between hi and end (B2B's
-    // empty group must not leave an orphan delimiter).
-    let pipe_count = result.token_ids.iter().filter(|&&id| id == pipe).count();
-    assert_eq!(
-      pipe_count, 1,
-      "exactly one `|` between the two non-empty groups; got {pipe_count} in {:?}",
+    assert!(
+      result.token_ids.is_empty(),
+      "any semantic-OOV word must drop the whole chunk's \
+       alignment; got tokens for hi/end despite B2B being OOV: {:?}",
       result.token_ids
     );
-    // word 1 ("B2B") must not appear in word_idx_per_token.
+    assert!(result.word_idx_per_token.is_empty());
+  }
+
+  /// Companion: a partial-OOV word at the end of the sentence
+  /// also drops the whole chunk. Pre-fix the trailing OOV
+  /// just got skipped and `hi end` aligned alone.
+  #[test]
+  fn partial_oov_trailing_word_drops_whole_chunk_alignment() {
+    let tok = uppercase_tokenizer();
+    let unk = tok.token_to_id("<unk>");
+
+    let result =
+      tokenize_with_word_map(&tok, "hi end B2B", 3, true, true, unk, &Lang::En).expect("ok");
     assert!(
-      result.word_idx_per_token.iter().all(|w| *w != Some(1)),
-      "B2B (word 1) must contribute zero tokens; got {:?}",
-      result.word_idx_per_token
+      result.token_ids.is_empty(),
+      "trailing OOV must drop whole chunk; got {:?}",
+      result.token_ids
     );
   }
 
-  /// Leading all-OOV word: the orphan-delimiter fix makes sure
-  /// the leading `1000` (zero in-vocab chars) does NOT leave a
-  /// stray `|` token in the CTC stream. Pre-fix, that orphan
-  /// delimiter made Viterbi burn a frame on an unspoken word
-  /// boundary, shifting `hello`'s timestamps left.
+  /// Leading all-OOV word: chunk-level drop. Pre-fix, the
+  /// leading `1000` was skipped and `hello` aligned alone
+  /// without an orphan `|`. Bridging across `1000`'s audio
+  /// would let CTC absorb the spoken digits into `hello`'s
+  /// blank transitions and shift its timestamps. The new
+  /// strict policy is to drop the chunk's alignment whenever
+  /// any word has semantic OOV.
   #[test]
-  fn leading_all_unk_word_emits_no_orphan_delimiter() {
+  fn leading_all_unk_word_drops_whole_chunk() {
     let tok = uppercase_tokenizer();
     let unk = tok.token_to_id("<unk>");
-    let pipe = tok.token_to_id("|").unwrap();
 
     let result =
       tokenize_with_word_map(&tok, "1000 hello", 2, true, true, unk, &Lang::En).expect("ok");
-
-    // Five letter ids tagged with word_idx=1 ("hello"); zero
-    // tokens for word 0; **no `|` token in the stream** because
-    // there's no preceding non-empty group to separate from.
-    assert_eq!(result.token_ids.len(), 5);
     assert!(
-      !result.token_ids.contains(&pipe),
-      "no orphan `|` for leading all-OOV word; got {:?}",
+      result.token_ids.is_empty(),
+      "leading all-OOV `1000` must drop chunk alignment; got {:?}",
       result.token_ids
     );
-    assert!(
-      result.word_idx_per_token.iter().all(|w| *w != Some(0)),
-      "all-<unk> word 0 must contribute zero tokens"
-    );
+    assert!(result.word_idx_per_token.is_empty());
   }
 
-  /// Trailing all-OOV word: same invariant — no trailing `|`.
+  /// Trailing all-OOV word: same chunk-level drop.
   #[test]
-  fn trailing_all_unk_word_emits_no_orphan_delimiter() {
+  fn trailing_all_unk_word_drops_whole_chunk() {
     let tok = uppercase_tokenizer();
     let unk = tok.token_to_id("<unk>");
-    let pipe = tok.token_to_id("|").unwrap();
 
     let result =
       tokenize_with_word_map(&tok, "hello 1000", 2, true, true, unk, &Lang::En).expect("ok");
-
-    assert_eq!(result.token_ids.len(), 5);
-    assert!(!result.token_ids.contains(&pipe));
+    assert!(result.token_ids.is_empty());
+    assert!(result.word_idx_per_token.is_empty());
   }
 
-  /// Middle all-OOV word: `hello 1000 world` → letters of
-  /// `hello`, single `|`, letters of `world`. Pre-fix there
-  /// would have been TWO `|` tokens around the OOV middle
-  /// word, doubling the unspoken delimiter mass.
+  /// Middle all-OOV word: chunk-level drop. Pre-fix this
+  /// emitted `hello | world` and let CTC absorb `1000`'s
+  /// audio into the blank/self-loop region between `hello`
+  /// and `world` — risk of timing drift on the neighbours.
   #[test]
-  fn middle_all_unk_word_emits_single_delimiter() {
+  fn middle_all_unk_word_drops_whole_chunk() {
     let tok = uppercase_tokenizer();
     let unk = tok.token_to_id("<unk>");
-    let pipe = tok.token_to_id("|").unwrap();
 
     let result =
       tokenize_with_word_map(&tok, "hello 1000 world", 3, true, true, unk, &Lang::En).expect("ok");
-
-    let pipe_count = result.token_ids.iter().filter(|&&id| id == pipe).count();
-    assert_eq!(
-      pipe_count, 1,
-      "exactly one `|` between the two real words; got {:?}",
+    assert!(
+      result.token_ids.is_empty(),
+      "middle all-OOV `1000` must drop chunk alignment; got {:?}",
       result.token_ids
     );
-    // hello(5) + `|`(1) + world(5) = 11
-    assert_eq!(result.token_ids.len(), 11);
   }
 
-  /// Real word sandwiched by all-OOV words on both sides:
-  /// only the real word's letters survive, no delimiters.
+  /// Real word sandwiched by all-OOV words: same drop.
   #[test]
-  fn all_unk_words_around_real_word_emit_no_delimiters() {
+  fn all_unk_words_around_real_word_drop_whole_chunk() {
     let tok = uppercase_tokenizer();
     let unk = tok.token_to_id("<unk>");
-    let pipe = tok.token_to_id("|").unwrap();
 
     let result = tokenize_with_word_map(
       &tok,
@@ -570,8 +582,6 @@ mod tests {
       &Lang::En,
     )
     .expect("ok");
-
-    assert_eq!(result.token_ids.len(), 5);
-    assert!(!result.token_ids.contains(&pipe));
+    assert!(result.token_ids.is_empty());
   }
 }
