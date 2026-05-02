@@ -90,7 +90,14 @@ pub(crate) fn build_speech_frames(
   // mostly zero-masked audio. ≥50 % is the natural threshold
   // — frames whose majority of samples are silence don't
   // qualify; frames whose majority is speech do.
-  let min_overlap_samples = hop / 2;
+  //
+  // Use ceil-half so odd custom strides still need a strict
+  // majority of samples (`hop=3` → 2 samples, not 1) and
+  // clamp the threshold to ≥1 so `hop=1` doesn't trivialise
+  // to "any-overlap-counts" — without the clamp, an empty
+  // sub_segments list would pass the `>= 0` check for every
+  // frame and mark the whole chunk as speech.
+  let min_overlap_samples = ((hop + 1) / 2).max(1);
   let mut overlap_per_frame = alloc::vec![0_i64; n_frames];
   for seg in sub_segments {
     let seg_start = seg.start_pts().max(0);
@@ -1056,6 +1063,54 @@ mod tests {
   fn build_speech_frames_handles_no_segments() {
     let mask = build_speech_frames(4, 320, &[]);
     assert_eq!(mask, alloc::vec![false; 4]);
+  }
+
+  /// `hop_samples == 1` with no VAD segments must produce an
+  /// all-false mask. Pre-fix the threshold floored to `0`
+  /// (because `1 / 2 = 0`) and `0 >= 0` for every frame's zero
+  /// overlap, so an empty `sub_segments` list marked every
+  /// frame as speech — defeating the silence-mask drop and
+  /// emitting forced-alignment timestamps over non-speech
+  /// audio. Ceil-half + min-1 fixes both branches.
+  #[test]
+  fn build_speech_frames_hop_one_with_no_segments_is_all_silence() {
+    let mask = build_speech_frames(8, 1, &[]);
+    assert_eq!(
+      mask,
+      alloc::vec![false; 8],
+      "hop=1, no VAD: every frame must be silence; got {:?}",
+      mask
+    );
+  }
+
+  /// Odd custom stride: with `hop=3` the threshold must be 2
+  /// samples (ceil of half), not 1 (floor of half). A
+  /// 1-sample overlap inside a 3-sample frame is below 50 %
+  /// and must not count as speech.
+  #[test]
+  fn build_speech_frames_odd_hop_requires_strict_majority() {
+    use core::num::NonZeroU32;
+    use mediatime::{TimeRange, Timebase};
+
+    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    // 4 frames × hop=3 = 12 samples. VAD island [0, 1) is
+    // 1 sample inside frame 0 — below the 2-sample threshold.
+    let segs = alloc::vec![TimeRange::new(0, 1, tb_16k)];
+    let mask = build_speech_frames(4, 3, &segs);
+    assert_eq!(
+      mask,
+      alloc::vec![false; 4],
+      "hop=3, 1-sample overlap is below ceil-half threshold; got {:?}",
+      mask
+    );
+
+    // Boundary: 2 samples in frame 0 = exactly the threshold.
+    let segs_at = alloc::vec![TimeRange::new(0, 2, tb_16k)];
+    let mask_at = build_speech_frames(4, 3, &segs_at);
+    assert_eq!(
+      mask_at[0], true,
+      "hop=3, 2-sample overlap (= ceil-half) is at threshold and must count"
+    );
   }
 
   /// A 1-sample VAD island inside an otherwise-silent frame

@@ -427,8 +427,28 @@ pub(crate) fn log_softmax_with_finite_guard(
         language: language.clone(),
       });
     }
+    // Each output log-probability must also be finite. A finite
+    // input row + finite `log_z` can still produce a non-finite
+    // `x - log_z` when `x` and `log_z` straddle f32's limits
+    // (e.g. row `[f32::MAX, -f32::MAX]` → log_z = f32::MAX,
+    // `-f32::MAX - f32::MAX` overflows to `-inf`). Without this
+    // check the `-inf` lands in `data`; Viterbi sees it as a
+    // valid-but-very-low log-prob and can return
+    // `NoAlignmentPath` (a *recoverable* outcome), silently
+    // hiding what is actually a backend numeric failure as
+    // `words: []`.
     for &x in row {
-      data.push(x - log_z);
+      let lp = x - log_z;
+      if !lp.is_finite() {
+        return Err(WorkFailure::AlignmentFailed {
+          kind: AlignmentFailureKind::ModelInferenceFailed,
+          message: alloc::format!(
+            "log-softmax output non-finite at frame {t_idx}: x={x}, log_z={log_z}, lp={lp}"
+          ),
+          language: language.clone(),
+        });
+      }
+      data.push(lp);
     }
   }
   Ok(data)
@@ -593,6 +613,30 @@ mod tests {
     use crate::types::Lang;
     let raw = alloc::vec![f32::NEG_INFINITY; 3];
     assert!(log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).is_err());
+  }
+
+  /// Finite extreme logits can produce a non-finite output
+  /// log-prob: `[f32::MAX, -f32::MAX]` has finite input,
+  /// finite max, finite log_z (= f32::MAX), but the second
+  /// element's `x - log_z = -f32::MAX - f32::MAX = -inf`.
+  /// Pre-fix the `-inf` was stored in `data`; Viterbi would
+  /// later return `NoAlignmentPath` (recoverable) hiding a
+  /// real backend numeric failure as `words: []`. The
+  /// per-element finite check now surfaces it as fatal
+  /// `ModelInferenceFailed`.
+  #[test]
+  fn log_softmax_rejects_finite_extremes_that_overflow_lp() {
+    use crate::types::Lang;
+    let raw = alloc::vec![f32::MAX, -f32::MAX];
+    let err = log_softmax_with_finite_guard(&raw, 1, 2, &Lang::En).unwrap_err();
+    let WorkFailure::AlignmentFailed { kind, message, .. } = err else {
+      panic!("expected AlignmentFailed");
+    };
+    assert!(matches!(kind, AlignmentFailureKind::ModelInferenceFailed));
+    assert!(
+      message.contains("log-softmax output non-finite"),
+      "diagnostic must call out the per-element finite check; got {message:?}"
+    );
   }
 
   /// Sanity: a finite, well-behaved row produces a finite

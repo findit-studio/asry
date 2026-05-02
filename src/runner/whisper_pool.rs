@@ -822,10 +822,18 @@ fn worker_loop(
     // early once inference completes — a `thread::sleep` would
     // wait the full timeout regardless, blocking `watchdog.join()`
     // and adding `asr_timeout` of latency per chunk.
+    //
+    // Under thread/fd/memory exhaustion `Builder::spawn` can
+    // fail. Surface it as an in-band `WorkFailure::AsrFailed`
+    // for this chunk and continue serving subsequent jobs;
+    // panicking would either kill the only worker (single-
+    // worker pool) or strand the chunk on the result channel
+    // until drain timeout (multi-worker pool, blocking
+    // in-order emission).
     let abort_flag = job.abort_flag.clone();
     let timeout = job.asr_timeout;
     let (cancel_tx, cancel_rx) = bounded::<()>(1);
-    let watchdog = std::thread::Builder::new()
+    let watchdog = match std::thread::Builder::new()
       .name("whispery-asr-watchdog".into())
       .spawn(move || {
         // Block on the cancel channel for up to `timeout`.
@@ -836,8 +844,22 @@ fn worker_loop(
         if cancel_rx.recv_timeout(timeout).is_err() {
           abort_flag.store(true, Ordering::Relaxed);
         }
-      })
-      .expect("spawn watchdog");
+      }) {
+      Ok(handle) => handle,
+      Err(e) => {
+        let _ = result_tx.send((
+          job.chunk_id,
+          Err(WorkFailure::AsrFailed {
+            kind: AsrFailureKind::BackendError,
+            message: format!(
+              "failed to spawn ASR watchdog ({e}); refusing to run inference \
+               without a cancellable timeout"
+            ),
+          }),
+        ));
+        continue;
+      }
+    };
 
     let started_at = std::time::Instant::now();
     let outcome = run_with_temperature_ladder(state, &job, started_at);
