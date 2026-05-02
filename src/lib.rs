@@ -61,8 +61,9 @@ pub use whisper_rs::{WhisperContext, WhisperContextParameters};
 #[cfg(feature = "alignment")]
 pub use runner::{
   Aligner, AlignerKey, AlignmentFallback, AlignmentLookup, AlignmentSet, AlignmentSetBuilder,
-  ChineseNormalizer, DynTextNormalizer, EnglishNormalizer, JapaneseNormalizer, NormalizationError,
-  NormalizedText, TextNormalizer, bundled,
+  ChineseNormalizer, DEFAULT_MAX_INTRA_SILENT_RUN, DEFAULT_MIN_SPEECH_COVERAGE, DynTextNormalizer,
+  EnglishNormalizer, JapaneseNormalizer, NormalizationError, NormalizedText, TextNormalizer,
+  bundled,
 };
 
 // Re-export ort types that appear on the alignment public API.

@@ -2,13 +2,15 @@
 //! surface-form recovery.
 
 use alloc::{borrow::Cow, vec::Vec};
+use core::{num::NonZeroU32, time::Duration};
 
-use mediatime::TimeRange;
+use mediatime::{Timebase, TimeRange};
 use smol_str::SmolStr;
 
 use crate::{
   core::AlignmentResult,
   runner::aligner::algorithm::{encode::LogProbsTV, viterbi::ViterbiPath},
+  time::SAMPLE_RATE_HZ,
   types::Word,
 };
 
@@ -35,20 +37,26 @@ struct WordAccum {
   total_emissions: u32,
 }
 
-/// Minimum `speech_emissions / total_emissions` ratio required
-/// to keep a word. Half-coverage is the natural threshold —
-/// majority-speech words stay; mostly-masked words drop. Codex
-/// round-21.
-const MIN_SPEECH_COVERAGE: f32 = 0.5;
+/// Default minimum `speech_emissions / total_emissions` ratio
+/// for [`Aligner::min_speech_coverage`](crate::Aligner::min_speech_coverage).
+/// Half-coverage is the natural threshold — majority-speech
+/// words stay; mostly-masked words drop. Codex round-21.
+pub const DEFAULT_MIN_SPEECH_COVERAGE: f32 = 0.5;
 
-/// Maximum allowed contiguous silent run inside a word's
-/// `[start_frame, end_frame)` span. With wav2vec2's typical
-/// hop (320 samples at 16 kHz → 20 ms/frame), 5 frames is
-/// 100 ms — tolerates brief unvoiced consonants, glottal
-/// stops, and VAD jitter while rejecting words whose emissions
-/// straddle a long masked gap (a CTC alignment artifact, not
-/// a real word). Codex round-21.
-const MAX_INTRA_SILENT_RUN_FRAMES: usize = 5;
+/// Default maximum contiguous silent run inside a word's
+/// `[start_frame, end_frame)` span for
+/// [`Aligner::max_intra_silent_run`](crate::Aligner::max_intra_silent_run).
+/// 80 ms tolerates most unvoiced consonants (the closure of
+/// `/t/`, `/k/`, `/p/` is typically 30–80 ms), glottal stops,
+/// and VAD jitter (1–2 frames) while rejecting longer gaps
+/// where a word's emissions straddle silence — usually a CTC
+/// alignment artifact, not real speech.
+///
+/// At wav2vec2-base-960h's frame rate (`hop_samples=320` at
+/// 16 kHz → 50 fps), this resolves to 4 frames. Models with a
+/// different stride convert via the same `Duration` and
+/// auto-correct.
+pub const DEFAULT_MAX_INTRA_SILENT_RUN: Duration = Duration::from_millis(80);
 
 /// Build a per-frame speech mask of length `n_frames`, marking
 /// `true` exactly for frames whose audio sample range overlaps any
@@ -123,6 +131,8 @@ fn accumulate_per_word(
   word_idx_per_token: &[Option<usize>],
   n_words: usize,
   speech_frames: &[bool],
+  min_speech_coverage: f32,
+  max_silent_run_frames: usize,
 ) -> Vec<Option<WordAccum>> {
   let mut per_word: Vec<Option<WordAccum>> = alloc::vec![None; n_words];
 
@@ -180,12 +190,14 @@ fn accumulate_per_word(
   //   speech frame still emitted with a high-confidence score
   //   over a misleading bounding range.
   // - Round-21 (current): drop on either signal — speech
-  //   coverage below `MIN_SPEECH_COVERAGE` ("fragmented")
+  //   coverage below `min_speech_coverage` ("fragmented")
   //   *or* longest contiguous silent run inside the bounding
-  //   span exceeds `MAX_INTRA_SILENT_RUN_FRAMES` ("long
-  //   straddle"). Brief intra-word silences (unvoiced
-  //   consonants, glottal stops, ≤100 ms VAD jitter) still
-  //   keep the word.
+  //   span exceeds `max_silent_run_frames` ("long straddle").
+  //   Both thresholds are configurable on `Aligner` (defaults
+  //   in `DEFAULT_MIN_SPEECH_COVERAGE` /
+  //   `DEFAULT_MAX_INTRA_SILENT_RUN`); brief intra-word
+  //   silences (unvoiced consonants, glottal stops, VAD jitter
+  //   under the configured threshold) still keep the word.
   for slot in per_word.iter_mut() {
     let Some(accum) = slot else { continue };
     if accum.speech_emissions == 0 {
@@ -193,7 +205,7 @@ fn accumulate_per_word(
       continue;
     }
     let coverage = accum.speech_emissions as f32 / accum.total_emissions as f32;
-    if coverage < MIN_SPEECH_COVERAGE {
+    if coverage < min_speech_coverage {
       *slot = None;
       continue;
     }
@@ -212,7 +224,7 @@ fn accumulate_per_word(
           current = 0;
         }
       }
-      if max_run > MAX_INTRA_SILENT_RUN_FRAMES {
+      if max_run > max_silent_run_frames {
         *slot = None;
       }
     }
@@ -246,12 +258,30 @@ pub(crate) fn compose_words<F>(
   chunk_first_sample_in_stream: u64,
   hop_samples: u32,
   samples_to_output_range: F,
+  min_speech_coverage: f32,
+  max_intra_silent_run: Duration,
 ) -> AlignmentResult
 where
   F: Fn(u64, u64) -> TimeRange,
 {
+  // Convert the wall-clock silent-run threshold into encoder
+  // frames using the model's frame timebase (`hop_samples` per
+  // 16 kHz analysis sample → seconds per frame). Done once per
+  // alignment so `accumulate_per_word` can compare directly
+  // against frame indices.
+  let frame_tb = Timebase::new(hop_samples, NonZeroU32::new(SAMPLE_RATE_HZ).unwrap());
+  let max_silent_run_frames = frame_tb.duration_to_pts(max_intra_silent_run) as usize;
+
   let n_words = original_words.len();
-  let per_word = accumulate_per_word(path, log_probs, word_idx_per_token, n_words, speech_frames);
+  let per_word = accumulate_per_word(
+    path,
+    log_probs,
+    word_idx_per_token,
+    n_words,
+    speech_frames,
+    min_speech_coverage,
+    max_silent_run_frames,
+  );
 
   let mut words: Vec<Word> = Vec::with_capacity(n_words);
   for (i, slot) in per_word.iter().enumerate() {
@@ -316,6 +346,8 @@ mod tests {
       0,
       320,
       fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     let words = result.words();
     assert_eq!(words.len(), 1, "silence-masked word must drop");
@@ -347,6 +379,8 @@ mod tests {
       0,
       320,
       fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     let words = result.words();
     assert_eq!(words.len(), 2);
@@ -377,6 +411,8 @@ mod tests {
       0,
       320,
       fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert_eq!(result.words()[0].text(), "Hello!");
   }
@@ -406,6 +442,8 @@ mod tests {
       8_000,
       320,
       fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     let r = result.words()[0].range();
     // start_frame = 1 -> 8000 + 320 = 8320
@@ -441,6 +479,8 @@ mod tests {
       0,
       320,
       fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert!(
       result.words().is_empty(),
@@ -471,6 +511,8 @@ mod tests {
       0,
       320,
       fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert_eq!(result.words().len(), 1);
     assert_eq!(result.words()[0].text(), "hello");
@@ -511,6 +553,8 @@ mod tests {
       0,
       320,
       fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert_eq!(
       result.words().len(),
@@ -561,6 +605,8 @@ mod tests {
       0,
       320,
       fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert!(
       result.words().is_empty(),
@@ -573,8 +619,8 @@ mod tests {
   /// both sides of a long silent gap must drop — the bounding
   /// `Word.range` would otherwise misrepresent where the word
   /// actually occurred. The 19-frame masked gap inside the
-  /// span (~380 ms at 50 fps) blows past
-  /// `MAX_INTRA_SILENT_RUN_FRAMES = 5`. Coverage alone passes
+  /// span (~380 ms at 50 fps) blows past the default 80 ms
+  /// (`DEFAULT_MAX_INTRA_SILENT_RUN`). Coverage alone passes
   /// (2 of 2 emissions are speech-supported), so the gap check
   /// is what catches this.
   #[test]
@@ -606,6 +652,8 @@ mod tests {
       0,
       320,
       fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert!(
       result.words().is_empty(),
@@ -614,24 +662,25 @@ mod tests {
     );
   }
 
-  /// Boundary check on the long-gap rule: a word with exactly
-  /// `MAX_INTRA_SILENT_RUN_FRAMES = 5` masked frames inside its
-  /// span survives (the threshold is "exceeds 5", strict).
-  /// Coverage 2/2 = 1.0 also passes. The kept span bookends the
-  /// two speech-supported emission frames.
+  /// Boundary check on the long-gap rule with the default
+  /// 80 ms tolerance: a word with exactly 4 masked frames
+  /// (4 × 20 ms = 80 ms at wav2vec2-base's 50 fps) inside its
+  /// bounding span survives. The threshold is strict (`>`), so
+  /// the run-at-threshold case is kept; one more frame would
+  /// drop. Coverage 2/2 = 1.0 also passes.
   #[test]
   fn word_with_silent_run_at_threshold_is_kept() {
-    // 7 frames; state 1 emits at frame 0 and frame 6, blank
-    // elsewhere. The 5 silent middle frames sit at the
-    // tolerance limit.
+    // 6 frames; state 1 emits at frame 0 and frame 5, blank
+    // elsewhere. The 4 silent middle frames sit at the
+    // tolerance limit (80 ms / 20 ms per frame = 4 frames).
     let path = ViterbiPath {
-      state_per_frame: alloc::vec![1, 0, 0, 0, 0, 0, 1],
+      state_per_frame: alloc::vec![1, 0, 0, 0, 0, 1],
       tokens: alloc::vec![10],
     };
-    let log_probs = lp_const(7, 30, -1.0);
+    let log_probs = lp_const(6, 30, -1.0);
     let word_idx_per_token = alloc::vec![Some(0)];
     let original = alloc::vec![Cow::Borrowed("ok")];
-    let speech_frames = alloc::vec![true, false, false, false, false, false, true];
+    let speech_frames = alloc::vec![true, false, false, false, false, true];
 
     let result = compose_words(
       &path,
@@ -642,16 +691,131 @@ mod tests {
       0,
       320,
       fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert_eq!(
       result.words().len(),
       1,
-      "5-frame intra-silent run is at threshold and must be kept; got {:?}",
+      "4-frame intra-silent run is at the 80 ms threshold and must be kept; got {:?}",
       result.words()
     );
     let r = result.words()[0].range();
     assert_eq!(r.start_pts(), 0);
-    assert_eq!(r.end_pts(), 7 * 320);
+    assert_eq!(r.end_pts(), 6 * 320);
+  }
+
+  /// Configurable threshold: overriding `max_intra_silent_run`
+  /// to 100 ms (5 frames at 50 fps) lets a 5-frame silent run
+  /// through that the default 80 ms would drop. Verifies the
+  /// new `Aligner::with_max_intra_silent_run` plumbing reaches
+  /// the post-pass.
+  #[test]
+  fn longer_max_intra_silent_run_keeps_word_default_would_drop() {
+    // 7 frames; speech at 0 and 6, masked silence between.
+    let path = ViterbiPath {
+      state_per_frame: alloc::vec![1, 0, 0, 0, 0, 0, 1],
+      tokens: alloc::vec![10],
+    };
+    let log_probs = lp_const(7, 30, -1.0);
+    let word_idx_per_token = alloc::vec![Some(0)];
+    let original = alloc::vec![Cow::Borrowed("ok")];
+    let speech_frames = alloc::vec![true, false, false, false, false, false, true];
+
+    // With the default 80 ms (= 4 frames), 5-frame run drops.
+    let default_result = compose_words(
+      &path,
+      &log_probs,
+      &word_idx_per_token,
+      &original,
+      &speech_frames,
+      0,
+      320,
+      fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
+    );
+    assert!(
+      default_result.words().is_empty(),
+      "default 80 ms threshold must drop a 5-frame (100 ms) silent run"
+    );
+
+    // Bumping the threshold to 100 ms lets the same word through.
+    let permissive_result = compose_words(
+      &path,
+      &log_probs,
+      &word_idx_per_token,
+      &original,
+      &speech_frames,
+      0,
+      320,
+      fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      Duration::from_millis(100),
+    );
+    assert_eq!(
+      permissive_result.words().len(),
+      1,
+      "100 ms threshold must keep a 5-frame silent run; got {:?}",
+      permissive_result.words()
+    );
+  }
+
+  /// Configurable coverage: bumping `min_speech_coverage` to
+  /// 0.9 drops a word whose 4-of-5 emissions are speech-
+  /// supported (coverage 0.8). The default 0.5 keeps it.
+  #[test]
+  fn stricter_min_speech_coverage_drops_word_default_would_keep() {
+    // 5 frames; word 0's token (state 1) emits at every frame.
+    // 4 of 5 are speech-supported.
+    let path = ViterbiPath {
+      state_per_frame: alloc::vec![1, 1, 1, 1, 1],
+      tokens: alloc::vec![10],
+    };
+    let log_probs = lp_const(5, 30, -1.0);
+    let word_idx_per_token = alloc::vec![Some(0)];
+    let original = alloc::vec![Cow::Borrowed("ok")];
+    // 4/5 speech-supported = coverage 0.8.
+    let speech_frames = alloc::vec![true, true, false, true, true];
+
+    // Default 0.5 keeps it.
+    let default_result = compose_words(
+      &path,
+      &log_probs,
+      &word_idx_per_token,
+      &original,
+      &speech_frames,
+      0,
+      320,
+      fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
+    );
+    assert_eq!(
+      default_result.words().len(),
+      1,
+      "default 0.5 coverage must keep an 0.8-coverage word; got {:?}",
+      default_result.words()
+    );
+
+    // Strict 0.9 drops it.
+    let strict_result = compose_words(
+      &path,
+      &log_probs,
+      &word_idx_per_token,
+      &original,
+      &speech_frames,
+      0,
+      320,
+      fake_samples_to_output_range,
+      0.9,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
+    );
+    assert!(
+      strict_result.words().is_empty(),
+      "strict 0.9 coverage must drop an 0.8-coverage word; got {:?}",
+      strict_result.words()
+    );
   }
 
   /// Codex round-20 [medium]: long word with brief intra-silence
@@ -683,6 +847,8 @@ mod tests {
       0,
       320,
       fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert_eq!(
       result.words().len(),
@@ -720,6 +886,8 @@ mod tests {
       0,
       320,
       fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert_eq!(result.words().len(), 1);
   }
@@ -762,6 +930,8 @@ mod tests {
       0,
       320,
       fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     let s = result.words()[0].score();
     assert!((0.0..=1.0).contains(&s));

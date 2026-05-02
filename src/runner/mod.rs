@@ -22,6 +22,7 @@ pub use whisper_pool::WhisperPoolOptions;
 #[cfg(feature = "alignment")]
 pub use aligner::{
   Aligner, AlignerKey, AlignmentFallback, AlignmentLookup, AlignmentSet, AlignmentSetBuilder,
-  ChineseNormalizer, DynTextNormalizer, EnglishNormalizer, JapaneseNormalizer, NormalizationError,
-  NormalizedText, TextNormalizer, bundled,
+  ChineseNormalizer, DEFAULT_MAX_INTRA_SILENT_RUN, DEFAULT_MIN_SPEECH_COVERAGE, DynTextNormalizer,
+  EnglishNormalizer, JapaneseNormalizer, NormalizationError, NormalizedText, TextNormalizer,
+  bundled,
 };

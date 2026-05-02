@@ -48,6 +48,24 @@ pub struct Aligner {
   /// (lowercase-emitting) [`crate::EnglishNormalizer`] doesn't
   /// produce a stream of `<unk>`s on every English word.
   vocab_uppercase_only: bool,
+  /// Minimum `speech_emissions / total_emissions` ratio required
+  /// for a word to survive the alignment composer's post-pass.
+  /// Words whose CTC visit has too many masked frames drop —
+  /// they would otherwise emit a high-confidence range over
+  /// mostly-silent audio. Defaults to
+  /// [`compose::DEFAULT_MIN_SPEECH_COVERAGE`](crate::runner::aligner::algorithm::compose::DEFAULT_MIN_SPEECH_COVERAGE).
+  /// Override via [`Self::with_min_speech_coverage`] when
+  /// stricter or more permissive thresholds are needed (e.g.,
+  /// tighter for closed-caption use, looser for noisy audio).
+  min_speech_coverage: f32,
+  /// Maximum allowed contiguous silent run inside a word's
+  /// `[start_frame, end_frame)` bounding span. Defaults to
+  /// [`compose::DEFAULT_MAX_INTRA_SILENT_RUN`](crate::runner::aligner::algorithm::compose::DEFAULT_MAX_INTRA_SILENT_RUN).
+  /// Stored as a `Duration` so the threshold stays meaningful
+  /// across alignment models with different frame strides;
+  /// converted to encoder frames at align time using
+  /// `hop_samples` and the 16 kHz analysis timebase.
+  max_intra_silent_run: Duration,
 }
 
 impl Aligner {
@@ -120,6 +138,8 @@ impl Aligner {
       blank_token_id,
       unk_token_id,
       vocab_uppercase_only,
+      min_speech_coverage: crate::runner::aligner::algorithm::compose::DEFAULT_MIN_SPEECH_COVERAGE,
+      max_intra_silent_run: crate::runner::aligner::algorithm::compose::DEFAULT_MAX_INTRA_SILENT_RUN,
     })
   }
 
@@ -162,6 +182,48 @@ impl Aligner {
   /// Builder-style override for [`Self::hop_samples`].
   pub const fn with_hop_samples(mut self, value: u32) -> Self {
     self.hop_samples = value;
+    self
+  }
+
+  /// Minimum `speech_emissions / total_emissions` ratio
+  /// required for a word to survive the alignment composer's
+  /// post-pass. See the field doc on [`Self`] for the
+  /// motivation. Default: `0.5`
+  /// (`DEFAULT_MIN_SPEECH_COVERAGE`).
+  pub const fn min_speech_coverage(&self) -> f32 {
+    self.min_speech_coverage
+  }
+
+  /// Set [`Self::min_speech_coverage`]. Values outside `[0.0,
+  /// 1.0]` are stored verbatim — out-of-range values
+  /// effectively disable the coverage check (`< 0.0` always
+  /// passes; `> 1.0` always fails).
+  pub const fn set_min_speech_coverage(&mut self, value: f32) {
+    self.min_speech_coverage = value;
+  }
+
+  /// Builder-style override for [`Self::min_speech_coverage`].
+  pub const fn with_min_speech_coverage(mut self, value: f32) -> Self {
+    self.min_speech_coverage = value;
+    self
+  }
+
+  /// Maximum allowed contiguous silent run inside a word's
+  /// bounding span. Default: 80 ms
+  /// (`DEFAULT_MAX_INTRA_SILENT_RUN`). See the field doc on
+  /// [`Self`] for the rationale.
+  pub const fn max_intra_silent_run(&self) -> Duration {
+    self.max_intra_silent_run
+  }
+
+  /// Set [`Self::max_intra_silent_run`].
+  pub const fn set_max_intra_silent_run(&mut self, value: Duration) {
+    self.max_intra_silent_run = value;
+  }
+
+  /// Builder-style override for [`Self::max_intra_silent_run`].
+  pub const fn with_max_intra_silent_run(mut self, value: Duration) -> Self {
+    self.max_intra_silent_run = value;
     self
   }
 
@@ -386,6 +448,8 @@ impl Aligner {
       chunk_first_sample_in_stream,
       self.hop_samples,
       samples_to_output_range,
+      self.min_speech_coverage,
+      self.max_intra_silent_run,
     ))
   }
 }

@@ -19,7 +19,13 @@ let aligner = Aligner::from_paths(
     Path::new("path/to/wav2vec2-base-960h.onnx"),
     Path::new("path/to/wav2vec2-base-960h-tokenizer.json"),
     Box::new(EnglishNormalizer::new()),
-)?;
+)?
+// Optional: tighten / loosen the composer's per-word post-pass.
+// Defaults: 0.5 coverage + 80 ms intra-word silence tolerance —
+// see `whispery::DEFAULT_MIN_SPEECH_COVERAGE` and
+// `whispery::DEFAULT_MAX_INTRA_SILENT_RUN`.
+.with_min_speech_coverage(0.5)
+.with_max_intra_silent_run(Duration::from_millis(80));
 
 let set = AlignmentSetBuilder::new()
     .with_fallback(AlignmentFallback::SkipChunk)
