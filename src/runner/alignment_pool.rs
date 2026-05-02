@@ -252,7 +252,51 @@ fn run_one_alignment(
     });
   }
 
-  outcome
+  // Codex round-15 [high]: an alignment-stage failure is NOT a
+  // reason to discard the cached ASR transcript. Without this,
+  // a `NoAlignmentPath` from a too-short chunk or a 32 M-cell
+  // budget overflow would propagate to `inject_failure` upstream,
+  // turning the chunk into `Event::Error` and dropping the
+  // (perfectly valid) ASR text. Convert recoverable
+  // alignment-stage failures to an empty `AlignmentResult` so
+  // the dispatch emits `Transcript { text, words: [] }` instead
+  // — alignment is best-effort, not destructive.
+  //
+  // `WorkerHangTimeout` and the abort-flag race above stay fatal
+  // because they signal a worker liveness problem the runner
+  // needs to know about. Configuration / setup failures
+  // (`LanguageUnsupportedForAlignment` produced by
+  // `AlignmentFallback::Error`) also stay fatal — those are
+  // intentional opt-in errors from the registry policy, not
+  // recoverable alignment-compute failures.
+  match outcome {
+    Ok(_) => outcome,
+    Err(ref f) if alignment_failure_is_recoverable(f) => {
+      Ok(AlignmentResult::new(alloc::vec::Vec::new()))
+    }
+    Err(_) => outcome,
+  }
+}
+
+/// Classify an alignment worker error: best-effort
+/// (recoverable, ASR text preserved) vs fatal (event surfaces as
+/// `Event::Error`).
+///
+/// Recoverable: anything the alignment compute legitimately
+/// gives up on — `AlignmentFailed { kind: NoAlignmentPath, .. }`
+/// from a too-short chunk or budget overflow,
+/// `TokenizationFailed` from upstream model/tokenizer skew,
+/// `ModelInferenceFailed` from a stuck graph, etc. Codex
+/// round-15 [high] flagged that these were dropping the ASR
+/// transcript.
+///
+/// Fatal: `WorkerHangTimeout` (liveness — the worker thread or
+/// ORT graph misbehaved), `AsrFailed` (logically impossible on
+/// the alignment path; treat as a bug), and
+/// `LanguageUnsupportedForAlignment` (a configured-by-policy
+/// rejection from `AlignmentFallback::Error`).
+fn alignment_failure_is_recoverable(failure: &WorkFailure) -> bool {
+  matches!(failure, WorkFailure::AlignmentFailed { .. })
 }
 
 /// Lock the per-language `Mutex<Aligner>` and run the 8-step
@@ -314,5 +358,60 @@ mod tests {
   fn alignment_pool_channel_halves_are_send() {
     assert_send::<crossbeam_channel::Sender<AlignWorkItem>>();
     assert_send::<crossbeam_channel::Receiver<AlignResultMsg>>();
+  }
+
+  /// Codex round-15 [high]: every flavour of `AlignmentFailed`
+  /// is best-effort and must NOT discard the cached ASR
+  /// transcript. The `run_one_alignment` path converts these to
+  /// `Ok(AlignmentResult::new(vec![]))` before the runner sees
+  /// them.
+  #[test]
+  fn alignment_failed_kinds_are_recoverable() {
+    use crate::types::AlignmentFailureKind;
+    let kinds = [
+      AlignmentFailureKind::NoAlignmentPath,
+      AlignmentFailureKind::TokenizationFailed,
+      AlignmentFailureKind::ModelInferenceFailed,
+      AlignmentFailureKind::NormalizationFailed,
+      AlignmentFailureKind::EmptyText,
+    ];
+    for kind in kinds {
+      let f = WorkFailure::AlignmentFailed {
+        kind,
+        message: alloc::string::String::new(),
+        language: crate::types::Lang::En,
+      };
+      assert!(
+        alignment_failure_is_recoverable(&f),
+        "{kind:?} must be best-effort to preserve ASR text",
+      );
+    }
+  }
+
+  /// Liveness / configuration failures stay fatal. The runner
+  /// drops the ASR result and surfaces `Event::Error` for
+  /// these because they signal a worker or registry problem,
+  /// not a "couldn't compute alignment" outcome.
+  #[test]
+  fn liveness_and_config_failures_stay_fatal() {
+    use core::time::Duration;
+
+    use crate::types::{AsrFailureKind, Lang, WorkerKind};
+
+    assert!(!alignment_failure_is_recoverable(
+      &WorkFailure::WorkerHangTimeout {
+        kind: WorkerKind::Alignment,
+        elapsed: Duration::from_secs(30),
+      }
+    ));
+    assert!(!alignment_failure_is_recoverable(
+      &WorkFailure::LanguageUnsupportedForAlignment { language: Lang::En }
+    ));
+    // Logically impossible on the alignment path, but if it
+    // ever shows up we surface it rather than swallow it.
+    assert!(!alignment_failure_is_recoverable(&WorkFailure::AsrFailed {
+      kind: AsrFailureKind::AllTemperaturesFailed,
+      message: alloc::string::String::new(),
+    }));
   }
 }

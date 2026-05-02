@@ -11,6 +11,8 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use mediatime::TimeRange;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
 use crate::types::{ChunkId, Lang};
@@ -22,21 +24,88 @@ use crate::types::{ChunkId, Lang};
 ///
 /// Fields are private; use [`AsrParams::new`] (or
 /// [`Default::default`]) and the `set_*` / `with_*` accessors.
+///
+/// **Serde encoding** (when `feature = "serde"` is on): every
+/// field carries a `serde(default = ...)` matching the value
+/// `Self::new()` produces, so partial config files round-trip
+/// without forcing every knob to be present. `Option<T>` fields
+/// use `skip_serializing_if = "Option::is_none"` to keep
+/// serialised configs compact.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AsrParams {
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Option::is_none")
+  )]
   language_hint: Option<Lang>,
+  #[cfg_attr(feature = "serde", serde(default))]
   strategy: SamplingStrategy,
+  #[cfg_attr(feature = "serde", serde(default = "default_initial_temperature"))]
   initial_temperature: f32,
+  #[cfg_attr(feature = "serde", serde(default = "default_temperature_increment"))]
   temperature_increment: f32,
+  #[cfg_attr(feature = "serde", serde(default = "default_max_attempts"))]
   max_attempts: u8,
+  #[cfg_attr(feature = "serde", serde(default = "default_log_prob_threshold"))]
   log_prob_threshold: f32,
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_compression_ratio_threshold")
+  )]
   compression_ratio_threshold: f32,
+  #[cfg_attr(feature = "serde", serde(default = "default_no_speech_threshold"))]
   no_speech_threshold: f32,
+  #[cfg_attr(feature = "serde", serde(default = "default_no_context"))]
   no_context: bool,
+  #[cfg_attr(feature = "serde", serde(default = "default_suppress_blank"))]
   suppress_blank: bool,
+  #[cfg_attr(feature = "serde", serde(default))]
   suppress_non_speech_tokens: bool,
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Option::is_none")
+  )]
   initial_prompt: Option<SmolStr>,
+  #[cfg_attr(feature = "serde", serde(default = "default_n_threads"))]
   n_threads: i32,
+}
+
+#[cfg(feature = "serde")]
+const fn default_initial_temperature() -> f32 {
+  0.0
+}
+#[cfg(feature = "serde")]
+const fn default_temperature_increment() -> f32 {
+  0.2
+}
+#[cfg(feature = "serde")]
+const fn default_max_attempts() -> u8 {
+  6
+}
+#[cfg(feature = "serde")]
+const fn default_log_prob_threshold() -> f32 {
+  -1.0
+}
+#[cfg(feature = "serde")]
+const fn default_compression_ratio_threshold() -> f32 {
+  2.4
+}
+#[cfg(feature = "serde")]
+const fn default_no_speech_threshold() -> f32 {
+  0.6
+}
+#[cfg(feature = "serde")]
+const fn default_no_context() -> bool {
+  true
+}
+#[cfg(feature = "serde")]
+const fn default_suppress_blank() -> bool {
+  true
+}
+#[cfg(feature = "serde")]
+const fn default_n_threads() -> i32 {
+  1
 }
 
 impl AsrParams {
@@ -289,7 +358,13 @@ impl Default for AsrParams {
 }
 
 /// Decoder sampling strategy.
+///
+/// `snake_case` external representation when `serde` is on,
+/// matching the silero options pattern (`{ "greedy": { "best_of": 1 } }`
+/// / `{ "beam_search": { "beam_size": 5, "patience": -1.0 } }`).
 #[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum SamplingStrategy {
   /// Greedy decoding: pick the token with highest probability
   /// after considering `best_of` candidates.
@@ -305,6 +380,15 @@ pub enum SamplingStrategy {
     /// keep `-1.0` to match whisper-rs default).
     patience: f32,
   },
+}
+
+impl Default for SamplingStrategy {
+  fn default() -> Self {
+    Self::BeamSearch {
+      beam_size: 5,
+      patience: -1.0,
+    }
+  }
 }
 
 /// Result of one chunk's ASR inference. Fields are private; use
@@ -460,11 +544,37 @@ pub enum Command {
 /// the corresponding default from the runner's `AsrParams` for chunks
 /// produced from the packet. Fields are private; use the builder-style
 /// `with_*` accessors or the `set_*` mutators.
+///
+/// Serde encoding: every field is `serde(default)` and skips
+/// serialisation when `None`, so the empty override round-trips
+/// as `{}`. The double-`Option` on `language_hint` /
+/// `initial_prompt` is the override-vs-clear distinction:
+/// `Some(None)` clears the field on the underlying `AsrParams`,
+/// `Some(Some(_))` sets it, and `None` leaves the field
+/// untouched. The serde derive handles both nesting layers
+/// transparently.
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AsrParamsOverride {
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Option::is_none")
+  )]
   language_hint: Option<Option<Lang>>,
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Option::is_none")
+  )]
   strategy: Option<SamplingStrategy>,
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Option::is_none")
+  )]
   initial_temperature: Option<f32>,
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Option::is_none")
+  )]
   initial_prompt: Option<Option<SmolStr>>,
 }
 
@@ -593,5 +703,59 @@ mod tests {
     assert!((p.temperature_increment - 0.2).abs() < 1e-9);
     assert_eq!(p.max_attempts, 6);
     assert!(p.no_context);
+  }
+
+  /// Serde round-trip + partial-config contract for `AsrParams`.
+  /// Mirrors silero's `test_serde` shape: tweak a non-default
+  /// field, encode, decode, assert equal; then deserialise from
+  /// `{}` and assert every field matches `Default::default`.
+  #[cfg(feature = "serde")]
+  #[test]
+  fn asr_params_serde_round_trip() {
+    let mut p = AsrParams::default();
+    p.set_initial_temperature(0.7);
+    p.set_max_attempts(3);
+    let json = serde_json::to_string(&p).expect("serialize");
+    let back: AsrParams = serde_json::from_str(&json).expect("deserialize");
+    assert!((back.initial_temperature() - 0.7).abs() < 1e-9);
+    assert_eq!(back.max_attempts(), 3);
+  }
+
+  /// Partial config — `{}` deserialises to defaults thanks to
+  /// per-field `serde(default = "...")`. Codex round-15-paired:
+  /// exercises the silero-shape contract that human-edited
+  /// configs only need to mention the fields they want to
+  /// change.
+  #[cfg(feature = "serde")]
+  #[test]
+  fn asr_params_serde_empty_yields_defaults() {
+    let p: AsrParams = serde_json::from_str("{}").expect("deserialize empty");
+    assert_eq!(
+      p.initial_temperature(),
+      AsrParams::default().initial_temperature()
+    );
+    assert_eq!(p.max_attempts(), AsrParams::default().max_attempts());
+    assert_eq!(p.no_context(), AsrParams::default().no_context());
+    // `language_hint` / `initial_prompt` round-trip as absent.
+    assert!(p.language_hint().is_none());
+    assert!(p.initial_prompt().is_none());
+  }
+
+  /// `SamplingStrategy` snake_case external representation,
+  /// matching the silero `SampleRate` precedent.
+  #[cfg(feature = "serde")]
+  #[test]
+  fn sampling_strategy_serde_uses_snake_case() {
+    let strat = SamplingStrategy::Greedy { best_of: 1 };
+    let json = serde_json::to_string(&strat).expect("serialize");
+    assert!(
+      json.contains("greedy"),
+      "external rep must be snake_case; got {json}"
+    );
+    let back: SamplingStrategy = serde_json::from_str(&json).expect("deserialize");
+    match back {
+      SamplingStrategy::Greedy { best_of } => assert_eq!(best_of, 1),
+      _ => panic!("expected Greedy"),
+    }
   }
 }

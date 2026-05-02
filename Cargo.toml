@@ -35,16 +35,27 @@ tokenizers = { version = "0.20", optional = true, default-features = false, feat
 ndarray = { version = "0.16", optional = true, default-features = false, features = ["std"] }
 
 # Optional features (Plan A scope only).
-serde      = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
-arbitrary  = { version = "1", optional = true, features = ["derive"] }
-quickcheck = { version = "1", optional = true, default-features = false }
+serde           = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
+# `humantime_serde` formats `Duration` as `"30s"` / `"100ms"` etc.
+# instead of the raw `{ secs, nanos }` numeric struct serde derives
+# by default. Pulled in only when `serde` is on; the conditional
+# `with = "humantime_serde"` attribute on `Duration` fields elects
+# the friendlier encoding for human-edited config files.
+humantime-serde = { version = "1", optional = true, default-features = false }
+arbitrary       = { version = "1", optional = true, features = ["derive"] }
+quickcheck      = { version = "1", optional = true, default-features = false }
 
 [dev-dependencies]
-criterion = { version = "0.8", default-features = false, features = ["html_reports"] }
-smol_str  = "0.3"
-tempfile  = "3"
-hound     = "3"          # WAV decoding for end-to-end tests
-sha2      = "0.10"       # build.rs SHA-256 verification
+criterion  = { version = "0.8", default-features = false, features = ["html_reports"] }
+smol_str   = "0.3"
+tempfile   = "3"
+hound      = "3"          # WAV decoding for end-to-end tests
+sha2       = "0.10"       # build.rs SHA-256 verification
+# serde_json is dev-only — exercised in `#[cfg(feature = "serde")]`
+# round-trip tests for the per-options serde encoding (silero's
+# pattern). Production never serialises options at runtime; the
+# encoding is for human-edited config files.
+serde_json = "1"
 
 [build-dependencies]
 sha2 = "0.10"
@@ -53,7 +64,7 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 [features]
 default  = ["std", "runner"]
 std      = ["mediatime/std", "smol_str/std", "serde?/std"]
-serde    = ["dep:serde", "smol_str/serde", "mediatime/serde"]
+serde    = ["dep:serde", "dep:humantime-serde", "smol_str/serde", "mediatime/serde"]
 runner   = ["dep:whisper-rs", "dep:crossbeam-channel", "dep:num_cpus", "std"]
 alignment = ["runner", "dep:ort", "dep:tokenizers", "dep:ndarray"]
 # Re-exports `pub(crate)` alignment internals (scalar/NEON normaliser

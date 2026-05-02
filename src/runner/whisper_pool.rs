@@ -9,6 +9,8 @@ use std::{
 };
 
 use crossbeam_channel::{Receiver, Sender, bounded};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 use whisper_rs::{
   FullParams, SamplingStrategy as WhisperStrategy, WhisperContext, WhisperContextParameters,
   WhisperState,
@@ -30,16 +32,51 @@ use crate::{
 /// fields (`model_path`) cannot be `const fn` because [`PathBuf`]
 /// does not currently expose const accessors.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct WhisperPoolConfig {
+  #[cfg_attr(feature = "serde", serde(default = "default_worker_count"))]
   worker_count: usize,
+  // No `default = ...` because there is no sane default model path —
+  // a deserialised config must specify one. `PathBuf` itself is
+  // serde-friendly (`String` round-trip).
   model_path: PathBuf,
+  #[cfg_attr(feature = "serde", serde(default))]
   use_gpu: bool,
+  #[cfg_attr(feature = "serde", serde(default))]
   gpu_device: i32,
+  #[cfg_attr(feature = "serde", serde(default))]
   flash_attn: bool,
+  // `default_max_queued_chunks` mirrors `Self::new`'s
+  // `worker_count + 4` heuristic without needing a reference to
+  // `worker_count` (serde defaults can't see other fields). We
+  // resolve the dependency conservatively at default-time using
+  // the same `default_worker_count()`, so a partial config with a
+  // bumped `worker_count` but no `max_queued_chunks` matches the
+  // `Self::new` shape.
+  #[cfg_attr(feature = "serde", serde(default = "default_max_queued_chunks"))]
   max_queued_chunks: usize,
+  #[cfg_attr(feature = "serde", serde(default = "default_block_on_full_queue"))]
   block_on_full_queue: bool,
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_dispatch_idle_poll", with = "humantime_serde")
+  )]
   dispatch_idle_poll: Duration,
+  #[cfg_attr(feature = "serde", serde(default = "default_timeout_streak_threshold"))]
   timeout_streak_threshold: u32,
+}
+
+#[cfg(feature = "serde")]
+fn default_max_queued_chunks() -> usize {
+  default_worker_count() + 4
+}
+#[cfg(feature = "serde")]
+const fn default_block_on_full_queue() -> bool {
+  true
+}
+#[cfg(feature = "serde")]
+const fn default_dispatch_idle_poll() -> Duration {
+  Duration::from_millis(10)
 }
 
 impl WhisperPoolConfig {

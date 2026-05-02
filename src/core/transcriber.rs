@@ -9,6 +9,8 @@
 use core::time::Duration;
 
 use mediatime::{Timebase, Timestamp};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 use crate::{
   core::{
@@ -22,7 +24,18 @@ use crate::{
 };
 
 /// Language-detection / locking strategy.
+///
+/// Serialised in `snake_case` external representation when the
+/// `serde` feature is on:
+/// - `"auto"` for [`Self::Auto`]
+/// - `{ "lock": { "hint": "en" } }` for [`Self::Lock`]
+/// - `{ "auto_lock_after": 3 }` for [`Self::AutoLockAfter`]
+///
+/// The same shape silero uses for its `SampleRate` enum (silero's
+/// options module is the reference design).
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum LanguagePolicy {
   /// Each chunk independently auto-detects.
   Auto,
@@ -52,16 +65,59 @@ impl Default for LanguagePolicy {
 /// construct and tweak. The `with_*` methods are consuming
 /// builder-style; `set_*` mutate in place. Most accessors are
 /// `const fn` and can run in const contexts.
+///
+/// **Serde encoding** (when `feature = "serde"` is on): every
+/// field has a `serde(default = ...)` so deserialising from a
+/// partial config (e.g. `{}` or `{"chunk_size": "10s"}`) fills
+/// the rest with `Self::new()`'s defaults. `Duration` fields use
+/// `humantime_serde` so config files can write `"30s"` /
+/// `"100ms"` instead of `{ secs, nanos }`.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TranscriberConfig {
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_chunk_size", with = "humantime_serde")
+  )]
   chunk_size: Duration,
+  #[cfg_attr(feature = "serde", serde(default = "default_buffer_cap_samples"))]
   buffer_cap_samples: usize,
+  #[cfg_attr(feature = "serde", serde(default = "default_gap_tolerance_samples"))]
   gap_tolerance_samples: u64,
+  #[cfg_attr(feature = "serde", serde(default))]
   word_alignment: bool,
+  #[cfg_attr(feature = "serde", serde(default = "default_max_in_flight"))]
   max_in_flight: usize,
+  #[cfg_attr(feature = "serde", serde(default))]
   asr_params: AsrParams,
+  #[cfg_attr(feature = "serde", serde(default))]
   language_policy: LanguagePolicy,
+  #[cfg_attr(
+    feature = "serde",
+    serde(
+      default,
+      with = "humantime_serde::option",
+      skip_serializing_if = "Option::is_none"
+    )
+  )]
   flush_on_silence_gap: Option<Duration>,
+}
+
+#[cfg(feature = "serde")]
+const fn default_chunk_size() -> Duration {
+  Duration::from_secs(30)
+}
+#[cfg(feature = "serde")]
+const fn default_buffer_cap_samples() -> usize {
+  60 * 16_000
+}
+#[cfg(feature = "serde")]
+const fn default_gap_tolerance_samples() -> u64 {
+  200 * 16
+}
+#[cfg(feature = "serde")]
+const fn default_max_in_flight() -> usize {
+  6
 }
 
 impl TranscriberConfig {
