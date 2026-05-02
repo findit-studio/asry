@@ -49,11 +49,47 @@ let mut runner = ManagedTranscriber::from_options(pool)?
 
 ```bash
 cargo run --example core_only        # Plan A: drive the core with mocked backends
-# Real-model end-to-end (needs ~75 MB model fetch on first run):
-cargo test --features runner --test runner_e2e -- --test-threads=1
-# Real wav2vec2 alignment (needs ~360 MB ONNX fetch on first run):
-cargo test --features alignment --test alignment_e2e -- --test-threads=1
+# Real-model end-to-end. The fixture fetch is opt-in — set
+# WHISPERY_FETCH_MODEL=1 to download ~75 MB of Whisper +
+# JFK WAV on first build:
+WHISPERY_FETCH_MODEL=1 \
+  cargo test --features runner --test runner_e2e -- --test-threads=1
+# Real wav2vec2 alignment. Add WHISPERY_FETCH_W2V=1 for the
+# ~360 MB ONNX + tokenizer fetch:
+WHISPERY_FETCH_MODEL=1 WHISPERY_FETCH_W2V=1 \
+  cargo test --features alignment --test alignment_e2e -- --test-threads=1
 ```
+
+Plain `cargo build` makes no network requests; fixture
+downloads only run when both env vars are set.
+
+## Bundled assets
+
+The `wav2vec2-base-960h` tokenizer JSON ships in the crate
+(2 KB) and is available via `whispery::wav2vec2_base_960h_tokenizer_json()`
+under `feature = "alignment"`. The matching ONNX model
+(~378 MB) is too large for crates.io; download it once from
+HuggingFace and pass the path to `Aligner::from_paths`.
+
+## WhisperX parity
+
+For English forced alignment whispery uses the same upstream
+weights as [WhisperX](https://github.com/m-bain/whisperX):
+
+| Component | WhisperX (PyTorch) | whispery (ONNX) |
+| --- | --- | --- |
+| EN aligner | `torchaudio` `WAV2VEC2_ASR_BASE_960H` (= `facebook/wav2vec2-base-960h`) | [`onnx-community/wav2vec2-base-960h-ONNX`](https://huggingface.co/onnx-community/wav2vec2-base-960h-ONNX) (direct ONNX export of the same weights) |
+| Tokenizer | bundled w/ torchaudio bundle | bundled in this crate (`wav2vec2_base_960h_tokenizer_json()`) |
+
+For other languages WhisperX picks language-specific
+`jonatasgrosman/wav2vec2-large-xlsr-53-{lang}` checkpoints.
+ONNX exports of those exist on the HuggingFace hub and slot
+into `Aligner::from_paths` with the matching language
+[`TextNormalizer`](crate::TextNormalizer) — supply your own ONNX +
+tokenizer pair via `AlignmentSetBuilder::register`. Whispery
+ships [`EnglishNormalizer`], [`ChineseNormalizer`], and
+[`JapaneseNormalizer`]; mapping new languages amounts to
+implementing the trait.
 
 ## Documentation
 
