@@ -793,10 +793,12 @@ impl Dispatch {
     chunk_id: ChunkId,
   ) -> Option<alloc::sync::Arc<dyn Fn(u64, u64) -> mediatime::TimeRange + Send + Sync>> {
     let record = self.in_flight.get(&chunk_id)?;
-    Some(crate::core::buffer::SampleBuffer::samples_to_output_range_fn_at(
-      record.output_tb,
-      record.base_pts_out_anchor,
-    ))
+    Some(
+      crate::core::buffer::SampleBuffer::samples_to_output_range_fn_at(
+        record.output_tb,
+        record.base_pts_out_anchor,
+      ),
+    )
   }
 
   /// True iff every queue is empty: no buffered samples (caller

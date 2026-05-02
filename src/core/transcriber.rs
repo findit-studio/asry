@@ -1025,7 +1025,11 @@ mod tests {
     let pre = closure_pre(0, 16_000);
     assert_eq!(pre.start_pts(), 0, "pre-restart closure starts at PTS 0");
     // 16_000 samples at 1/16000 → 1 second → 48_000 in 1/48000.
-    assert_eq!(pre.end_pts(), 48_000, "pre-restart closure ends at PTS 48_000");
+    assert_eq!(
+      pre.end_pts(),
+      48_000,
+      "pre-restart closure ends at PTS 48_000"
+    );
 
     // Restart far ahead in PTS-space — 5e9 in 1/48000 ticks,
     // ~28.9 hours, so any leakage of the new anchor is loud.

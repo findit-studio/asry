@@ -327,8 +327,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// path; the bundled English aligner gets parsed-already
 /// constants.
 fn codegen_wav2vec2_base_960h_tokens() -> Result<(), String> {
-  let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-    .map_err(|e| format!("CARGO_MANIFEST_DIR not set: {e}"))?;
+  let manifest_dir =
+    std::env::var("CARGO_MANIFEST_DIR").map_err(|e| format!("CARGO_MANIFEST_DIR not set: {e}"))?;
   let json_path = std::path::PathBuf::from(&manifest_dir)
     .join("assets")
     .join("wav2vec2_base_960h_tokenizer.json");
@@ -351,7 +351,8 @@ fn codegen_wav2vec2_base_960h_tokens() -> Result<(), String> {
     let id = id_val
       .as_u64()
       .ok_or_else(|| format!("vocab[{token:?}] is not an integer"))?;
-    let id_u32 = u32::try_from(id).map_err(|e| format!("vocab[{token:?}] id {id} > u32::MAX: {e}"))?;
+    let id_u32 =
+      u32::try_from(id).map_err(|e| format!("vocab[{token:?}] id {id} > u32::MAX: {e}"))?;
     entries.push((token.clone(), id_u32));
   }
   entries.sort_by_key(|(_, id)| *id);
@@ -361,7 +362,8 @@ fn codegen_wav2vec2_base_960h_tokens() -> Result<(), String> {
   // consumer's fault — fail the build with a clear message.
   let pad_id = lookup_id(&entries, "<pad>").ok_or_else(|| "vocab missing `<pad>`".to_string())?;
   let unk_id = lookup_id(&entries, "<unk>").ok_or_else(|| "vocab missing `<unk>`".to_string())?;
-  let delim_id = lookup_id(&entries, "|").ok_or_else(|| "vocab missing `|` (word delimiter)".to_string())?;
+  let delim_id =
+    lookup_id(&entries, "|").ok_or_else(|| "vocab missing `|` (word delimiter)".to_string())?;
 
   // Emit Rust source. `include!`-d at runtime; no external
   // schema, just constants.
@@ -403,8 +405,5 @@ fn codegen_wav2vec2_base_960h_tokens() -> Result<(), String> {
 }
 
 fn lookup_id(entries: &[(String, u32)], token: &str) -> Option<u32> {
-  entries
-    .iter()
-    .find(|(t, _)| t == token)
-    .map(|(_, id)| *id)
+  entries.iter().find(|(t, _)| t == token).map(|(_, id)| *id)
 }

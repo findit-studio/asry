@@ -58,7 +58,11 @@ pub mod bundled {
     /// at the documented ids and is non-empty.
     #[test]
     fn bundled_vocab_has_required_special_tokens() {
-      assert!(VOCAB.len() >= 32, "vocab suspiciously small: {}", VOCAB.len());
+      assert!(
+        VOCAB.len() >= 32,
+        "vocab suspiciously small: {}",
+        VOCAB.len()
+      );
       assert_eq!(token_to_id("<pad>"), Some(PAD_TOKEN_ID));
       assert_eq!(token_to_id("<unk>"), Some(UNK_TOKEN_ID));
       assert_eq!(token_to_id("|"), Some(DELIMITER_TOKEN_ID));
