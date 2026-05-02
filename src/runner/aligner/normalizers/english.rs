@@ -4,24 +4,31 @@ use alloc::{borrow::Cow, string::String, vec::Vec};
 
 use crate::runner::aligner::normalizer::{NormalizationError, NormalizedText, TextNormalizer};
 
-/// English normaliser: lowercase + strip ASCII punct + expand a
-/// canonical contraction table.
+/// English normaliser: lowercase + strip ASCII punct, surface-
+/// form preserved.
 ///
 /// Surface-form invariant (spec §6.3.2 step 9): the `original_words`
 /// map points each normalised-word index back to the original
-/// substring of the input text. When a contraction expands to
-/// multiple normalised words (e.g., `"don't"` → `"do not"`), every
-/// expanded word maps back to the same source slice — so the
-/// emitted [`crate::Word`] entries carry the original `"don't"`
-/// twice (once for the time range covering `"do"`, once for the
-/// range covering `"not"`). Downstream consumers can dedupe by
-/// `Word.text == prior.text` if needed.
+/// substring of the input text. The normaliser does **not** expand
+/// contractions — `"don't"` stays one word with normalised form
+/// `"don't"` (lowercased) and a single `original_words` entry
+/// pointing back to `"Don't"`.
+///
+/// **Why not expand contractions?** wav2vec2-base-960h's vocab has
+/// the apostrophe glyph (`'` at id 27) and was trained on
+/// LibriSpeech transcripts that write `DON'T` directly. Expanding
+/// to `"do not"` forces the CTC graph to insert a `|` word
+/// delimiter between `do` and `not`, which the speaker never
+/// pronounces — the model then assigns word boundaries inside a
+/// single phonetic blob, shifting timings and producing duplicate
+/// `Word.text()` values that consumers can't safely dedupe (real
+/// repeated words exist too). Codex round-22.
 ///
 /// **Punctuation handling:** ASCII punctuation `[ . , ! ? ; : " ' (
 /// ) [ ] { } - — – ]` is stripped from word boundaries (leading and
 /// trailing). Internal apostrophes inside contractions (e.g., the
-/// `'` in `"don't"`) are *not* stripped — they trigger expansion
-/// instead.
+/// `'` in `"don't"`) survive into the normalised form so the
+/// wav2vec2 tokenizer aligns the apostrophe character directly.
 ///
 /// **Empty result:** if normalisation produces zero words (input
 /// was all whitespace/punctuation), `normalize` returns
@@ -41,60 +48,6 @@ impl EnglishNormalizer {
     Self
   }
 }
-
-/// Canonical contractions table. Order matters only when prefixes
-/// collide (we apply the longest-match rule); the table is small
-/// enough that linear scan is fine.
-const CONTRACTIONS: &[(&str, &str)] = &[
-  ("won't", "will not"),
-  ("can't", "can not"),
-  ("shan't", "shall not"),
-  ("ain't", "is not"),
-  ("don't", "do not"),
-  ("doesn't", "does not"),
-  ("didn't", "did not"),
-  ("isn't", "is not"),
-  ("aren't", "are not"),
-  ("wasn't", "was not"),
-  ("weren't", "were not"),
-  ("hasn't", "has not"),
-  ("haven't", "have not"),
-  ("hadn't", "had not"),
-  ("wouldn't", "would not"),
-  ("couldn't", "could not"),
-  ("shouldn't", "should not"),
-  ("mustn't", "must not"),
-  ("needn't", "need not"),
-  ("mightn't", "might not"),
-  ("oughtn't", "ought not"),
-  ("i'm", "i am"),
-  ("i've", "i have"),
-  ("i'll", "i will"),
-  ("i'd", "i would"),
-  ("you're", "you are"),
-  ("you've", "you have"),
-  ("you'll", "you will"),
-  ("you'd", "you would"),
-  ("he's", "he is"),
-  ("she's", "she is"),
-  ("it's", "it is"),
-  ("we're", "we are"),
-  ("we've", "we have"),
-  ("we'll", "we will"),
-  ("we'd", "we would"),
-  ("they're", "they are"),
-  ("they've", "they have"),
-  ("they'll", "they will"),
-  ("they'd", "they would"),
-  ("there's", "there is"),
-  ("that's", "that is"),
-  ("what's", "what is"),
-  ("who's", "who is"),
-  ("let's", "let us"),
-  ("here's", "here is"),
-  ("how's", "how is"),
-  ("where's", "where is"),
-];
 
 fn is_word_punct(c: char) -> bool {
   matches!(
@@ -125,10 +78,10 @@ fn is_word_punct(c: char) -> bool {
 // Note on ASCII `'` boundary handling: `is_word_punct` includes
 // `'`, but `strip_word_punct` only trims leading/trailing matches
 // (`trim_start_matches` / `trim_end_matches`). Internal apostrophes
-// inside contractions like `don't` survive the trim and trigger
-// the contraction-expansion table downstream — that's the desired
-// behaviour. Codex round-16 [medium] flagged that the previous
-// list omitted ASCII `'` entirely, so quoted text like `'hello'`
+// inside contractions like `don't` survive the trim — wav2vec2
+// aligns them as a single word with the `'` character emitted
+// inline. Codex round-16 [medium] flagged that the previous list
+// omitted ASCII `'` entirely, so quoted text like `'hello'`
 // kept the surrounding apostrophes in the normalised string;
 // wav2vec2's tokeniser then forced unspoken apostrophe states
 // into the CTC graph, stealing frames from real-word states.
@@ -164,13 +117,6 @@ fn lowercase_for_match(s: &str) -> String {
   s.to_lowercase()
 }
 
-fn expand_contraction(lower: &str) -> Option<&'static str> {
-  CONTRACTIONS
-    .iter()
-    .find(|(k, _)| *k == lower)
-    .map(|(_, v)| *v)
-}
-
 impl TextNormalizer for EnglishNormalizer {
   fn normalize<'a>(&self, text: &'a str) -> Result<NormalizedText<'a>, NormalizationError> {
     let mut normalized = String::with_capacity(text.len());
@@ -188,35 +134,23 @@ impl TextNormalizer for EnglishNormalizer {
       // is preserved verbatim — punctuation included).
       let original_slice: &'a str = &text[word_start..word_start + word.len()];
 
-      if let Some(expansion) = expand_contraction(&lower) {
-        // The contraction expands to N normalised words, each
-        // pointing back to the same original slice (so callers
-        // see the apostrophe-preserved `"don't"` for every
-        // expanded position).
-        let expanded_words: Vec<&str> = expansion.split_whitespace().collect();
-        for expanded in expanded_words {
-          if !normalized.is_empty() {
-            normalized.push(' ');
-          }
-          normalized.push_str(expanded);
-          original_words.push(Cow::Borrowed(original_slice));
+      // Split on internal separators (`hello-world` →
+      // `["hello", "world"]`). Each piece is a real word the
+      // wav2vec2 vocab can encode; without this the literal
+      // `-` would survive into the normalised text and the
+      // tokeniser's `<unk>` rejection would fail the whole
+      // chunk on a single hyphen. The apostrophe is *not* an
+      // internal separator, so `don't` stays one piece and
+      // aligns as a single word with the `'` character emitted
+      // inline by the wav2vec2 tokenizer (Codex round-22).
+      // Multiple pieces share one `original_slice` Cow to keep
+      // the surface-form invariant.
+      for piece in lower.split(is_internal_separator).filter(|p| !p.is_empty()) {
+        if !normalized.is_empty() {
+          normalized.push(' ');
         }
-      } else {
-        // Split on internal separators (`hello-world` →
-        // `["hello", "world"]`). Each piece is a real word the
-        // wav2vec2 vocab can encode; without this the literal
-        // `-` would survive into the normalised text and the
-        // tokeniser's `<unk>` rejection would fail the whole
-        // chunk on a single hyphen. Each piece points back to
-        // the same original surface slice — same pattern as
-        // contraction expansion above.
-        for piece in lower.split(is_internal_separator).filter(|p| !p.is_empty()) {
-          if !normalized.is_empty() {
-            normalized.push(' ');
-          }
-          normalized.push_str(piece);
-          original_words.push(Cow::Borrowed(original_slice));
-        }
+        normalized.push_str(piece);
+        original_words.push(Cow::Borrowed(original_slice));
       }
     }
 
@@ -257,16 +191,23 @@ mod tests {
     assert_eq!(nt.original_words()[1], "World!");
   }
 
+  /// Codex round-22 [high]: contractions stay one normalised
+  /// word with the apostrophe character preserved inline. The
+  /// previous round expanded `"Don't" → "do not"` and emitted
+  /// duplicate `Word.text()` entries spanning a forced `|`
+  /// delimiter that the speaker never pronounced — shifting
+  /// timings and breaking dedupe semantics for downstream
+  /// consumers. wav2vec2-base-960h's vocab has the apostrophe
+  /// glyph; aligning `don't` directly is the supported path.
   #[test]
-  fn expands_contraction_and_duplicates_surface() {
+  fn contraction_stays_one_word_with_apostrophe_inline() {
     let n = EnglishNormalizer::new();
     let nt = n.normalize("Don't go.").unwrap();
-    // "Don't" → "do not"; "go" stripped of trailing period.
-    assert_eq!(nt.normalized(), "do not go");
-    assert_eq!(nt.original_words().len(), 3);
-    assert_eq!(nt.original_words()[0], "Don't"); // do
-    assert_eq!(nt.original_words()[1], "Don't"); // not
-    assert_eq!(nt.original_words()[2], "go.");
+    // "Don't" stays one word; trailing period strips off "go.".
+    assert_eq!(nt.normalized(), "don't go");
+    assert_eq!(nt.original_words().len(), 2);
+    assert_eq!(nt.original_words()[0], "Don't");
+    assert_eq!(nt.original_words()[1], "go.");
   }
 
   #[test]
@@ -300,20 +241,23 @@ mod tests {
   }
 
   #[test]
-  fn contraction_inside_sentence() {
+  fn contraction_inside_sentence_stays_intact() {
     let n = EnglishNormalizer::new();
     let nt = n.normalize("I won't be late.").unwrap();
-    assert_eq!(nt.normalized(), "i will not be late");
+    assert_eq!(nt.normalized(), "i won't be late");
+    assert_eq!(nt.original_words().len(), 4);
+    assert_eq!(nt.original_words()[0], "I");
     assert_eq!(nt.original_words()[1], "won't");
-    assert_eq!(nt.original_words()[2], "won't");
+    assert_eq!(nt.original_words()[2], "be");
+    assert_eq!(nt.original_words()[3], "late.");
   }
 
   #[test]
-  fn unknown_apostrophe_token_passes_through_lowercased() {
+  fn apostrophe_word_passes_through_lowercased() {
     let n = EnglishNormalizer::new();
     let nt = n.normalize("O'Brien rocks.").unwrap();
-    // "O'Brien" is not in CONTRACTIONS; lowercased pass-through
-    // preserves the apostrophe in the normalised form.
+    // Apostrophe survives lowercasing and is *not* an internal
+    // separator; the word stays whole.
     assert_eq!(nt.normalized(), "o'brien rocks");
   }
 
@@ -332,19 +276,16 @@ mod tests {
     assert_eq!(nt.original_words()[0], "'hello'");
   }
 
-  /// Quoted contraction: leading/trailing `'` strips, but the
-  /// internal one survives long enough to trigger the
-  /// contraction-expansion table.
+  /// Quoted contraction: leading/trailing `'` strip but the
+  /// internal one survives, leaving the contraction intact as a
+  /// single normalised word that wav2vec2 aligns directly.
   #[test]
   fn boundary_apostrophe_around_contraction_keeps_internal() {
     let n = EnglishNormalizer::new();
     let nt = n.normalize("'don't'").unwrap();
-    assert_eq!(nt.normalized(), "do not");
-    // Both expanded words point back to the same surface slice
-    // (which still has the surrounding quotes — that's what the
-    // user originally typed).
+    assert_eq!(nt.normalized(), "don't");
+    assert_eq!(nt.original_words().len(), 1);
     assert_eq!(nt.original_words()[0], "'don't'");
-    assert_eq!(nt.original_words()[1], "'don't'");
   }
 
   /// Mixed: trailing apostrophe + word + sentence punctuation.

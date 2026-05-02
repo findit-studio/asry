@@ -171,20 +171,66 @@ pub(crate) fn encode_log_softmax(
 /// adjacent memory. Codex round-18 [medium] flagged this as a
 /// missing typed-failure path.
 ///
-/// All four mismatch flavours surface as
-/// `WorkFailure::AlignmentFailed { kind: ModelInferenceFailed,
-/// .. }` (fatal per round-16). Pulled out as a helper so unit
-/// tests can drive each branch without an ORT session.
+/// Failure classification:
+/// - **Fatal** (`ModelInferenceFailed`) for impossible shapes
+///   the operator should hear about: `V <= 0`, negative `T`,
+///   `T * V` overflow, or shape-vs-buffer-length mismatch.
+/// - **Recoverable** (`NoAlignmentPath`) for `T == 0` with an
+///   empty buffer — a chunk shorter than the model's stride
+///   produces zero encoder frames; the ASR transcript should
+///   surface with `words: []` rather than fail the chunk.
+///   Codex round-22 [high] flagged the original blanket
+///   "non-positive dim" rule as turning a data-dependent
+///   short-chunk miss into fatal transcript loss.
+///
+/// Pulled out as a helper so unit tests can drive each branch
+/// without an ORT session.
 pub(crate) fn validate_output_dims(
   raw_t: i64,
   raw_v: i64,
   raw_len: usize,
   language: &Lang,
 ) -> Result<(usize, usize), WorkFailure> {
-  if raw_t <= 0 || raw_v <= 0 {
+  // V == 0 means the model declared no vocabulary axis — never
+  // legitimate. Always fatal.
+  if raw_v <= 0 {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::ModelInferenceFailed,
-      message: alloc::format!("ORT output has non-positive dimension: T={raw_t}, V={raw_v}"),
+      message: alloc::format!("ORT output has non-positive vocab dim: V={raw_v}"),
+      language: language.clone(),
+    });
+  }
+  // Negative T is always a backend bug (truncated /
+  // sign-flipped shape descriptor).
+  if raw_t < 0 {
+    return Err(WorkFailure::AlignmentFailed {
+      kind: AlignmentFailureKind::ModelInferenceFailed,
+      message: alloc::format!("ORT output has negative time dim: T={raw_t}"),
+      language: language.clone(),
+    });
+  }
+  // T == 0 — the model returned a well-formed empty output.
+  // With an empty buffer that's a legitimate "chunk too short
+  // for any encoder frame" outcome and we surface as
+  // recoverable `NoAlignmentPath`. With a non-empty buffer the
+  // shape declaration disagrees with the data length — fatal
+  // model bug.
+  if raw_t == 0 {
+    if raw_len != 0 {
+      return Err(WorkFailure::AlignmentFailed {
+        kind: AlignmentFailureKind::ModelInferenceFailed,
+        message: alloc::format!(
+          "ORT output declared T=0 but buffer has {raw_len} elements; shape/data mismatch"
+        ),
+        language: language.clone(),
+      });
+    }
+    return Err(WorkFailure::AlignmentFailed {
+      kind: AlignmentFailureKind::NoAlignmentPath,
+      message: String::from(
+        "ORT output has zero encoder frames (chunk too short to align); \
+                 transcript will surface with words: []",
+      ),
       language: language.clone(),
     });
   }
@@ -476,13 +522,59 @@ mod tests {
       panic!("expected AlignmentFailed");
     };
     assert!(matches!(kind, AlignmentFailureKind::ModelInferenceFailed));
-    assert!(message.contains("non-positive dimension"));
+    assert!(message.contains("negative time dim"));
   }
 
   #[test]
   fn validate_output_dims_rejects_zero_v() {
     use crate::types::Lang;
-    assert!(validate_output_dims(100, 0, 0, &Lang::En).is_err());
+    let err = validate_output_dims(100, 0, 0, &Lang::En).unwrap_err();
+    let WorkFailure::AlignmentFailed { kind, .. } = err else {
+      panic!("expected AlignmentFailed");
+    };
+    // V=0 is always fatal — model has no vocab axis.
+    assert!(matches!(kind, AlignmentFailureKind::ModelInferenceFailed));
+  }
+
+  /// Codex round-22 [high]: a chunk too short to produce any
+  /// encoder frame must surface as recoverable `NoAlignmentPath`,
+  /// not fatal `ModelInferenceFailed`. The ASR transcript stays
+  /// alive with `words: []`.
+  #[test]
+  fn validate_output_dims_zero_t_with_empty_buffer_is_recoverable_no_alignment_path() {
+    use crate::types::Lang;
+    let err = validate_output_dims(0, 32, 0, &Lang::En).unwrap_err();
+    let WorkFailure::AlignmentFailed { kind, message, .. } = err else {
+      panic!("expected AlignmentFailed");
+    };
+    assert!(
+      matches!(kind, AlignmentFailureKind::NoAlignmentPath),
+      "T=0 with empty buffer must be NoAlignmentPath; got {kind:?}"
+    );
+    assert!(
+      message.contains("zero encoder frames"),
+      "diagnostic must explain the short-chunk cause; got {message:?}"
+    );
+  }
+
+  /// T=0 with a non-empty buffer means the model declared zero
+  /// frames but returned data anyway — a shape/data
+  /// inconsistency that should stay fatal.
+  #[test]
+  fn validate_output_dims_zero_t_with_nonempty_buffer_stays_fatal() {
+    use crate::types::Lang;
+    let err = validate_output_dims(0, 32, 5, &Lang::En).unwrap_err();
+    let WorkFailure::AlignmentFailed { kind, message, .. } = err else {
+      panic!("expected AlignmentFailed");
+    };
+    assert!(
+      matches!(kind, AlignmentFailureKind::ModelInferenceFailed),
+      "T=0 with non-empty buffer must stay fatal; got {kind:?}"
+    );
+    assert!(
+      message.contains("shape/data mismatch") || message.contains("buffer has"),
+      "diagnostic must call out the shape/data inconsistency; got {message:?}"
+    );
   }
 
   #[test]
