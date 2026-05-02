@@ -55,13 +55,37 @@ cargo run --example core_only        # Plan A: drive the core with mocked backen
 WHISPERY_FETCH_MODEL=1 \
   cargo test --features runner --test runner_e2e -- --test-threads=1
 # Real wav2vec2 alignment. Add WHISPERY_FETCH_W2V=1 for the
-# ~360 MB ONNX + tokenizer fetch:
+# ~360 MB ONNX + tokenizer fetch, plus ORT_DYLIB_PATH so ort
+# can find libonnxruntime at run time (compile-time linking is
+# not required — see "ONNX Runtime" below):
 WHISPERY_FETCH_MODEL=1 WHISPERY_FETCH_W2V=1 \
+ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib \
   cargo test --features alignment --test alignment_e2e -- --test-threads=1
 ```
 
 Plain `cargo build` makes no network requests; fixture
 downloads only run when both env vars are set.
+
+## ONNX Runtime
+
+The `alignment` feature uses `ort` in **load-dynamic** mode —
+`cargo build --features alignment` succeeds on a clean
+toolchain (no system `libonnxruntime` needed at build time).
+To actually run an `Aligner`, point `ort` at a runtime
+library:
+
+```bash
+# Pick one:
+export ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib   # macOS
+export ORT_DYLIB_PATH=/path/to/libonnxruntime.so      # Linux
+# Or place the dylib on the platform's default search path
+# (e.g. brew's `onnxruntime` formula on macOS).
+```
+
+This is intentional: the build path stays portable and
+network-free, while users keep full control over which
+ONNX Runtime build (CPU / CoreML / CUDA / DirectML) they
+ship with.
 
 ## Bundled assets
 

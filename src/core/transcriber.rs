@@ -1007,8 +1007,13 @@ mod tests {
     let mut t = Transcriber::new(config);
 
     // Pre-restart epoch: anchor at PTS 0 in the 1/48000 timebase.
-    t.push_samples(ts(0), &[0.0; 4_000]).unwrap();
+    // Two consecutive 2 000-sample VAD segments — Cut emits chunk
+    // 0 once a second segment forces the merged length past
+    // `chunk_size_samples` (`len > chunk_size_samples` is the
+    // emission predicate).
+    t.push_samples(ts(0), &[0.0; 8_000]).unwrap();
     t.push_vad_segment(VadSegment::new(0, 2_000)).unwrap();
+    t.push_vad_segment(VadSegment::new(2_000, 4_000)).unwrap();
 
     // Drain RunAsr — chunk 0 is now in_flight, ASR not yet
     // resolved. This is the surviving pre-restart chunk.

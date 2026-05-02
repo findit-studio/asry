@@ -26,7 +26,7 @@ num_cpus          = { version = "1",   optional = true }
 # ort: ONNX runtime bindings. Pinned to =2.0.0-rc.12 because rc.13+
 # changed Session API in incompatible ways and rc.x versions don't
 # follow semver across rc bumps.
-ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, features = ["std", "ndarray"] }
+ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, features = ["std", "ndarray", "load-dynamic", "api-24"] }
 # tokenizers: HuggingFace WordPiece/BPE/Unigram tokenizer used to
 # read wav2vec2's tokenizer.json. ^0.20 ships pure-Rust without
 # pulling onig.
