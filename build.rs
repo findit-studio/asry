@@ -44,13 +44,35 @@ fn main() {
   println!("cargo:rerun-if-env-changed=CARGO_FEATURE_ALIGNMENT");
   println!("cargo:rerun-if-env-changed=WHISPERY_FETCH_W2V");
 
+  // Codex round-18 [high]: fixture fetching is OPT-IN. The
+  // previous policy fetched whenever the `runner` feature was
+  // active and `WHISPERY_OFFLINE` was unset — but `runner` is a
+  // default feature, so a plain `cargo build` made network
+  // requests. That breaks ordinary consumer builds (offline /
+  // sandboxed CI) and surprises anyone who didn't expect a
+  // build.rs to phone home.
+  //
+  // New gate: the user must explicitly set `WHISPERY_FETCH_MODEL`
+  // (and `WHISPERY_FETCH_W2V` for alignment) before any
+  // download happens. The `WHISPERY_OFFLINE` knob stays as a
+  // belt-and-braces "definitely don't fetch" override; in the
+  // new design it's redundant with "don't set FETCH" but
+  // existing scripts that rely on `WHISPERY_OFFLINE=1` keep
+  // working.
   if std::env::var("WHISPERY_OFFLINE").is_ok() {
     eprintln!("[whispery build.rs] WHISPERY_OFFLINE set; skipping model fetch");
     return;
   }
+  let fetch_whisper_opt_in = std::env::var("WHISPERY_FETCH_MODEL").is_ok();
+  if !fetch_whisper_opt_in {
+    // Default: skip silently. Only test infrastructure that
+    // actually needs the fixture sets the env var.
+    return;
+  }
 
-  // The 'runner' feature gates whether the test fixture is needed at
-  // all. Plan A builds (--no-default-features) skip the fetch.
+  // The 'runner' feature gates whether the test fixture is even
+  // applicable. Plan A builds (--no-default-features) skip
+  // anyway, even with FETCH_MODEL set.
   let runner_active = std::env::var("CARGO_FEATURE_RUNNER").is_ok();
   if !runner_active {
     return;
@@ -140,7 +162,18 @@ fn fetch_jfk_wav(fixture_dir: &std::path::Path) {
 }
 
 fn fetch_wav2vec2_fixtures(fixture_dir: &std::path::Path) {
-  // Only fetch when the alignment feature is active.
+  // Codex round-18 [high]: opt-in via WHISPERY_FETCH_W2V. Same
+  // gate shape as the parent `main`'s WHISPERY_FETCH_MODEL
+  // check — default builds never hit the network, even when
+  // the alignment feature is enabled. A user who wants the
+  // bundled fixture sets both env vars together.
+  let fetch_w2v_opt_in = std::env::var("WHISPERY_FETCH_W2V").is_ok();
+  if !fetch_w2v_opt_in {
+    return;
+  }
+  // Only fetch when the alignment feature is active. (Even with
+  // FETCH_W2V set, an alignment-feature-off build doesn't need
+  // the wav2vec2 assets.)
   let alignment_active = std::env::var("CARGO_FEATURE_ALIGNMENT").is_ok();
   if !alignment_active {
     return;

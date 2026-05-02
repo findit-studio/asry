@@ -104,6 +104,12 @@ impl Aligner {
     let vocab_uppercase_only =
       tokenizer.token_to_id("A").is_some() && tokenizer.token_to_id("a").is_none();
 
+    // Codex round-18 [medium]: when the normaliser declares
+    // `use_word_delimiter == true` (the English-shape default),
+    // the tokenizer MUST expose a `|` token. See
+    // [`validate_word_delimiter_present`] for the rationale.
+    validate_word_delimiter_present(&tokenizer, normalizer.use_word_delimiter())?;
+
     Ok(Self {
       session,
       tokenizer,
@@ -403,6 +409,41 @@ fn detect_blank_token_id(tok: &Tokenizer) -> Option<u32> {
 /// via the `worker_timeouts(_, align)` builder hook in Plan B.
 pub(crate) const DEFAULT_ALIGN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Validate that the tokenizer exposes the wav2vec2 `|`
+/// word-delimiter token whenever the normaliser declared
+/// `use_word_delimiter == true`.
+///
+/// Codex round-18 [medium]: pre-fix a missing `|` token slipped
+/// through silently — `tokenize_with_word_map` would simply emit
+/// no inter-word delimiter, glueing adjacent words together in
+/// the CTC graph. Word timings would then be plausible but
+/// wrong with no configuration error visible to the caller.
+///
+/// Char-segmented normalisers (`use_word_delimiter == false`)
+/// don't need the delimiter and pass through.
+///
+/// Pulled out as a free function so unit tests can exercise it
+/// against an in-memory tokenizer without spinning up ORT.
+fn validate_word_delimiter_present(
+  tokenizer: &Tokenizer,
+  use_word_delimiter: bool,
+) -> Result<(), RunnerError> {
+  if !use_word_delimiter {
+    return Ok(());
+  }
+  if tokenizer.token_to_id("|").is_some() {
+    return Ok(());
+  }
+  Err(RunnerError::AlignerLoad {
+    message: String::from(
+      "tokenizer is missing the `|` word-delimiter token, but the language's normaliser \
+       declared `use_word_delimiter = true`. wav2vec2 word-segmented vocabularies require \
+       a `|` token between spoken words. Either swap to a tokenizer that exposes `|`, or \
+       supply a normaliser whose `use_word_delimiter` returns false (char-level segmentation).",
+    ),
+  })
+}
+
 /// Load a HuggingFace tokenizer.json with `tokenizers 0.20`
 /// compatibility shimming.
 ///
@@ -568,6 +609,78 @@ mod tests {
       }
     }"#;
     assert!(inject_wordlevel_model_type(already_typed).is_none());
+  }
+
+  // --- Codex round-18 [medium]: word-delimiter validation ---
+
+  /// In-memory tokenizer with a `|` token. Use for "valid"
+  /// cases where the delimiter check should pass.
+  fn tokenizer_with_pipe_delimiter() -> Tokenizer {
+    let json = r#"{
+      "version": "1.0",
+      "truncation": null,
+      "padding": null,
+      "added_tokens": [],
+      "normalizer": null,
+      "pre_tokenizer": {"type": "Split", "pattern": {"Regex": ""}, "behavior": "Isolated", "invert": false},
+      "post_processor": null,
+      "decoder": null,
+      "model": {
+        "type": "WordLevel",
+        "vocab": {"<unk>": 0, "<pad>": 1, "|": 2, "A": 3, "B": 4},
+        "unk_token": "<unk>"
+      }
+    }"#;
+    Tokenizer::from_bytes(json.as_bytes()).expect("parse")
+  }
+
+  /// Same shape WITHOUT the `|` token. Reproduces the
+  /// configuration mistake the round-18 check catches.
+  fn tokenizer_without_pipe_delimiter() -> Tokenizer {
+    let json = r#"{
+      "version": "1.0",
+      "truncation": null,
+      "padding": null,
+      "added_tokens": [],
+      "normalizer": null,
+      "pre_tokenizer": {"type": "Split", "pattern": {"Regex": ""}, "behavior": "Isolated", "invert": false},
+      "post_processor": null,
+      "decoder": null,
+      "model": {
+        "type": "WordLevel",
+        "vocab": {"<unk>": 0, "<pad>": 1, "A": 2, "B": 3},
+        "unk_token": "<unk>"
+      }
+    }"#;
+    Tokenizer::from_bytes(json.as_bytes()).expect("parse")
+  }
+
+  #[test]
+  fn delimiter_check_passes_when_token_present_and_required() {
+    let tok = tokenizer_with_pipe_delimiter();
+    assert!(validate_word_delimiter_present(&tok, true).is_ok());
+  }
+
+  #[test]
+  fn delimiter_check_fails_when_required_but_missing() {
+    let tok = tokenizer_without_pipe_delimiter();
+    let err = validate_word_delimiter_present(&tok, true).unwrap_err();
+    let RunnerError::AlignerLoad { message } = err else {
+      panic!("expected AlignerLoad");
+    };
+    assert!(
+      message.contains("`|` word-delimiter"),
+      "must call out the missing delimiter; got {message:?}"
+    );
+  }
+
+  #[test]
+  fn delimiter_check_passes_for_char_segmented_normalizers() {
+    // CJK-shape normaliser: `use_word_delimiter == false`.
+    // Missing `|` is fine — char-segmented inputs don't use
+    // inter-word delimiters in the CTC graph.
+    let tok = tokenizer_without_pipe_delimiter();
+    assert!(validate_word_delimiter_present(&tok, false).is_ok());
   }
 
   #[test]

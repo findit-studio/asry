@@ -144,20 +144,94 @@ pub(crate) fn encode_log_softmax(
       language: language.clone(),
     });
   }
-  let t = shape[1] as usize;
-  let v = shape[2] as usize;
-  if t == 0 || v == 0 {
-    return Err(WorkFailure::AlignmentFailed {
-      kind: AlignmentFailureKind::ModelInferenceFailed,
-      message: alloc::format!("output has zero T={t} or V={v}"),
-      language: language.clone(),
-    });
-  }
+
+  // Codex round-18 [medium]: validate the shape integers and
+  // their product against the raw buffer length BEFORE we cast
+  // to usize / allocate / slice. Pre-fix a model export bug
+  // that emitted a negative dimension would have wrapped to a
+  // huge usize and OOM'd the worker, and a buffer-vs-shape
+  // mismatch would have panicked on the row-slice in
+  // `log_softmax_with_finite_guard`.
+  let (t, v) = validate_output_dims(shape[1], shape[2], raw.len(), language)?;
 
   // Codex round-17 [high]: validate logits + log-softmax for
   // finiteness. See `log_softmax_with_finite_guard`.
   let data = log_softmax_with_finite_guard(raw, t, v, language)?;
   Ok(LogProbsTV { t, v, data })
+}
+
+/// Validate the `(T, V)` output dimensions before allocation /
+/// slicing.
+///
+/// Pre-fix a malformed ORT output (negative dim from a buggy
+/// export, overflow on `t * v`, or `raw.len()` not matching the
+/// declared shape) would either panic the alignment worker on
+/// the row-slice, OOM the process on a `Vec::with_capacity` for
+/// a wrapped-huge size, or — worst case — silently read into
+/// adjacent memory. Codex round-18 [medium] flagged this as a
+/// missing typed-failure path.
+///
+/// All four mismatch flavours surface as
+/// `WorkFailure::AlignmentFailed { kind: ModelInferenceFailed,
+/// .. }` (fatal per round-16). Pulled out as a helper so unit
+/// tests can drive each branch without an ORT session.
+pub(crate) fn validate_output_dims(
+  raw_t: i64,
+  raw_v: i64,
+  raw_len: usize,
+  language: &Lang,
+) -> Result<(usize, usize), WorkFailure> {
+  if raw_t <= 0 || raw_v <= 0 {
+    return Err(WorkFailure::AlignmentFailed {
+      kind: AlignmentFailureKind::ModelInferenceFailed,
+      message: alloc::format!("ORT output has non-positive dimension: T={raw_t}, V={raw_v}"),
+      language: language.clone(),
+    });
+  }
+  // i64 → usize is safe after the >0 check on 64-bit; on 32-bit
+  // we still want the explicit overflow guard.
+  let t = match usize::try_from(raw_t) {
+    Ok(v) => v,
+    Err(_) => {
+      return Err(WorkFailure::AlignmentFailed {
+        kind: AlignmentFailureKind::ModelInferenceFailed,
+        message: alloc::format!("ORT output T={raw_t} doesn't fit in usize"),
+        language: language.clone(),
+      });
+    }
+  };
+  let v = match usize::try_from(raw_v) {
+    Ok(v) => v,
+    Err(_) => {
+      return Err(WorkFailure::AlignmentFailed {
+        kind: AlignmentFailureKind::ModelInferenceFailed,
+        message: alloc::format!("ORT output V={raw_v} doesn't fit in usize"),
+        language: language.clone(),
+      });
+    }
+  };
+  let total = match t.checked_mul(v) {
+    Some(p) => p,
+    None => {
+      return Err(WorkFailure::AlignmentFailed {
+        kind: AlignmentFailureKind::ModelInferenceFailed,
+        message: alloc::format!(
+          "ORT output dimensions overflow: T={t} * V={v} doesn't fit in usize"
+        ),
+        language: language.clone(),
+      });
+    }
+  };
+  if total != raw_len {
+    return Err(WorkFailure::AlignmentFailed {
+      kind: AlignmentFailureKind::ModelInferenceFailed,
+      message: alloc::format!(
+        "ORT output buffer length {raw_len} doesn't match declared T={t} × V={v} = {total}"
+      ),
+      language: language.clone(),
+    });
+  }
+  Ok((t, v))
 }
 
 /// Compute row-major `(T, V)` log-softmax of `raw` with a fatal
@@ -390,6 +464,71 @@ mod tests {
     assert!(out.iter().all(|x| x.is_finite()));
     let sum: f32 = out.iter().map(|x| x.exp()).sum();
     assert!((sum - 1.0).abs() < 1e-5);
+  }
+
+  // --- Codex round-18 [medium]: ORT output dims validation ---
+
+  #[test]
+  fn validate_output_dims_rejects_negative_t() {
+    use crate::types::Lang;
+    let err = validate_output_dims(-1, 32, 32, &Lang::En).unwrap_err();
+    let WorkFailure::AlignmentFailed { kind, message, .. } = err else {
+      panic!("expected AlignmentFailed");
+    };
+    assert!(matches!(kind, AlignmentFailureKind::ModelInferenceFailed));
+    assert!(message.contains("non-positive dimension"));
+  }
+
+  #[test]
+  fn validate_output_dims_rejects_zero_v() {
+    use crate::types::Lang;
+    assert!(validate_output_dims(100, 0, 0, &Lang::En).is_err());
+  }
+
+  #[test]
+  fn validate_output_dims_rejects_buffer_length_mismatch() {
+    use crate::types::Lang;
+    // Declared T=10, V=4 → 40 elements; provided buffer = 39.
+    let err = validate_output_dims(10, 4, 39, &Lang::En).unwrap_err();
+    let WorkFailure::AlignmentFailed { message, .. } = err else {
+      panic!("expected AlignmentFailed");
+    };
+    assert!(
+      message.contains("doesn't match"),
+      "must call out length mismatch; got {message:?}"
+    );
+  }
+
+  /// 32-bit-only path: usize is 32 bits, so `i64` of 1 << 33
+  /// can't fit. We test the overflow logic indirectly by
+  /// asking for `T * V` larger than usize::MAX; on aarch64
+  /// (64-bit) we'd need an astronomical product, so this
+  /// targets the `checked_mul` branch with two values whose
+  /// product overflows. usize::MAX ≈ 1.8e19 on 64-bit; we use
+  /// √max + 1 each.
+  #[test]
+  fn validate_output_dims_rejects_t_v_product_overflow() {
+    use crate::types::Lang;
+    // Two large values whose product overflows usize on any
+    // platform. 2^32 × 2^32 = 2^64 > usize::MAX on 64-bit
+    // (overflow); same on 32-bit (overflow much earlier).
+    let big = i64::from(u32::MAX) + 1; // 2^32
+    let err = validate_output_dims(big, big, 0, &Lang::En).unwrap_err();
+    let WorkFailure::AlignmentFailed { message, .. } = err else {
+      panic!("expected AlignmentFailed");
+    };
+    assert!(
+      message.contains("overflow") || message.contains("doesn't fit"),
+      "must call out overflow; got {message:?}"
+    );
+  }
+
+  #[test]
+  fn validate_output_dims_accepts_well_formed_shape() {
+    use crate::types::Lang;
+    let (t, v) = validate_output_dims(1500, 32, 1500 * 32, &Lang::En).expect("ok");
+    assert_eq!(t, 1500);
+    assert_eq!(v, 32);
   }
 
   /// Multi-frame: a NaN in frame 2 surfaces with `frame 2` in
