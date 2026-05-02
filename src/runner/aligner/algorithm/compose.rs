@@ -15,11 +15,40 @@ use crate::{
 /// Per-word accumulator (M4 sparse vector).
 #[derive(Clone, Copy)]
 struct WordAccum {
+  /// First *speech-supported* emission frame index. Range
+  /// `[start_frame, end_frame)` therefore bookends speech
+  /// support, not all token emissions.
   start_frame: u32,
+  /// One past the last speech-supported emission frame.
   end_frame: u32,
+  /// Log-probability sum over speech-supported emissions only.
   logprob_sum: f32,
-  frame_count: u32,
+  /// Count of speech-supported emissions. Score numerator's
+  /// denominator (mean log-prob → exp() → score).
+  speech_emissions: u32,
+  /// Count of *all* token emissions for this word — silent and
+  /// speech-supported. Denominator for the post-pass coverage
+  /// ratio. Codex round-21: required to detect "fragmented
+  /// speech support" (most of a word masked, one stray frame
+  /// surviving) so we don't emit a high-confidence word over a
+  /// bounding range that misrepresents the audio.
+  total_emissions: u32,
 }
+
+/// Minimum `speech_emissions / total_emissions` ratio required
+/// to keep a word. Half-coverage is the natural threshold —
+/// majority-speech words stay; mostly-masked words drop. Codex
+/// round-21.
+const MIN_SPEECH_COVERAGE: f32 = 0.5;
+
+/// Maximum allowed contiguous silent run inside a word's
+/// `[start_frame, end_frame)` span. With wav2vec2's typical
+/// hop (320 samples at 16 kHz → 20 ms/frame), 5 frames is
+/// 100 ms — tolerates brief unvoiced consonants, glottal
+/// stops, and VAD jitter while rejecting words whose emissions
+/// straddle a long masked gap (a CTC alignment artifact, not
+/// a real word). Codex round-21.
+const MAX_INTRA_SILENT_RUN_FRAMES: usize = 5;
 
 /// Build a per-frame speech mask of length `n_frames`, marking
 /// `true` exactly for frames whose audio sample range overlaps any
@@ -68,8 +97,8 @@ pub(crate) fn build_speech_frames(
 }
 
 /// Walk the Viterbi path and accumulate per-word `(start_frame,
-/// end_frame, logprob_sum, frame_count)` into a `Vec<Option<...>>`
-/// indexed by normalised-word position.
+/// end_frame, logprob_sum, speech_emissions, total_emissions)`
+/// into a `Vec<Option<...>>` indexed by normalised-word position.
 ///
 /// Step 7 of §6.3.2:
 /// - Skip frames whose state is a blank (`state % 2 == 0`).
@@ -101,76 +130,93 @@ fn accumulate_per_word(
     if state % 2 == 0 {
       continue; // blank
     }
-    // Drop frames that fall inside silence-masked audio. Without
-    // this guard, words assigned to silence regions by the CTC
-    // forced-alignment would emit fabricated timestamps.
-    if !speech_frames.get(t_idx).copied().unwrap_or(true) {
-      continue;
-    }
     let token_idx = state / 2;
     let Some(word_idx) = word_idx_per_token.get(token_idx).copied().flatten() else {
       continue; // delimiter / special; skip
     };
-    let token_id = path.tokens[token_idx];
-    let lp = log_probs.at(t_idx, token_id as usize);
+    let Some(slot) = per_word.get_mut(word_idx) else {
+      // word_idx out of range — caller / tokeniser bug. Skip
+      // rather than panic.
+      continue;
+    };
 
-    match per_word.get_mut(word_idx) {
-      Some(slot) => match slot {
-        Some(accum) => {
-          accum.end_frame = (t_idx + 1) as u32;
-          accum.logprob_sum += lp;
-          accum.frame_count += 1;
-        }
-        None => {
-          *slot = Some(WordAccum {
-            start_frame: t_idx as u32,
-            end_frame: (t_idx + 1) as u32,
-            logprob_sum: lp,
-            frame_count: 1,
-          });
-        }
-      },
-      None => {
-        // word_idx out of range — caller / tokeniser bug.
-        // Skip rather than panic (the silence-mask drop
-        // case is `None` per_word entries, not out-of-range).
-        continue;
+    let is_speech = speech_frames.get(t_idx).copied().unwrap_or(true);
+
+    // Open the slot regardless of speech support so silent
+    // emissions count toward `total_emissions` (the coverage
+    // denominator). The bounding `[start_frame, end_frame)` is
+    // still anchored to speech-supported frames — only those
+    // contribute to `start_frame`/`end_frame`/`logprob_sum`/
+    // `speech_emissions`. Codex round-21.
+    let entry = slot.get_or_insert_with(|| WordAccum {
+      start_frame: 0,
+      end_frame: 0,
+      logprob_sum: 0.0,
+      speech_emissions: 0,
+      total_emissions: 0,
+    });
+    entry.total_emissions += 1;
+    if is_speech {
+      let token_id = path.tokens[token_idx];
+      let lp = log_probs.at(t_idx, token_id as usize);
+      if entry.speech_emissions == 0 {
+        entry.start_frame = t_idx as u32;
       }
+      entry.end_frame = (t_idx + 1) as u32;
+      entry.logprob_sum += lp;
+      entry.speech_emissions += 1;
     }
   }
 
-  // Codex round-20 [medium]: previous round-16 fix added a
-  // post-pass that dropped any word whose `[start_frame,
-  // end_frame)` span covered a silent frame. The intent was
-  // sound — a word's emitted `Word.range` shouldn't span
-  // silence-masked audio — but the implementation was too
-  // aggressive: a single VAD false-negative inside a real
-  // word (a 20 ms unvoiced consonant, a glottal stop, brief
-  // jitter) caused the entire word to disappear, even though
-  // the accumulator already had speech-supported emissions on
-  // both sides of the gap.
+  // Post-pass: drop fragmented and long-gap words. (Codex
+  // round-21.)
   //
-  // The per-frame skip earlier in this function (`if
-  // !speech_frames[t_idx]`) already anchors `start_frame`,
-  // `end_frame`, `frame_count`, and `logprob_sum` to
-  // speech-supported frames only. A word that opens an
-  // accumulator therefore has at least one speech-supported
-  // emission, and its range `[start_frame, end_frame)`
-  // bookends the *speech-supported* span. Words with no
-  // speech support never open an accumulator and stay `None`
-  // (the all-silence case stays handled by the existing
-  // `slot.is_none()` drop in `compose_words`).
-  //
-  // Trade-off: the emitted range can include a brief silent
-  // intra-word fragment. Representing a word's real audio as
-  // multiple disjoint ranges would need a `Word`-API change;
-  // a single bounding range is the closest single-`TimeRange`
-  // approximation and matches what whisper.cpp / WhisperX
-  // emit in equivalent situations. Pathological wide spans
-  // (a "word" with isolated speech emissions hundreds of
-  // frames apart and silence between) are theoretically
-  // possible but bounded by CTC monotonicity — one word's
-  // tokens occupy a contiguous lattice run.
+  // History:
+  // - Round-16: dropped any word whose bounding span covered
+  //   a silent frame. Too aggressive — a 1-frame VAD
+  //   false-negative inside a real word killed the word.
+  // - Round-20: removed the post-pass entirely. Too lax —
+  //   a word with most emissions masked and one surviving
+  //   speech frame still emitted with a high-confidence score
+  //   over a misleading bounding range.
+  // - Round-21 (current): drop on either signal — speech
+  //   coverage below `MIN_SPEECH_COVERAGE` ("fragmented")
+  //   *or* longest contiguous silent run inside the bounding
+  //   span exceeds `MAX_INTRA_SILENT_RUN_FRAMES` ("long
+  //   straddle"). Brief intra-word silences (unvoiced
+  //   consonants, glottal stops, ≤100 ms VAD jitter) still
+  //   keep the word.
+  for slot in per_word.iter_mut() {
+    let Some(accum) = slot else { continue };
+    if accum.speech_emissions == 0 {
+      *slot = None;
+      continue;
+    }
+    let coverage = accum.speech_emissions as f32 / accum.total_emissions as f32;
+    if coverage < MIN_SPEECH_COVERAGE {
+      *slot = None;
+      continue;
+    }
+    let start = accum.start_frame as usize;
+    let end = accum.end_frame as usize;
+    if let Some(slice) = speech_frames.get(start..end) {
+      let mut max_run: usize = 0;
+      let mut current: usize = 0;
+      for &b in slice {
+        if !b {
+          current += 1;
+          if current > max_run {
+            max_run = current;
+          }
+        } else {
+          current = 0;
+        }
+      }
+      if max_run > MAX_INTRA_SILENT_RUN_FRAMES {
+        *slot = None;
+      }
+    }
+  }
 
   per_word
 }
@@ -186,7 +232,7 @@ fn accumulate_per_word(
 /// Step 8/9: for each `(i, slot)`:
 /// - `Some` => build `Word { text: original_words[i].into(), range:
 ///   frames_to_output_range(start_frame, end_frame), score:
-///   exp(logprob_sum / frame_count) }`.
+///   exp(logprob_sum / speech_emissions) }`.
 /// - `None` => skip; the word had no speech-supported audio
 ///   (typically silence-masked or all-`<unk>`). It is *not* added
 ///   to `words`. The total chunk text on `Transcript.text` still
@@ -217,7 +263,7 @@ where
     let end_sample = chunk_first_sample_in_stream + (accum.end_frame as u64) * (hop_samples as u64);
     let range = samples_to_output_range(start_sample, end_sample);
 
-    let mean_lp = accum.logprob_sum / (accum.frame_count.max(1) as f32);
+    let mean_lp = accum.logprob_sum / (accum.speech_emissions.max(1) as f32);
     let score = mean_lp.exp().clamp(0.0, 1.0);
 
     words.push(Word::new(SmolStr::new(&original_words[i]), range, score));
@@ -484,6 +530,128 @@ mod tests {
       1_600,
       "range ends one past last speech-supported frame"
     );
+  }
+
+  /// Codex round-21 [high]: a word whose token visits the path
+  /// 5 times but only one frame is speech-supported (4 silent
+  /// emissions skipped) must drop. Coverage = 1 / 5 = 0.20,
+  /// below `MIN_SPEECH_COVERAGE = 0.5`. Pre-fix the round-20
+  /// implementation kept it — emitting a high-confidence word
+  /// scored from the single surviving emission while ignoring
+  /// the 4 masked-out token frames.
+  #[test]
+  fn fragmented_word_with_minority_speech_support_drops() {
+    // 5 frames; word 0's token (state 1) emits at every frame.
+    let path = ViterbiPath {
+      state_per_frame: alloc::vec![1, 1, 1, 1, 1],
+      tokens: alloc::vec![10],
+    };
+    let log_probs = lp_const(5, 30, -1.0);
+    let word_idx_per_token = alloc::vec![Some(0)];
+    let original = alloc::vec![Cow::Borrowed("missed")];
+    // Only frame 0 is speech-supported; frames 1-4 are masked.
+    let speech_frames = alloc::vec![true, false, false, false, false];
+
+    let result = compose_words(
+      &path,
+      &log_probs,
+      &word_idx_per_token,
+      &original,
+      &speech_frames,
+      0,
+      320,
+      fake_samples_to_output_range,
+    );
+    assert!(
+      result.words().is_empty(),
+      "fragmented word (1/5 coverage) must drop; got {:?}",
+      result.words()
+    );
+  }
+
+  /// Codex round-21 [high]: a word with speech emissions on
+  /// both sides of a long silent gap must drop — the bounding
+  /// `Word.range` would otherwise misrepresent where the word
+  /// actually occurred. The 19-frame masked gap inside the
+  /// span (~380 ms at 50 fps) blows past
+  /// `MAX_INTRA_SILENT_RUN_FRAMES = 5`. Coverage alone passes
+  /// (2 of 2 emissions are speech-supported), so the gap check
+  /// is what catches this.
+  #[test]
+  fn word_spanning_long_silent_gap_drops() {
+    // 21 frames; state 1 (token 0, word 0) emits at frame 0 and
+    // frame 20 only; everything else is blank.
+    let mut state_per_frame = alloc::vec![0_usize; 21];
+    state_per_frame[0] = 1;
+    state_per_frame[20] = 1;
+    let path = ViterbiPath {
+      state_per_frame,
+      tokens: alloc::vec![10],
+    };
+    let log_probs = lp_const(21, 30, -1.0);
+    let word_idx_per_token = alloc::vec![Some(0)];
+    let original = alloc::vec![Cow::Borrowed("split")];
+    // Speech only at the two emission frames; everything else
+    // is masked silence (a 19-frame masked run inside the span).
+    let mut speech_frames = alloc::vec![false; 21];
+    speech_frames[0] = true;
+    speech_frames[20] = true;
+
+    let result = compose_words(
+      &path,
+      &log_probs,
+      &word_idx_per_token,
+      &original,
+      &speech_frames,
+      0,
+      320,
+      fake_samples_to_output_range,
+    );
+    assert!(
+      result.words().is_empty(),
+      "word with 19-frame intra-silent run must drop; got {:?}",
+      result.words()
+    );
+  }
+
+  /// Boundary check on the long-gap rule: a word with exactly
+  /// `MAX_INTRA_SILENT_RUN_FRAMES = 5` masked frames inside its
+  /// span survives (the threshold is "exceeds 5", strict).
+  /// Coverage 2/2 = 1.0 also passes. The kept span bookends the
+  /// two speech-supported emission frames.
+  #[test]
+  fn word_with_silent_run_at_threshold_is_kept() {
+    // 7 frames; state 1 emits at frame 0 and frame 6, blank
+    // elsewhere. The 5 silent middle frames sit at the
+    // tolerance limit.
+    let path = ViterbiPath {
+      state_per_frame: alloc::vec![1, 0, 0, 0, 0, 0, 1],
+      tokens: alloc::vec![10],
+    };
+    let log_probs = lp_const(7, 30, -1.0);
+    let word_idx_per_token = alloc::vec![Some(0)];
+    let original = alloc::vec![Cow::Borrowed("ok")];
+    let speech_frames = alloc::vec![true, false, false, false, false, false, true];
+
+    let result = compose_words(
+      &path,
+      &log_probs,
+      &word_idx_per_token,
+      &original,
+      &speech_frames,
+      0,
+      320,
+      fake_samples_to_output_range,
+    );
+    assert_eq!(
+      result.words().len(),
+      1,
+      "5-frame intra-silent run is at threshold and must be kept; got {:?}",
+      result.words()
+    );
+    let r = result.words()[0].range();
+    assert_eq!(r.start_pts(), 0);
+    assert_eq!(r.end_pts(), 7 * 320);
   }
 
   /// Codex round-20 [medium]: long word with brief intra-silence
