@@ -47,7 +47,7 @@ fn mode_with_first_occurrence_tiebreak(observations: &[Lang]) -> Lang {
   best.expect("observations must not be empty").0.clone()
 }
 
-#[allow(dead_code)] // alignment fields land in Plan C
+#[allow(dead_code)] // alignment fields land in alignment feature
 #[derive(Debug)]
 pub(crate) enum ChunkPhase {
   AwaitingAsr,
@@ -65,9 +65,8 @@ pub(crate) struct ChunkRecord {
   pub sub_segments: Vec<TimeRange>,
   /// Sub-VAD-segments in stream-coordinate 16 kHz sample indices,
   /// preserved alongside the output-timebase form so the alignment
-  /// worker can build the silence mask in chunk-local space (Plan
-  /// C, Task 22). Each `(start, end)` is half-open in 16 kHz
-  /// stream samples.
+  /// worker can build the silence mask in chunk-local space.
+  /// Each `(start, end)` is half-open in 16 kHz stream samples.
   #[cfg(feature = "alignment")]
   #[allow(dead_code)] // exposed via Dispatch::chunk_sub_segments_samples
   pub sub_segments_samples: Vec<(u64, u64)>,
@@ -79,7 +78,7 @@ pub(crate) struct ChunkRecord {
   /// the live buffer's anchor while in-flight chunks survive,
   /// so a fresh closure built post-restart would map this
   /// chunk's pre-restart sample indices through the wrong PTS
-  /// origin. (Codex round-19.)
+  /// origin.
   #[cfg(feature = "alignment")]
   pub output_tb: mediatime::Timebase,
   /// PTS-anchor snapshot at stream-zero in `output_tb`,
@@ -87,7 +86,7 @@ pub(crate) struct ChunkRecord {
   /// [`Self::output_tb`] for the rationale.
   #[cfg(feature = "alignment")]
   pub base_pts_out_anchor: i64,
-  #[allow(dead_code)] // used by alignment in Plan C
+  #[allow(dead_code)] // used by alignment feature
   pub sub_origins: Vec<SubOrigin>,
   pub phase: ChunkPhase,
   pub asr_result: Option<AsrResult>,
@@ -99,8 +98,7 @@ pub(crate) struct ChunkRecord {
 /// yet). `cut_pending` entries are stored as `ExtractedChunk` so
 /// they survive `restart_at`'s buffer reset without needing the old
 /// `draining_for_restart` bypass — and so the AutoLockAfter
-/// observation-window gate is preserved during recovery (Codex
-/// round-7 fix).
+/// observation-window gate is preserved during recovery.
 #[derive(Debug)]
 pub(crate) struct ExtractedChunk {
   pub chunk_id: ChunkId,
@@ -111,14 +109,14 @@ pub(crate) struct ExtractedChunk {
   /// Sub-VAD-segments in stream-coordinate 16 kHz sample indices.
   /// Preserved alongside the output-timebase `sub_segments` so the
   /// runner's alignment dispatch can rebuild chunk-local sample
-  /// indices for the aligner's silence mask (Plan C, Task 22).
+  /// indices for the aligner's silence mask.
   #[cfg(feature = "alignment")]
   pub sub_segments_samples: Vec<(u64, u64)>,
   /// Output timebase snapshot captured at extract time. Promoted
   /// onto [`ChunkRecord::output_tb`] so the runner's alignment
   /// dispatch can rebuild a per-chunk
   /// `samples_to_output_range` closure that survives a later
-  /// `restart_at`. (Codex round-19.)
+  /// `restart_at`.
   #[cfg(feature = "alignment")]
   pub output_tb: mediatime::Timebase,
   /// PTS anchor at stream-zero, captured at extract time. See
@@ -169,7 +167,7 @@ impl ExtractedChunk {
     // Capture the output timebase + PTS anchor *now*, before
     // any later `restart_at` shifts the buffer onto a new
     // epoch. Promoted to `ChunkRecord` at promote-time and
-    // consulted at alignment-dispatch time. (Codex round-19.)
+    // consulted at alignment-dispatch time.
     #[cfg(feature = "alignment")]
     let output_tb = buffer
       .output_timebase()
@@ -194,10 +192,10 @@ impl ExtractedChunk {
   }
 
   /// Stream-coordinate first 16 kHz sample index of this chunk's
-  /// audio. Used by the alignment worker (Plan C) to map wav2vec2
-  /// frame indices back to stream sample positions.
+  /// audio. Used by the alignment worker to map wav2vec2 frame
+  /// indices back to stream sample positions.
   ///
-  /// Plan A's `SampleRange` is half-open and stream-relative, so
+  /// `SampleRange` is half-open and stream-relative, so
   /// `sample_range.start` is exactly the chunk's first sample
   /// index since stream zero.
   #[cfg(feature = "alignment")]
@@ -236,11 +234,10 @@ pub(crate) struct Dispatch {
   /// tiebreaking among ties — the language that appeared first
   /// in chunk_id order wins).
   ///
-  /// Codex round-2 fix: previously this was a `usize` counter
-  /// that just stored the last-observed language at threshold.
-  /// For `n > 1` that diverged from the spec's "most-frequent"
-  /// contract — a noisy `En, En, Zh` sequence would have
-  /// locked to Zh.
+  /// Previously this was a `usize` counter that just stored the
+  /// last-observed language at threshold. For `n > 1` that
+  /// diverged from the "most-frequent" contract — a noisy
+  /// `En, En, Zh` sequence would have locked to Zh.
   pub auto_lock_observations: alloc::vec::Vec<Lang>,
   /// Per-ChunkId resolution status for AutoLockAfter ordering. An
   /// entry's value is `Some(lang)` for a non-empty ASR result and
@@ -249,12 +246,11 @@ pub(crate) struct Dispatch {
   /// here until earlier chunks resolve; the cursor drains them in
   /// chunk_id order via `advance_auto_lock_cursor`.
   ///
-  /// Codex round-3 fix: previously observations were appended in
-  /// ASR completion order, so out-of-order completion (chunk 1
-  /// finishing before chunk 0) race-determined the locked
-  /// language. The spec calls for locking on the first non-empty
-  /// chunks *in the stream*, not the first to complete on the
-  /// runner.
+  /// Previously observations were appended in ASR completion
+  /// order, so out-of-order completion (chunk 1 finishing before
+  /// chunk 0) race-determined the locked language. The contract
+  /// is to lock on the first non-empty chunks *in the stream*,
+  /// not the first to complete on the runner.
   pub auto_lock_pending: BTreeMap<ChunkId, Option<Lang>>,
   /// Next ChunkId the auto-lock cursor will consider. Advances
   /// monotonically, only moving past a ChunkId once that chunk has
@@ -361,12 +357,11 @@ impl Dispatch {
 
   /// Total audio samples currently held in `cut_pending`'s
   /// pre-extracted `Arc<[f32]>`s. Used by `Transcriber` to count
-  /// queued audio toward `buffer_cap_samples` (Codex round-8 fix:
-  /// post-round-7 pre-extraction moved cut_pending audio out of
-  /// the live buffer; without including this in the Backpressure
-  /// check, a slow runner could let cut_pending grow unboundedly
-  /// every time the live buffer trimmed and the caller pushed
-  /// more samples).
+  /// queued audio toward `buffer_cap_samples`. The pre-extraction
+  /// design moved cut_pending audio out of the live buffer;
+  /// without including this in the Backpressure check, a slow
+  /// runner could let cut_pending grow unboundedly every time the
+  /// live buffer trimmed and the caller pushed more samples.
   pub(crate) fn cut_pending_audio_samples(&self) -> usize {
     self.cut_pending.iter().map(|c| c.samples.len()).sum()
   }
@@ -376,9 +371,7 @@ impl Dispatch {
   /// budget and (for unlocked AutoLockAfter) the observation
   /// window threshold.
   ///
-  /// Round-6 introduced an "in-flight count cap of `n`" gate to
-  /// hold back unhinted chunks. Round-10 (this method) replaces
-  /// it with a per-ChunkId threshold:
+  /// The gate is a per-ChunkId threshold:
   /// `threshold = auto_lock_cursor + (n - observations.len())`.
   ///
   /// Chunks with id < threshold are observation candidates —
@@ -386,7 +379,7 @@ impl Dispatch {
   /// with id >= threshold wait for the lock regardless of
   /// available in-flight slots.
   ///
-  /// The pre-round-10 count-cap had a sliding-window bug: when
+  /// A simpler in-flight-count cap had a sliding-window bug: when
   /// chunk 0 of an `AutoLockAfter(3)` stream completed and its
   /// in-flight slot freed, chunk 3 was promoted with no hint
   /// even though chunks 1 and 2 might still complete and lock
@@ -394,9 +387,8 @@ impl Dispatch {
   /// chunk 3 is past the observation window and waits regardless
   /// of slot count.
   ///
-  /// Round-7 invariant preserved: cut_pending entries hold
-  /// pre-extracted audio, so the gate is enforced even across
-  /// `restart_at`.
+  /// Cut_pending entries hold pre-extracted audio, so the gate is
+  /// enforced even across `restart_at`.
   fn can_promote(&self, chunk_id: ChunkId) -> bool {
     if self.in_flight.len() >= self.max_in_flight {
       return false;
@@ -418,9 +410,8 @@ impl Dispatch {
   /// by `on_emit` and by `after_inject`'s post-resolve promotion
   /// loop.
   ///
-  /// Param precedence (default → locked → override) matches the
-  /// pre-Codex-fix behaviour where `try_dispatch` merged the
-  /// runtime override last. The crucial difference is that
+  /// Param precedence (default → locked → override): the runtime
+  /// override merges last. The crucial detail is that
   /// `ext.override_at_creation` is the override that was active
   /// when *this chunk* was extracted, so a chunk parked or held
   /// in `cut_pending` always carries its own override — it can't
@@ -492,21 +483,20 @@ impl Dispatch {
     }
   }
 
-  /// Compute trim's low-water. After the round-7 refactor, both
-  /// `in_flight` chunks and `cut_pending` chunks hold their own
-  /// `Arc<[f32]>` audio (extracted at emit time), so neither
-  /// pins the live buffer. The only constraint from the live
-  /// audio side is the cut accumulator: samples back to its
-  /// start are still referenced by an unextracted partial chunk.
+  /// Compute trim's low-water. Both `in_flight` chunks and
+  /// `cut_pending` chunks hold their own `Arc<[f32]>` audio
+  /// (extracted at emit time), so neither pins the live buffer.
+  /// The only constraint from the live audio side is the cut
+  /// accumulator: samples back to its start are still referenced
+  /// by an unextracted partial chunk.
   ///
   /// `cut_accumulator_start` is `Cut::pending_start()`. If it's
   /// `None` (no chunk accumulating), the trim falls back to
   /// `safe_trim_high_water` — usually the caller's VAD analysis
-  /// watermark. This is the round-9 fix: the previous fallback
-  /// was the buffer's absolute high-water mark, which dropped
-  /// audio past any unanalyzed VAD tail. With the watermark as
-  /// the upper bound, trim respects "VAD hasn't analyzed past
-  /// here yet, don't drop the audio".
+  /// watermark. A previous fallback to the buffer's absolute
+  /// high-water mark dropped audio past any unanalyzed VAD tail.
+  /// With the watermark as the upper bound, trim respects "VAD
+  /// hasn't analyzed past here yet, don't drop the audio".
   pub(crate) fn low_water_samples(
     &self,
     cut_accumulator_start: Option<u64>,
@@ -519,7 +509,7 @@ impl Dispatch {
   /// in-flight chunks as events, then promote pending chunks if
   /// slots have opened. The caller (`Transcriber`) must invoke
   /// `flush_in_order_events()` then `trim()` in this order on
-  /// every inject path (§5.5 invariant 3).
+  /// every inject path.
   ///
   /// `cut_accumulator_start` is `Cut::pending_start()` — see
   /// `low_water_samples`.
@@ -528,7 +518,7 @@ impl Dispatch {
   /// the caller's VAD analysis watermark (`vad_watermark`).
   /// Passing `buffer.absolute_sample_offset()` is only safe in
   /// `signal_eof` paths where the stream is ending and audio
-  /// past the watermark won't be analyzed (round-9 fix).
+  /// past the watermark won't be analyzed.
   pub(crate) fn after_inject(
     &mut self,
     buffer: &mut SampleBuffer,
@@ -538,8 +528,8 @@ impl Dispatch {
     self.flush_in_order_events();
     let low = self.low_water_samples(cut_accumulator_start, safe_trim_high_water);
     buffer.trim_to(low);
-    // Promote pending chunks while the gate allows them. Round-10
-    // gate is per-ChunkId (auto_lock_cursor + n - observations.len());
+    // Promote pending chunks while the gate allows them. The gate
+    // is per-ChunkId (auto_lock_cursor + n - observations.len());
     // older slots free up when observations land or the lock fires.
     // Peek the front entry to ask `can_promote(its chunk_id)`; if
     // it's gated, stop (cut_pending is in chunk_id order, so later
@@ -756,9 +746,9 @@ impl Dispatch {
 
   /// Stream-coordinate first 16 kHz sample index of the chunk
   /// `chunk_id`, or `None` if the chunk is not in flight. Used by
-  /// the runner's alignment dispatch (Plan C, Task 22) to convert
-  /// stream-sample sub_segments into chunk-local space before
-  /// shipping them to the alignment worker.
+  /// the runner's alignment dispatch to convert stream-sample
+  /// sub_segments into chunk-local space before shipping them to
+  /// the alignment worker.
   #[cfg(feature = "alignment")]
   pub(crate) fn chunk_first_sample(&self, chunk_id: ChunkId) -> Option<u64> {
     let record = self.in_flight.get(&chunk_id)?;
@@ -767,9 +757,9 @@ impl Dispatch {
 
   /// Sub-VAD-segments of the chunk `chunk_id` in stream-coordinate
   /// 16 kHz sample indices, as `(start, end)` pairs. Used by the
-  /// runner's alignment dispatch (Plan C, Task 22) to build the
-  /// chunk-local sample-indexed sub_segments the alignment worker
-  /// consumes for its silence mask.
+  /// runner's alignment dispatch to build the chunk-local
+  /// sample-indexed sub_segments the alignment worker consumes
+  /// for its silence mask.
   #[cfg(feature = "alignment")]
   pub(crate) fn chunk_sub_segments_samples(
     &self,
@@ -786,7 +776,7 @@ impl Dispatch {
   /// the live buffer's anchor.
   ///
   /// Returns `None` if `chunk_id` is not in flight (e.g. already
-  /// drained as `Transcript`/`Failed`). Codex round-19.
+  /// drained as `Transcript`/`Failed`).
   #[cfg(feature = "alignment")]
   pub(crate) fn chunk_samples_to_output_range_fn(
     &self,
@@ -843,7 +833,7 @@ mod tests {
   fn dispatch_default() -> Dispatch {
     // Tests using this helper exercise dispatch ordering / phase
     // checks / commands without language-policy involvement;
-    // LanguagePolicy::Auto avoids the round-6 gate that holds
+    // LanguagePolicy::Auto avoids the auto-lock gate that holds
     // back chunks under unlocked AutoLockAfter.
     Dispatch::new(
       AsrParams::default(),
@@ -1006,7 +996,7 @@ mod tests {
   #[test]
   fn cut_pending_holds_chunks_when_max_in_flight_reached() {
     // Auto policy: tests pure max_in_flight gating without the
-    // round-6 unlocked-AutoLockAfter restriction.
+    // unlocked-AutoLockAfter restriction.
     let mut d = Dispatch::new(AsrParams::default(), false, 2, LanguagePolicy::Auto);
     let mut b = make_buffer_with_samples(10_000);
     d.on_emit(fake_chunk(0, 1_000), ChunkId::from_raw(0), &b);
@@ -1036,15 +1026,14 @@ mod tests {
     }
   }
 
-  /// Covers the dequeue half of §5.5 invariant 4: when an in-flight
-  /// chunk completes and `after_inject` runs, a chunk that was
-  /// queued in `cut_pending` because `max_in_flight` was full
-  /// must be promoted (audio extracted, RunAsr command queued)
-  /// in the same call.
+  /// When an in-flight chunk completes and `after_inject` runs,
+  /// a chunk that was queued in `cut_pending` because
+  /// `max_in_flight` was full must be promoted (audio extracted,
+  /// RunAsr command queued) in the same call.
   #[test]
   fn cut_pending_promotes_on_slot_open() {
     // Auto policy: tests pure max_in_flight gating without the
-    // round-6 unlocked-AutoLockAfter restriction.
+    // unlocked-AutoLockAfter restriction.
     let mut d = Dispatch::new(AsrParams::default(), false, 2, LanguagePolicy::Auto);
     let mut b = make_buffer_with_samples(10_000);
 
@@ -1079,8 +1068,8 @@ mod tests {
     assert_eq!(d.pending_events.len(), 1, "chunk 0's Transcript emitted");
   }
 
-  /// Codex round-1 finding [high]: `LanguagePolicy::Lock { hint }`
-  /// must apply the hint to every emitted RunAsr command.
+  /// `LanguagePolicy::Lock { hint }` must apply the hint to
+  /// every emitted RunAsr command.
   #[test]
   fn language_policy_lock_applies_hint_to_first_chunk() {
     let mut d = Dispatch::new(
@@ -1104,10 +1093,9 @@ mod tests {
     }
   }
 
-  /// Codex round-1 finding [high]: `LanguagePolicy::AutoLockAfter(1)`
-  /// must lock the language after observing the first non-empty
-  /// ASR result, then apply that hint to all subsequent RunAsr
-  /// commands.
+  /// `LanguagePolicy::AutoLockAfter(1)` must lock the language
+  /// after observing the first non-empty ASR result, then apply
+  /// that hint to all subsequent RunAsr commands.
   #[test]
   fn language_policy_auto_lock_after_one_locks_on_first_observation() {
     let mut d = Dispatch::new(
@@ -1165,10 +1153,9 @@ mod tests {
     }
   }
 
-  /// Codex round-1 finding [medium]: a duplicate `inject_asr_result`
-  /// on a chunk that's already `Ready` (waiting in-order) must be
-  /// rejected — otherwise the second call could overwrite the
-  /// final transcript.
+  /// A duplicate `inject_asr_result` on a chunk that's already
+  /// `Ready` (waiting in-order) must be rejected — otherwise the
+  /// second call could overwrite the final transcript.
   #[test]
   fn inject_asr_on_ready_phase_returns_unknown_chunk() {
     let mut d = dispatch_default();
@@ -1191,10 +1178,10 @@ mod tests {
     assert!(matches!(r, Err(TranscriberError::UnknownChunk(c)) if c.as_u64() == 1));
   }
 
-  /// Codex round-1 finding [medium]: alignment results aimed at a
-  /// chunk in `AwaitingAsr` (not `AwaitingAlignment`) must be
-  /// rejected — otherwise an unsolicited alignment result could
-  /// overwrite a still-in-flight chunk.
+  /// Alignment results aimed at a chunk in `AwaitingAsr` (not
+  /// `AwaitingAlignment`) must be rejected — otherwise an
+  /// unsolicited alignment result could overwrite a
+  /// still-in-flight chunk.
   #[test]
   fn inject_alignment_on_awaiting_asr_returns_unknown_chunk() {
     let mut d = dispatch_default();
@@ -1208,9 +1195,9 @@ mod tests {
     assert!(matches!(r, Err(TranscriberError::UnknownChunk(_))));
   }
 
-  /// Codex round-1 finding [medium]: a failure aimed at a chunk
-  /// already in `Ready` phase must be rejected — it must not
-  /// retroactively turn a successful Transcript into an Error.
+  /// A failure aimed at a chunk already in `Ready` phase must
+  /// be rejected — it must not retroactively turn a successful
+  /// Transcript into an Error.
   #[test]
   fn inject_failure_on_ready_returns_unknown_chunk() {
     let mut d = dispatch_default();
@@ -1230,12 +1217,12 @@ mod tests {
     assert!(matches!(r, Err(TranscriberError::UnknownChunk(_))));
   }
 
-  /// Codex round-2 finding [medium]: `AutoLockAfter(n)` must lock
-  /// to the most-frequent observed language, not the last
-  /// observation. With n=3 and observations [En, En, Zh], the
-  /// pre-fix code locked to Zh (last seen); the spec says En
-  /// (most frequent). First-occurrence tiebreaking handles
-  /// equally-frequent languages deterministically.
+  /// `AutoLockAfter(n)` must lock to the most-frequent observed
+  /// language, not the last observation. With n=3 and
+  /// observations [En, En, Zh], the pre-fix code locked to Zh
+  /// (last seen); the contract is En (most frequent).
+  /// First-occurrence tiebreaking handles equally-frequent
+  /// languages deterministically.
   #[test]
   fn auto_lock_after_three_locks_to_most_frequent() {
     let mut d = Dispatch::new(
@@ -1291,15 +1278,15 @@ mod tests {
     }
   }
 
-  /// Codex round-3 finding [high]: AutoLockAfter must order
-  /// observations by ChunkId, not by ASR completion order. With
-  /// max_in_flight > 1, chunk 1 can finish before chunk 0; the
-  /// pre-fix code recorded observations in completion order,
-  /// race-determining the lock based on which worker happened to
-  /// finish first. Reproduction: chunk 0 = En, chunk 1 = Zh, ASR
-  /// for chunk 1 arrives first. With first-occurrence tiebreaking,
-  /// chunk_id order [En, Zh] picks En; completion order [Zh, En]
-  /// picks Zh — pre-fix would have locked Zh.
+  /// AutoLockAfter must order observations by ChunkId, not by
+  /// ASR completion order. With max_in_flight > 1, chunk 1 can
+  /// finish before chunk 0; pre-fix code recorded observations
+  /// in completion order, race-determining the lock based on
+  /// which worker happened to finish first. Reproduction: chunk
+  /// 0 = En, chunk 1 = Zh, ASR for chunk 1 arrives first. With
+  /// first-occurrence tiebreaking, chunk_id order [En, Zh] picks
+  /// En; completion order [Zh, En] picks Zh — pre-fix would have
+  /// locked Zh.
   #[test]
   fn auto_lock_after_orders_by_chunk_id_not_completion() {
     let mut d = Dispatch::new(
@@ -1344,9 +1331,9 @@ mod tests {
     );
   }
 
-  /// Round-3 corollary: an ASR failure on AwaitingAsr must advance
-  /// the auto-lock cursor without contributing an observation.
-  /// Otherwise a single failed chunk would block auto-lock forever.
+  /// An ASR failure on AwaitingAsr must advance the auto-lock
+  /// cursor without contributing an observation. Otherwise a
+  /// single failed chunk would block auto-lock forever.
   /// Reproduction: chunk 0 fails ASR; chunks 1 and 2 succeed in
   /// English. AutoLockAfter(2) must still lock to En.
   #[test]
@@ -1401,9 +1388,9 @@ mod tests {
     );
   }
 
-  /// Round-3 corollary: an empty-text ASR result must advance the
-  /// cursor without contributing an observation, even when arriving
-  /// out of order. Reproduction: chunks 0–2 promoted; chunk 1 = En,
+  /// An empty-text ASR result must advance the cursor without
+  /// contributing an observation, even when arriving out of
+  /// order. Reproduction: chunks 0–2 promoted; chunk 1 = En,
   /// chunk 0 = empty silent chunk, chunk 2 = En. AutoLockAfter(2)
   /// must lock on En after chunk 2 resolves.
   #[test]
@@ -1451,14 +1438,14 @@ mod tests {
     assert_eq!(d.locked_language, Some(Lang::En));
   }
 
-  /// Codex round-6 finding [high]: under unlocked
-  /// `AutoLockAfter(n)`, dispatch must hold back chunks past the
-  /// observation window — otherwise chunks 1..N get RunAsr with
-  /// `language_hint = None` and may auto-detect different
-  /// languages, defeating the lock contract. Reproduction:
-  /// `AutoLockAfter(1)` + `max_in_flight = 4`. Emit 3 chunks
-  /// without injecting. Pre-fix code promoted all three with no
-  /// hint. Post-fix code keeps only 1 in flight; the rest wait.
+  /// Under unlocked `AutoLockAfter(n)`, dispatch must hold back
+  /// chunks past the observation window — otherwise chunks 1..N
+  /// get RunAsr with `language_hint = None` and may auto-detect
+  /// different languages, defeating the lock contract.
+  /// Reproduction: `AutoLockAfter(1)` + `max_in_flight = 4`.
+  /// Emit 3 chunks without injecting. Pre-fix code promoted all
+  /// three with no hint. Post-fix code keeps only 1 in flight;
+  /// the rest wait.
   #[test]
   fn unlocked_auto_lock_after_caps_in_flight_to_observation_window() {
     let mut d = Dispatch::new(
@@ -1490,8 +1477,8 @@ mod tests {
     );
   }
 
-  /// Round-6 corollary: once the lock is established, the gate
-  /// lifts and the held-back chunks promote with the locked hint.
+  /// Once the lock is established, the gate lifts and the
+  /// held-back chunks promote with the locked hint.
   #[test]
   fn unlocked_auto_lock_after_releases_pending_with_hint_after_lock() {
     let mut d = Dispatch::new(
@@ -1537,17 +1524,16 @@ mod tests {
     }
   }
 
-  /// Codex round-10 finding [high]: AutoLockAfter(n>1) must hold
-  /// back chunks past the observation window even after earlier
-  /// observation chunks complete. Pre-fix gate was a fixed
-  /// in-flight count cap of `n`, which slid: when chunk 0 of an
-  /// AutoLockAfter(3) stream completed and freed a slot, chunk 3
-  /// was promoted with `language_hint = None` even though the
-  /// lock hadn't fired (chunks 1 and 2 still pending). Chunk 3
-  /// would run ASR without the locked language, defeating the
-  /// AutoLockAfter contract for n>1.
+  /// AutoLockAfter(n>1) must hold back chunks past the
+  /// observation window even after earlier observation chunks
+  /// complete. A simpler in-flight count cap of `n` slid: when
+  /// chunk 0 of an AutoLockAfter(3) stream completed and freed
+  /// a slot, chunk 3 was promoted with `language_hint = None`
+  /// even though the lock hadn't fired (chunks 1 and 2 still
+  /// pending). Chunk 3 would run ASR without the locked
+  /// language, defeating the AutoLockAfter contract for n>1.
   ///
-  /// Post-fix: gate by ChunkId threshold = auto_lock_cursor +
+  /// The fix gates by ChunkId threshold = auto_lock_cursor +
   /// (n - observations.len()). Chunks past that threshold wait
   /// for the lock regardless of in_flight occupancy.
   #[test]
@@ -1632,13 +1618,13 @@ mod tests {
     );
   }
 
-  /// Round-10 corollary: if an early observation chunk resolves
-  /// empty/failed, the threshold slides forward by one and the
-  /// next chunk becomes a candidate (still without the lock).
-  /// Reproduction: AutoLockAfter(2). Chunk 0 returns empty. The
-  /// threshold was 0+2=2 (chunks 0, 1 in window); after chunk 0's
-  /// empty result advances cursor to 1, threshold = 1+2 = 3,
-  /// so chunk 2 is now a candidate.
+  /// If an early observation chunk resolves empty/failed, the
+  /// threshold slides forward by one and the next chunk becomes
+  /// a candidate (still without the lock). Reproduction:
+  /// AutoLockAfter(2). Chunk 0 returns empty. The threshold was
+  /// 0+2=2 (chunks 0, 1 in window); after chunk 0's empty result
+  /// advances cursor to 1, threshold = 1+2 = 3, so chunk 2 is
+  /// now a candidate.
   #[test]
   fn auto_lock_after_threshold_slides_on_empty() {
     let mut d = Dispatch::new(

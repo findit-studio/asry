@@ -1,4 +1,4 @@
-//! Text-normaliser trait + canonical error type. See spec §6.3.
+//! Text-normaliser trait + canonical error type.
 
 use alloc::{borrow::Cow, string::String, vec::Vec};
 
@@ -22,7 +22,6 @@ pub enum NormalizationError {
 }
 
 /// Normalised text + back-pointer to original surface forms.
-/// See spec §6.3.2 step 1.
 #[derive(Clone, Debug)]
 pub struct NormalizedText<'a> {
   /// Normalised text the aligner tokenises against the wav2vec2
@@ -61,7 +60,7 @@ impl<'a> NormalizedText<'a> {
   }
 }
 
-/// Language-specific text normaliser. See spec §6.3.
+/// Language-specific text normaliser.
 ///
 /// Implementations must be `Send` because each `Aligner` lives
 /// inside a `Mutex<Aligner>` that crosses thread boundaries to the

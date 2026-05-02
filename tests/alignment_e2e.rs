@@ -1,6 +1,5 @@
 //! End-to-end alignment test using a real wav2vec2-base-960h ONNX,
-//! a real tiny whisper model, and the canned ~11 s JFK WAV. Spec
-//! §10.2.
+//! a real tiny whisper model, and the canned ~11 s JFK WAV.
 //!
 //! Skipped when WHISPERY_W2V_MODEL / WHISPERY_W2V_TOKENIZER /
 //! WHISPERY_TINY_EN_MODEL / WHISPERY_JFK_WAV are not set (CI
@@ -12,12 +11,9 @@ use core::{num::NonZeroU32, time::Duration};
 use std::path::Path;
 
 use mediatime::{Timebase, Timestamp};
-// Plan note: the plan's example imports `Aligner`, `AlignerKey`,
-// `AlignmentFallback`, `AlignmentSetBuilder`, and `EnglishNormalizer`
-// from `whispery::` directly; those crate-root re-exports land in
-// Task 29 (§3.3). For Task 25 we name them via the existing
-// `whispery::runner` path to keep the test self-contained (no lib.rs
-// change in this task's file list).
+// We name `Aligner`, `AlignerKey`, `AlignmentFallback`,
+// `AlignmentSetBuilder`, and `EnglishNormalizer` via the existing
+// `whispery::runner` path to keep the test self-contained.
 use whispery::{
   Lang, LanguagePolicy, ManagedTranscriber, VadSegment, WhisperPoolOptions,
   runner::{Aligner, AlignerKey, AlignmentFallback, AlignmentSetBuilder, EnglishNormalizer},
@@ -42,12 +38,10 @@ fn read_wav_16k_mono_f32(path: &str) -> Vec<f32> {
   }
 }
 
-// Codex round-9 [critical]: the round-9 drain-event fix in
-// `drive_one_step` (drain core events into the runner's per-chunk
-// queues) makes `drain` return in real time instead of the
-// previous 10+ minute hang. Verified locally — test panics on
-// the empty-transcript assertion in ~0.4 s rather than running
-// out the drain budget.
+// `drive_one_step` drains core events into the runner's
+// per-chunk queues, so `drain` returns in real time. Verified
+// locally — test panics on the empty-transcript assertion in
+// ~0.4 s rather than running out the drain budget.
 //
 // Still `#[ignore]`'d because the upstream encode issue affects
 // alignment too: the ASR worker returns `GenericError(-6)` on

@@ -1,16 +1,14 @@
 //! `SampleBuffer` — bounded f32 buffer with output-timebase PTS
 //! arithmetic anchored at the first push.
 //!
-//! Round-3 / round-4 invariants: `base_pts_out_anchor` is immutable
-//! after the first push (so trim doesn't accumulate drift on
-//! non-integer-ratio output timebases); the regression check runs
-//! in output-PTS space (so contiguous caller pushes on NTSC-like
-//! timebases don't produce spurious `PtsRegression`); trim's
-//! low-water is computed from `cut_pending` only, not `in_flight`,
-//! because in-flight chunks already hold their audio in their own
+//! Invariants: `base_pts_out_anchor` is immutable after the first
+//! push (so trim doesn't accumulate drift on non-integer-ratio
+//! output timebases); the regression check runs in output-PTS
+//! space (so contiguous caller pushes on NTSC-like timebases
+//! don't produce spurious `PtsRegression`); trim's low-water is
+//! computed from `cut_pending` only, not `in_flight`, because
+//! in-flight chunks already hold their audio in their own
 //! `Arc<[f32]>` (decoupled from the live buffer).
-//!
-//! See spec §5.4.
 
 use alloc::vec::Vec;
 
@@ -66,7 +64,6 @@ impl SampleBuffer {
   /// extract time so post-restart word-mapping for surviving
   /// pre-restart chunks uses the original epoch's anchor
   /// rather than whatever the buffer is currently anchored at.
-  /// (Codex round-19.)
   #[cfg(feature = "alignment")]
   pub(crate) fn base_pts_out_anchor(&self) -> i64 {
     self.base_pts_out_anchor
@@ -83,9 +80,9 @@ impl SampleBuffer {
     packet: &[f32],
     extra_queued_samples: usize,
   ) -> Result<(), TranscriberError> {
-    // Round-3 fix: do NOT commit `output_tb` / `base_pts_out_anchor`
-    // until every error path has been cleared. Pre-fix code wrote
-    // the anchor on first push *before* the capacity check, so a
+    // Do NOT commit `output_tb` / `base_pts_out_anchor` until
+    // every error path has been cleared. Pre-fix code wrote the
+    // anchor on first push *before* the capacity check, so a
     // first-push Backpressure left a "ghost" timebase that later
     // retries (with a corrected timebase or smaller packet) would
     // race against, tripping InconsistentTimebase / PtsRegression.
@@ -105,11 +102,10 @@ impl SampleBuffer {
     };
 
     // Compute expected next-PTS in output-tb space, then the
-    // delta against caller's starts_at. This is the round-4
-    // M-δ fix: the regression check stays in output-PTS space
-    // so contiguous pushes on non-integer-ratio output
-    // timebases don't trip spurious regressions through round-trip
-    // truncation.
+    // delta against caller's starts_at. The regression check
+    // stays in output-PTS space so contiguous pushes on
+    // non-integer-ratio output timebases don't trip spurious
+    // regressions through round-trip truncation.
     let expected_pts_out = effective_anchor
       + Timebase::rescale_pts(
         self.absolute_sample_offset as i64,
@@ -138,19 +134,19 @@ impl SampleBuffer {
       g as u64
     };
 
-    // Codex round-2 fix: check capacity BEFORE mutating. The
-    // spec doc on TranscriberError::Backpressure says "buffered
-    // samples *would* exceed the cap" — the original code
-    // mutated first then reported, which left the caller in an
-    // un-retryable position (samples committed, retry trips
-    // PtsRegression). With the pre-mutation check, Backpressure
-    // is a true atomic rejection: the input is dropped on the
-    // floor and the caller can retry the same packet later.
+    // Check capacity BEFORE mutating. The doc on
+    // TranscriberError::Backpressure says "buffered samples
+    // *would* exceed the cap" — earlier code mutated first then
+    // reported, which left the caller in an un-retryable
+    // position (samples committed, retry trips PtsRegression).
+    // With the pre-mutation check, Backpressure is a true atomic
+    // rejection: the input is dropped on the floor and the
+    // caller can retry the same packet later.
     //
-    // Codex round-8 fix: include `extra_queued_samples` (audio
-    // already held in cut_pending Arcs from round-7 pre-extraction).
-    // Without this term, a slow runner could let cut_pending
-    // grow unboundedly because trim emptied the live buffer.
+    // Include `extra_queued_samples` (audio already held in
+    // cut_pending Arcs from the pre-extraction design). Without
+    // this term, a slow runner could let cut_pending grow
+    // unboundedly because trim emptied the live buffer.
     let final_size = self.samples.len() + delta_samples as usize + packet.len();
     let total_with_queued = final_size + extra_queued_samples;
     if total_with_queued > self.cap {
@@ -233,7 +229,7 @@ impl SampleBuffer {
   /// `dispatch::ChunkRecord::output_tb`) and feeds it back here
   /// at alignment-dispatch time, so word ranges stay anchored in
   /// the chunk's own PTS epoch even after a `restart_at` shifts
-  /// the live buffer onto a new one. (Codex round-19.)
+  /// the live buffer onto a new one.
   ///
   /// Conversion math is identical to
   /// [`samples_to_output_range`](Self::samples_to_output_range)
@@ -291,9 +287,9 @@ impl SampleBuffer {
   }
 }
 
-/// Construct a default `SampleBuffer` with the spec's defaults
-/// (60 s × 16 kHz cap, 200 ms gap tolerance). Used by tests and as
-/// the default in `TranscriberOptions`.
+/// Construct a default `SampleBuffer` (60 s × 16 kHz cap, 200 ms
+/// gap tolerance). Used by tests and as the default in
+/// `TranscriberOptions`.
 pub(crate) fn default_buffer() -> SampleBuffer {
   SampleBuffer::new(60 * 16_000, 200 * 16) // 200 ms × 16 samples/ms = 3200
 }
@@ -374,11 +370,11 @@ mod tests {
     assert!(
       matches!(r, Err(TranscriberError::Backpressure { buffered, cap }) if buffered == 200 && cap == 150)
     );
-    // Codex round-2 fix: Backpressure must NOT mutate state.
-    // The buffer should be empty and absolute_sample_offset
-    // should still be 0 — the caller can retry the same packet
-    // later (e.g., after the runner drains chunks and the cap
-    // has been raised, or with a smaller packet).
+    // Backpressure must NOT mutate state. The buffer should be
+    // empty and absolute_sample_offset should still be 0 — the
+    // caller can retry the same packet later (e.g., after the
+    // runner drains chunks and the cap has been raised, or with
+    // a smaller packet).
     assert_eq!(
       b.buffered_samples(),
       0,
@@ -391,10 +387,10 @@ mod tests {
     );
   }
 
-  /// Codex round-2 fix: the rejected packet from a Backpressure
-  /// can be retried after the buffer drains. Without the
-  /// pre-mutation check, the state advanced, retrying the same
-  /// packet would have tripped PtsRegression.
+  /// The rejected packet from a Backpressure can be retried
+  /// after the buffer drains. Without the pre-mutation check,
+  /// the state advanced, retrying the same packet would have
+  /// tripped PtsRegression.
   #[test]
   fn backpressure_allows_retry_with_smaller_packet() {
     let mut b = SampleBuffer::new(150, 3200);
@@ -409,12 +405,12 @@ mod tests {
     assert_eq!(b.absolute_sample_offset(), 100);
   }
 
-  /// Codex round-3 finding [medium]: a Backpressure on the FIRST
-  /// push must be fully atomic — the rejected packet must not
-  /// commit the stream's timebase or anchor. Without the fix, a
-  /// retry (after the cap is raised, or with a smaller packet, or
-  /// with a corrected timebase) would race against an already-fixed
-  /// anchor and trip InconsistentTimebase / PtsRegression /
+  /// A Backpressure on the FIRST push must be fully atomic —
+  /// the rejected packet must not commit the stream's timebase
+  /// or anchor. Without the fix, a retry (after the cap is
+  /// raised, or with a smaller packet, or with a corrected
+  /// timebase) would race against an already-fixed anchor and
+  /// trip InconsistentTimebase / PtsRegression /
   /// GapExceedsTolerance even though the rejected input was
   /// supposed to be uncommitted.
   #[test]
@@ -435,10 +431,10 @@ mod tests {
     );
   }
 
-  /// Round-3 corollary: after a first-push Backpressure, the buffer
-  /// must accept a *different* timebase as its actual first push.
-  /// (Pre-fix behavior committed the rejected timebase, so this
-  /// would have tripped InconsistentTimebase.)
+  /// After a first-push Backpressure, the buffer must accept a
+  /// *different* timebase as its actual first push. (Pre-fix
+  /// behavior committed the rejected timebase, so this would
+  /// have tripped InconsistentTimebase.)
   #[test]
   fn first_push_backpressure_allows_different_timebase_on_retry() {
     let mut b = SampleBuffer::new(150, 3200);
@@ -510,8 +506,7 @@ mod tests {
     assert_eq!(b.absolute_sample_offset(), 0);
     assert_eq!(b.buffer_drop_offset(), 0);
     assert_eq!(b.buffered_samples(), 0);
-    // Next push at 50_000_000 must succeed without PtsRegression
-    // — this is the round-4 NB-α regression test.
+    // Next push at 50_000_000 must succeed without PtsRegression.
     b.append(ts_at_48k(50_000_000), &[2.0; 1000], 0).unwrap();
   }
 }

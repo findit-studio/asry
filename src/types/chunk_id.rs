@@ -3,7 +3,7 @@
 /// Monotonic identity for a chunk within a single `Transcriber`
 /// lifetime. Increases by 1 per emitted chunk (including chunks
 /// that produce `Event::Error`); suitable as a lancedb primary
-/// key. See spec §4.2 and §5.5.
+/// key.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ChunkId(u64);

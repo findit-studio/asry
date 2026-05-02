@@ -1,4 +1,4 @@
-//! English text normaliser. See spec §6.3.
+//! English text normaliser.
 
 use alloc::{borrow::Cow, string::String, vec::Vec};
 
@@ -7,8 +7,8 @@ use crate::runner::aligner::normalizer::{NormalizationError, NormalizedText, Tex
 /// English normaliser: lowercase + strip ASCII punct, surface-
 /// form preserved.
 ///
-/// Surface-form invariant (spec §6.3.2 step 9): the `original_words`
-/// map points each normalised-word index back to the original
+/// Surface-form invariant: the `original_words` map points each
+/// normalised-word index back to the original
 /// substring of the input text. The normaliser does **not** expand
 /// contractions — `"don't"` stays one word with normalised form
 /// `"don't"` (lowercased) and a single `original_words` entry
@@ -22,7 +22,7 @@ use crate::runner::aligner::normalizer::{NormalizationError, NormalizedText, Tex
 /// pronounces — the model then assigns word boundaries inside a
 /// single phonetic blob, shifting timings and producing duplicate
 /// `Word.text()` values that consumers can't safely dedupe (real
-/// repeated words exist too). Codex round-22.
+/// repeated words exist too).
 ///
 /// **Punctuation handling:** ASCII punctuation `[ . , ! ? ; : " ' (
 /// ) [ ] { } - — – ]` is stripped from word boundaries (leading and
@@ -80,11 +80,11 @@ fn is_word_punct(c: char) -> bool {
 // (`trim_start_matches` / `trim_end_matches`). Internal apostrophes
 // inside contractions like `don't` survive the trim — wav2vec2
 // aligns them as a single word with the `'` character emitted
-// inline. Codex round-16 [medium] flagged that the previous list
-// omitted ASCII `'` entirely, so quoted text like `'hello'`
-// kept the surrounding apostrophes in the normalised string;
-// wav2vec2's tokeniser then forced unspoken apostrophe states
-// into the CTC graph, stealing frames from real-word states.
+// inline. An earlier list omitted ASCII `'` entirely, so quoted
+// text like `'hello'` kept the surrounding apostrophes in the
+// normalised string; wav2vec2's tokeniser then forced unspoken
+// apostrophe states into the CTC graph, stealing frames from
+// real-word states.
 
 fn strip_word_punct(s: &str) -> &str {
   let trimmed_left = s.trim_start_matches(is_word_punct);
@@ -144,19 +144,22 @@ impl TextNormalizer for EnglishNormalizer {
       // chunk on a single hyphen. The apostrophe is *not* an
       // internal separator, so `don't` stays one piece and
       // aligns as a single word with the `'` character emitted
-      // inline by the wav2vec2 tokenizer (Codex round-22).
+      // inline by the wav2vec2 tokenizer.
       //
-      // Codex round-23 [medium]: each piece carries its own
-      // surface span, not the full hyphenated word. Pre-fix
-      // every split piece pointed back to the same
-      // `original_slice`, so `Hello-World` emitted two
+      // Each piece carries its own surface span, not the full
+      // hyphenated word. Without per-piece surface spans, every
+      // split piece would point back to the same
+      // `original_slice`, so `Hello-World` would emit two
       // `Word.text() == "Hello-World"` entries that downstream
       // consumers couldn't dedupe (real repeated words also
       // exist). The split runs over `stripped` (no boundary
       // punct) so each `piece_orig` is a borrow into the input
       // text — surface form is preserved per piece.
       if stripped.contains(is_internal_separator) {
-        for piece_orig in stripped.split(is_internal_separator).filter(|p| !p.is_empty()) {
+        for piece_orig in stripped
+          .split(is_internal_separator)
+          .filter(|p| !p.is_empty())
+        {
           let piece_lower = lowercase_for_match(piece_orig);
           if !normalized.is_empty() {
             normalized.push(' ');
@@ -214,14 +217,14 @@ mod tests {
     assert_eq!(nt.original_words()[1], "World!");
   }
 
-  /// Codex round-22 [high]: contractions stay one normalised
-  /// word with the apostrophe character preserved inline. The
-  /// previous round expanded `"Don't" → "do not"` and emitted
-  /// duplicate `Word.text()` entries spanning a forced `|`
-  /// delimiter that the speaker never pronounced — shifting
-  /// timings and breaking dedupe semantics for downstream
-  /// consumers. wav2vec2-base-960h's vocab has the apostrophe
-  /// glyph; aligning `don't` directly is the supported path.
+  /// Contractions stay one normalised word with the apostrophe
+  /// character preserved inline. An earlier version expanded
+  /// `"Don't" → "do not"` and emitted duplicate `Word.text()`
+  /// entries spanning a forced `|` delimiter that the speaker
+  /// never pronounced — shifting timings and breaking dedupe
+  /// semantics for downstream consumers. wav2vec2-base-960h's
+  /// vocab has the apostrophe glyph; aligning `don't` directly
+  /// is the supported path.
   #[test]
   fn contraction_stays_one_word_with_apostrophe_inline() {
     let n = EnglishNormalizer::new();
@@ -233,10 +236,10 @@ mod tests {
     assert_eq!(nt.original_words()[1], "go.");
   }
 
-  /// Codex round-23 [medium]: em-dash-glued tokens split into
-  /// per-piece surface spans. Pre-fix every piece pointed back
-  /// to the full `hello—world` slice, so the emitted alignment
-  /// would carry two `Word.text() == "hello—world"` entries —
+  /// Em-dash-glued tokens split into per-piece surface spans.
+  /// Without that, every piece would point back to the full
+  /// `hello—world` slice, so the emitted alignment would carry
+  /// two `Word.text() == "hello—world"` entries —
   /// indistinguishable from a real repetition.
   #[test]
   fn em_dash_splits_into_per_piece_surface_spans() {
@@ -248,10 +251,10 @@ mod tests {
     assert_eq!(nt.original_words()[1], "world");
   }
 
-  /// Codex round-23 [medium]: hyphen-glued compound. Each piece
-  /// must carry its own surface span — the full `Hello-World`
-  /// would corrupt downstream word indexes / highlights and
-  /// break dedupe semantics.
+  /// Hyphen-glued compound. Each piece must carry its own
+  /// surface span — the full `Hello-World` would corrupt
+  /// downstream word indexes / highlights and break dedupe
+  /// semantics.
   #[test]
   fn hyphen_compound_splits_into_per_piece_surface_spans() {
     let n = EnglishNormalizer::new();
@@ -312,11 +315,11 @@ mod tests {
     assert_eq!(nt.normalized(), "o'brien rocks");
   }
 
-  /// Codex round-16 [medium]: quoted text like `'hello'` must
-  /// have its surrounding apostrophes stripped at boundaries so
-  /// the wav2vec2 tokeniser doesn't inject unspoken apostrophe
-  /// states into the CTC graph. Internal apostrophes inside
-  /// contractions / proper nouns must still survive.
+  /// Quoted text like `'hello'` must have its surrounding
+  /// apostrophes stripped at boundaries so the wav2vec2
+  /// tokeniser doesn't inject unspoken apostrophe states into
+  /// the CTC graph. Internal apostrophes inside contractions /
+  /// proper nouns must still survive.
   #[test]
   fn boundary_ascii_apostrophes_are_stripped() {
     let n = EnglishNormalizer::new();
@@ -358,10 +361,9 @@ mod tests {
     assert!(n.use_word_delimiter());
   }
 
-  // Codex round-23 [medium]: the old
-  // `hyphenated_word_splits_into_pieces` test pinned the
-  // pre-fix behaviour where every split piece pointed back to
-  // the full `Hello-World` surface — see
+  // The old `hyphenated_word_splits_into_pieces` test pinned a
+  // prior behaviour where every split piece pointed back to the
+  // full `Hello-World` surface — see
   // `hyphen_compound_splits_into_per_piece_surface_spans`
   // earlier in this module for the corrected contract.
 

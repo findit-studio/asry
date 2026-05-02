@@ -1,4 +1,4 @@
-//! Strict lookup-order regression. Spec §6.3.1.
+//! Strict lookup-order regression.
 //!
 //! AlignmentSet::lookup returns:
 //!   - Hit { matched: Lang(L), .. } when Lang(L) is registered.
@@ -16,11 +16,8 @@
 
 #![cfg(feature = "alignment")]
 
-// Plan note: Task 28's example imports these names from `whispery::`
-// directly; the crate-root re-exports land in Task 29 (§3.3). For
-// Task 28 we name them via the existing `whispery::runner` path to
-// keep the test self-contained (no lib.rs change in this task), the
-// same workaround Task 25 (alignment_e2e.rs) used.
+// We name these types via the existing `whispery::runner` path
+// to keep the test self-contained.
 use whispery::{
   Lang,
   runner::{AlignmentFallback, AlignmentLookup, AlignmentSetBuilder},

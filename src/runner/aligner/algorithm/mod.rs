@@ -1,4 +1,4 @@
-//! 8-step alignment algorithm modules. See spec §6.3.2.
+//! Alignment algorithm modules.
 
 pub(crate) mod compose;
 pub(crate) mod encode;

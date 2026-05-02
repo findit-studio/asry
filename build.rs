@@ -55,13 +55,13 @@ fn main() {
     panic!("failed to codegen bundled wav2vec2 tokens: {e}");
   }
 
-  // Codex round-18 [high]: fixture fetching is OPT-IN. The
-  // previous policy fetched whenever the `runner` feature was
-  // active and `WHISPERY_OFFLINE` was unset — but `runner` is a
-  // default feature, so a plain `cargo build` made network
-  // requests. That breaks ordinary consumer builds (offline /
-  // sandboxed CI) and surprises anyone who didn't expect a
-  // build.rs to phone home.
+  // Fixture fetching is OPT-IN. A previous policy fetched
+  // whenever the `runner` feature was active and
+  // `WHISPERY_OFFLINE` was unset — but `runner` is a default
+  // feature, so a plain `cargo build` made network requests.
+  // That breaks ordinary consumer builds (offline / sandboxed
+  // CI) and surprises anyone who didn't expect a build.rs to
+  // phone home.
   //
   // New gate: the user must explicitly set `WHISPERY_FETCH_MODEL`
   // (and `WHISPERY_FETCH_W2V` for alignment) before any
@@ -82,8 +82,9 @@ fn main() {
   }
 
   // The 'runner' feature gates whether the test fixture is even
-  // applicable. Plan A builds (--no-default-features) skip
-  // anyway, even with FETCH_MODEL set.
+  // applicable. Builds without the runner feature
+  // (--no-default-features) skip anyway, even with FETCH_MODEL
+  // set.
   let runner_active = std::env::var("CARGO_FEATURE_RUNNER").is_ok();
   if !runner_active {
     return;
@@ -173,11 +174,11 @@ fn fetch_jfk_wav(fixture_dir: &std::path::Path) {
 }
 
 fn fetch_wav2vec2_fixtures(fixture_dir: &std::path::Path) {
-  // Codex round-18 [high]: opt-in via WHISPERY_FETCH_W2V. Same
-  // gate shape as the parent `main`'s WHISPERY_FETCH_MODEL
-  // check — default builds never hit the network, even when
-  // the alignment feature is enabled. A user who wants the
-  // bundled fixture sets both env vars together.
+  // Opt-in via WHISPERY_FETCH_W2V. Same gate shape as the
+  // parent `main`'s WHISPERY_FETCH_MODEL check — default builds
+  // never hit the network, even when the alignment feature is
+  // enabled. A user who wants the bundled fixture sets both env
+  // vars together.
   let fetch_w2v_opt_in = std::env::var("WHISPERY_FETCH_W2V").is_ok();
   if !fetch_w2v_opt_in {
     return;
@@ -200,15 +201,15 @@ fn fetch_wav2vec2_fixtures(fixture_dir: &std::path::Path) {
   );
 
   let tokenizer_path = fixture_dir.join(TOKENIZER_W2V_FILENAME);
-  // Codex round-13 [high]: previously this path patched the
-  // downloaded tokenizer.json before storing it, so the runtime
-  // `Aligner::from_paths` only had to handle the patched
-  // form. The compat shim now lives in `Aligner::from_paths`
-  // itself (`load_tokenizer_with_compat`), which lets
-  // out-of-tree consumers load any HuggingFace wav2vec2
-  // tokenizer.json — patched, unpatched, or in a totally
-  // different format. The build.rs path is now a plain
-  // SHA-verified fetch, identical to the model fetch shape.
+  // Previously this path patched the downloaded tokenizer.json
+  // before storing it, so the runtime `Aligner::from_paths`
+  // only had to handle the patched form. The compat shim now
+  // lives in `Aligner::from_paths` itself
+  // (`load_tokenizer_with_compat`), which lets out-of-tree
+  // consumers load any HuggingFace wav2vec2 tokenizer.json —
+  // patched, unpatched, or in a totally different format. The
+  // build.rs path is now a plain SHA-verified fetch, identical
+  // to the model fetch shape.
   if !fetch_with_sha(TOKENIZER_W2V_URL, &tokenizer_path, TOKENIZER_W2V_SHA256) {
     return;
   }

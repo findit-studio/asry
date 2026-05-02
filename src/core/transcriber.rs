@@ -3,8 +3,6 @@
 //! `Transcriber` is `Send + !Sync` (every public mutating method
 //! takes `&mut self`). Multi-threaded drivers must wrap in
 //! `Mutex<Transcriber>` themselves.
-//!
-//! See spec §5.1.
 
 use core::time::Duration;
 
@@ -147,15 +145,14 @@ impl TranscriberOptions {
   /// **Caller contract:** `buffer_cap_samples` must be at least
   /// as large as the longest single VAD segment the caller
   /// expects to push. `push_vad_segment` requires all of the
-  /// segment's audio to be buffered (the round-2 `VadAheadOfAudio`
+  /// segment's audio to be buffered (the `VadAheadOfAudio`
   /// guard) before it accepts the segment, so a single VAD
   /// segment longer than `buffer_cap_samples` cannot be
   /// processed: `push_samples` would return `Backpressure`
   /// before enough audio is buffered, and the only recovery is
   /// `restart_at` (which drops the partial segment). Hard-split
   /// in `Cut::push_segment` only runs after the segment is
-  /// accepted, so it cannot rescue this case (Codex round-9 [high]
-  /// finding 2).
+  /// accepted, so it cannot rescue this case.
   ///
   /// Practical guidance: with default 60 s cap, a single VAD
   /// segment must fit in 60 s of speech. Configure your upstream
@@ -302,7 +299,7 @@ impl Default for TranscriberOptions {
   }
 }
 
-/// The Sans-I/O state machine. See spec §5.1.
+/// The Sans-I/O state machine.
 ///
 /// `Transcriber` is `Send` (movable across threads) but `!Sync`
 /// (every public mutating method takes `&mut self`). A consumer that
@@ -323,8 +320,7 @@ pub struct Transcriber {
   /// surface as `TranscriberError::PtsRegression { kind: VadSegment }`.
   /// Independent from `Cut::last_pushed_end()` because the cut
   /// state machine only tracks pushed segments, while the
-  /// watermark also incorporates explicit silence declarations
-  /// (Codex round-5 fix).
+  /// watermark also incorporates explicit silence declarations.
   vad_watermark: u64,
 }
 
@@ -333,11 +329,11 @@ impl Transcriber {
   ///
   /// # Panics
   ///
-  /// Codex round-4 finding [high]: invalid config values are
-  /// rejected up-front rather than turning into deadlocks (zero
-  /// `max_in_flight`), divide-by-zero panics in cut
-  /// (`chunk_size` that rounds to 0 samples), or empty-list panics
-  /// in the auto-lock mode helper (`AutoLockAfter(0)`).
+  /// Invalid config values are rejected up-front rather than
+  /// turning into deadlocks (zero `max_in_flight`),
+  /// divide-by-zero panics in cut (`chunk_size` that rounds to 0
+  /// samples), or empty-list panics in the auto-lock mode helper
+  /// (`AutoLockAfter(0)`).
   ///
   /// - `max_in_flight == 0` — the dispatch loop would route every
   ///   emitted chunk to `cut_pending` and never issue a `RunAsr`.
@@ -450,8 +446,8 @@ impl Transcriber {
   /// Pre-bind a closure mapping `(start_sample, end_sample)` (in
   /// stream coordinates) to an output-timebase `TimeRange`.
   ///
-  /// Used by the alignment worker (Plan C) to convert wav2vec2
-  /// frame indices back into the caller's output timebase. The
+  /// Used by the alignment worker to convert wav2vec2 frame
+  /// indices back into the caller's output timebase. The
   /// closure captures snapshots of the buffer's timebase and
   /// pts-anchor so it can outlive borrows of `Transcriber`; the
   /// alignment worker keeps it alive across thread boundaries via
@@ -466,15 +462,15 @@ impl Transcriber {
   /// has the chunk's `chunk_first_sample_in_stream` offset and
   /// adds `frame * hop` to land in the same coordinate system.
   ///
-  /// Codex round-19: a previous live-buffer-based variant
-  /// captured the buffer's *current* PTS anchor, which a
-  /// `restart_at` between chunk-extract and ASR-finish would
-  /// have re-anchored — mapping the chunk's pre-restart sample
-  /// indices through the post-restart PTS origin and emitting
-  /// word ranges far outside the transcript's own range. The
-  /// per-chunk form snapshots the anchor pair at extract time
-  /// (see [`super::dispatch::ChunkRecord::output_tb`]) so the
-  /// rebuilt closure stays in the chunk's own epoch.
+  /// A previous live-buffer-based variant captured the buffer's
+  /// *current* PTS anchor, which a `restart_at` between
+  /// chunk-extract and ASR-finish would have re-anchored —
+  /// mapping the chunk's pre-restart sample indices through the
+  /// post-restart PTS origin and emitting word ranges far
+  /// outside the transcript's own range. The per-chunk form
+  /// snapshots the anchor pair at extract time (see
+  /// [`super::dispatch::ChunkRecord::output_tb`]) so the rebuilt
+  /// closure stays in the chunk's own epoch.
   #[cfg(feature = "alignment")]
   pub(crate) fn chunk_samples_to_output_range_fn(
     &self,
@@ -485,9 +481,9 @@ impl Transcriber {
 
   /// Stream-coordinate first 16 kHz sample index of the chunk
   /// `chunk_id`, or `None` if the chunk is not in flight. Used by
-  /// the runner's alignment dispatch (Plan C, Task 22) to convert
-  /// stream-sample sub_segments into chunk-local space before
-  /// shipping them to the alignment worker.
+  /// the runner's alignment dispatch to convert stream-sample
+  /// sub_segments into chunk-local space before shipping them to
+  /// the alignment worker.
   #[cfg(feature = "alignment")]
   pub(crate) fn chunk_first_sample(&self, chunk_id: ChunkId) -> Option<u64> {
     self.dispatch.chunk_first_sample(chunk_id)
@@ -496,7 +492,7 @@ impl Transcriber {
   /// Sub-VAD-segments of the chunk `chunk_id`, in stream-coordinate
   /// 16 kHz sample indices, as `(start, end)` pairs. Used by the
   /// alignment worker to build the silence mask in chunk-local
-  /// space (Plan C, Task 22).
+  /// space.
   #[cfg(feature = "alignment")]
   pub(crate) fn chunk_sub_segments_samples(
     &self,
@@ -508,13 +504,13 @@ impl Transcriber {
   /// Non-mutating predicate: would the next push of `samples_len`
   /// audio samples plus `vad_count` VAD segments fit under the
   /// configured caps? Counts cut_pending's pre-extracted audio
-  /// (round-8 fix) alongside the live buffer.
+  /// alongside the live buffer.
   pub fn would_accept(&self, samples_len: usize, _vad_count: usize) -> bool {
     let queued = self.dispatch.cut_pending_audio_samples();
     self.buffered_samples() + samples_len + queued <= self.config.buffer_cap_samples
   }
 
-  /// Push samples into the buffer. See spec §4.1 / §5.4.
+  /// Push samples into the buffer.
   ///
   /// Errors:
   /// - `PtsRegression`, `GapExceedsTolerance`, `Backpressure`,
@@ -527,24 +523,23 @@ impl Transcriber {
     if self.eof_signaled {
       return Err(TranscriberError::AfterEof);
     }
-    // Codex round-11 fix: reject malformed timebases at the API
-    // boundary. mediatime::Timebase::new(0, _) is constructible
-    // and would panic later in rescale_pts.
+    // Reject malformed timebases at the API boundary.
+    // mediatime::Timebase::new(0, _) is constructible and would
+    // panic later in rescale_pts.
     let tb = starts_at.timebase();
     if tb.num() == 0 {
       return Err(TranscriberError::InvalidTimebase {
         numerator: tb.num(),
       });
     }
-    // Codex round-8 fix: count cut_pending audio (pre-extracted
-    // Arcs, round-7) toward the buffer cap so a slow runner
-    // can't accumulate queued audio outside any cap.
+    // Count cut_pending audio (pre-extracted Arcs) toward the
+    // buffer cap so a slow runner can't accumulate queued audio
+    // outside any cap.
     let queued = self.dispatch.cut_pending_audio_samples();
     self.buffer.append(starts_at, samples, queued)
   }
 
-  /// Push a VAD segment into the cut state machine. See spec
-  /// §5.3.
+  /// Push a VAD segment into the cut state machine.
   ///
   /// **Caller contract:** the entire segment's audio must be
   /// buffered first (`seg.end_sample() <= absolute_sample_offset()`).
@@ -577,11 +572,11 @@ impl Transcriber {
     if self.buffer.output_timebase().is_none() {
       return Err(TranscriberError::OutputTimebaseUnset);
     }
-    // Codex round-2 fix: VAD must not reference audio that has
-    // not been buffered. Otherwise the cut state machine would
-    // happily accept the segment, accumulate it, and later
-    // (on a chunk emit or signal_eof flush) trip a panic in
-    // buffer.extract when it tries to slice past the tail.
+    // VAD must not reference audio that has not been buffered.
+    // Otherwise the cut state machine would happily accept the
+    // segment, accumulate it, and later (on a chunk emit or
+    // signal_eof flush) trip a panic in buffer.extract when it
+    // tries to slice past the tail.
     let high_water = self.buffer.absolute_sample_offset();
     if seg.end_sample() > high_water {
       return Err(TranscriberError::VadAheadOfAudio {
@@ -592,8 +587,8 @@ impl Transcriber {
     // Strict-monotonic check against the VAD watermark. The
     // watermark advances with every push_vad_segment AND every
     // signal_no_speech_through, so a VAD push that would
-    // contradict an explicit silence declaration (Codex round-5)
-    // is also caught here.
+    // contradict an explicit silence declaration is also caught
+    // here.
     if seg.start_sample() < self.vad_watermark {
       return Err(TranscriberError::PtsRegression {
         kind: crate::types::PushKind::VadSegment,
@@ -609,15 +604,14 @@ impl Transcriber {
       self.next_chunk_id += 1;
       self.dispatch.on_emit(chunk, chunk_id, &self.buffer);
     }
-    // Codex round-11 fix: each on_emit pre-extracts a chunk's
-    // audio into an Arc but the same audio is still live in the
-    // buffer. Without trim, total queued = live + cut_pending
-    // briefly exceeds the cap. Run after_inject so trim drops
-    // the duplicated live audio (low-water = cut.pending_start
-    // or vad_watermark). flush_in_order_events is a no-op (no
-    // injects happened); the promote loop is also typically a
-    // no-op (cut_pending was just added; gate state hasn't
-    // changed).
+    // Each on_emit pre-extracts a chunk's audio into an Arc but
+    // the same audio is still live in the buffer. Without trim,
+    // total queued = live + cut_pending briefly exceeds the cap.
+    // Run after_inject so trim drops the duplicated live audio
+    // (low-water = cut.pending_start or vad_watermark).
+    // flush_in_order_events is a no-op (no injects happened);
+    // the promote loop is also typically a no-op (cut_pending
+    // was just added; gate state hasn't changed).
     if emitted_any {
       self.dispatch.after_inject(
         &mut self.buffer,
@@ -663,10 +657,10 @@ impl Transcriber {
     if self.buffer.output_timebase().is_none() {
       return Err(TranscriberError::OutputTimebaseUnset);
     }
-    // Codex round-6 fix: like push_vad_segment, signal_no_speech
-    // must not advance the watermark past audio the buffer hasn't
-    // seen. Without the guard, a future-sample signal would
-    // poison the watermark and later valid VAD inside the
+    // Like push_vad_segment, signal_no_speech must not advance
+    // the watermark past audio the buffer hasn't seen. Without
+    // the guard, a future-sample signal would poison the
+    // watermark and later valid VAD inside the
     // (eventually-buffered) interval would be rejected as
     // PtsRegression. Atomic rejection: vad_watermark stays put.
     let high_water = self.buffer.absolute_sample_offset();
@@ -689,7 +683,7 @@ impl Transcriber {
     // either by exceeding `chunk_size_samples` or by exceeding
     // the configured `flush_on_silence_gap` threshold. Without
     // this, a partial chunk would sit until chunk_size or EOF,
-    // defeating utterance-boundary mode (Codex round-7 fix).
+    // defeating utterance-boundary mode.
     if self.cut.would_flush_at(sample_index) {
       if let Some(chunk) = self.cut.flush() {
         let chunk_id = ChunkId::from_raw(self.next_chunk_id);
@@ -701,7 +695,7 @@ impl Transcriber {
     // Run the standard post-mutation drain so trim drops audio
     // unreferenced by any live chunk. Trim's upper bound is the
     // VAD watermark we just advanced — never past audio that
-    // hasn't been declared analyzed (round-9 fix).
+    // hasn't been declared analyzed.
     self.dispatch.after_inject(
       &mut self.buffer,
       self.cut.pending_start(),
@@ -751,9 +745,9 @@ impl Transcriber {
     result: AsrResult,
   ) -> Result<(), TranscriberError> {
     self.dispatch.inject_asr_result(chunk_id, result)?;
-    // Trim cap: VAD watermark, not high-water — round-9 fix.
-    // inject_* doesn't change what's been analyzed, so audio
-    // past the watermark must survive trim until VAD catches up.
+    // Trim cap: VAD watermark, not high-water. inject_* doesn't
+    // change what's been analyzed, so audio past the watermark
+    // must survive trim until VAD catches up.
     self.dispatch.after_inject(
       &mut self.buffer,
       self.cut.pending_start(),
@@ -799,7 +793,7 @@ impl Transcriber {
     Ok(())
   }
 
-  /// Recover from a `GapExceedsTolerance`. See spec §5.4.1.
+  /// Recover from a `GapExceedsTolerance`.
   ///
   /// Steps:
   /// 1. Flush the cut state machine. Any partial chunk goes through
@@ -810,33 +804,33 @@ impl Transcriber {
   /// 3. Re-anchor `base_pts_out_anchor` to `starts_at.pts()`.
   /// 4. `next_chunk_id` continues monotonically.
   /// 5. Pre-existing `cut_pending` entries already hold their audio
-  ///    in their own `Arc<[f32]>`s (round-7 refactor) — they
-  ///    survive the buffer reset without a special drain pass.
+  ///    in their own `Arc<[f32]>`s — they survive the buffer reset
+  ///    without a special drain pass.
   ///
-  /// Round-7 fix: previously this method drained `cut_pending` into
-  /// `in_flight` via a `draining_for_restart` bypass that ignored
-  /// the AutoLockAfter observation-window cap. With the cap
-  /// suspended, chunks 1..N could be issued as `RunAsr` without
-  /// the language hint, defeating the round-6 lock contract during
-  /// recovery. The refactored `cut_pending` (stores
-  /// `ExtractedChunk` rather than a sample range into the live
-  /// buffer) makes the drain unnecessary; the gate is preserved.
+  /// Previously this method drained `cut_pending` into `in_flight`
+  /// via a `draining_for_restart` bypass that ignored the
+  /// AutoLockAfter observation-window cap. With the cap suspended,
+  /// chunks 1..N could be issued as `RunAsr` without the language
+  /// hint, defeating the lock contract during recovery. The
+  /// refactored `cut_pending` (stores `ExtractedChunk` rather than
+  /// a sample range into the live buffer) makes the drain
+  /// unnecessary; the gate is preserved.
   ///
   /// Errors:
   /// - `AfterEof` if `signal_eof()` was previously called.
   /// - `InconsistentTimebase` if the buffer already has an established
   ///   output timebase from a prior `push_samples` and `starts_at`'s
-  ///   timebase doesn't match. Codex round-4 fix: pre-fix code
-  ///   silently overwrote the timebase, so a 48 kHz stream restarted
-  ///   at a millisecond timebase would produce post-restart chunks
-  ///   in a different unit from pre-restart ones — corrupting
-  ///   ordering and PTS arithmetic with no surfaced error.
+  ///   timebase doesn't match. Pre-fix code silently overwrote the
+  ///   timebase, so a 48 kHz stream restarted at a millisecond
+  ///   timebase would produce post-restart chunks in a different
+  ///   unit from pre-restart ones — corrupting ordering and PTS
+  ///   arithmetic with no surfaced error.
   pub fn restart_at(&mut self, starts_at: Timestamp) -> Result<(), TranscriberError> {
     if self.eof_signaled {
       return Err(TranscriberError::AfterEof);
     }
-    // Round-11: reject malformed (zero-numerator) timebases at
-    // the API boundary; rescale_pts later would panic.
+    // Reject malformed (zero-numerator) timebases at the API
+    // boundary; rescale_pts later would panic.
     let tb = starts_at.timebase();
     if tb.num() == 0 {
       return Err(TranscriberError::InvalidTimebase {
@@ -872,8 +866,7 @@ impl Transcriber {
     // The VAD watermark lives in absolute-sample space, which
     // restart_at just reset to 0. Reset the watermark too,
     // otherwise post-restart VAD pushes at small sample indices
-    // fail the regression check against the pre-restart end
-    // (Codex round-5 corollary).
+    // fail the regression check against the pre-restart end.
     self.vad_watermark = 0;
 
     Ok(())
@@ -978,18 +971,16 @@ mod tests {
     // chunks (the originally-promoted one PLUS the formerly-
     // pending ones) survive — they hold their audio in their
     // own Arc<[f32]>s and will emit normally.
-    // (Spec §5.4.1 + §5.5 invariant 4 exception: drain is
-    // allowed to exceed max_in_flight transiently.)
+    // (Drain is allowed to exceed max_in_flight transiently.)
   }
 
-  /// Codex round-19 finding [high]: a `restart_at` between a
-  /// chunk's extraction and its ASR-finish callback used to
-  /// silently corrupt that chunk's word timestamps. The
-  /// alignment dispatch built `samples_to_output_range` from
-  /// the *live* buffer, which `restart_at` had just re-anchored
-  /// onto a new PTS epoch — but the chunk's
-  /// `chunk_first_sample_in_stream` was still in the
-  /// pre-restart epoch. Result: words landed at
+  /// A `restart_at` between a chunk's extraction and its
+  /// ASR-finish callback used to silently corrupt that chunk's
+  /// word timestamps. The alignment dispatch built
+  /// `samples_to_output_range` from the *live* buffer, which
+  /// `restart_at` had just re-anchored onto a new PTS epoch —
+  /// but the chunk's `chunk_first_sample_in_stream` was still
+  /// in the pre-restart epoch. Result: words landed at
   /// `new_anchor + (pre_restart_sample * scale)`, often far
   /// outside the surviving chunk's own `Transcript::range`.
   /// Fix: snapshot `(output_tb, base_pts_out_anchor)` onto
@@ -1065,14 +1056,14 @@ mod tests {
     assert_eq!(post.start().timebase(), tb_48k());
   }
 
-  /// Codex round-1 finding [high]: trim must NOT drop audio still
-  /// referenced by the cut accumulator. Reproduction: chunk 0
-  /// emitted, chunk 1 accumulating in Cut without being emitted,
-  /// chunk 0 ASR completes → after_inject runs trim. Without the
-  /// fix, trim's low-water defaulted to absolute_sample_offset
-  /// when cut_pending was empty and dropped the in-buffer audio
-  /// that chunk 1 would later need; the next push_vad_segment
-  /// that closed chunk 1 would then panic in buffer.extract.
+  /// Trim must NOT drop audio still referenced by the cut
+  /// accumulator. Reproduction: chunk 0 emitted, chunk 1
+  /// accumulating in Cut without being emitted, chunk 0 ASR
+  /// completes → after_inject runs trim. Without the fix,
+  /// trim's low-water defaulted to absolute_sample_offset when
+  /// cut_pending was empty and dropped the in-buffer audio that
+  /// chunk 1 would later need; the next push_vad_segment that
+  /// closed chunk 1 would then panic in buffer.extract.
   #[test]
   fn trim_keeps_samples_for_unextracted_cut_accumulator() {
     use crate::core::command::Command;
@@ -1127,11 +1118,10 @@ mod tests {
     assert_eq!(chunk_id.as_u64(), 1, "chunk 1 ran without panic");
   }
 
-  /// Codex round-1 finding [medium]: silent EOF (samples pushed,
-  /// no VAD ever pushed) must leave the transcriber idle.
-  /// Without the fix, signal_eof returned without trimming the
-  /// buffer; is_idle()'s `buffered_samples() == 0` check stayed
-  /// false forever.
+  /// Silent EOF (samples pushed, no VAD ever pushed) must leave
+  /// the transcriber idle. Without the fix, signal_eof returned
+  /// without trimming the buffer; is_idle()'s
+  /// `buffered_samples() == 0` check stayed false forever.
   #[test]
   fn silent_eof_makes_transcriber_idle() {
     let mut t = fresh();
@@ -1141,9 +1131,9 @@ mod tests {
     assert!(t.is_idle(), "after silent EOF, transcriber should be idle");
   }
 
-  /// Codex round-4 finding [high]: `max_in_flight = 0` deadlocks
-  /// the dispatch loop — every emitted chunk goes to cut_pending,
-  /// no `RunAsr` command ever fires. Reject at construction.
+  /// `max_in_flight = 0` deadlocks the dispatch loop — every
+  /// emitted chunk goes to cut_pending, no `RunAsr` command ever
+  /// fires. Reject at construction.
   #[test]
   #[should_panic(expected = "max_in_flight")]
   fn config_with_zero_max_in_flight_panics() {
@@ -1151,10 +1141,9 @@ mod tests {
     let _ = Transcriber::new(config);
   }
 
-  /// Round-4 corollary: `AutoLockAfter(0)` calls
-  /// `mode_with_first_occurrence_tiebreak` on a possibly-empty
-  /// observation list (when the first chunk lands empty/failed),
-  /// which panics. Reject at construction.
+  /// `AutoLockAfter(0)` calls `mode_with_first_occurrence_tiebreak`
+  /// on a possibly-empty observation list (when the first chunk
+  /// lands empty/failed), which panics. Reject at construction.
   #[test]
   #[should_panic(expected = "AutoLockAfter")]
   fn config_with_zero_auto_lock_after_panics() {
@@ -1163,8 +1152,8 @@ mod tests {
     let _ = Transcriber::new(config);
   }
 
-  /// Round-4 corollary: a `chunk_size` that rounds to 0 samples
-  /// (e.g. `Duration::ZERO`) makes `Cut::push_segment`'s
+  /// A `chunk_size` that rounds to 0 samples (e.g.
+  /// `Duration::ZERO`) makes `Cut::push_segment`'s
   /// `len.div_ceil(self.chunk_size_samples)` divide by zero on
   /// any non-trivial VAD segment. Reject at construction.
   #[test]
@@ -1174,12 +1163,12 @@ mod tests {
     let _ = Transcriber::new(config);
   }
 
-  /// Codex round-4 finding [high]: restart_at must not silently
-  /// switch the output timebase. Without the guard, a stream
-  /// anchored at 1/48000 could be restarted at 1/1000 and produce
-  /// post-restart `TimeRange`s in a different unit from pre-restart
-  /// chunks — corrupts ordering and downstream PTS arithmetic with
-  /// no error surfaced.
+  /// restart_at must not silently switch the output timebase.
+  /// Without the guard, a stream anchored at 1/48000 could be
+  /// restarted at 1/1000 and produce post-restart `TimeRange`s
+  /// in a different unit from pre-restart chunks — corrupts
+  /// ordering and downstream PTS arithmetic with no error
+  /// surfaced.
   #[test]
   fn restart_at_with_different_timebase_returns_inconsistent_timebase() {
     let mut t = fresh();
@@ -1199,7 +1188,7 @@ mod tests {
     assert_eq!(t.output_timebase(), Some(tb_48k()));
   }
 
-  /// Round-4 corollary: a restart at the same timebase succeeds.
+  /// A restart at the same timebase succeeds.
   #[test]
   fn restart_at_same_timebase_succeeds() {
     let mut t = fresh();
@@ -1208,17 +1197,16 @@ mod tests {
     assert_eq!(t.output_timebase(), Some(tb_48k()));
   }
 
-  /// Codex round-11 finding [high]: VAD-emission used to grow
-  /// cut_pending (pre-extracted Arcs) without dropping the
-  /// duplicated live-buffer audio. After several push_vad_segment
-  /// calls, total queued = live + cut_pending could exceed the
-  /// configured cap, even though push_samples's cap check (round-8)
-  /// would later reject. Fix: push_vad_segment runs after_inject
-  /// at the end so trim drops the live audio that's now in
-  /// cut_pending Arcs. `would_accept(0, 0)` is the predicate for
-  /// "cap is currently respected" — if that returns false right
-  /// after a sequence of push_vad_segment calls, the cap was
-  /// transiently violated.
+  /// VAD-emission used to grow cut_pending (pre-extracted Arcs)
+  /// without dropping the duplicated live-buffer audio. After
+  /// several push_vad_segment calls, total queued = live +
+  /// cut_pending could exceed the configured cap, even though
+  /// push_samples's cap check would later reject. Fix:
+  /// push_vad_segment runs after_inject at the end so trim drops
+  /// the live audio that's now in cut_pending Arcs.
+  /// `would_accept(0, 0)` is the predicate for "cap is currently
+  /// respected" — if that returns false right after a sequence of
+  /// push_vad_segment calls, the cap was transiently violated.
   #[test]
   fn vad_emission_keeps_total_memory_within_cap() {
     let config = TranscriberOptions::default()
@@ -1249,12 +1237,12 @@ mod tests {
     );
   }
 
-  /// Codex round-11 finding [high]: `mediatime::Timebase::new(0, _)`
-  /// is constructible (the type only enforces non-zero denominator).
-  /// Using such a timebase as the target of `Timebase::rescale_pts`
-  /// panics. push_samples and restart_at reject it explicitly with
-  /// `InvalidTimebase` so a malformed caller timebase surfaces as
-  /// `Err(_)` instead of an abort.
+  /// `mediatime::Timebase::new(0, _)` is constructible (the type
+  /// only enforces non-zero denominator). Using such a timebase
+  /// as the target of `Timebase::rescale_pts` panics. push_samples
+  /// and restart_at reject it explicitly with `InvalidTimebase`
+  /// so a malformed caller timebase surfaces as `Err(_)` instead
+  /// of an abort.
   #[test]
   fn push_samples_rejects_zero_numerator_timebase() {
     let mut t = fresh();
@@ -1267,7 +1255,7 @@ mod tests {
     );
   }
 
-  /// Round-11 corollary: restart_at also validates the timebase.
+  /// restart_at also validates the timebase.
   #[test]
   fn restart_at_rejects_zero_numerator_timebase() {
     let mut t = fresh();
@@ -1281,10 +1269,10 @@ mod tests {
     );
   }
 
-  /// Codex round-9 finding [high]: signal_no_speech_through must
-  /// not let trim drop audio past the declared `sample_index`.
-  /// Pre-fix code passed `cut.pending_start()` to `after_inject`;
-  /// when no cut accumulator existed, after_inject's fallback was
+  /// signal_no_speech_through must not let trim drop audio past
+  /// the declared `sample_index`. Pre-fix code passed
+  /// `cut.pending_start()` to `after_inject`; when no cut
+  /// accumulator existed, after_inject's fallback was
   /// `buffer.absolute_sample_offset()` (drop everything). With
   /// audio buffered ahead of the no-speech declaration, that
   /// dropped the still-unanalyzed tail. A subsequent VAD push
@@ -1330,14 +1318,13 @@ mod tests {
     assert!(got_chunk, "chunk for VAD [600, 800) should have emitted");
   }
 
-  /// Codex round-8 finding [high]: cut_pending audio (round-7's
-  /// pre-extracted ExtractedChunk Arcs) must count toward the
-  /// buffer cap for Backpressure. Pre-fix code only counted the
-  /// live buffer's samples, so a runner slower than ingest could
-  /// build up cut_pending arbitrarily — every trim emptied the
-  /// live buffer and let the caller push more, but cut_pending
-  /// retained the audio. Net effect: unbounded memory growth on
-  /// long indexing jobs.
+  /// cut_pending audio (the pre-extracted ExtractedChunk Arcs)
+  /// must count toward the buffer cap for Backpressure. Pre-fix
+  /// code only counted the live buffer's samples, so a runner
+  /// slower than ingest could build up cut_pending arbitrarily —
+  /// every trim emptied the live buffer and let the caller push
+  /// more, but cut_pending retained the audio. Net effect:
+  /// unbounded memory growth on long indexing jobs.
   ///
   /// Reproduction: cap=12 000, max_in_flight=1, chunk_size=0.25 s
   /// (4 000 samples). Push 12 000 samples + 3 VAD segments: chunks
@@ -1377,10 +1364,11 @@ mod tests {
       "trim drops up to cut accumulator's start"
     );
 
-    // Push 6 000 more samples. Without the round-8 fix,
-    // buffer.append's check is live(4 000) + new(6 000) = 10 000
-    // ≤ cap(12 000) — accepted. With the fix, queued(4 000) is
-    // included → 14 000 > 12 000 → Backpressure.
+    // Push 6 000 more samples. Without the cut_pending-aware
+    // cap check, buffer.append's check is live(4 000) +
+    // new(6 000) = 10 000 ≤ cap(12 000) — accepted. With the
+    // check, queued(4 000) is included → 14 000 > 12 000 →
+    // Backpressure.
     let next = t.next_expected_starts_at().unwrap();
     let r = t.push_samples(next, &[0.0; 6_000]);
     assert!(
@@ -1391,17 +1379,17 @@ mod tests {
     );
   }
 
-  /// Codex round-7 finding [high]: restart_at must NOT bypass the
-  /// AutoLockAfter observation-window gate. Pre-fix code routed
-  /// every drained chunk through on_emit with `draining_for_restart`
-  /// flag set, which forced promotion regardless of the round-6
-  /// effective-cap-of-n rule. Net effect: a recovery happening
-  /// before the lock fires would dispatch chunks 1..N as RunAsr
-  /// without the language hint, defeating the lock contract.
+  /// restart_at must NOT bypass the AutoLockAfter
+  /// observation-window gate. Pre-fix code routed every drained
+  /// chunk through on_emit with `draining_for_restart` flag set,
+  /// which forced promotion regardless of the effective-cap-of-n
+  /// rule. Net effect: a recovery happening before the lock
+  /// fires would dispatch chunks 1..N as RunAsr without the
+  /// language hint, defeating the lock contract.
   ///
   /// Reproduction: AutoLockAfter(1) + max_in_flight = 4. Push
-  /// audio + 4 VAD segments. The round-6 gate caps in_flight at
-  /// 1, so chunks 1, 2, 3 sit in cut_pending. Trigger restart_at
+  /// audio + 4 VAD segments. The gate caps in_flight at 1, so
+  /// chunks 1, 2, 3 sit in cut_pending. Trigger restart_at
   /// without injecting chunk 0's result. Pre-fix would have
   /// promoted chunks 1, 2, 3 (issuing RunAsr without lock).
   /// Post-fix: chunks 1, 2, 3 stay in cut_pending; only after the
@@ -1445,7 +1433,7 @@ mod tests {
     }
     assert_eq!(
       run_asr_count, 1,
-      "round-7 fix: only chunk 0 issued RunAsr before lock; got hints {:?}",
+      "only chunk 0 issued RunAsr before lock; got hints {:?}",
       hints
     );
     assert_eq!(hints[0].0, 0);
@@ -1455,12 +1443,11 @@ mod tests {
     );
   }
 
-  /// Round-5 corollary: `restart_at` resets the buffer's
-  /// `absolute_sample_offset` to 0, so the VAD watermark — which
-  /// is in absolute-sample space — must reset too. Without the
-  /// reset, a post-restart VAD push starting near sample 0
-  /// fails the watermark regression check against the
-  /// pre-restart VAD's end.
+  /// `restart_at` resets the buffer's `absolute_sample_offset`
+  /// to 0, so the VAD watermark — which is in absolute-sample
+  /// space — must reset too. Without the reset, a post-restart
+  /// VAD push starting near sample 0 fails the watermark
+  /// regression check against the pre-restart VAD's end.
   #[test]
   fn restart_at_resets_vad_watermark() {
     let mut t = fresh();
@@ -1484,8 +1471,8 @@ mod tests {
   fn flush_on_silence_gap_yields_at_utterance_boundary() {
     // Auto policy: this test exercises silence-flush behavior;
     // default AutoLockAfter(1) would gate the second chunk
-    // (round-6 fix) until chunk 0's ASR result lands, hiding
-    // the silence-flush effect we're trying to verify.
+    // until chunk 0's ASR result lands, hiding the silence-flush
+    // effect we're trying to verify.
     let config = TranscriberOptions::default()
       .with_chunk_size(Duration::from_secs(30))
       .with_flush_on_silence_gap(Some(Duration::from_millis(500)))
@@ -1513,13 +1500,12 @@ mod tests {
     );
   }
 
-  /// Codex round-5 finding [high]: a stream with no VAD activity
-  /// for longer than `buffer_cap_samples` would fill the buffer
-  /// and trip Backpressure with no recovery path — chunks emit
-  /// only on VAD or EOF, so trim never runs. The watermark API
-  /// lets the caller explicitly declare "VAD analyzed through
-  /// here, no segments" so the core can safely drop the buffered
-  /// audio.
+  /// A stream with no VAD activity for longer than
+  /// `buffer_cap_samples` would fill the buffer and trip
+  /// Backpressure with no recovery path — chunks emit only on
+  /// VAD or EOF, so trim never runs. The watermark API lets the
+  /// caller explicitly declare "VAD analyzed through here, no
+  /// segments" so the core can safely drop the buffered audio.
   #[test]
   fn signal_no_speech_through_drains_pure_silence_buffer() {
     // Tighten cap so test doesn't have to push 60 s of audio.
@@ -1546,12 +1532,12 @@ mod tests {
     t.push_samples(next, &[0.0; 16_000]).unwrap();
   }
 
-  /// Round-5 corollary: speech followed by long silence must be
-  /// flushable. After a partial chunk has been accumulating in the
-  /// cut state machine, signal_no_speech_through(sample_index)
-  /// past `current_start + chunk_size_samples` pre-flushes the
-  /// chunk — any future segment starting >= sample_index would
-  /// force the cut to flush anyway.
+  /// Speech followed by long silence must be flushable. After a
+  /// partial chunk has been accumulating in the cut state
+  /// machine, signal_no_speech_through(sample_index) past
+  /// `current_start + chunk_size_samples` pre-flushes the chunk
+  /// — any future segment starting >= sample_index would force
+  /// the cut to flush anyway.
   #[test]
   fn signal_no_speech_through_flushes_orphaned_partial_chunk() {
     let config = TranscriberOptions::default().with_chunk_size(Duration::from_secs(2)); // 32 000 samples
@@ -1577,10 +1563,9 @@ mod tests {
     }
   }
 
-  /// Codex round-7 finding [medium]: signal_no_speech_through
-  /// must pre-flush when the silence gap exceeds
-  /// `flush_on_silence_gap` even if the chunk is far from
-  /// `chunk_size`. Otherwise the utterance-boundary mode is
+  /// signal_no_speech_through must pre-flush when the silence
+  /// gap exceeds `flush_on_silence_gap` even if the chunk is far
+  /// from `chunk_size`. Otherwise the utterance-boundary mode is
   /// defeated for trailing silence — the partial chunk sits in
   /// the cut state until chunk_size or EOF.
   #[test]
@@ -1613,10 +1598,10 @@ mod tests {
     }
   }
 
-  /// Round-5 corollary: a no-speech signal advances the VAD
-  /// watermark, so subsequent VAD pushes that start before the
-  /// watermark must be rejected with PtsRegression — otherwise
-  /// the caller could contradict their own no-speech declaration.
+  /// A no-speech signal advances the VAD watermark, so
+  /// subsequent VAD pushes that start before the watermark must
+  /// be rejected with PtsRegression — otherwise the caller could
+  /// contradict their own no-speech declaration.
   #[test]
   fn vad_segment_before_no_speech_watermark_returns_pts_regression() {
     let mut t = fresh();
@@ -1632,9 +1617,8 @@ mod tests {
     ));
   }
 
-  /// Round-5 corollary: a regression on the no-speech watermark
-  /// itself (calling it twice with a smaller index second) returns
-  /// PtsRegression.
+  /// A regression on the no-speech watermark itself (calling it
+  /// twice with a smaller index second) returns PtsRegression.
   #[test]
   fn signal_no_speech_through_regression_returns_error() {
     let mut t = fresh();
@@ -1650,8 +1634,8 @@ mod tests {
     ));
   }
 
-  /// Round-5 corollary: signal_no_speech_through before any push
-  /// returns OutputTimebaseUnset (consistent with push_vad_segment).
+  /// signal_no_speech_through before any push returns
+  /// OutputTimebaseUnset (consistent with push_vad_segment).
   #[test]
   fn signal_no_speech_through_before_push_samples_returns_unset() {
     let mut t = fresh();
@@ -1659,12 +1643,12 @@ mod tests {
     assert!(matches!(r, Err(TranscriberError::OutputTimebaseUnset)));
   }
 
-  /// Codex round-6 finding [high]: signal_no_speech_through must
-  /// not advance the watermark past audio the buffer hasn't seen
-  /// yet. Without the guard, a caller that mistakenly signals a
-  /// future sample index would poison the watermark — later valid
-  /// VAD inside the not-yet-buffered interval would get rejected
-  /// as PtsRegression even though the audio eventually arrives.
+  /// signal_no_speech_through must not advance the watermark
+  /// past audio the buffer hasn't seen yet. Without the guard, a
+  /// caller that mistakenly signals a future sample index would
+  /// poison the watermark — later valid VAD inside the
+  /// not-yet-buffered interval would get rejected as
+  /// PtsRegression even though the audio eventually arrives.
   /// Symmetric with `push_vad_segment`'s VadAheadOfAudio guard.
   #[test]
   fn signal_no_speech_through_past_buffered_audio_returns_typed_error() {
@@ -1696,8 +1680,8 @@ mod tests {
     t.push_vad_segment(VadSegment::new(2_000, 4_000)).unwrap();
   }
 
-  /// Round-5 corollary: signal_no_speech_through after signal_eof
-  /// returns AfterEof (consistent with push_*).
+  /// signal_no_speech_through after signal_eof returns AfterEof
+  /// (consistent with push_*).
   #[test]
   fn signal_no_speech_through_after_eof_returns_after_eof() {
     let mut t = fresh();
@@ -1707,11 +1691,11 @@ mod tests {
     assert!(matches!(r, Err(TranscriberError::AfterEof)));
   }
 
-  /// Codex round-2 finding [high]: VAD must not reference audio
-  /// past the buffer's high-water mark. Without the guard, the
-  /// segment is accumulated, signal_eof flushes it, dispatch's
-  /// promote calls buffer.extract on a range that doesn't exist,
-  /// and the program panics.
+  /// VAD must not reference audio past the buffer's high-water
+  /// mark. Without the guard, the segment is accumulated,
+  /// signal_eof flushes it, dispatch's promote calls
+  /// buffer.extract on a range that doesn't exist, and the
+  /// program panics.
   #[test]
   fn vad_segment_past_buffered_audio_returns_typed_error() {
     let mut t = fresh();

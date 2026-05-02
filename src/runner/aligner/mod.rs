@@ -12,8 +12,8 @@ mod normalizer;
 mod normalizers;
 mod set;
 
-pub use aligner::Aligner;
 pub use algorithm::compose::{DEFAULT_MAX_INTRA_SILENT_RUN, DEFAULT_MIN_SPEECH_COVERAGE};
+pub use aligner::Aligner;
 pub use bundled::wav2vec2_base_960h;
 
 /// Bundled assets, decoded at build time.

@@ -128,8 +128,9 @@ pub fn ctc_viterbi(
   // while turning pathological inputs into an in-band
   // `NoAlignmentPath` failure that the runner can drain past.
   //
-  // Codex round-11 [high]: pre-fix this allocation happened
-  // before any abort check, so the watchdog couldn't intervene.
+  // The allocation must be gated by an abort check; previously
+  // this happened before any abort check, so the watchdog
+  // couldn't intervene.
   const LATTICE_CELL_BUDGET: usize = 32_000_000;
   let lattice_cells = match t.checked_mul(n_states) {
     Some(v) => v,
@@ -440,10 +441,10 @@ mod tests {
     assert_eq!(path.state_per_frame.len(), t);
   }
 
-  /// Codex round-11 [high]: pathological (T × m) lattice must
-  /// be rejected up-front, BEFORE the multi-gigabyte
-  /// backpointer allocation, with an in-band `NoAlignmentPath`
-  /// rather than an OOM the runner can't recover from.
+  /// Pathological (T × m) lattice must be rejected up-front,
+  /// BEFORE the multi-gigabyte backpointer allocation, with an
+  /// in-band `NoAlignmentPath` rather than an OOM the runner
+  /// can't recover from.
   ///
   /// Sized just past the 32 M-cell budget: T = 8 k frames,
   /// m = 4 k tokens, n_states = 8 001 → 64 M cells (~512 MB

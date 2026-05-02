@@ -1,13 +1,13 @@
-//! Alignment worker pool. See spec §6.3.3.
+//! Alignment worker pool.
 //!
-//! Single worker per spec §6.3.3 (v1). The pool consumes
-//! `AlignWorkItem`s from a bounded crossbeam channel, looks up
-//! the right `Aligner` in the shared `Arc<AlignmentSet>`, runs the
-//! 8-step pipeline, and ships `AlignResultMsg` back to the runner
-//! via a separate result channel.
+//! Single worker (v1). The pool consumes `AlignWorkItem`s from a
+//! bounded crossbeam channel, looks up the right `Aligner` in the
+//! shared `Arc<AlignmentSet>`, runs the alignment pipeline, and
+//! ships `AlignResultMsg` back to the runner via a separate result
+//! channel.
 //!
-//! Mirrors Plan B's `WhisperPool` shape with three differences:
-//! 1. **Single worker** by spec §6.3.3 (no per-language parallel).
+//! Mirrors `WhisperPool`'s shape with three differences:
+//! 1. **Single worker** (no per-language parallel).
 //! 2. **Drop-hang fix from the start** — `mem::replace`s `work_tx`
 //!    with a dummy disconnected channel before joining workers, so
 //!    the worker's blocking `recv()` returns immediately.
@@ -57,7 +57,7 @@ pub(super) struct AlignWorkItem {
   /// output-timebase via the `samples_to_output_range` closure.
   pub chunk_first_sample_in_stream: u64,
   /// Bridge from stream sample indices to output-timebase
-  /// `TimeRange`s. Pre-bound by the runner to Plan A's
+  /// `TimeRange`s. Pre-bound by the runner to the core's
   /// `SampleBuffer::samples_to_output_range`.
   pub samples_to_output_range: Arc<dyn Fn(u64, u64) -> TimeRange + Send + Sync>,
 }
@@ -80,7 +80,7 @@ use crate::{
   types::{AlignmentFailureKind, WorkerKind},
 };
 
-/// Single-thread alignment pool. See spec §6.3.3.
+/// Single-thread alignment pool.
 pub(super) struct AlignmentPool {
   workers: alloc::vec::Vec<JoinHandle<()>>,
   pub(super) work_tx: Sender<AlignWorkItem>,
@@ -89,8 +89,8 @@ pub(super) struct AlignmentPool {
 }
 
 impl AlignmentPool {
-  /// Build the pool with a single alignment worker. Per spec
-  /// §6.3.3, v1 ships exactly one worker; multi-worker is v2.
+  /// Build the pool with a single alignment worker. v1 ships
+  /// exactly one worker; multi-worker is v2.
   pub(super) fn new(set: Arc<AlignmentSet>, max_queued_chunks: usize) -> Result<Self, RunnerError> {
     let (work_tx, work_rx) = bounded::<AlignWorkItem>(max_queued_chunks);
     let (result_tx, result_rx) = bounded::<AlignResultMsg>(max_queued_chunks + 16);
@@ -162,10 +162,10 @@ fn worker_loop(
 /// fallback policy), runs `Aligner::align` under the lock, and
 /// returns the per-chunk result.
 ///
-/// Strictness contract (spec §6.3.1): if the registered Lang(L)
-/// aligner returns `WorkFailure::AlignmentFailed`, that failure is
-/// returned as-is — `Any` is *not* consulted. The worker only
-/// consults `Any` on registry miss.
+/// Strictness contract: if the registered Lang(L) aligner returns
+/// `WorkFailure::AlignmentFailed`, that failure is returned as-is
+/// — `Any` is *not* consulted. The worker only consults `Any` on
+/// registry miss.
 fn run_one_alignment(
   set: &AlignmentSet,
   job: &AlignWorkItem,
@@ -190,9 +190,9 @@ fn run_one_alignment(
   };
 
   // Spawn the cancellable watchdog. Uses recv_timeout on a
-  // one-shot oneshot channel so the worker can cancel it by
-  // dropping the sender once inference completes (Plan B's
-  // watchdog sleep-blocks the join; this avoids that).
+  // one-shot channel so the worker can cancel it by dropping the
+  // sender once inference completes (a sleep-based watchdog
+  // would block the join until the timeout elapsed).
   let (cancel_tx, cancel_rx) = bounded::<()>(1);
   let abort_flag = job.abort_flag.clone();
   let timeout = job.align_timeout;
@@ -252,15 +252,15 @@ fn run_one_alignment(
     });
   }
 
-  // Codex round-15 [high]: an alignment-stage failure is NOT a
-  // reason to discard the cached ASR transcript. Without this,
-  // a `NoAlignmentPath` from a too-short chunk or a 32 M-cell
-  // budget overflow would propagate to `inject_failure` upstream,
-  // turning the chunk into `Event::Error` and dropping the
-  // (perfectly valid) ASR text. Convert recoverable
-  // alignment-stage failures to an empty `AlignmentResult` so
-  // the dispatch emits `Transcript { text, words: [] }` instead
-  // — alignment is best-effort, not destructive.
+  // An alignment-stage failure is NOT a reason to discard the
+  // cached ASR transcript. Without this, a `NoAlignmentPath`
+  // from a too-short chunk or a 32 M-cell budget overflow would
+  // propagate to `inject_failure` upstream, turning the chunk
+  // into `Event::Error` and dropping the (perfectly valid) ASR
+  // text. Convert recoverable alignment-stage failures to an
+  // empty `AlignmentResult` so the dispatch emits
+  // `Transcript { text, words: [] }` instead — alignment is
+  // best-effort, not destructive.
   //
   // `WorkerHangTimeout` and the abort-flag race above stay fatal
   // because they signal a worker liveness problem the runner
@@ -282,12 +282,10 @@ fn run_one_alignment(
 /// (recoverable, ASR text preserved) vs fatal (event surfaces as
 /// `Event::Error`).
 ///
-/// Codex round-16 [high] tightened this from "any
-/// `AlignmentFailed` is recoverable" to a per-`AlignmentFailureKind`
-/// classification. Backend / configuration failures must
-/// propagate so the caller learns about a broken setup —
-/// silently emitting empty alignments forever would mask a real
-/// problem.
+/// The classification is per-`AlignmentFailureKind`. Backend /
+/// configuration failures must propagate so the caller learns
+/// about a broken setup — silently emitting empty alignments
+/// forever would mask a real problem.
 ///
 /// Recoverable (return empty `AlignmentResult`, preserve ASR
 /// text):
@@ -331,9 +329,9 @@ fn alignment_failure_is_recoverable(failure: &WorkFailure) -> bool {
   )
 }
 
-/// Lock the per-language `Mutex<Aligner>` and run the 8-step
-/// pipeline. The mutex is uncontended in the v1 single-worker case
-/// but exists for v2 multi-worker safety (spec §6.3.3).
+/// Lock the per-language `Mutex<Aligner>` and run the alignment
+/// pipeline. The mutex is uncontended in the v1 single-worker
+/// case but exists for v2 multi-worker safety.
 fn run_under_lock(
   aligner: &Mutex<Aligner>,
   job: &AlignWorkItem,
@@ -392,11 +390,10 @@ mod tests {
     assert_send::<crossbeam_channel::Receiver<AlignResultMsg>>();
   }
 
-  /// Codex round-16 [high]: only data-dependent alignment
-  /// failures preserve the ASR transcript. Backend / config
-  /// kinds (`ModelInferenceFailed` / `TokenizationFailed` /
-  /// `NormalizationFailed`) propagate as `Event::Error` so the
-  /// caller can detect a broken setup.
+  /// Only data-dependent alignment failures preserve the ASR
+  /// transcript. Backend / config kinds (`ModelInferenceFailed` /
+  /// `TokenizationFailed` / `NormalizationFailed`) propagate as
+  /// `Event::Error` so the caller can detect a broken setup.
   #[test]
   fn data_dependent_failures_are_recoverable() {
     use crate::types::AlignmentFailureKind;

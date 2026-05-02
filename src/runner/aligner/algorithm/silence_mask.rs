@@ -1,4 +1,4 @@
-//! Step 0 of the alignment algorithm: silence-mask construction.
+//! Silence-mask construction stage of the alignment algorithm.
 
 use alloc::vec::Vec;
 
@@ -15,9 +15,9 @@ use mediatime::TimeRange;
 ///
 /// **Coordinate space.** The chunk's `samples` are 16 kHz f32 mono;
 /// indices are chunk-local (0..samples.len()). The
-/// `sub_segments` come from Plan A's `MergedChunk.sub_segments`,
-/// which are `TimeRange`s in the *output timebase* — they could
-/// be 48 kHz or 90 kHz or anything else the caller chose.
+/// `sub_segments` come from `MergedChunk.sub_segments`, which are
+/// `TimeRange`s in the *output timebase* — they could be 48 kHz
+/// or 90 kHz or anything else the caller chose.
 ///
 /// `chunk_first_sample_in_stream` is the chunk's first 16 kHz
 /// sample index in stream coordinates; `output_range_to_chunk_local`

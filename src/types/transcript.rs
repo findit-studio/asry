@@ -12,7 +12,7 @@ use crate::types::{ChunkId, Lang};
 ///
 /// One emitted `MergedChunk` produces exactly one `Transcript`.
 /// Fields are private; access is via getters per the findit-studio
-/// convention. See spec §4.2.
+/// convention.
 #[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Transcript {
@@ -128,9 +128,9 @@ impl Word {
 
   /// Original surface form of the word, preserving casing and
   /// punctuation as Whisper emitted them. Recovered after CTC
-  /// alignment via the normalisation map (§6.3.2 step 9); the
-  /// word that wav2vec2 actually aligned was the lowercased,
-  /// punctuation-stripped form.
+  /// alignment via the normalisation map; the word that wav2vec2
+  /// actually aligned was the lowercased, punctuation-stripped
+  /// form.
   pub fn text(&self) -> &str {
     self.text.as_str()
   }

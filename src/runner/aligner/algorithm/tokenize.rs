@@ -300,10 +300,10 @@ mod tests {
     assert!(result.word_idx_per_token.is_empty());
   }
 
-  /// `"1000"` against the A-Z English vocab — Codex round-10
-  /// regression. Digits are all-OOV; tokenisation must produce
-  /// zero tokens (empty result, not error) so alignment can
-  /// short-circuit and the ASR transcript survives.
+  /// `"1000"` against the A-Z English vocab — digits are
+  /// all-OOV; tokenisation must produce zero tokens (empty
+  /// result, not error) so alignment can short-circuit and the
+  /// ASR transcript survives.
   #[test]
   fn digits_against_uppercase_alphabet_yield_empty_not_error() {
     let tok = uppercase_tokenizer();

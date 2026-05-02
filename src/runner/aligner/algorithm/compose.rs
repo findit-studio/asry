@@ -1,10 +1,10 @@
-//! Steps 7-9 of the alignment algorithm: per-word state +
-//! surface-form recovery.
+//! Per-word state + surface-form recovery stages of the
+//! alignment algorithm.
 
 use alloc::{borrow::Cow, vec::Vec};
 use core::{num::NonZeroU32, time::Duration};
 
-use mediatime::{Timebase, TimeRange};
+use mediatime::{TimeRange, Timebase};
 use smol_str::SmolStr;
 
 use crate::{
@@ -30,17 +30,17 @@ struct WordAccum {
   speech_emissions: u32,
   /// Count of *all* token emissions for this word — silent and
   /// speech-supported. Denominator for the post-pass coverage
-  /// ratio. Codex round-21: required to detect "fragmented
-  /// speech support" (most of a word masked, one stray frame
-  /// surviving) so we don't emit a high-confidence word over a
-  /// bounding range that misrepresents the audio.
+  /// ratio. Required to detect "fragmented speech support" (most
+  /// of a word masked, one stray frame surviving) so we don't
+  /// emit a high-confidence word over a bounding range that
+  /// misrepresents the audio.
   total_emissions: u32,
 }
 
 /// Default minimum `speech_emissions / total_emissions` ratio
 /// for [`Aligner::min_speech_coverage`](crate::Aligner::min_speech_coverage).
 /// Half-coverage is the natural threshold — majority-speech
-/// words stay; mostly-masked words drop. Codex round-21.
+/// words stay; mostly-masked words drop.
 pub const DEFAULT_MIN_SPEECH_COVERAGE: f32 = 0.5;
 
 /// Default maximum contiguous silent run inside a word's
@@ -108,7 +108,7 @@ pub(crate) fn build_speech_frames(
 /// end_frame, logprob_sum, speech_emissions, total_emissions)`
 /// into a `Vec<Option<...>>` indexed by normalised-word position.
 ///
-/// Step 7 of §6.3.2:
+/// Step 7:
 /// - Skip frames whose state is a blank (`state % 2 == 0`).
 /// - Skip frames whose mapped token's `word_idx_per_token == None`
 ///   (delimiters / `<unk>` / specials).
@@ -157,7 +157,7 @@ fn accumulate_per_word(
     // denominator). The bounding `[start_frame, end_frame)` is
     // still anchored to speech-supported frames — only those
     // contribute to `start_frame`/`end_frame`/`logprob_sum`/
-    // `speech_emissions`. Codex round-21.
+    // `speech_emissions`.
     let entry = slot.get_or_insert_with(|| WordAccum {
       start_frame: 0,
       end_frame: 0,
@@ -178,23 +178,22 @@ fn accumulate_per_word(
     }
   }
 
-  // Post-pass: drop fragmented and long-gap words. (Codex
-  // round-21.)
+  // Post-pass: drop fragmented and long-gap words.
   //
   // History:
-  // - Round-16: dropped any word whose bounding span covered
-  //   a silent frame. Too aggressive — a 1-frame VAD
+  // - An earlier version dropped any word whose bounding span
+  //   covered a silent frame. Too aggressive — a 1-frame VAD
   //   false-negative inside a real word killed the word.
-  // - Round-20: removed the post-pass entirely. Too lax —
-  //   a word with most emissions masked and one surviving
-  //   speech frame still emitted with a high-confidence score
-  //   over a misleading bounding range.
-  // - Round-21 (current): drop on either signal — speech
-  //   coverage below `min_speech_coverage` ("fragmented")
-  //   *or* longest contiguous silent run inside the bounding
-  //   span exceeds `max_silent_run_frames` ("long straddle").
-  //   Both thresholds are configurable on `Aligner` (defaults
-  //   in `DEFAULT_MIN_SPEECH_COVERAGE` /
+  // - Removing the post-pass entirely was too lax — a word with
+  //   most emissions masked and one surviving speech frame
+  //   still emitted with a high-confidence score over a
+  //   misleading bounding range.
+  // - Current rule: drop on either signal — speech coverage
+  //   below `min_speech_coverage` ("fragmented") *or* longest
+  //   contiguous silent run inside the bounding span exceeds
+  //   `max_silent_run_frames` ("long straddle"). Both
+  //   thresholds are configurable on `Aligner` (defaults in
+  //   `DEFAULT_MIN_SPEECH_COVERAGE` /
   //   `DEFAULT_MAX_INTRA_SILENT_RUN`); brief intra-word
   //   silences (unvoiced consonants, glottal stops, VAD jitter
   //   under the configured threshold) still keep the word.
@@ -518,19 +517,17 @@ mod tests {
     assert_eq!(result.words()[0].text(), "hello");
   }
 
-  /// Codex round-20 [medium] (replacing round-16's
-  /// over-aggressive drop): a word with speech-supported
-  /// emissions on both sides of a brief silent gap must be
-  /// kept. The accumulator's per-frame skip already anchors
-  /// `start_frame`/`end_frame` to speech-supported frames; the
-  /// emitted range bookends those frames even when a single
-  /// silent frame falls inside.
+  /// A word with speech-supported emissions on both sides of a
+  /// brief silent gap must be kept. The accumulator's per-frame
+  /// skip already anchors `start_frame`/`end_frame` to
+  /// speech-supported frames; the emitted range bookends those
+  /// frames even when a single silent frame falls inside.
   ///
   /// Path: word 0's token (state 1) emits at frames 0, 2, 4,
-  /// with frame 2 masked silent (frames 1 and 3 are blank).
-  /// Round-16 dropped this word entirely. Round-20 emits it
-  /// with range [0, 5) — accumulator's first/last
-  /// speech-supported frame indices.
+  /// with frame 2 masked silent (frames 1 and 3 are blank). An
+  /// over-aggressive earlier rule dropped this word entirely;
+  /// the current rule emits it with range [0, 5) — accumulator's
+  /// first/last speech-supported frame indices.
   #[test]
   fn word_with_brief_silent_gap_is_kept_with_speech_supported_span() {
     // states: [y_0, blank, y_0, blank, y_0]
@@ -576,13 +573,13 @@ mod tests {
     );
   }
 
-  /// Codex round-21 [high]: a word whose token visits the path
-  /// 5 times but only one frame is speech-supported (4 silent
-  /// emissions skipped) must drop. Coverage = 1 / 5 = 0.20,
-  /// below `MIN_SPEECH_COVERAGE = 0.5`. Pre-fix the round-20
-  /// implementation kept it — emitting a high-confidence word
-  /// scored from the single surviving emission while ignoring
-  /// the 4 masked-out token frames.
+  /// A word whose token visits the path 5 times but only one
+  /// frame is speech-supported (4 silent emissions skipped) must
+  /// drop. Coverage = 1 / 5 = 0.20, below
+  /// `MIN_SPEECH_COVERAGE = 0.5`. A previous implementation kept
+  /// it — emitting a high-confidence word scored from the single
+  /// surviving emission while ignoring the 4 masked-out token
+  /// frames.
   #[test]
   fn fragmented_word_with_minority_speech_support_drops() {
     // 5 frames; word 0's token (state 1) emits at every frame.
@@ -615,8 +612,8 @@ mod tests {
     );
   }
 
-  /// Codex round-21 [high]: a word with speech emissions on
-  /// both sides of a long silent gap must drop — the bounding
+  /// A word with speech emissions on both sides of a long
+  /// silent gap must drop — the bounding
   /// `Word.range` would otherwise misrepresent where the word
   /// actually occurred. The 19-frame masked gap inside the
   /// span (~380 ms at 50 fps) blows past the default 80 ms
@@ -818,10 +815,10 @@ mod tests {
     );
   }
 
-  /// Codex round-20 [medium]: long word with brief intra-silence
-  /// (1-frame VAD jitter) must be kept. Common in real audio
-  /// when VAD misses a brief unvoiced consonant inside a word.
-  /// Pre-fix this case was dropped — losing real speech.
+  /// A long word with brief intra-silence (1-frame VAD jitter)
+  /// must be kept. Common in real audio when VAD misses a brief
+  /// unvoiced consonant inside a word. Earlier implementations
+  /// dropped this case — losing real speech.
   #[test]
   fn long_word_with_one_frame_silent_gap_is_kept() {
     // 11 frames; word 0's token emits at every odd frame

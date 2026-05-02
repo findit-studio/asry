@@ -8,8 +8,6 @@
 //! - **External (output) timebase = caller-chosen.** Every public
 //!   [`mediatime::TimeRange`] whispery emits is in the timebase of
 //!   the caller's first `push_samples` call.
-//!
-//! See spec §4.1 for the full discussion.
 
 use core::num::NonZeroU32;
 

@@ -8,8 +8,6 @@
 //! - [`WorkFailure`] is for per-chunk inference failures surfaced
 //!   asynchronously via `Event::Error { chunk_id, error: WorkFailure }`
 //!   (drained by `poll_event`).
-//!
-//! See spec §4.5.
 
 use core::time::Duration;
 

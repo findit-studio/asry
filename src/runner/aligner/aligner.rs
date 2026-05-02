@@ -18,9 +18,8 @@ use crate::{
 /// model, its HuggingFace tokenizer, and the language's text
 /// normaliser. Each instance is heavyweight (ONNX session +
 /// tokenizer state); the [`crate::AlignmentSet`] registry keeps one
-/// per registered language, gated behind `Mutex<Aligner>` (spec
-/// §6.3.3) so the single alignment worker can drive any language
-/// without copying.
+/// per registered language, gated behind `Mutex<Aligner>` so the
+/// single alignment worker can drive any language without copying.
 ///
 /// Fields are private; access is via getters per the findit-studio
 /// convention.
@@ -122,10 +121,10 @@ impl Aligner {
     let vocab_uppercase_only =
       tokenizer.token_to_id("A").is_some() && tokenizer.token_to_id("a").is_none();
 
-    // Codex round-18 [medium]: when the normaliser declares
-    // `use_word_delimiter == true` (the English-shape default),
-    // the tokenizer MUST expose a `|` token. See
-    // [`validate_word_delimiter_present`] for the rationale.
+    // When the normaliser declares `use_word_delimiter == true`
+    // (the English-shape default), the tokenizer MUST expose a
+    // `|` token. See [`validate_word_delimiter_present`] for the
+    // rationale.
     validate_word_delimiter_present(&tokenizer, normalizer.use_word_delimiter())?;
 
     Ok(Self {
@@ -139,7 +138,8 @@ impl Aligner {
       unk_token_id,
       vocab_uppercase_only,
       min_speech_coverage: crate::runner::aligner::algorithm::compose::DEFAULT_MIN_SPEECH_COVERAGE,
-      max_intra_silent_run: crate::runner::aligner::algorithm::compose::DEFAULT_MAX_INTRA_SILENT_RUN,
+      max_intra_silent_run:
+        crate::runner::aligner::algorithm::compose::DEFAULT_MAX_INTRA_SILENT_RUN,
     })
   }
 
@@ -170,7 +170,7 @@ impl Aligner {
   /// Panics if `value == 0`. A zero sample rate would make the
   /// frame-timebase math collapse and downstream PTS conversions
   /// produce nonsense ranges; failing fast at the construction
-  /// boundary is correct. Codex round-23.
+  /// boundary is correct.
   pub const fn set_sample_rate(&mut self, value: u32) {
     assert!(value > 0, "sample_rate must be > 0");
     self.sample_rate = value;
@@ -194,7 +194,7 @@ impl Aligner {
   /// Panics if `value == 0`. A zero hop would collapse the
   /// frame→sample conversion in `compose_words` (every word
   /// would land at the chunk's first sample), corrupting word
-  /// timings silently. Fail fast. Codex round-23.
+  /// timings silently. Fail fast.
   pub const fn set_hop_samples(&mut self, value: u32) {
     assert!(value > 0, "hop_samples must be > 0");
     self.hop_samples = value;
@@ -253,12 +253,7 @@ impl Aligner {
     self
   }
 
-  // The crate-private `align` method is implemented across Tasks
-  // 10-14. The signature is fixed here so other modules can
-  // declare it as a dependency.
-
-  /// Crate-private alignment entrypoint. Implemented incrementally
-  /// in Tasks 10-14.
+  /// Crate-private alignment entrypoint.
   ///
   /// Inputs:
   /// - `samples`: the chunk's 16 kHz f32 mono audio.
@@ -269,11 +264,9 @@ impl Aligner {
   ///   sample index in stream coordinates (used to convert
   ///   wav2vec2 frame indices back to stream sample indices).
   /// - `samples_to_output_range`: callback bridging stream sample
-  ///   indices to output-timebase `TimeRange`s. Plan A's
+  ///   indices to output-timebase `TimeRange`s. The core's
   ///   `SampleBuffer::samples_to_output_range` is `pub(crate)`;
-  ///   the worker constructs a closure over it (see Task 21).
-  ///
-  /// Implemented in Tasks 10-14; this stub is the API contract.
+  ///   the worker constructs a closure over it.
   pub(crate) fn align<F>(
     &mut self,
     samples: &[f32],
@@ -328,12 +321,11 @@ impl Aligner {
     // returns the buffer it's already been (1) normalised over
     // speech samples only and (2) zeroed at non-speech
     // positions, so the silence-mask invariant survives all the
-    // way to ORT. Codex round-14 [high]: pre-fix this was two
-    // steps — `build_masked_samples` then a non-mask-aware
-    // normalise inside `encode_log_softmax`. The intermediate
-    // zeros got mean-shifted by the normaliser, so masked
-    // regions became `(0 - mean) / std` ≠ 0 by the time they
-    // reached the model.
+    // way to ORT. A previous two-step approach
+    // (`build_masked_samples` then a non-mask-aware normalise
+    // inside `encode_log_softmax`) had the intermediate zeros
+    // mean-shifted by the normaliser, so masked regions became
+    // `(0 - mean) / std` ≠ 0 by the time they reached the model.
     let mut speech_mask = alloc::vec![false; samples.len()];
     for &seg in sub_segments {
       let start = (seg.start_pts() as u64 as usize).min(samples.len());
@@ -356,9 +348,9 @@ impl Aligner {
     // mirrors the empty-tokens short-circuit below. Returning
     // `Ok(empty AlignmentResult)` lets the cached ASR
     // transcript surface as `Transcript { text, words: [] }`
-    // instead of `Event::Error`. Codex round-12 [medium] flagged
-    // this as a data-loss path that contradicts the
-    // `AlignmentResult` contract.
+    // instead of `Event::Error`. Otherwise this would be a
+    // data-loss path that contradicts the `AlignmentResult`
+    // contract.
     let normalized = match self.normalizer.normalize(text) {
       Ok(nt) => nt,
       Err(crate::runner::aligner::normalizer::NormalizationError::EmptyText) => {
@@ -423,9 +415,8 @@ impl Aligner {
     //
     // The samples we hand to ORT have already gone through the
     // silence-aware normaliser above — `encode_log_softmax`
-    // expects pre-normalised input. (Codex round-14 [high]: the
-    // pre-fix internal-normalise inside `encode_log_softmax`
-    // broke the silence mask.)
+    // expects pre-normalised input. A pre-fix internal-normalise
+    // inside `encode_log_softmax` broke the silence mask.
     let normalized_samples =
       crate::runner::aligner::algorithm::normalize::normalize_with_silence_mask(
         samples,
@@ -438,18 +429,17 @@ impl Aligner {
       &self.language,
     )?;
 
-    // Codex round-23 [high]: validate the encoder's stride
-    // against the input audio length. wav2vec2's CNN
-    // downsamples by `hop_samples` (320 for *-base / *-large),
-    // so the encoded "time" `T * hop_samples` should be at
-    // most `samples.len()` plus a couple of frames of
-    // receptive-field slack. A grossly larger T means the
-    // model export uses a different stride or `hop_samples`
-    // is misconfigured — `compose_words`'s `frame * hop`
-    // mapping would otherwise emit plausible-looking word
-    // ranges past the chunk's audio boundary with no error
-    // surfaced. Fatal because the only recovery is fixing
-    // the model/config, not retrying.
+    // Validate the encoder's stride against the input audio
+    // length. wav2vec2's CNN downsamples by `hop_samples` (320
+    // for *-base / *-large), so the encoded "time"
+    // `T * hop_samples` should be at most `samples.len()` plus
+    // a couple of frames of receptive-field slack. A grossly
+    // larger T means the model export uses a different stride
+    // or `hop_samples` is misconfigured — `compose_words`'s
+    // `frame * hop` mapping would otherwise emit
+    // plausible-looking word ranges past the chunk's audio
+    // boundary with no error surfaced. Fatal because the only
+    // recovery is fixing the model/config, not retrying.
     let frame_extent = (log_probs.t as u64).saturating_mul(self.hop_samples as u64);
     let chunk_extent = samples.len() as u64;
     let max_allowed = chunk_extent.saturating_add(2 * self.hop_samples as u64);
@@ -528,18 +518,18 @@ fn detect_blank_token_id(tok: &Tokenizer) -> Option<u32> {
 }
 
 /// Default per-job timeout for one chunk's alignment. Surfaced
-/// via the `worker_timeouts(_, align)` builder hook in Plan B.
+/// via the `worker_timeouts(_, align)` builder hook.
 pub(crate) const DEFAULT_ALIGN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Validate that the tokenizer exposes the wav2vec2 `|`
 /// word-delimiter token whenever the normaliser declared
 /// `use_word_delimiter == true`.
 ///
-/// Codex round-18 [medium]: pre-fix a missing `|` token slipped
-/// through silently — `tokenize_with_word_map` would simply emit
-/// no inter-word delimiter, glueing adjacent words together in
-/// the CTC graph. Word timings would then be plausible but
-/// wrong with no configuration error visible to the caller.
+/// Without this check, a missing `|` token slips through silently
+/// — `tokenize_with_word_map` would simply emit no inter-word
+/// delimiter, glueing adjacent words together in the CTC graph.
+/// Word timings would then be plausible but wrong with no
+/// configuration error visible to the caller.
 ///
 /// Char-segmented normalisers (`use_word_delimiter == false`)
 /// don't need the delimiter and pass through.
@@ -578,7 +568,7 @@ fn validate_word_delimiter_present(
 /// `build.rs` patches the build-time fixture, but a downstream
 /// consumer following the public `Aligner::from_paths` API with
 /// their own tokenizer file would have hit the same load
-/// failure. Codex round-13 [high].
+/// failure.
 ///
 /// We try the raw file first so already-compliant tokenizer
 /// JSONs (BPE / Unigram models, or modern WordLevel exports
@@ -662,18 +652,17 @@ mod tests {
   use super::*;
 
   // Unit tests for `from_paths` are tricky: they require real
-  // wav2vec2 ONNX + tokenizer.json files. Task 25's end-to-end
-  // test exercises the actual loader against the build.rs-fetched
+  // wav2vec2 ONNX + tokenizer.json files. The end-to-end test
+  // exercises the actual loader against the build.rs-fetched
   // fixture. Here we lock in the type-level invariants and the
   // blank-token-id detection helper.
 
-  /// Codex round-13 [high] regression: the upstream wav2vec2
-  /// tokenizer.json (HF format, no `model.type` discriminator)
-  /// loaded directly via `Aligner::from_paths` used to fail
-  /// with `tokenizers 0.20`'s ModelUntagged deserialiser. The
-  /// build.rs fixture got patched, but a downstream consumer
-  /// loading their own copy from HuggingFace would have hit a
-  /// load-time error.
+  /// Regression: the upstream wav2vec2 tokenizer.json (HF format,
+  /// no `model.type` discriminator) loaded directly via
+  /// `Aligner::from_paths` used to fail with `tokenizers 0.20`'s
+  /// ModelUntagged deserialiser. The build.rs fixture got
+  /// patched, but a downstream consumer loading their own copy
+  /// from HuggingFace would have hit a load-time error.
   ///
   /// Fix: `load_tokenizer_with_compat` patches in-memory and
   /// retries. This test exercises that path with the canonical
@@ -733,7 +722,7 @@ mod tests {
     assert!(inject_wordlevel_model_type(already_typed).is_none());
   }
 
-  // --- Codex round-18 [medium]: word-delimiter validation ---
+  // --- Word-delimiter validation ---
 
   /// In-memory tokenizer with a `|` token. Use for "valid"
   /// cases where the delimiter check should pass.
@@ -757,7 +746,7 @@ mod tests {
   }
 
   /// Same shape WITHOUT the `|` token. Reproduces the
-  /// configuration mistake the round-18 check catches.
+  /// configuration mistake the delimiter check catches.
   fn tokenizer_without_pipe_delimiter() -> Tokenizer {
     let json = r#"{
       "version": "1.0",
@@ -817,13 +806,12 @@ mod tests {
     assert_send::<Aligner>();
   }
 
-  /// Codex round-12 [medium] regression: punctuation-only ASR
-  /// text normalises to empty, but alignment must NOT turn the
-  /// successful ASR transcript into `Event::Error`. The fix
-  /// short-circuits `EmptyText` to `Ok(empty AlignmentResult)`
-  /// inside `Aligner::align`; this test exercises that path
-  /// without ONNX inference (the short-circuit returns before
-  /// `encode_log_softmax` runs).
+  /// Regression: punctuation-only ASR text normalises to empty,
+  /// but alignment must NOT turn the successful ASR transcript
+  /// into `Event::Error`. The fix short-circuits `EmptyText` to
+  /// `Ok(empty AlignmentResult)` inside `Aligner::align`; this
+  /// test exercises that path without ONNX inference (the
+  /// short-circuit returns before `encode_log_softmax` runs).
   ///
   /// Skips when the build.rs fixture isn't present (offline /
   /// `WHISPERY_OFFLINE=1`); aligner_load already verifies the

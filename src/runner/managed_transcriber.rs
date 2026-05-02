@@ -1,4 +1,4 @@
-//! ManagedTranscriber — the runner's public surface. See spec §6.1.
+//! ManagedTranscriber — the runner's public surface.
 
 use alloc::collections::VecDeque;
 use core::time::Duration;
@@ -30,7 +30,7 @@ pub(super) enum DispatchOutcome {
 }
 
 /// Public runner: wraps `core::Transcriber` and a `WhisperPool` with
-/// the saturation-deadlock-safe dispatch loop from spec §6.4.1.
+/// a saturation-deadlock-safe dispatch loop.
 pub struct ManagedTranscriber {
   core: Transcriber,
   whisper_pool: WhisperPool,
@@ -43,9 +43,8 @@ pub struct ManagedTranscriber {
   pending_transcripts: VecDeque<Transcript>,
   pending_errors: VecDeque<(ChunkId, WorkFailure)>,
 
-  /// Plan C: alignment pool (single worker per spec §6.3.3).
-  /// `None` when `with_alignment` was not called or the supplied
-  /// set was empty.
+  /// Alignment pool (single worker). `None` when `with_alignment`
+  /// was not called or the supplied set was empty.
   #[cfg(feature = "alignment")]
   alignment_pool: Option<crate::runner::alignment_pool::AlignmentPool>,
 
@@ -57,8 +56,8 @@ pub struct ManagedTranscriber {
 
 impl ManagedTranscriber {
   /// Try to send a Command into the appropriate worker pool.
-  /// Non-blocking. Plan C, Task 22: also handles
-  /// `Command::RunAlignment` by shipping into the alignment pool.
+  /// Non-blocking. Also handles `Command::RunAlignment` by
+  /// shipping into the alignment pool.
   fn try_dispatch(&self, cmd: Command, asr_timeout: Duration) -> DispatchOutcome {
     match cmd {
       Command::RunAsr {
@@ -108,11 +107,10 @@ impl ManagedTranscriber {
         text,
         language,
       } => {
-        // Plan B params bug precedent: text + language are
-        // Whisper's authoritative output (the registry lookup
-        // depends on `language`). They are forwarded into the
-        // AlignWorkItem verbatim — never re-derived from a
-        // runner-side default.
+        // text + language are Whisper's authoritative output
+        // (the registry lookup depends on `language`). They are
+        // forwarded into the AlignWorkItem verbatim — never
+        // re-derived from a runner-side default.
         let Some(pool) = self.alignment_pool.as_ref() else {
           // Core emitted RunAlignment but we have no pool.
           // This is a misconfigured builder (with_word_alignment
@@ -134,7 +132,6 @@ impl ManagedTranscriber {
         // extract time) rather than the live buffer, so word
         // ranges stay in this chunk's PTS epoch even if a
         // `restart_at` happened between extract and now.
-        // (Codex round-19.)
         let Some(samples_to_output_range) = self.core.chunk_samples_to_output_range_fn(chunk_id)
         else {
           return DispatchOutcome::Backpressure(Command::RunAlignment {
@@ -170,7 +167,7 @@ impl ManagedTranscriber {
         // for the aligner's silence mask we need them in
         // chunk-local 16 kHz sample-index space. Pull the raw
         // stream-sample form preserved alongside on the
-        // dispatch record (Plan C: ChunkRecord::sub_segments_samples)
+        // dispatch record (`ChunkRecord::sub_segments_samples`)
         // and offset by `chunk_first_sample` so start_pts ==
         // chunk-local sample index.
         let chunk_local_subs = self
@@ -209,12 +206,11 @@ impl ManagedTranscriber {
             // sub_segments were consumed into the work
             // item. The core's unpoll_command + dispatch
             // record retain the authoritative copy
-            // (Plan A: ChunkRecord::sub_segments), so the
-            // next poll_command can rebuild from there.
-            // For the re-parked Command we ship an empty
-            // Vec — the data is recoverable from the
-            // record on retry via this same try_dispatch
-            // path.
+            // (`ChunkRecord::sub_segments`), so the next
+            // poll_command can rebuild from there. For the
+            // re-parked Command we ship an empty Vec — the
+            // data is recoverable from the record on retry
+            // via this same try_dispatch path.
             let cmd = Command::RunAlignment {
               chunk_id: item.chunk_id,
               samples: item.samples,
@@ -229,12 +225,11 @@ impl ManagedTranscriber {
       }
 
       // Without the `alignment` cargo feature, RunAlignment is
-      // emitted by Plan A only when `word_alignment` was set on
-      // the core's TranscriberOptions — which the runner's
+      // emitted by the core only when `word_alignment` was set
+      // on the core's TranscriberOptions — which the runner's
       // builder gates on the alignment pool's presence. Reaching
       // this arm with feature off means a non-runner caller is
-      // driving the core; re-park indefinitely (matches the
-      // pre-Task-22 behavior).
+      // driving the core; re-park indefinitely.
       #[cfg(not(feature = "alignment"))]
       cmd @ Command::RunAlignment { .. } => DispatchOutcome::Backpressure(cmd),
     }
@@ -250,8 +245,8 @@ impl ManagedTranscriber {
   /// `block_on_full_queue=false` and a try_send hit Full. The
   /// command was re-parked via `Transcriber::unpoll_command`; the
   /// core's buffer state has already advanced (samples buffered,
-  /// segments merged into possibly-pending chunks). Per spec
-  /// §6.4.2 the caller must drain via `poll_*` before pushing again.
+  /// segments merged into possibly-pending chunks). The caller
+  /// must drain via `poll_*` before pushing again.
   ///
   /// `Err(RunnerError::WhisperPoolShutdown)` is fatal: a worker
   /// channel disconnected.
@@ -277,11 +272,11 @@ impl ManagedTranscriber {
     }
 
     // Phase 1b: drain alignment results (when the pool exists).
-    // Plan C, Task 22: parallel to whisper pool drain. An
-    // alignment-pool disconnect is mapped onto WhisperPoolShutdown
-    // for now (same semantics: rebuild the runner). A dedicated
-    // RunnerError::AlignmentPoolShutdown is straightforward future
-    // work.
+    // Parallel to the whisper pool drain. An alignment-pool
+    // disconnect is mapped onto WhisperPoolShutdown for now
+    // (same semantics: rebuild the runner). A dedicated
+    // RunnerError::AlignmentPoolShutdown is straightforward
+    // future work.
     #[cfg(feature = "alignment")]
     if let Some(pool) = self.alignment_pool.as_ref() {
       loop {
@@ -309,9 +304,9 @@ impl ManagedTranscriber {
     // and `core.is_idle()` (which checks `pending_events.is_empty()`)
     // never goes true. `drain` would then loop until
     // `drain_timeout` fires even when every worker has long since
-    // returned its result — exactly the codex round-9
-    // [critical] drain hang. Pulling here keeps `is_idle` honest:
-    // it goes true as soon as the last chunk's event is bucketed.
+    // returned its result — a drain hang. Pulling here keeps
+    // `is_idle` honest: it goes true as soon as the last chunk's
+    // event is bucketed.
     while let Some(ev) = self.core.poll_event() {
       progress = true;
       match ev {
@@ -346,15 +341,14 @@ impl ManagedTranscriber {
   /// Block (with `dispatch_idle_poll` safety) until at least one
   /// worker channel has data, OR the safety-timeout fires. Does NOT
   /// consume any message — the next `drive_one_step` does that via
-  /// `try_recv`. See spec §6.4.1 for why `Select::ready_timeout`
-  /// is the correct primitive (consuming variants would silently
-  /// drop results: NB-β).
+  /// `try_recv`. `Select::ready_timeout` is the correct primitive;
+  /// consuming variants would silently drop results.
   fn wait_for_progress(&self) -> Result<(), RunnerError> {
     let mut sel = crossbeam_channel::Select::new();
     sel.recv(&self.whisper_pool.result_rx);
-    // Plan C, Task 22: also wake on alignment results when the
-    // pool exists. The index is unused — drive_one_step's
-    // try_recv handles message vs. disconnect on each receiver.
+    // Also wake on alignment results when the pool exists.
+    // The index is unused — drive_one_step's try_recv handles
+    // message vs. disconnect on each receiver.
     #[cfg(feature = "alignment")]
     let _alignment_idx = if let Some(pool) = self.alignment_pool.as_ref() {
       Some(sel.recv(&pool.result_rx))
@@ -400,8 +394,8 @@ impl ManagedTranscriber {
 
 /// Builder for [`ManagedTranscriber`].
 ///
-/// All knobs are `with_*` style; defaults match spec §8. Construct
-/// via [`ManagedTranscriber::builder`].
+/// All knobs are `with_*` style. Construct via
+/// [`ManagedTranscriber::builder`].
 pub struct ManagedTranscriberBuilder {
   whisper_ctx: WhisperContext,
   pool_options: WhisperPoolOptions,
@@ -414,14 +408,14 @@ pub struct ManagedTranscriberBuilder {
   worker_timeouts_align: Duration,
   drain_timeout: Option<Duration>,
 
-  /// Plan C: optional alignment registry. When `Some(set)` and
+  /// Optional alignment registry. When `Some(set)` and
   /// `set.is_empty() == false`, `build()` spawns an alignment
   /// worker and emits `Command::RunAlignment` per chunk.
   #[cfg(feature = "alignment")]
   alignment_set: Option<crate::runner::aligner::AlignmentSet>,
 
-  /// Plan C: queue depth for the alignment work channel. Default
-  /// = whisper pool's `max_queued_chunks` (mirrors §6.3.3).
+  /// Queue depth for the alignment work channel. Default =
+  /// whisper pool's `max_queued_chunks`.
   #[cfg(feature = "alignment")]
   alignment_max_queued_chunks: Option<usize>,
 }
@@ -530,12 +524,12 @@ impl ManagedTranscriberBuilder {
   /// wires channels.
   pub fn build(self) -> Result<ManagedTranscriber, RunnerError> {
     let drain_timeout = self.drain_timeout.unwrap_or_else(|| {
-      // 10× the longest worker timeout per spec §6.1 / §8.
+      // 10× the longest worker timeout.
       let longest = core::cmp::max(self.worker_timeouts_asr, self.worker_timeouts_align);
       longest * 10
     });
 
-    // Plan C: build the alignment pool only when a non-empty
+    // Build the alignment pool only when a non-empty
     // AlignmentSet was supplied. An empty set is silently
     // accepted (callers can conditionally configure alignment
     // without branching at the call site) and produces a build
@@ -596,8 +590,7 @@ impl ManagedTranscriberBuilder {
 impl ManagedTranscriber {
   /// Begin building a `ManagedTranscriber` from a pre-constructed
   /// `WhisperContext`. The caller controls flash_attn / DTW / GPU
-  /// device explicitly when constructing the context (spec §5.6,
-  /// §6.2).
+  /// device explicitly when constructing the context.
   ///
   /// `pool_options` carries the runner-side knobs (worker count,
   /// queue depth, backpressure mode).
@@ -652,7 +645,7 @@ impl ManagedTranscriber {
   /// `RunnerError::Transcriber(TranscriberError::PtsRegression {
   /// kind: PushKind::VadSegment, .. })`.
   ///
-  /// **Backpressure contract** (spec §6.4.2): when this returns
+  /// **Backpressure contract**: when this returns
   /// `Err(RunnerError::Backpressure { .. })`, inputs were already
   /// consumed; the caller must drain via `poll_transcript` /
   /// `poll_error` before pushing again.
@@ -699,7 +692,7 @@ impl ManagedTranscriber {
     samples: &[f32],
   ) -> Result<(), RunnerError> {
     if samples.is_empty() {
-      // Plan A's push_samples accepts empty packets when
+      // The core's push_samples accepts empty packets when
       // delta_pts_out == 0; the underlying buffer call returns
       // Ok(()). We still call through so the timebase / EOF
       // checks fire normally.
@@ -726,23 +719,22 @@ impl ManagedTranscriber {
     // a RunAsr command; for v1, that's the only injection point.
     let merged = merge_overrides(&self.asr_params_default, ovr);
     let prior = core::mem::replace(&mut self.asr_params_default, merged);
-    // Plan A's TranscriberOptions defaults are baked into the core
-    // at construction; the runtime override path is via the
-    // Command's `params` field. Plan A does NOT expose a runtime
-    // setter for the dispatch's default AsrParams; this is OK
-    // because the runner's own default lives on
+    // The core's TranscriberOptions defaults are baked in at
+    // construction; the runtime override path is via the
+    // Command's `params` field. The core does NOT expose a
+    // runtime setter for the dispatch's default AsrParams; this
+    // is OK because the runner's own default lives on
     // `asr_params_default` and the runner is the one that emits
     // RunAsr commands' `params`. We override at dispatch time in
     // `try_dispatch`'s `params` consumption — that path is not
-    // currently used because Plan A's poll_command pre-fills
+    // currently used because the core's poll_command pre-fills
     // `params` from the core's config.
     //
     // To honor the runner's override semantics, we substitute the
     // params on the issued command in dispatch. The simplest
     // correct approach: keep `asr_params_default` updated; have
     // try_dispatch overwrite the Command's `params` with our own
-    // before sending. (See try_dispatch's note in Task 11; if
-    // that override hook isn't already in place, add it now.)
+    // before sending.
     prior
   }
 
@@ -881,16 +873,16 @@ fn merge_overrides(base: &AsrParams, ovr: &AsrParamsOverride) -> AsrParams {
 #[cfg(feature = "alignment")]
 mod alignment_dispatch_smoke {
   // Real ManagedTranscriber construction needs WhisperContext +
-  // AlignmentSet with real ONNX. The end-to-end test in Task 25
-  // covers the real flow; here we only assert that the core's
-  // is_idle path is consulted and that RunAlignment dispatch
-  // does not panic on the misconfigured-no-pool path.
+  // AlignmentSet with real ONNX. End-to-end tests cover the
+  // real flow; here we only assert that the core's is_idle path
+  // is consulted and that RunAlignment dispatch does not panic
+  // on the misconfigured-no-pool path.
 
   #[test]
   fn alignment_pool_optional_default_none() {
     // Type-level smoke: alignment_pool field is Option, so the
-    // misconfigured path (with_word_alignment via Plan A but
-    // no with_alignment) yields None and short-circuits.
+    // misconfigured path (with_word_alignment set on the core
+    // but no with_alignment) yields None and short-circuits.
   }
 }
 

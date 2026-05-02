@@ -1,4 +1,4 @@
-//! Whisper worker pool. See spec §6.2.
+//! Whisper worker pool.
 
 use alloc::sync::Arc;
 use core::{sync::atomic::Ordering, time::Duration};
@@ -35,11 +35,11 @@ use std::{
 /// our `FullParams<'static, 'static>` return type forces a `'static`
 /// `&str`).
 ///
-/// Codex round-23 [medium]: the prior `Box::leak(Box::<str>::from(s))`
-/// in `full_params_from` allocated a fresh leak on every chunk
-/// attempt — bounded *per call* but unbounded over a long-running
-/// stream. With auto-lock, a 24-hour transcription can leak tens
-/// of thousands of identical `"en"` strings.
+/// A naive `Box::leak(Box::<str>::from(s))` in `full_params_from`
+/// would allocate a fresh leak on every chunk attempt — bounded
+/// *per call* but unbounded over a long-running stream. With
+/// auto-lock, a 24-hour transcription can leak tens of thousands
+/// of identical `"en"` strings.
 ///
 /// This intern table allocates+leaks at most **once per distinct
 /// language code** the process ever sees. Named [`Lang`] variants
@@ -177,7 +177,6 @@ impl WhisperPoolOptions {
   /// When `true` (default), `process_packet` blocks when the work
   /// channel is full. When `false`, surfaces
   /// [`crate::RunnerError::Backpressure`] for caller-side pacing.
-  /// See spec §6.4.2 for the side-effect contract.
   pub const fn block_on_full_queue(&self) -> bool {
     self.block_on_full_queue
   }
@@ -190,7 +189,7 @@ impl WhisperPoolOptions {
 
   /// Recycle a worker's `WhisperState` after this many consecutive
   /// `WorkerHangTimeout`s. Default 1 on CPU (cheap recycle), 3 on
-  /// GPU. See spec §6.4.3.
+  /// GPU.
   pub const fn timeout_streak_threshold(&self) -> u32 {
     self.timeout_streak_threshold
   }
@@ -312,7 +311,7 @@ fn default_worker_count() -> usize {
   }
 }
 
-/// Default threshold per spec §6.4.3: 1 on CPU, 3 on GPU.
+/// Default threshold: 1 on CPU, 3 on GPU.
 const fn default_timeout_streak_threshold() -> u32 {
   if is_gpu_backend_active_const() { 3 } else { 1 }
 }
@@ -370,11 +369,11 @@ pub(super) type AsrResultMsg = (
 ///
 /// Disables whisper.cpp's internal temperature ladder via
 /// `set_temperature_inc(0.0)`; each `state.full()` call is exactly
-/// one decoding attempt at exactly `attempt_temperature`. The
-/// `set_max_decoding_failures(...)` belt-and-braces secondary safeguard
-/// documented in spec §5.6 is omitted here because whisper-rs 0.13.x
-/// does not expose that setter; with `temperature_inc = 0.0` the
-/// internal ladder iterates exactly once regardless.
+/// one decoding attempt at exactly `attempt_temperature`. A
+/// `set_max_decoding_failures(...)` belt-and-braces secondary
+/// safeguard is omitted here because whisper-rs 0.13.x does not
+/// expose that setter; with `temperature_inc = 0.0` the internal
+/// ladder iterates exactly once regardless.
 ///
 /// Wires the worker-hang watchdog via `set_abort_callback_safe`. The
 /// closure reads `abort_flag` on every whisper.cpp progress callback;
@@ -413,9 +412,9 @@ pub(super) fn full_params_from(
     // Intern through `INTERNED_LANG_STRS` so we allocate+leak at
     // most once per distinct language code over the process'
     // lifetime, regardless of how many chunk attempts the
-    // temperature ladder makes. Codex round-23 [medium] flagged
-    // the per-attempt `Box::leak` as an unbounded leak under
-    // long-running locked-language streams.
+    // temperature ladder makes. A per-attempt `Box::leak` would
+    // be an unbounded leak under long-running locked-language
+    // streams.
     let static_lang: &'static str = intern_lang_str(lang.as_str());
     p.set_language(Some(static_lang));
   } else {
@@ -431,7 +430,7 @@ pub(super) fn full_params_from(
   p.set_print_realtime(false);
   p.set_print_timestamps(false);
 
-  // Pin temperature; disable internal ladder. See spec §5.6.
+  // Pin temperature; disable internal ladder.
   p.set_temperature(attempt_temperature);
   p.set_temperature_inc(0.0);
 
@@ -548,7 +547,7 @@ pub(super) fn compute_compression_ratio(state: &WhisperState) -> f32 {
 /// whisper.cpp's internal `for t = initial; t <= 1.0; t += inc` loop
 /// runs exactly once at the runner-supplied temperature.
 ///
-/// Success criteria (spec §5.6):
+/// Success criteria:
 /// - `avg_logprob >= params.log_prob_threshold` (default −1.0)
 /// - `compression_ratio <= params.compression_ratio_threshold` (default 2.4)
 ///
@@ -684,7 +683,7 @@ fn build_asr_result(
 }
 
 /// Worker pool. Shared `Arc<WhisperContext>` per the v1 architecture
-/// decision (§13.1 verification: whisper-rs 0.13.x marks the context
+/// decision (verified: whisper-rs 0.13.x marks the context
 /// thread-safe; states are owned per worker).
 pub(super) struct WhisperPool {
   pub(super) ctx: Arc<WhisperContext>,
@@ -789,7 +788,7 @@ impl Drop for WhisperPool {
 }
 
 /// Worker thread main loop. Implements per-worker timeout-streak
-/// recycling per spec §6.4.3.
+/// recycling.
 fn worker_loop(
   ctx: Arc<WhisperContext>,
   work_rx: Receiver<AsrWorkItem>,
@@ -870,12 +869,12 @@ fn worker_loop(
 mod tests {
   use super::*;
 
-  /// Codex round-23 [medium]: language-code interning must
-  /// allocate at most once per distinct value. Calling
-  /// `intern_lang_str` twice with the same string returns the
-  /// same `&'static str` pointer; calling with a different
-  /// string returns a different pointer. (The bounded-leak
-  /// invariant — per-attempt `Box::leak` was unbounded.)
+  /// Language-code interning must allocate at most once per
+  /// distinct value. Calling `intern_lang_str` twice with the
+  /// same string returns the same `&'static str` pointer;
+  /// calling with a different string returns a different
+  /// pointer. (Bounded-leak invariant — per-attempt `Box::leak`
+  /// would be unbounded.)
   #[test]
   fn intern_lang_str_returns_stable_pointer_per_value() {
     let a1 = intern_lang_str("en");
@@ -953,9 +952,9 @@ mod tests {
     let flag = Arc::new(AtomicBool::new(false));
     let _full = full_params_from(&p, 0.4, flag);
     // FullParams' fields aren't all readable; the assertion is that
-    // the build does not panic and the abort closure compiles. The
-    // recording-mock test in Task 18 verifies temperature_inc=0.0
-    // and the explicit set_temperature(t) call sequence.
+    // the build does not panic and the abort closure compiles.
+    // Recording-mock tests verify temperature_inc=0.0 and the
+    // explicit set_temperature(t) call sequence.
   }
 
   #[test]
@@ -1012,10 +1011,9 @@ mod tests {
 
   /// Sanity check: confirm `run_with_temperature_ladder` is callable
   /// with the expected signature (and is pinned as `Send` so it can
-  /// run on a worker thread). The end-to-end ladder behaviour test
-  /// lives in Task 19; the mock-state test for layered-ladder
-  /// suppression goes in Task 18. Here we only assert the type
-  /// signature compiles.
+  /// run on a worker thread). End-to-end ladder behaviour and
+  /// layered-ladder suppression are exercised by other tests.
+  /// Here we only assert the type signature compiles.
   #[test]
   fn run_with_temperature_ladder_signature_compiles() {
     // Coerce the function to its expected signature; if the actual

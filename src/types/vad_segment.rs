@@ -4,7 +4,7 @@
 /// Speech segment as 16 kHz analysis-frame indices. Whispery accepts
 /// silero-shaped input via this type and converts to output-timebase
 /// `TimeRange`s internally; the caller never does PTS arithmetic for
-/// VAD inputs. See spec §4.1.3 and §5.3.
+/// VAD inputs.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VadSegment {

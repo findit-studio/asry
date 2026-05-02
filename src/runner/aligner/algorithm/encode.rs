@@ -1,4 +1,4 @@
-//! Step 3-4 of the alignment algorithm: ONNX encode + log-softmax.
+//! ONNX encode + log-softmax stage of the alignment algorithm.
 
 use alloc::{string::String, vec::Vec};
 
@@ -49,9 +49,9 @@ impl LogProbsTV {
 /// silence-aware
 /// [`crate::runner::aligner::algorithm::normalize::normalize_with_silence_mask`]
 /// runs in `Aligner::align` before this function so the silence
-/// mask is preserved through preprocessing — Codex round-14
-/// [high]'s fix moved normalisation up the call stack so masked
-/// regions stay exactly zero in the tensor we feed to ORT.
+/// mask is preserved through preprocessing. Normalisation lives
+/// up the call stack so masked regions stay exactly zero in the
+/// tensor we feed to ORT.
 ///
 /// The model is expected to take an input named `"input_values"` of
 /// shape `(1, T_samples)` and return logits of shape `(1, T_frames,
@@ -86,9 +86,8 @@ pub(crate) fn encode_log_softmax(
     });
   }
 
-  // Codex round-13 [medium]: reject non-finite samples up front
-  // with a typed in-band failure. See [`reject_non_finite_input`]
-  // for the rationale.
+  // Reject non-finite samples up front with a typed in-band
+  // failure. See [`reject_non_finite_input`] for the rationale.
   reject_non_finite_input(samples_for_aligner, language)?;
 
   // Build a (1, T) f32 input via ort's `(shape, Vec<T>)` tensor
@@ -145,17 +144,16 @@ pub(crate) fn encode_log_softmax(
     });
   }
 
-  // Codex round-18 [medium]: validate the shape integers and
-  // their product against the raw buffer length BEFORE we cast
-  // to usize / allocate / slice. Pre-fix a model export bug
-  // that emitted a negative dimension would have wrapped to a
-  // huge usize and OOM'd the worker, and a buffer-vs-shape
-  // mismatch would have panicked on the row-slice in
-  // `log_softmax_with_finite_guard`.
+  // Validate the shape integers and their product against the
+  // raw buffer length BEFORE we cast to usize / allocate /
+  // slice. A model export bug that emits a negative dimension
+  // would otherwise wrap to a huge usize and OOM the worker,
+  // and a buffer-vs-shape mismatch would panic on the row-slice
+  // in `log_softmax_with_finite_guard`.
   let (t, v) = validate_output_dims(shape[1], shape[2], raw.len(), language)?;
 
-  // Codex round-17 [high]: validate logits + log-softmax for
-  // finiteness. See `log_softmax_with_finite_guard`.
+  // Validate logits + log-softmax for finiteness. See
+  // `log_softmax_with_finite_guard`.
   let data = log_softmax_with_finite_guard(raw, t, v, language)?;
   Ok(LogProbsTV { t, v, data })
 }
@@ -163,13 +161,12 @@ pub(crate) fn encode_log_softmax(
 /// Validate the `(T, V)` output dimensions before allocation /
 /// slicing.
 ///
-/// Pre-fix a malformed ORT output (negative dim from a buggy
-/// export, overflow on `t * v`, or `raw.len()` not matching the
-/// declared shape) would either panic the alignment worker on
-/// the row-slice, OOM the process on a `Vec::with_capacity` for
-/// a wrapped-huge size, or — worst case — silently read into
-/// adjacent memory. Codex round-18 [medium] flagged this as a
-/// missing typed-failure path.
+/// Without these checks, a malformed ORT output (negative dim
+/// from a buggy export, overflow on `t * v`, or `raw.len()` not
+/// matching the declared shape) would either panic the alignment
+/// worker on the row-slice, OOM the process on a
+/// `Vec::with_capacity` for a wrapped-huge size, or — worst case
+/// — silently read into adjacent memory.
 ///
 /// Failure classification:
 /// - **Fatal** (`ModelInferenceFailed`) for impossible shapes
@@ -178,9 +175,8 @@ pub(crate) fn encode_log_softmax(
 /// - **Recoverable** (`NoAlignmentPath`) for `T == 0` with an
 ///   empty buffer — a chunk shorter than the model's stride
 ///   produces zero encoder frames; the ASR transcript should
-///   surface with `words: []` rather than fail the chunk.
-///   Codex round-22 [high] flagged the original blanket
-///   "non-positive dim" rule as turning a data-dependent
+///   surface with `words: []` rather than fail the chunk. A
+///   blanket "non-positive dim" rule would turn a data-dependent
 ///   short-chunk miss into fatal transcript loss.
 ///
 /// Pulled out as a helper so unit tests can drive each branch
@@ -283,16 +279,16 @@ pub(crate) fn validate_output_dims(
 /// Compute row-major `(T, V)` log-softmax of `raw` with a fatal
 /// finiteness guard.
 ///
-/// Codex round-17 [high]: pre-fix a NaN / ±inf in any logit
-/// produced a NaN row in the output; Viterbi then computed a
-/// non-finite final `dp_prev` and surfaced `NoAlignmentPath`,
-/// which the alignment pool classifies as recoverable per
-/// round-16 — silently swallowing a backend numeric failure
-/// (model export bug, GPU / ORT regression, NaN propagation
-/// from upstream) as "no words". This helper checks each row's
-/// input and the resulting `log_z`; either non-finite returns
-/// `ModelInferenceFailed` so the runner emits `Event::Error`
-/// and the operator learns about the broken backend.
+/// Without this guard a NaN / ±inf in any logit produced a NaN
+/// row in the output; Viterbi then computed a non-finite final
+/// `dp_prev` and surfaced `NoAlignmentPath`, which the alignment
+/// pool classifies as recoverable — silently swallowing a backend
+/// numeric failure (model export bug, GPU / ORT regression, NaN
+/// propagation from upstream) as "no words". This helper checks
+/// each row's input and the resulting `log_z`; either non-finite
+/// returns `ModelInferenceFailed` so the runner emits
+/// `Event::Error` and the operator learns about the broken
+/// backend.
 ///
 /// Pulled out of the public `encode_log_softmax` body so unit
 /// tests can exercise the rejection paths without a `Session`.
@@ -345,8 +341,7 @@ pub(crate) fn log_softmax_with_finite_guard(
 /// (NaN poisons every downstream f64 op) and ends up in the
 /// tensor we hand to ORT. The model then returns either NaN
 /// logits (every word gets a NaN score) or the chunk fails
-/// downstream as `NoAlignmentPath` with no clue why — exactly
-/// the failure mode Codex round-13 [medium] flagged.
+/// downstream as `NoAlignmentPath` with no clue why.
 ///
 /// Pulled out as a helper so the unit tests can exercise the
 /// rejection path without spinning up a `Session` (the public
@@ -389,11 +384,11 @@ mod tests {
     }
   }
 
-  /// Codex round-13 [medium] regression: NaN / ±inf input
-  /// must fail in-band with `ModelInferenceFailed` before the
-  /// scalar normaliser runs. The error message names the
-  /// offending index so a downstream operator has a hook for
-  /// debugging upstream audio pipelines.
+  /// Regression: NaN / ±inf input must fail in-band with
+  /// `ModelInferenceFailed` before the scalar normaliser runs.
+  /// The error message names the offending index so a
+  /// downstream operator has a hook for debugging upstream audio
+  /// pipelines.
   #[test]
   fn reject_non_finite_input_flags_nan() {
     use crate::types::Lang;
@@ -448,10 +443,10 @@ mod tests {
     assert_eq!(lp.at(1, 2), -6.0);
   }
 
-  /// Codex round-17 [high]: NaN logits from a broken backend
-  /// must surface as fatal `ModelInferenceFailed`, not get
-  /// swallowed into NaN log-probs that Viterbi later
-  /// classifies as `NoAlignmentPath` (round-16 recoverable).
+  /// NaN logits from a broken backend must surface as fatal
+  /// `ModelInferenceFailed`, not get swallowed into NaN
+  /// log-probs that Viterbi later classifies as
+  /// `NoAlignmentPath` (the recoverable bucket).
   #[test]
   fn log_softmax_rejects_nan_logits_with_model_inference_failed() {
     use crate::types::Lang;
@@ -512,7 +507,7 @@ mod tests {
     assert!((sum - 1.0).abs() < 1e-5);
   }
 
-  // --- Codex round-18 [medium]: ORT output dims validation ---
+  // --- ORT output dims validation ---
 
   #[test]
   fn validate_output_dims_rejects_negative_t() {
@@ -536,10 +531,10 @@ mod tests {
     assert!(matches!(kind, AlignmentFailureKind::ModelInferenceFailed));
   }
 
-  /// Codex round-22 [high]: a chunk too short to produce any
-  /// encoder frame must surface as recoverable `NoAlignmentPath`,
-  /// not fatal `ModelInferenceFailed`. The ASR transcript stays
-  /// alive with `words: []`.
+  /// A chunk too short to produce any encoder frame must surface
+  /// as recoverable `NoAlignmentPath`, not fatal
+  /// `ModelInferenceFailed`. The ASR transcript stays alive with
+  /// `words: []`.
   #[test]
   fn validate_output_dims_zero_t_with_empty_buffer_is_recoverable_no_alignment_path() {
     use crate::types::Lang;
@@ -642,8 +637,8 @@ mod tests {
   }
 
   // Note: the centring / scale and empty-input behaviour tests
-  // moved to `super::normalize::tests` after Codex round-14
-  // pulled normalisation up the call stack into `Aligner::align`.
+  // moved to `super::normalize::tests` after normalisation was
+  // pulled up the call stack into `Aligner::align`.
   // `encode_log_softmax` no longer normalises, so its tests
   // here cover only the reductions and the input-validation
   // boundary it does still own.

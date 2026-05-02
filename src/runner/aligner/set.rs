@@ -19,8 +19,8 @@ use crate::{
 pub enum AlignmentLookup<'a> {
   /// Hit on `AlignerKey::Lang(L)`. The worker locks the mutex
   /// and runs the language-specific aligner. Failure of this
-  /// path does NOT silently fall through to `Any` (spec §6.3.1
-  /// strict-lookup contract).
+  /// path does NOT silently fall through to `Any`
+  /// (strict-lookup contract).
   Hit {
     /// The matched key (always `Lang(...)`).
     matched: AlignerKey,
@@ -45,10 +45,10 @@ pub enum AlignmentLookup<'a> {
 /// Registry of `Aligner`s. Owned by `ManagedTranscriber`; shared
 /// with the alignment worker via `Arc<AlignmentSet>`.
 ///
-/// Fields are private; construct via [`AlignmentSetBuilder`] (see
-/// Task 16). Lookup is `&self` so the worker can hold a long-lived
-/// borrow without blocking other workers (the `Mutex<Aligner>`
-/// inside is the per-language lock).
+/// Fields are private; construct via [`AlignmentSetBuilder`].
+/// Lookup is `&self` so the worker can hold a long-lived borrow
+/// without blocking other workers (the `Mutex<Aligner>` inside
+/// is the per-language lock).
 pub struct AlignmentSet {
   aligners: HashMap<AlignerKey, Mutex<Aligner>>,
   fallback: AlignmentFallback,
@@ -57,7 +57,8 @@ pub struct AlignmentSet {
 impl AlignmentSet {
   /// Crate-private constructor. Public callers go through
   /// `AlignmentSetBuilder` so the construction surface stays
-  /// consistent with Plan A/B's `with_*` builder pattern.
+  /// consistent with the `with_*` builder pattern used elsewhere
+  /// in the crate.
   pub(super) const fn from_parts(
     aligners: HashMap<AlignerKey, Mutex<Aligner>>,
     fallback: AlignmentFallback,
@@ -83,7 +84,8 @@ impl AlignmentSet {
     self.aligners.is_empty()
   }
 
-  /// Look up an aligner for `language`, applying §6.3.1's order.
+  /// Look up an aligner for `language`, applying the
+  /// strict-lookup order.
   pub fn lookup<'a>(&'a self, language: &Lang) -> AlignmentLookup<'a> {
     let lang_key = AlignerKey::Lang(language.clone());
     if let Some(m) = self.aligners.get(&lang_key) {

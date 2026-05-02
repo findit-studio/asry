@@ -8,7 +8,8 @@ use crate::runner::aligner::{
   set::AlignmentSet,
 };
 
-/// Builder for [`AlignmentSet`]. Mirrors Plan A/B's `with_*` style.
+/// Builder for [`AlignmentSet`]. Mirrors the `with_*` builder
+/// style used elsewhere in the crate.
 ///
 /// Usage:
 ///
@@ -62,7 +63,7 @@ impl AlignmentSetBuilder {
   /// Register an aligner under `key`. Replaces any prior
   /// registration for the same key (last call wins).
   ///
-  /// Wrapped in a `Mutex<Aligner>` per spec §6.3.3.
+  /// Wrapped in a `Mutex<Aligner>`.
   pub fn register(mut self, key: AlignerKey, aligner: Aligner) -> Self {
     self.aligners.insert(key, Mutex::new(aligner));
     self
@@ -123,5 +124,5 @@ mod tests {
   }
 
   // The register-with-real-Aligner test path requires a real
-  // ONNX file; covered by the e2e test in Task 25.
+  // ONNX file; covered by an end-to-end test.
 }

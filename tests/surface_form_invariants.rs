@@ -1,5 +1,4 @@
 //! Surface-form preservation + special-token skipping regressions.
-//! Spec §6.3.2 step 9, step 7.
 
 #![cfg(feature = "alignment")]
 

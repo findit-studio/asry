@@ -69,8 +69,8 @@ fn happy_path_three_chunks_emit_in_order() {
 fn out_of_order_completion_emits_in_chunk_id_order() {
   // Auto policy: this test exercises out-of-order completion, not
   // language locking. Default AutoLockAfter(1) would gate chunks
-  // 1, 2 (round-6 fix) until chunk 0 resolves, defeating the
-  // out-of-order scenario.
+  // 1, 2 until chunk 0 resolves, defeating the out-of-order
+  // scenario.
   let config = TranscriberOptions::default()
     .with_chunk_size(Duration::from_secs(1))
     .with_language_policy(LanguagePolicy::Auto);

@@ -2,7 +2,7 @@
 //!
 //! All internal arithmetic is in 16 kHz analysis sample-index space
 //! (`SampleRange`); conversion to the output timebase happens at
-//! emission time. See spec §5.3.
+//! emission time.
 
 use alloc::vec::Vec;
 use core::time::Duration;
@@ -51,14 +51,14 @@ pub(crate) enum SubOrigin {
   /// reconstructed by joining all `SubRange`s sharing this
   /// `vad_seq`.
   ///
-  /// Codex round-4 fix: `part` and `total_parts` were `u8` and
-  /// the algorithm asserted `n_full <= 255`. With smaller
-  /// `chunk_size` settings, realistic long-form audio (lectures,
-  /// podcasts) can need more than 255 hard-split parts — the
-  /// assertion turned valid input into a process panic. Widening
-  /// to `u32` removes the artificial ceiling; with default
-  /// `chunk_size = 30 s` the new bound is >2 hours per VAD
-  /// segment, well past anything seen in practice.
+  /// `part` and `total_parts` are `u32`. An earlier `u8` shape
+  /// asserted `n_full <= 255`; with smaller `chunk_size`
+  /// settings, realistic long-form audio (lectures, podcasts)
+  /// can need more than 255 hard-split parts — the assertion
+  /// would turn valid input into a process panic. Widening to
+  /// `u32` removes the artificial ceiling; with default
+  /// `chunk_size = 30 s` the bound is >2 hours per VAD segment,
+  /// well past anything seen in practice.
   HardSplit {
     /// Original VAD segment's sequence number.
     vad_seq: u32,
@@ -169,7 +169,7 @@ impl Cut {
   /// hypothetical future segment at `sample_index` would have
   /// triggered a flush — the caller has already declared that no
   /// such segment is coming, so the partial chunk can yield now
-  /// instead of sitting until EOF or chunk_size (Codex round-7).
+  /// instead of sitting until EOF or chunk_size.
   pub(crate) fn would_flush_at(&self, sample_index: u64) -> bool {
     let Some(start) = self.current_start else {
       return false;
@@ -204,12 +204,12 @@ impl Cut {
       // Pre-split overlong segment into n equal-ish parts.
       // n = ceil(len / chunk_size_samples).
       let n_full = len.div_ceil(self.chunk_size_samples);
-      // Codex round-4: the previous u8 ceiling (255 parts) made
-      // realistic long-form audio panic at small chunk_size
-      // settings. SubOrigin::HardSplit's `part` / `total_parts`
-      // are now u32 — only truly absurd input (>4 G parts)
-      // would overflow, and that's well past any realistic
-      // upper bound on `len / chunk_size_samples`.
+      // The previous u8 ceiling (255 parts) made realistic
+      // long-form audio panic at small chunk_size settings.
+      // SubOrigin::HardSplit's `part` / `total_parts` are now
+      // u32 — only truly absurd input (>4 G parts) would
+      // overflow, and that's well past any realistic upper bound
+      // on `len / chunk_size_samples`.
       assert!(
         n_full <= u32::MAX as u64,
         "VadSegment of {} samples exceeds u32::MAX × chunk_size_samples ({}); pathological input",
@@ -425,11 +425,11 @@ mod tests {
     }
   }
 
-  /// Codex round-4 finding [medium]: a single VAD segment longer
-  /// than 255 × chunk_size used to panic in the old u8-bounded
-  /// code. With chunk_size=625ms (10_000 samples), a ~3-minute
-  /// segment (300 parts) is realistic for lectures / podcasts and
-  /// must split successfully rather than aborting the process.
+  /// A single VAD segment longer than 255 × chunk_size used to
+  /// panic in the old u8-bounded code. With chunk_size=625ms
+  /// (10_000 samples), a ~3-minute segment (300 parts) is
+  /// realistic for lectures / podcasts and must split
+  /// successfully rather than aborting the process.
   #[test]
   fn hard_split_supports_more_than_255_parts() {
     let mut c = Cut::new(Duration::from_millis(625), None); // 10_000 samples

@@ -1,4 +1,4 @@
-//! Runner-level error type. See spec §4.5 / §9.
+//! Runner-level error type.
 
 use core::time::Duration;
 
@@ -12,8 +12,6 @@ use crate::types::TranscriberError;
 /// [`crate::runner::ManagedTranscriber::process_packet`],
 /// `signal_eof`, `drain`, the builder's `build`, and (with the
 /// `alignment` feature) `Aligner::from_paths`.
-///
-/// See spec §4.5 / §9.
 #[derive(Debug, thiserror::Error)]
 pub enum RunnerError {
   /// `WhisperContext::new_with_params` failed at builder time.
@@ -52,8 +50,8 @@ pub enum RunnerError {
   /// is `false`. The caller must drain via `poll_transcript` /
   /// `poll_error` before pushing more audio.
   ///
-  /// **Side-effect contract (spec §6.4.2):** when this is returned
-  /// from `process_packet`, the input *was already consumed* — the
+  /// **Side-effect contract:** when this is returned from
+  /// `process_packet`, the input *was already consumed* — the
   /// caller must not retry the same call with the same arguments.
   #[error("backpressure: buffer at {buffered}/{cap} samples")]
   Backpressure {

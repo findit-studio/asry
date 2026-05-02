@@ -14,8 +14,6 @@ use smol_str::SmolStr;
 /// enum-known code. This keeps structural `PartialEq`/`Hash` correct:
 /// `Lang::En != Lang::Other("en")` is fine because no API path
 /// constructs `Lang::Other("en")`.
-///
-/// See spec §4.4 and Appendix C for the variant table.
 #[non_exhaustive]
 #[allow(missing_docs)] // variants are ISO 639-1 codes; self-documenting by name
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -363,7 +361,7 @@ mod tests {
 
   /// Every named variant round-trips through `from_iso639_1(as_str())`
   /// AND does not match `Lang::Other(_)`. This is the
-  /// canonicalisation invariant from spec §4.4.
+  /// canonicalisation invariant.
   #[test]
   fn named_variants_canonicalise() {
     let known = [

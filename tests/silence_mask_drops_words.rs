@@ -1,5 +1,5 @@
 //! M4 regression: silence-masked words drop from output without
-//! shifting remaining word indices. Spec §6.3.2 step 7.
+//! shifting remaining word indices.
 //!
 //! This test exercises the algorithm modules directly via the
 //! crate's pub(crate) surface (we re-export the test harness in a
@@ -9,7 +9,7 @@
 //!
 //! The cleaner path is to colocate this test inside
 //! `src/runner/aligner/algorithm/compose.rs`'s test module —
-//! which Task 14 already did — and assert the same thing here at
+//! which is where it lives — and assert the same thing here at
 //! the integration level once Aligner::from_paths is mockable.
 //! For v1, we redirect callers to the unit test.
 

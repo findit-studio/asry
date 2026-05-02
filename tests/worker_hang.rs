@@ -4,21 +4,17 @@
 //! whisper-rs can produce any output, so the worker emits
 //! WorkFailure::WorkerHangTimeout for every chunk_id. We assert that
 //! the runner surfaces the failure via poll_error and continues
-//! processing subsequent chunks (recycling the WhisperState per spec
-//! §6.4.3 timeout-streak hysteresis).
+//! processing subsequent chunks (recycling the WhisperState via
+//! the timeout-streak hysteresis).
 
 #![cfg(feature = "runner")]
 
 use core::{num::NonZeroU32, time::Duration};
 
 use mediatime::{Timebase, Timestamp};
-// Plan note: the plan's example imports `ManagedTranscriber` and
-// `WhisperPoolOptions` from `whispery::` directly; those crate-root
-// re-exports land in Task 24 (§3.3). For Task 23 we name them via
-// the existing `whispery::runner` path to keep the test self-contained
-// (no lib.rs change in this task's file list), mirroring the same
-// workaround used in `tests/runner_e2e.rs`,
-// `tests/saturation_no_loss.rs`, and `tests/unpoll_round_trip.rs`.
+// We name `ManagedTranscriber` and `WhisperPoolOptions` via the
+// existing `whispery::runner` path to keep the test
+// self-contained.
 use whispery::{
   LanguagePolicy, VadSegment, WorkFailure,
   runner::{ManagedTranscriber, WhisperPoolOptions},

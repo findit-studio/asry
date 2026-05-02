@@ -67,9 +67,9 @@ fn reconcile_mean(simd_sum: f64, samples: &[f32]) -> f64 {
 }
 
 /// Same overflow-recovery contract as [`reconcile_mean`], applied
-/// to the variance pass. Codex round-10 [medium]: `[1e20, -1e20]`
-/// keeps `var ≈ 1e40` in f64 but overflows the f32 `d * d` to
-/// `inf`; the fallback pulls the result back to scalar parity.
+/// to the variance pass. `[1e20, -1e20]` keeps `var ≈ 1e40` in
+/// f64 but overflows the f32 `d * d` to `inf`; the fallback pulls
+/// the result back to scalar parity.
 #[inline]
 fn reconcile_var_sum(simd_var_sum: f64, samples: &[f32], mean: f64) -> f64 {
   if simd_var_sum.is_finite() {
@@ -92,7 +92,7 @@ fn reconcile_var_sum(simd_var_sum: f64, samples: &[f32], mean: f64) -> f64 {
 /// that exceeds the parity tolerance.
 ///
 /// Note we use `|mean| * 2^-23` (the *worst-case* f32 round)
-/// rather than the actual `|mean_f32 - mean|`. For Codex's cited
+/// rather than the actual `|mean_f32 - mean|`. For the cited
 /// `[1.0, next_up(1.0), ...]` case the f32 mean lands at exactly
 /// 1.0 (mid-ULP rounds to even), so the actual rounding *of the
 /// f64 mean* is zero — but the SIMD pass-1 *itself* already lost
@@ -171,15 +171,14 @@ fn samples_within_simd_safe_range(samples: &[f32]) -> bool {
 /// pattern; both crates' MSRVs match the macro's stabilisation.
 #[inline]
 pub fn zero_mean_unit_var_normalize(samples: &[f32]) -> Vec<f32> {
-  // Codex round-11 [medium] precision guard: SIMD backends
-  // reduce in f32 before widening to f64, so finite f32 inputs
-  // beyond ~1e4 in magnitude can lose precision relative to the
-  // scalar f64 reference *without* tripping the inf/NaN
-  // recovery in `reconcile_*`. Detect that case at the dispatch
-  // boundary and route to scalar f64 directly. Real audio is
-  // `[-1, 1]` and never trips this; pathological f32 inputs go
-  // down the slow path with full precision instead of producing
-  // backend-skewed output.
+  // Precision guard: SIMD backends reduce in f32 before widening
+  // to f64, so finite f32 inputs beyond ~1e4 in magnitude can
+  // lose precision relative to the scalar f64 reference *without*
+  // tripping the inf/NaN recovery in `reconcile_*`. Detect that
+  // case at the dispatch boundary and route to scalar f64
+  // directly. Real audio is `[-1, 1]` and never trips this;
+  // pathological f32 inputs go down the slow path with full
+  // precision instead of producing backend-skewed output.
   if !samples_within_simd_safe_range(samples) {
     return scalar::zero_mean_unit_var_normalize(samples);
   }
@@ -271,11 +270,11 @@ pub mod scalar {
 
   /// Scalar f64 sum of squared deviations. Used by the SIMD
   /// backends as the precision-recovery fallback when the f32
-  /// `d * d` overflowed for high-dynamic-range inputs (Codex
-  /// round-10 [medium]: `[1e20, -1e20]` overflows f32 but stays
-  /// finite in f64). Real audio in `[-1, 1]` never trips this;
-  /// pathological inputs go down the slow path with full
-  /// precision instead of producing backend-skewed output.
+  /// `d * d` overflowed for high-dynamic-range inputs (e.g.
+  /// `[1e20, -1e20]` overflows f32 but stays finite in f64).
+  /// Real audio in `[-1, 1]` never trips this; pathological
+  /// inputs go down the slow path with full precision instead of
+  /// producing backend-skewed output.
   pub(super) fn scalar_var_sum(samples: &[f32], mean: f64) -> f64 {
     let mut var_sum = 0.0_f64;
     for &s in samples {
@@ -299,7 +298,7 @@ pub mod scalar {
 /// and `(0 - mean) / std` then becomes a non-zero value at every
 /// silence position. That contradicts the silence-mask contract —
 /// wav2vec2 must see uniform silence in masked regions, not a
-/// mean-shifted residue. Codex round-14 [high].
+/// mean-shifted residue.
 ///
 /// **Mirrors HF behaviour.** `Wav2Vec2FeatureExtractor.zero_mean_unit_var_norm`
 /// with an `attention_mask` does exactly this: stats over masked-in
@@ -434,11 +433,11 @@ pub mod neon {
     let var = super::reconcile_var_sum(var_sum, samples, mean) / nf;
     let inv_std = 1.0_f64 / (var + 1e-7_f64).sqrt();
 
-    // Codex round-14 [medium]: low-variance inputs drive
-    // `inv_std` so high that the f32 rounding of `mean` for the
-    // SIMD write-out lanes leaks visible per-sample error
-    // relative to scalar. Detect and route to scalar f64 to keep
-    // the dispatched output within parity tolerance.
+    // Low-variance inputs drive `inv_std` so high that the f32
+    // rounding of `mean` for the SIMD write-out lanes leaks
+    // visible per-sample error relative to scalar. Detect and
+    // route to scalar f64 to keep the dispatched output within
+    // parity tolerance.
     if super::simd_path_loses_precision(mean, inv_std) {
       return super::scalar::zero_mean_unit_var_normalize(samples);
     }
@@ -538,11 +537,11 @@ pub mod x86_sse41 {
     let var = super::reconcile_var_sum(var_sum, samples, mean) / nf;
     let inv_std = 1.0_f64 / (var + 1e-7_f64).sqrt();
 
-    // Codex round-14 [medium]: low-variance inputs drive
-    // `inv_std` so high that the f32 rounding of `mean` for the
-    // SIMD write-out lanes leaks visible per-sample error
-    // relative to scalar. Detect and route to scalar f64 to keep
-    // the dispatched output within parity tolerance.
+    // Low-variance inputs drive `inv_std` so high that the f32
+    // rounding of `mean` for the SIMD write-out lanes leaks
+    // visible per-sample error relative to scalar. Detect and
+    // route to scalar f64 to keep the dispatched output within
+    // parity tolerance.
     if super::simd_path_loses_precision(mean, inv_std) {
       return super::scalar::zero_mean_unit_var_normalize(samples);
     }
@@ -642,11 +641,11 @@ pub mod x86_avx2 {
     let var = super::reconcile_var_sum(var_sum, samples, mean) / nf;
     let inv_std = 1.0_f64 / (var + 1e-7_f64).sqrt();
 
-    // Codex round-14 [medium]: low-variance inputs drive
-    // `inv_std` so high that the f32 rounding of `mean` for the
-    // SIMD write-out lanes leaks visible per-sample error
-    // relative to scalar. Detect and route to scalar f64 to keep
-    // the dispatched output within parity tolerance.
+    // Low-variance inputs drive `inv_std` so high that the f32
+    // rounding of `mean` for the SIMD write-out lanes leaks
+    // visible per-sample error relative to scalar. Detect and
+    // route to scalar f64 to keep the dispatched output within
+    // parity tolerance.
     if super::simd_path_loses_precision(mean, inv_std) {
       return super::scalar::zero_mean_unit_var_normalize(samples);
     }
@@ -733,11 +732,11 @@ pub mod x86_avx512 {
     let var = super::reconcile_var_sum(var_sum, samples, mean) / nf;
     let inv_std = 1.0_f64 / (var + 1e-7_f64).sqrt();
 
-    // Codex round-14 [medium]: low-variance inputs drive
-    // `inv_std` so high that the f32 rounding of `mean` for the
-    // SIMD write-out lanes leaks visible per-sample error
-    // relative to scalar. Detect and route to scalar f64 to keep
-    // the dispatched output within parity tolerance.
+    // Low-variance inputs drive `inv_std` so high that the f32
+    // rounding of `mean` for the SIMD write-out lanes leaks
+    // visible per-sample error relative to scalar. Detect and
+    // route to scalar f64 to keep the dispatched output within
+    // parity tolerance.
     if super::simd_path_loses_precision(mean, inv_std) {
       return super::scalar::zero_mean_unit_var_normalize(samples);
     }
@@ -857,12 +856,11 @@ mod tests {
     assert!(out.iter().all(|&v| v.abs() < 1e-3));
   }
 
-  /// Codex round-10 [medium]: high-dynamic-range f32 inputs
-  /// `[1e20, -1e20, ...]` overflow the SIMD f32 squared-deviation
-  /// pass to `+inf`, while the scalar f64 reference keeps a
-  /// finite `var ≈ 1e40`. The SIMD backends must detect the
-  /// overflow and fall back to scalar so the dispatched result
-  /// matches the scalar reference.
+  /// High-dynamic-range f32 inputs `[1e20, -1e20, ...]` overflow
+  /// the SIMD f32 squared-deviation pass to `+inf`, while the
+  /// scalar f64 reference keeps a finite `var ≈ 1e40`. The SIMD
+  /// backends must detect the overflow and fall back to scalar
+  /// so the dispatched result matches the scalar reference.
   ///
   /// We pad the sequence to 4 / 8 / 16 lane-sized chunks plus
   /// a 1-element tail to also exercise the per-backend tail
@@ -937,17 +935,17 @@ mod tests {
     assert!(v.iter().all(|x| x.is_finite()));
   }
 
-  /// Codex round-11 [medium]: finite f32 inputs at magnitudes
-  /// where ULP exceeds ~1 (i.e. ~1e7+) lose precision in the
-  /// f32 horizontal-add before widening to f64, so the SIMD
-  /// reduction silently drifts from the scalar f64 reference
-  /// without producing inf/NaN. The dispatch-side
-  /// `samples_within_simd_safe_range` guard routes such inputs
-  /// to the scalar path so the output is always scalar-equivalent.
+  /// Finite f32 inputs at magnitudes where ULP exceeds ~1 (i.e.
+  /// ~1e7+) lose precision in the f32 horizontal-add before
+  /// widening to f64, so the SIMD reduction silently drifts from
+  /// the scalar f64 reference without producing inf/NaN. The
+  /// dispatch-side `samples_within_simd_safe_range` guard routes
+  /// such inputs to the scalar path so the output is always
+  /// scalar-equivalent.
   ///
   /// Constructs a 1024-sample buffer at magnitudes around 1e8
   /// where consecutive f32 increments are below ULP — the
-  /// canonical "f32 cancellation" shape Codex called out.
+  /// canonical "f32 cancellation" shape.
   fn finite_high_magnitude_input() -> Vec<f32> {
     let base = 1.0e8_f32;
     let mut xs = alloc::vec::Vec::with_capacity(1024);
@@ -989,7 +987,7 @@ mod tests {
     assert!(samples_within_simd_safe_range(&[]));
   }
 
-  // ---- Codex round-14 [high]: silence-aware normalisation ------
+  // ---- Silence-aware normalisation ------
 
   /// Speech with non-zero mean must NOT shift masked-silence
   /// positions away from zero in the output. Pre-fix, the
@@ -1063,10 +1061,10 @@ mod tests {
     assert_matches_scalar(&masked, &regular);
   }
 
-  // ---- Codex round-14 [medium]: low-variance SIMD parity ------
+  // ---- Low-variance SIMD parity ------
 
   /// `[1.0, 1.0_f32::next_up(), 1.0, 1.0_f32::next_up(), ...]`
-  /// — Codex's literal cited case. Rounding mean to f32 in the
+  /// — a low-variance edge case. Rounding mean to f32 in the
   /// SIMD write-out lanes leaks ~1.88e-4 of error against
   /// scalar f64. The dispatcher must detect this regime and
   /// route to scalar; we assert the dispatched output matches

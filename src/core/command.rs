@@ -3,10 +3,8 @@
 //! These types are deliberately backend-agnostic — they don't name
 //! `whisper-rs` types and don't include whisper.cpp-specific fields.
 //! The runner's `whisper_pool` translates `AsrParams` into
-//! `FullParams` (Plan B); a future swap to candle-whisper or a
-//! CTranslate2 binding would change only the runner.
-//!
-//! See spec §3.4 (backend invariant) and §5.6.
+//! `FullParams`; a future swap to candle-whisper or a CTranslate2
+//! binding would change only the runner.
 
 use alloc::{sync::Arc, vec::Vec};
 
@@ -679,7 +677,7 @@ impl AsrParamsOverride {
 
 /// Used by the dispatch state machine to refer to a chunk's audio
 /// + sub-segments without copying.
-#[allow(dead_code)] // consumed by the dispatch state machine in Task 16
+#[allow(dead_code)] // consumed by the dispatch state machine
 pub(crate) type ChunkAudio = Arc<[f32]>;
 
 #[cfg(test)]
@@ -722,10 +720,9 @@ mod tests {
   }
 
   /// Partial config — `{}` deserialises to defaults thanks to
-  /// per-field `serde(default = "...")`. Codex round-15-paired:
-  /// exercises the silero-shape contract that human-edited
-  /// configs only need to mention the fields they want to
-  /// change.
+  /// per-field `serde(default = "...")`. Exercises the
+  /// silero-shape contract that human-edited configs only need
+  /// to mention the fields they want to change.
   #[cfg(feature = "serde")]
   #[test]
   fn asr_params_serde_empty_yields_defaults() {

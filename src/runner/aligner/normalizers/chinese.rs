@@ -1,4 +1,4 @@
-//! Chinese text normaliser (character-level). See spec §6.3.
+//! Chinese text normaliser (character-level).
 
 use alloc::{borrow::Cow, string::String, vec::Vec};
 

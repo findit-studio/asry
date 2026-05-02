@@ -1,5 +1,5 @@
 //! End-to-end runner integration test using a real tiny whisper model
-//! and a canned ~11s JFK WAV. Spec §10.2.
+//! and a canned ~11s JFK WAV.
 //!
 //! Skipped when WHISPERY_OFFLINE=1 (no model available).
 
@@ -8,11 +8,9 @@
 use core::{num::NonZeroU32, time::Duration};
 
 use mediatime::{Timebase, Timestamp};
-// Plan note: the plan's example imports `ManagedTranscriber` and
-// `WhisperPoolOptions` from `whispery::` directly; those crate-root
-// re-exports land in Task 24 (§3.3). For Task 19 we name them via
-// the existing `whispery::runner` path to keep the test self-contained
-// (no lib.rs change in this task's file list).
+// We name `ManagedTranscriber` and `WhisperPoolOptions` via the
+// existing `whispery::runner` path to keep the test
+// self-contained.
 use whispery::{
   LanguagePolicy, VadSegment,
   runner::{ManagedTranscriber, WhisperPoolOptions},
@@ -52,19 +50,18 @@ fn levenshtein(a: &str, b: &str) -> usize {
   prev[b.len()]
 }
 
-// Codex round-9 [critical]: the round-9 fix to `drive_one_step`
-// now drains core events into the runner's per-chunk queues, so
-// `drain` returns in real time. Verified locally — the test
-// completes in ~0.3 s instead of the previous 10+ minute hang.
+// `drive_one_step` drains core events into the runner's
+// per-chunk queues, so `drain` returns in real time. Verified
+// locally — the test completes in ~0.3 s.
 //
 // Still `#[ignore]`'d because the bundled `ggml-tiny.en` + JFK
 // fixture combination triggers `whisper_full_with_state: failed
 // to encode` (whisper.cpp `GenericError(-6)`) on every chunk on
 // this host. The failure is reproducible without alignment, so
-// it predates this work and isn't introduced by Plan B/C; the
-// likely culprit is a whisper.cpp / whisper-rs 0.13.2 issue with
-// this specific model + audio combination, fixable by either
-// bumping whisper-rs upstream or swapping the fixture.
+// it isn't introduced by alignment work; the likely culprit is a
+// whisper.cpp / whisper-rs 0.13.2 issue with this specific model
+// + audio combination, fixable by either bumping whisper-rs
+// upstream or swapping the fixture.
 //
 // Run manually after fixing the encode issue:
 //
@@ -100,7 +97,7 @@ fn end_to_end_jfk_quote() {
     // Tight-but-realistic budgets: tiny.en encode + the JFK
     // clip's 11s of audio fit inside ~5s on commodity hardware;
     // 30s drain leaves headroom for slow CI without masking a
-    // regression of the round-9 drain hang.
+    // drain-hang regression.
     .worker_timeouts(Duration::from_secs(15), Duration::from_secs(10))
     .drain_timeout(Duration::from_secs(30))
     .build()

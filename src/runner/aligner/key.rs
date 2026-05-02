@@ -1,4 +1,4 @@
-//! Registry-key + miss-policy enums. See spec §6.3 / §6.3.1.
+//! Registry-key + miss-policy enums.
 
 use crate::types::Lang;
 
@@ -10,7 +10,7 @@ use crate::types::Lang;
 /// string in [`Lang`] and prevents `Lang::ANY` from accidentally
 /// being passed to whisper.cpp as a literal "*" language hint.
 ///
-/// Lookup order (spec §6.3.1):
+/// Lookup order:
 /// 1. `AlignerKey::Lang(L)` — explicit registered aligner.
 /// 2. `AlignerKey::Any` — multilingual fallback (registry miss only).
 /// 3. Apply [`AlignmentFallback`] (`SkipChunk` or `Error`).
@@ -30,8 +30,6 @@ pub enum AlignerKey {
 
 /// Policy for chunks whose detected language has no registered
 /// aligner (and no `Any` fallback registered either).
-///
-/// See spec §6.3.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub enum AlignmentFallback {
   /// Emit the chunk's `Transcript` with empty `words`. Default.

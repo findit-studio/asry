@@ -11,12 +11,9 @@
 use core::{num::NonZeroU32, time::Duration};
 
 use mediatime::{Timebase, Timestamp};
-// Plan note: the plan's example imports `ManagedTranscriber` and
-// `WhisperPoolOptions` from `whispery::` directly; those crate-root
-// re-exports land in Task 24 (§3.3). For Task 21 we name them via
-// the existing `whispery::runner` path to keep the test self-contained
-// (no lib.rs change in this task's file list), mirroring the same
-// workaround used in `tests/runner_e2e.rs`.
+// We name `ManagedTranscriber` and `WhisperPoolOptions` via the
+// existing `whispery::runner` path to keep the test
+// self-contained.
 use whispery::{
   LanguagePolicy, VadSegment,
   runner::{ManagedTranscriber, WhisperPoolOptions},
