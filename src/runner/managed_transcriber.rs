@@ -10,7 +10,7 @@ use whisper_rs::WhisperContext;
 use crate::{
   core::{AsrParams, AsrParamsOverride, Command, Event, LanguagePolicy, Transcriber},
   runner::{
-    RunnerError, WhisperPoolConfig,
+    RunnerError, WhisperPoolOptions,
     whisper_pool::{AsrWorkItem, WhisperPool},
   },
   types::{ChunkId, Transcript, VadSegment, WorkFailure},
@@ -224,7 +224,7 @@ impl ManagedTranscriber {
 
       // Without the `alignment` cargo feature, RunAlignment is
       // emitted by Plan A only when `word_alignment` was set on
-      // the core's TranscriberConfig — which the runner's
+      // the core's TranscriberOptions — which the runner's
       // builder gates on the alignment pool's presence. Reaching
       // this arm with feature off means a non-runner caller is
       // driving the core; re-park indefinitely (matches the
@@ -398,7 +398,7 @@ impl ManagedTranscriber {
 /// via [`ManagedTranscriber::builder`].
 pub struct ManagedTranscriberBuilder {
   whisper_ctx: WhisperContext,
-  pool_config: WhisperPoolConfig,
+  pool_options: WhisperPoolOptions,
   chunk_size: Duration,
   buffer_cap_samples: usize,
   gap_tolerance_samples: u64,
@@ -422,10 +422,10 @@ pub struct ManagedTranscriberBuilder {
 
 impl ManagedTranscriberBuilder {
   /// Internal constructor used by `ManagedTranscriber::builder`.
-  fn new(whisper_ctx: WhisperContext, pool_config: WhisperPoolConfig) -> Self {
+  fn new(whisper_ctx: WhisperContext, pool_options: WhisperPoolOptions) -> Self {
     Self {
       whisper_ctx,
-      pool_config,
+      pool_options,
       chunk_size: Duration::from_secs(30),
       buffer_cap_samples: 60 * 16_000,
       gap_tolerance_samples: 200 * 16,
@@ -441,33 +441,33 @@ impl ManagedTranscriberBuilder {
     }
   }
 
-  /// Override [`crate::core::TranscriberConfig::chunk_size`].
+  /// Override [`crate::core::TranscriberOptions::chunk_size`].
   pub fn chunk_size(mut self, d: Duration) -> Self {
     self.chunk_size = d;
     self
   }
 
-  /// Override [`crate::core::TranscriberConfig::buffer_cap_samples`].
+  /// Override [`crate::core::TranscriberOptions::buffer_cap_samples`].
   pub fn buffer_cap_samples(mut self, n: usize) -> Self {
     self.buffer_cap_samples = n;
     self
   }
 
-  /// Override [`crate::core::TranscriberConfig::gap_tolerance_samples`].
+  /// Override [`crate::core::TranscriberOptions::gap_tolerance_samples`].
   pub fn gap_tolerance_samples(mut self, n: u64) -> Self {
     self.gap_tolerance_samples = n;
     self
   }
 
-  /// Override [`crate::core::TranscriberConfig::language_policy`].
+  /// Override [`crate::core::TranscriberOptions::language_policy`].
   pub fn language_policy(mut self, p: LanguagePolicy) -> Self {
     self.language_policy = p;
     self
   }
 
-  /// Override the [`WhisperPoolConfig`].
-  pub fn whisper_pool(mut self, cfg: WhisperPoolConfig) -> Self {
-    self.pool_config = cfg;
+  /// Override the [`WhisperPoolOptions`].
+  pub fn whisper_pool(mut self, cfg: WhisperPoolOptions) -> Self {
+    self.pool_options = cfg;
     self
   }
 
@@ -539,7 +539,7 @@ impl ManagedTranscriberBuilder {
       Some(set) if !set.is_empty() => {
         let cap = self
           .alignment_max_queued_chunks
-          .unwrap_or_else(|| self.pool_config.max_queued_chunks());
+          .unwrap_or_else(|| self.pool_options.max_queued_chunks());
         let arc_set = alloc::sync::Arc::new(set);
         Some(crate::runner::alignment_pool::AlignmentPool::new(
           arc_set, cap,
@@ -551,22 +551,22 @@ impl ManagedTranscriberBuilder {
     // The core's `word_alignment` flag follows the alignment
     // pool's presence — if no pool, no `Command::RunAlignment`
     // should be emitted; the core respects this via
-    // `TranscriberConfig::with_word_alignment`.
+    // `TranscriberOptions::with_word_alignment`.
     #[cfg(feature = "alignment")]
     let word_alignment_flag = alignment_pool.is_some();
     #[cfg(not(feature = "alignment"))]
     let word_alignment_flag = false;
 
-    let core_config = crate::core::TranscriberConfig::new()
+    let core_config = crate::core::TranscriberOptions::new()
       .with_chunk_size(self.chunk_size)
       .with_buffer_cap_samples(self.buffer_cap_samples)
       .with_gap_tolerance_samples(self.gap_tolerance_samples)
       .with_language_policy(self.language_policy)
       .with_asr_params(self.asr_params.clone())
       .with_word_alignment(word_alignment_flag)
-      .with_max_in_flight(self.pool_config.worker_count() + 2);
+      .with_max_in_flight(self.pool_options.worker_count() + 2);
 
-    let whisper_pool = WhisperPool::new(self.whisper_ctx, &self.pool_config)?;
+    let whisper_pool = WhisperPool::new(self.whisper_ctx, &self.pool_options)?;
 
     Ok(ManagedTranscriber {
       core: Transcriber::new(core_config),
@@ -574,8 +574,8 @@ impl ManagedTranscriberBuilder {
       asr_params_default: self.asr_params,
       asr_timeout: self.worker_timeouts_asr,
       drain_timeout,
-      block_on_full_queue: self.pool_config.block_on_full_queue(),
-      dispatch_idle_poll: self.pool_config.dispatch_idle_poll(),
+      block_on_full_queue: self.pool_options.block_on_full_queue(),
+      dispatch_idle_poll: self.pool_options.dispatch_idle_poll(),
       buffer_cap_samples: self.buffer_cap_samples,
       pending_transcripts: VecDeque::new(),
       pending_errors: VecDeque::new(),
@@ -593,35 +593,35 @@ impl ManagedTranscriber {
   /// device explicitly when constructing the context (spec §5.6,
   /// §6.2).
   ///
-  /// `pool_config` carries the runner-side knobs (worker count,
+  /// `pool_options` carries the runner-side knobs (worker count,
   /// queue depth, backpressure mode).
   pub fn builder(
     whisper_ctx: WhisperContext,
-    pool_config: WhisperPoolConfig,
+    pool_options: WhisperPoolOptions,
   ) -> ManagedTranscriberBuilder {
-    ManagedTranscriberBuilder::new(whisper_ctx, pool_config)
+    ManagedTranscriberBuilder::new(whisper_ctx, pool_options)
   }
 
-  /// Convenience: build directly from a `WhisperPoolConfig`'s
+  /// Convenience: build directly from a `WhisperPoolOptions`'s
   /// `model_path`, loading the context with the config's GPU
   /// settings. Intended for callers that don't need to customise
-  /// `WhisperContextParameters` beyond what `WhisperPoolConfig`
+  /// `WhisperContextParameters` beyond what `WhisperPoolOptions`
   /// already exposes.
-  pub fn from_config(
-    pool_config: WhisperPoolConfig,
+  pub fn from_options(
+    pool_options: WhisperPoolOptions,
   ) -> Result<ManagedTranscriberBuilder, RunnerError> {
     let mut ctx_params = whisper_rs::WhisperContextParameters::default();
-    ctx_params.use_gpu(pool_config.use_gpu());
-    ctx_params.gpu_device(pool_config.gpu_device());
-    ctx_params.flash_attn(pool_config.flash_attn());
+    ctx_params.use_gpu(pool_options.use_gpu());
+    ctx_params.gpu_device(pool_options.gpu_device());
+    ctx_params.flash_attn(pool_options.flash_attn());
     let path =
-      pool_config
+      pool_options
         .model_path()
         .to_str()
         .ok_or_else(|| RunnerError::WhisperContextLoad {
           message: format!(
             "model_path is not valid UTF-8: {:?}",
-            pool_config.model_path()
+            pool_options.model_path()
           ),
         })?;
     let ctx = WhisperContext::new_with_params(path, ctx_params).map_err(|e| {
@@ -629,7 +629,7 @@ impl ManagedTranscriber {
         message: format!("{e:?}"),
       }
     })?;
-    Ok(ManagedTranscriberBuilder::new(ctx, pool_config))
+    Ok(ManagedTranscriberBuilder::new(ctx, pool_options))
   }
 }
 
@@ -720,7 +720,7 @@ impl ManagedTranscriber {
     // a RunAsr command; for v1, that's the only injection point.
     let merged = merge_overrides(&self.asr_params_default, ovr);
     let prior = core::mem::replace(&mut self.asr_params_default, merged);
-    // Plan A's TranscriberConfig defaults are baked into the core
+    // Plan A's TranscriberOptions defaults are baked into the core
     // at construction; the runtime override path is via the
     // Command's `params` field. Plan A does NOT expose a runtime
     // setter for the dispatch's default AsrParams; this is OK

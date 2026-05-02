@@ -4,7 +4,7 @@ use core::{num::NonZeroU32, time::Duration};
 
 use mediatime::{Timebase, Timestamp};
 use whispery::{
-  AsrResult, Command, Event, Lang, LanguagePolicy, Transcriber, TranscriberConfig, VadSegment,
+  AsrResult, Command, Event, Lang, LanguagePolicy, Transcriber, TranscriberOptions, VadSegment,
 };
 
 fn tb_48k() -> Timebase {
@@ -21,7 +21,7 @@ fn happy_asr_result(text: &str) -> AsrResult {
 
 #[test]
 fn happy_path_three_chunks_emit_in_order() {
-  let config = TranscriberConfig::default()
+  let config = TranscriberOptions::default()
     .with_chunk_size(Duration::from_secs(2))
     .with_max_in_flight(4);
 
@@ -71,7 +71,7 @@ fn out_of_order_completion_emits_in_chunk_id_order() {
   // language locking. Default AutoLockAfter(1) would gate chunks
   // 1, 2 (round-6 fix) until chunk 0 resolves, defeating the
   // out-of-order scenario.
-  let config = TranscriberConfig::default()
+  let config = TranscriberOptions::default()
     .with_chunk_size(Duration::from_secs(1))
     .with_language_policy(LanguagePolicy::Auto);
   let mut t = Transcriber::new(config);

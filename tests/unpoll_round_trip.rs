@@ -12,14 +12,14 @@ use core::{num::NonZeroU32, time::Duration};
 
 use mediatime::{Timebase, Timestamp};
 // Plan note: the plan's example imports `ManagedTranscriber` and
-// `WhisperPoolConfig` from `whispery::` directly; those crate-root
+// `WhisperPoolOptions` from `whispery::` directly; those crate-root
 // re-exports land in Task 24 (§3.3). For Task 22 we name them via
 // the existing `whispery::runner` path to keep the test self-contained
 // (no lib.rs change in this task's file list), mirroring the same
 // workaround used in `tests/runner_e2e.rs` and `tests/saturation_no_loss.rs`.
 use whispery::{
   LanguagePolicy, VadSegment,
-  runner::{ManagedTranscriber, WhisperPoolConfig},
+  runner::{ManagedTranscriber, WhisperPoolOptions},
 };
 
 const MODEL_PATH: Option<&str> = option_env!("WHISPERY_TINY_EN_MODEL");
@@ -41,11 +41,11 @@ fn parked_command_resumes_after_worker_drain() {
     None => return,
   };
   // Saturate aggressively: 1 worker, 1-slot queue, 4 chunks.
-  let pool = WhisperPoolConfig::new(model_path)
+  let pool = WhisperPoolOptions::new(model_path)
     .with_worker_count(1)
     .with_max_queued_chunks(1)
     .with_dispatch_idle_poll(Duration::from_millis(5));
-  let mut runner = ManagedTranscriber::from_config(pool)
+  let mut runner = ManagedTranscriber::from_options(pool)
     .expect("build pool config")
     .chunk_size(Duration::from_secs(2))
     .language_policy(LanguagePolicy::Lock {

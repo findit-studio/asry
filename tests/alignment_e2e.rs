@@ -19,7 +19,7 @@ use mediatime::{Timebase, Timestamp};
 // `whispery::runner` path to keep the test self-contained (no lib.rs
 // change in this task's file list).
 use whispery::{
-  Lang, LanguagePolicy, ManagedTranscriber, VadSegment, WhisperPoolConfig,
+  Lang, LanguagePolicy, ManagedTranscriber, VadSegment, WhisperPoolOptions,
   runner::{Aligner, AlignerKey, AlignmentFallback, AlignmentSetBuilder, EnglishNormalizer},
 };
 
@@ -80,10 +80,10 @@ fn jfk_alignment_emits_words_within_transcript_range() {
     .register(AlignerKey::Lang(Lang::En), aligner)
     .build();
 
-  let pool = WhisperPoolConfig::new(model_path)
+  let pool = WhisperPoolOptions::new(model_path)
     .with_worker_count(1)
     .with_max_queued_chunks(4);
-  let mut runner = ManagedTranscriber::from_config(pool)
+  let mut runner = ManagedTranscriber::from_options(pool)
     .expect("build pool config")
     .chunk_size(Duration::from_secs(30))
     .language_policy(LanguagePolicy::Lock { hint: Lang::En })

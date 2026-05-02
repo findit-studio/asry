@@ -17,7 +17,7 @@ mod alignment_pool;
 
 pub use errors::RunnerError;
 pub use managed_transcriber::{ManagedTranscriber, ManagedTranscriberBuilder};
-pub use whisper_pool::WhisperPoolConfig;
+pub use whisper_pool::WhisperPoolOptions;
 
 #[cfg(feature = "alignment")]
 pub use aligner::{

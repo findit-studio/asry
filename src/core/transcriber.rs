@@ -60,7 +60,7 @@ impl Default for LanguagePolicy {
 
 /// Configuration for the core state machine.
 ///
-/// Fields are private; use [`TranscriberConfig::new`] (or
+/// Fields are private; use [`TranscriberOptions::new`] (or
 /// [`Default::default`]) and the `set_*` / `with_*` accessors to
 /// construct and tweak. The `with_*` methods are consuming
 /// builder-style; `set_*` mutate in place. Most accessors are
@@ -74,7 +74,7 @@ impl Default for LanguagePolicy {
 /// `"100ms"` instead of `{ secs, nanos }`.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct TranscriberConfig {
+pub struct TranscriberOptions {
   #[cfg_attr(
     feature = "serde",
     serde(default = "default_chunk_size", with = "humantime_serde")
@@ -120,7 +120,7 @@ const fn default_max_in_flight() -> usize {
   6
 }
 
-impl TranscriberConfig {
+impl TranscriberOptions {
   /// Construct a config with all default values. Equivalent to
   /// [`Default::default`] but `const fn`.
   pub const fn new() -> Self {
@@ -296,7 +296,7 @@ impl TranscriberConfig {
   }
 }
 
-impl Default for TranscriberConfig {
+impl Default for TranscriberOptions {
   fn default() -> Self {
     Self::new()
   }
@@ -310,7 +310,7 @@ impl Default for TranscriberConfig {
 /// `Mutex<Transcriber>` themselves; whispery does not provide
 /// internal synchronisation.
 pub struct Transcriber {
-  config: TranscriberConfig,
+  config: TranscriberOptions,
   buffer: SampleBuffer,
   cut: Cut,
   dispatch: Dispatch,
@@ -346,10 +346,10 @@ impl Transcriber {
   ///   an empty list.
   /// - `chunk_size` that rounds to 0 16 kHz samples (e.g.
   ///   `Duration::ZERO`) — Cut's hard-split path divides by it.
-  pub fn new(config: TranscriberConfig) -> Self {
+  pub fn new(config: TranscriberOptions) -> Self {
     assert!(
       config.max_in_flight > 0,
-      "TranscriberConfig::max_in_flight must be > 0 (got 0; would deadlock the dispatch loop)"
+      "TranscriberOptions::max_in_flight must be > 0 (got 0; would deadlock the dispatch loop)"
     );
     // Borrow during validation: matching by value would partially
     // move `config.language_policy`, but since the inner `n: usize`
@@ -367,7 +367,7 @@ impl Transcriber {
       (config.chunk_size.as_secs_f64() * crate::time::SAMPLE_RATE_HZ as f64 + 0.5) as u64;
     assert!(
       chunk_size_samples > 0,
-      "TranscriberConfig::chunk_size must round to at least 1 sample at 16 kHz; got {:?}",
+      "TranscriberOptions::chunk_size must round to at least 1 sample at 16 kHz; got {:?}",
       config.chunk_size
     );
 
@@ -543,7 +543,7 @@ impl Transcriber {
   /// `Backpressure` before enough audio accumulates. Either
   /// configure upstream VAD to emit shorter segments at silence
   /// boundaries, or raise `buffer_cap_samples`. See
-  /// [`TranscriberConfig::buffer_cap_samples`] for details.
+  /// [`TranscriberOptions::buffer_cap_samples`] for details.
   ///
   /// Errors:
   /// - `OutputTimebaseUnset` if no `push_samples` has been called.
@@ -885,7 +885,7 @@ mod tests {
   }
 
   fn fresh() -> Transcriber {
-    Transcriber::new(TranscriberConfig::default())
+    Transcriber::new(TranscriberOptions::default())
   }
 
   #[test]
@@ -947,7 +947,7 @@ mod tests {
   #[test]
   fn restart_at_drains_cut_pending_into_in_flight() {
     // max_in_flight = 1 forces queueing.
-    let config = TranscriberConfig::default()
+    let config = TranscriberOptions::default()
             .with_max_in_flight(1)
             .with_chunk_size(Duration::from_millis(125)) // 2_000 samples
             .with_buffer_cap_samples(100_000);
@@ -985,7 +985,7 @@ mod tests {
     use crate::core::command::Command;
     use smol_str::SmolStr;
 
-    let config = TranscriberConfig::default()
+    let config = TranscriberOptions::default()
             .with_chunk_size(Duration::from_secs(2)) // 32_000 samples @ 16k
             .with_buffer_cap_samples(200_000)
             .with_max_in_flight(4);
@@ -1054,7 +1054,7 @@ mod tests {
   #[test]
   #[should_panic(expected = "max_in_flight")]
   fn config_with_zero_max_in_flight_panics() {
-    let config = TranscriberConfig::default().with_max_in_flight(0);
+    let config = TranscriberOptions::default().with_max_in_flight(0);
     let _ = Transcriber::new(config);
   }
 
@@ -1066,7 +1066,7 @@ mod tests {
   #[should_panic(expected = "AutoLockAfter")]
   fn config_with_zero_auto_lock_after_panics() {
     let config =
-      TranscriberConfig::default().with_language_policy(LanguagePolicy::AutoLockAfter(0));
+      TranscriberOptions::default().with_language_policy(LanguagePolicy::AutoLockAfter(0));
     let _ = Transcriber::new(config);
   }
 
@@ -1077,7 +1077,7 @@ mod tests {
   #[test]
   #[should_panic(expected = "chunk_size")]
   fn config_with_zero_chunk_size_panics() {
-    let config = TranscriberConfig::default().with_chunk_size(Duration::ZERO);
+    let config = TranscriberOptions::default().with_chunk_size(Duration::ZERO);
     let _ = Transcriber::new(config);
   }
 
@@ -1128,7 +1128,7 @@ mod tests {
   /// transiently violated.
   #[test]
   fn vad_emission_keeps_total_memory_within_cap() {
-    let config = TranscriberConfig::default()
+    let config = TranscriberOptions::default()
       .with_buffer_cap_samples(12_000)
       .with_max_in_flight(1)
       .with_language_policy(LanguagePolicy::Auto)
@@ -1201,7 +1201,7 @@ mod tests {
   fn signal_no_speech_through_does_not_trim_past_declared_index() {
     use crate::core::command::Command;
 
-    let config = TranscriberConfig::default()
+    let config = TranscriberOptions::default()
       .with_buffer_cap_samples(20_000)
       .with_language_policy(LanguagePolicy::Auto);
     let mut t = Transcriber::new(config);
@@ -1258,7 +1258,7 @@ mod tests {
   /// → Backpressure.
   #[test]
   fn cut_pending_audio_counts_against_buffer_cap() {
-    let config = TranscriberConfig::default()
+    let config = TranscriberOptions::default()
       .with_buffer_cap_samples(12_000)
       .with_max_in_flight(1)
       .with_language_policy(LanguagePolicy::Auto)
@@ -1317,7 +1317,7 @@ mod tests {
   fn restart_at_preserves_auto_lock_gate() {
     use crate::core::command::Command;
 
-    let config = TranscriberConfig::default()
+    let config = TranscriberOptions::default()
             .with_chunk_size(Duration::from_millis(125)) // 2_000 samples
             .with_max_in_flight(4)
             .with_buffer_cap_samples(100_000)
@@ -1393,7 +1393,7 @@ mod tests {
     // default AutoLockAfter(1) would gate the second chunk
     // (round-6 fix) until chunk 0's ASR result lands, hiding
     // the silence-flush effect we're trying to verify.
-    let config = TranscriberConfig::default()
+    let config = TranscriberOptions::default()
       .with_chunk_size(Duration::from_secs(30))
       .with_flush_on_silence_gap(Some(Duration::from_millis(500)))
       .with_language_policy(LanguagePolicy::Auto);
@@ -1430,7 +1430,7 @@ mod tests {
   #[test]
   fn signal_no_speech_through_drains_pure_silence_buffer() {
     // Tighten cap so test doesn't have to push 60 s of audio.
-    let config = TranscriberConfig::default().with_buffer_cap_samples(20_000);
+    let config = TranscriberOptions::default().with_buffer_cap_samples(20_000);
     let mut t = Transcriber::new(config);
     // Push 16 000 samples (close to cap, but under).
     t.push_samples(ts(0), &[0.0; 16_000]).unwrap();
@@ -1461,7 +1461,7 @@ mod tests {
   /// force the cut to flush anyway.
   #[test]
   fn signal_no_speech_through_flushes_orphaned_partial_chunk() {
-    let config = TranscriberConfig::default().with_chunk_size(Duration::from_secs(2)); // 32 000 samples
+    let config = TranscriberOptions::default().with_chunk_size(Duration::from_secs(2)); // 32 000 samples
     let mut t = Transcriber::new(config);
     // Push enough audio to cover speech + lots of silence.
     t.push_samples(ts(0), &[0.0; 200_000]).unwrap();
@@ -1493,7 +1493,7 @@ mod tests {
   #[test]
   fn signal_no_speech_through_flushes_on_silence_gap_below_chunk_size() {
     // chunk_size = 30 s (480 000 samples); silence threshold = 500 ms (8 000 samples).
-    let config = TranscriberConfig::default()
+    let config = TranscriberOptions::default()
       .with_chunk_size(Duration::from_secs(30))
       .with_flush_on_silence_gap(Some(Duration::from_millis(500)))
       .with_language_policy(LanguagePolicy::Auto);

@@ -267,7 +267,7 @@ impl Cut {
     // gap between the new sub's start and the current chunk's
     // end exceeds the configured threshold, flush the current
     // chunk before adding the new sub. This gives utterance-
-    // boundary chunking when callers want it (TranscriberConfig::
+    // boundary chunking when callers want it (TranscriberOptions::
     // flush_on_silence_gap = Some(threshold)). When the threshold
     // is None (default), small silences stay merged into one
     // chunk for better whisper context — original WhisperX

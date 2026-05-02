@@ -39,14 +39,14 @@ pub use types::{
 
 pub use core::{
   AlignmentResult, AsrParams, AsrParamsOverride, AsrResult, Command, Event, LanguagePolicy,
-  SamplingStrategy, Transcriber, TranscriberConfig,
+  SamplingStrategy, Transcriber, TranscriberOptions,
 };
 
 #[cfg(feature = "runner")]
 pub mod runner;
 
 #[cfg(feature = "runner")]
-pub use runner::{ManagedTranscriber, ManagedTranscriberBuilder, RunnerError, WhisperPoolConfig};
+pub use runner::{ManagedTranscriber, ManagedTranscriberBuilder, RunnerError, WhisperPoolOptions};
 
 // Re-export whisper-rs types that appear on the runner's public
 // API (so consumers don't need a direct whisper-rs dep just to name

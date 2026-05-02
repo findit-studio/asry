@@ -9,13 +9,13 @@ use core::{num::NonZeroU32, time::Duration};
 
 use mediatime::{Timebase, Timestamp};
 // Plan note: the plan's example imports `ManagedTranscriber` and
-// `WhisperPoolConfig` from `whispery::` directly; those crate-root
+// `WhisperPoolOptions` from `whispery::` directly; those crate-root
 // re-exports land in Task 24 (§3.3). For Task 19 we name them via
 // the existing `whispery::runner` path to keep the test self-contained
 // (no lib.rs change in this task's file list).
 use whispery::{
   LanguagePolicy, VadSegment,
-  runner::{ManagedTranscriber, WhisperPoolConfig},
+  runner::{ManagedTranscriber, WhisperPoolOptions},
 };
 
 const MODEL_PATH: Option<&str> = option_env!("WHISPERY_TINY_EN_MODEL");
@@ -88,10 +88,10 @@ fn end_to_end_jfk_quote() {
     }
   };
 
-  let pool = WhisperPoolConfig::new(model_path)
+  let pool = WhisperPoolOptions::new(model_path)
     .with_worker_count(1)
     .with_max_queued_chunks(4);
-  let mut runner = ManagedTranscriber::from_config(pool)
+  let mut runner = ManagedTranscriber::from_options(pool)
     .expect("build pool config")
     .chunk_size(Duration::from_secs(30))
     .language_policy(LanguagePolicy::Lock {
@@ -166,8 +166,8 @@ fn multi_chunk_synthetic_stream() {
     None => return,
   };
 
-  let pool = WhisperPoolConfig::new(model_path).with_worker_count(2);
-  let mut runner = ManagedTranscriber::from_config(pool)
+  let pool = WhisperPoolOptions::new(model_path).with_worker_count(2);
+  let mut runner = ManagedTranscriber::from_options(pool)
         .expect("build pool config")
         // Force ≥3 chunks: 2-second chunk size, 6 seconds of audio.
         .chunk_size(Duration::from_secs(2))
@@ -219,11 +219,11 @@ fn backpressure_returns_when_block_disabled() {
     None => return,
   };
 
-  let pool = WhisperPoolConfig::new(model_path)
+  let pool = WhisperPoolOptions::new(model_path)
     .with_worker_count(1)
     .with_max_queued_chunks(1)
     .with_block_on_full_queue(false);
-  let mut runner = ManagedTranscriber::from_config(pool)
+  let mut runner = ManagedTranscriber::from_options(pool)
     .expect("build pool config")
     .chunk_size(Duration::from_secs(1))
     .buffer_cap_samples(32_000)

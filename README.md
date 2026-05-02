@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::Duration;
 use whispery::{
     Aligner, AlignerKey, AlignmentFallback, AlignmentSetBuilder, EnglishNormalizer,
-    Lang, LanguagePolicy, ManagedTranscriber, WhisperPoolConfig,
+    Lang, LanguagePolicy, ManagedTranscriber, WhisperPoolOptions,
 };
 
 let aligner = Aligner::from_paths(
@@ -26,9 +26,9 @@ let set = AlignmentSetBuilder::new()
     .register(AlignerKey::Lang(Lang::En), aligner)
     .build();
 
-let pool = WhisperPoolConfig::new("path/to/ggml-tiny.en.bin")
+let pool = WhisperPoolOptions::new("path/to/ggml-tiny.en.bin")
     .with_worker_count(2);
-let mut runner = ManagedTranscriber::from_config(pool)?
+let mut runner = ManagedTranscriber::from_options(pool)?
     .chunk_size(Duration::from_secs(30))
     .language_policy(LanguagePolicy::Lock { hint: Lang::En })
     .with_alignment(set)
@@ -42,7 +42,7 @@ let mut runner = ManagedTranscriber::from_config(pool)?
 ## Status
 
 - Plan A — types + core. Public surface: `Transcript`, `Word`, `Lang`, `VadSegment`, errors, `Transcriber`, `Command`, `Event`. Mockable ASR / alignment via `inject_asr_result` / `inject_alignment_result`.
-- Plan B — runner + whisper-rs. Adds `ManagedTranscriber`, `WhisperPoolConfig`, `RunnerError`, `AsrParamsOverride`. Saturation-deadlock-safe dispatch loop, per-job worker-hang timeout, temperature retry ladder.
+- Plan B — runner + whisper-rs. Adds `ManagedTranscriber`, `WhisperPoolOptions`, `RunnerError`, `AsrParamsOverride`. Saturation-deadlock-safe dispatch loop, per-job worker-hang timeout, temperature retry ladder.
 - Plan C — alignment. Adds wav2vec2 forced alignment via `ort`. Lights up `Transcript.words`. Single alignment worker per spec §6.3.3.
 
 ## Try it

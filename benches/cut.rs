@@ -5,12 +5,12 @@ use core::{num::NonZeroU32, time::Duration};
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use mediatime::{Timebase, Timestamp};
-use whispery::{Transcriber, TranscriberConfig, VadSegment};
+use whispery::{Transcriber, TranscriberOptions, VadSegment};
 
 fn bench_push_vad(c: &mut Criterion) {
   c.bench_function("push_vad_segment_x1000", |b| {
     b.iter(|| {
-      let config = TranscriberConfig::default()
+      let config = TranscriberOptions::default()
         .with_chunk_size(Duration::from_secs(30))
         .with_buffer_cap_samples(100_000_000);
       let mut t = Transcriber::new(config);

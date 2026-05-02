@@ -3,12 +3,12 @@
 use core::time::Duration;
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use whispery::{AsrResult, Command, Lang, Transcriber, TranscriberConfig, VadSegment};
+use whispery::{AsrResult, Command, Lang, Transcriber, TranscriberOptions, VadSegment};
 
 fn bench_dispatch(c: &mut Criterion) {
   c.bench_function("e2e_300_chunks_mocked", |b| {
     b.iter(|| {
-      let config = TranscriberConfig::default()
+      let config = TranscriberOptions::default()
                 .with_chunk_size(Duration::from_millis(125)) // 2_000 samples
                 .with_buffer_cap_samples(64_000_000)
                 .with_max_in_flight(32);

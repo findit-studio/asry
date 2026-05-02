@@ -296,7 +296,7 @@ impl SampleBuffer {
 
 /// Construct a default `SampleBuffer` with the spec's defaults
 /// (60 s × 16 kHz cap, 200 ms gap tolerance). Used by tests and as
-/// the default in `TranscriberConfig`.
+/// the default in `TranscriberOptions`.
 pub(crate) fn default_buffer() -> SampleBuffer {
   SampleBuffer::new(60 * 16_000, 200 * 16) // 200 ms × 16 samples/ms = 3200
 }

@@ -48,7 +48,7 @@ pub enum RunnerError {
   #[error("whisper pool shutdown (worker channel disconnected)")]
   WhisperPoolShutdown,
 
-  /// Worker queue is full and `WhisperPoolConfig::block_on_full_queue`
+  /// Worker queue is full and `WhisperPoolOptions::block_on_full_queue`
   /// is `false`. The caller must drain via `poll_transcript` /
   /// `poll_error` before pushing more audio.
   ///

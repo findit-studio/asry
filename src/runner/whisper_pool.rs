@@ -26,14 +26,14 @@ use crate::{
 
 /// Configuration for the runner's whisper worker pool.
 ///
-/// Fields are private; use [`WhisperPoolConfig::new`] (or
+/// Fields are private; use [`WhisperPoolOptions::new`] (or
 /// [`Default::default`]) and the `set_*` / `with_*` accessors. Most
 /// accessors are `const fn` and run in const contexts. Path-typed
 /// fields (`model_path`) cannot be `const fn` because [`PathBuf`]
 /// does not currently expose const accessors.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct WhisperPoolConfig {
+pub struct WhisperPoolOptions {
   #[cfg_attr(feature = "serde", serde(default = "default_worker_count"))]
   worker_count: usize,
   // No `default = ...` because there is no sane default model path —
@@ -79,7 +79,7 @@ const fn default_dispatch_idle_poll() -> Duration {
   Duration::from_millis(10)
 }
 
-impl WhisperPoolConfig {
+impl WhisperPoolOptions {
   /// Construct a config with all defaults except `model_path`.
   pub fn new(model_path: impl Into<PathBuf>) -> Self {
     let worker_count = default_worker_count();
@@ -650,7 +650,7 @@ impl WhisperPool {
   /// Build the pool. Caller-supplied `WhisperContext` controls
   /// flash_attn / GPU device / model path explicitly (the public
   /// `ManagedTranscriberBuilder::build` hands one in).
-  pub(super) fn new(ctx: WhisperContext, config: &WhisperPoolConfig) -> Result<Self, RunnerError> {
+  pub(super) fn new(ctx: WhisperContext, config: &WhisperPoolOptions) -> Result<Self, RunnerError> {
     let ctx = Arc::new(ctx);
     let (work_tx, work_rx) = bounded::<AsrWorkItem>(config.max_queued_chunks());
     let (result_tx, result_rx) = bounded::<AsrResultMsg>(config.max_queued_chunks() + 16);
@@ -685,7 +685,7 @@ impl WhisperPool {
 
   /// Build a pool from a model path + config. Shorthand for
   /// `WhisperContext::new_with_params(...)?` then `Self::new`.
-  pub(super) fn from_path(config: &WhisperPoolConfig) -> Result<Self, RunnerError> {
+  pub(super) fn from_path(config: &WhisperPoolOptions) -> Result<Self, RunnerError> {
     let mut ctx_params = WhisperContextParameters::default();
     ctx_params.use_gpu(config.use_gpu());
     ctx_params.gpu_device(config.gpu_device());
@@ -824,7 +824,7 @@ mod tests {
 
   #[test]
   fn defaults_round_trip() {
-    let cfg = WhisperPoolConfig::new("/tmp/model.bin");
+    let cfg = WhisperPoolOptions::new("/tmp/model.bin");
     assert_eq!(cfg.use_gpu(), false);
     assert_eq!(cfg.gpu_device(), 0);
     assert_eq!(cfg.flash_attn(), false);
@@ -838,7 +838,7 @@ mod tests {
 
   #[test]
   fn with_setters_round_trip() {
-    let cfg = WhisperPoolConfig::new("/tmp/model.bin")
+    let cfg = WhisperPoolOptions::new("/tmp/model.bin")
       .with_worker_count(2)
       .with_use_gpu(true)
       .with_gpu_device(7)
@@ -859,7 +859,7 @@ mod tests {
 
   #[test]
   fn set_setters_round_trip() {
-    let mut cfg = WhisperPoolConfig::new("/tmp/model.bin");
+    let mut cfg = WhisperPoolOptions::new("/tmp/model.bin");
     cfg.set_worker_count(3);
     cfg.set_model_path("/var/cache/model.gguf");
     assert_eq!(cfg.worker_count(), 3);

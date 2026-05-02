@@ -9,13 +9,13 @@
 use core::{num::NonZeroU32, time::Duration};
 
 use mediatime::{Timebase, Timestamp};
-use whispery::{AsrResult, Command, Event, Lang, Transcriber, TranscriberConfig, VadSegment};
+use whispery::{AsrResult, Command, Event, Lang, Transcriber, TranscriberOptions, VadSegment};
 
 fn main() {
   // Output timebase: original media at 48 kHz.
   let output_tb = Timebase::new(1, NonZeroU32::new(48_000).unwrap());
 
-  let config = TranscriberConfig::default().with_chunk_size(Duration::from_secs(2));
+  let config = TranscriberOptions::default().with_chunk_size(Duration::from_secs(2));
   let mut t = Transcriber::new(config);
 
   // Push 4 seconds of audio at 16 kHz internal = 64_000 samples.
