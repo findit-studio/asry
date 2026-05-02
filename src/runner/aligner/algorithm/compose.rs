@@ -502,8 +502,9 @@ mod tests {
     let log_probs = lp_const(11, 30, -1.0);
     let word_idx_per_token = alloc::vec![Some(0)];
     let original = alloc::vec![Cow::Borrowed("alignment")];
-    let speech_frames =
-      alloc::vec![true, true, true, true, true, true, false, true, true, true, true];
+    let speech_frames = alloc::vec![
+      true, true, true, true, true, true, false, true, true, true, true
+    ];
 
     let result = compose_words(
       &path,
