@@ -209,9 +209,7 @@ pub(crate) fn get_trellis(
     None => {
       return Err(WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::NoAlignmentPath,
-        message: alloc::format!(
-          "trellis size overflows usize: T={t} * num_tokens={num_tokens}"
-        ),
+        message: alloc::format!("trellis size overflows usize: T={t} * num_tokens={num_tokens}"),
         language: language.clone(),
       });
     }
@@ -725,9 +723,8 @@ pub fn align_to_word_segments(
     }
     false
   };
-  let word_idx = |tok_idx: usize| -> Option<usize> {
-    word_idx_per_token.get(tok_idx).copied().flatten()
-  };
+  let word_idx =
+    |tok_idx: usize| -> Option<usize> { word_idx_per_token.get(tok_idx).copied().flatten() };
   Ok(merge_words(&char_segments, is_separator, word_idx))
 }
 
@@ -791,8 +788,7 @@ mod tests {
     let v = 3;
     let t = 5;
     let log_probs = lp(t, v, alloc::vec![-1.0_f32; t * v]);
-    let trellis =
-      get_trellis(&log_probs, &[1, 2, 1], 0, never(), &Lang::En).expect("trellis");
+    let trellis = get_trellis(&log_probs, &[1, 2, 1], 0, never(), &Lang::En).expect("trellis");
     assert!(trellis[3 * 3 + 0].is_infinite() && trellis[3 * 3 + 0] > 0.0);
     assert!(trellis[4 * 3 + 0].is_infinite() && trellis[4 * 3 + 0] > 0.0);
   }
@@ -871,11 +867,31 @@ mod tests {
   #[test]
   fn merge_repeats_groups_by_token_index() {
     let path = alloc::vec![
-      PathPointPublic { token_index: 0, time_index: 0, score: 0.5 },
-      PathPointPublic { token_index: 0, time_index: 1, score: 0.7 },
-      PathPointPublic { token_index: 1, time_index: 2, score: 0.9 },
-      PathPointPublic { token_index: 1, time_index: 3, score: 0.5 },
-      PathPointPublic { token_index: 2, time_index: 4, score: 0.5 },
+      PathPointPublic {
+        token_index: 0,
+        time_index: 0,
+        score: 0.5
+      },
+      PathPointPublic {
+        token_index: 0,
+        time_index: 1,
+        score: 0.7
+      },
+      PathPointPublic {
+        token_index: 1,
+        time_index: 2,
+        score: 0.9
+      },
+      PathPointPublic {
+        token_index: 1,
+        time_index: 3,
+        score: 0.5
+      },
+      PathPointPublic {
+        token_index: 2,
+        time_index: 4,
+        score: 0.5
+      },
     ];
     let segs = merge_repeats(&path);
     assert_eq!(segs.len(), 3);
@@ -929,8 +945,18 @@ mod tests {
     // score 1.0. Duration-weighted mean = (0.5*1 + 1.0*3) /
     // (1+3) = 3.5/4 = 0.875.
     let segs = alloc::vec![
-      CharSegment { token_index: 0, start_frame: 0, end_frame: 1, score: 0.5 },
-      CharSegment { token_index: 1, start_frame: 1, end_frame: 4, score: 1.0 },
+      CharSegment {
+        token_index: 0,
+        start_frame: 0,
+        end_frame: 1,
+        score: 0.5
+      },
+      CharSegment {
+        token_index: 1,
+        start_frame: 1,
+        end_frame: 4,
+        score: 1.0
+      },
     ];
     let is_sep = |_| false;
     let word_idx = |_| Some(0_usize);
@@ -1005,16 +1031,8 @@ mod tests {
     data[3 * v + 2] = -1.0;
     let log_probs = lp(t, v, data);
     let trellis = get_trellis(&log_probs, &[1, 2], 0, never(), &Lang::En).expect("trellis");
-    let path = backtrack_beam(
-      &trellis,
-      &log_probs,
-      &[1, 2],
-      0,
-      2,
-      never(),
-      &Lang::En,
-    )
-    .expect("path");
+    let path =
+      backtrack_beam(&trellis, &log_probs, &[1, 2], 0, 2, never(), &Lang::En).expect("path");
     assert_eq!(path.len(), t);
     // The path should include both token 0 and token 1.
     let tokens: alloc::vec::Vec<usize> = path.iter().map(|p| p.token_index).collect();

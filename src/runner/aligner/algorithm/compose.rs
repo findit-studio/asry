@@ -14,10 +14,8 @@ use mediatime::{TimeRange, Timebase};
 use smol_str::SmolStr;
 
 use crate::{
-  core::AlignmentResult,
-  runner::aligner::algorithm::trellis_beam::WordSegment,
-  time::SAMPLE_RATE_HZ,
-  types::Word,
+  core::AlignmentResult, runner::aligner::algorithm::trellis_beam::WordSegment,
+  time::SAMPLE_RATE_HZ, types::Word,
 };
 
 /// Default minimum `speech_emissions / total_emissions` ratio
@@ -240,10 +238,10 @@ where
     }
 
     // Frame-to-sample with WhisperX's effective ratio.
-    let raw_start = chunk_first_sample_in_stream
-      + (seg.start_frame as f64 * samples_per_frame).round() as u64;
-    let raw_end = chunk_first_sample_in_stream
-      + (seg.end_frame as f64 * samples_per_frame).round() as u64;
+    let raw_start =
+      chunk_first_sample_in_stream + (seg.start_frame as f64 * samples_per_frame).round() as u64;
+    let raw_end =
+      chunk_first_sample_in_stream + (seg.end_frame as f64 * samples_per_frame).round() as u64;
 
     if raw_start >= chunk_end_sample {
       continue;
@@ -560,10 +558,7 @@ mod tests {
       TimeRange::new(0, 80, tb_16k),
       TimeRange::new(160, 240, tb_16k),
     ];
-    assert_eq!(
-      build_speech_frames(2, 320, &segs),
-      alloc::vec![true, false]
-    );
+    assert_eq!(build_speech_frames(2, 320, &segs), alloc::vec![true, false]);
   }
 
   #[test]

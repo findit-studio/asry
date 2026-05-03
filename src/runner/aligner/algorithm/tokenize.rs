@@ -263,10 +263,7 @@ pub fn tokenize_with_word_map(
     // before tokenisation so we can only stack them at the end.
     // Functionally similar at coarse granularity: word range
     // covers the same TOTAL number of chars worth of frames.
-    let boundary_count = wildcard_chars_per_word
-      .get(wi)
-      .copied()
-      .unwrap_or(0);
+    let boundary_count = wildcard_chars_per_word.get(wi).copied().unwrap_or(0);
     let total_wildcards = (boundary_count + internal_skipped) as usize;
     for _ in 0..total_wildcards {
       word_tokens.push(WILDCARD_TOKEN_ID);
@@ -407,8 +404,7 @@ mod tests {
     let tok = uppercase_tokenizer();
     let unk = tok.token_to_id("<unk>");
 
-    let result = tokenize_with_word_map(&tok, ".", 1, true, true, unk, &[], &Lang::En)
-      .expect("ok");
+    let result = tokenize_with_word_map(&tok, ".", 1, true, true, unk, &[], &Lang::En).expect("ok");
     assert_eq!(result.token_ids, alloc::vec![WILDCARD_TOKEN_ID]);
     assert_eq!(result.word_idx_per_token, alloc::vec![Some(0)]);
   }
@@ -548,9 +544,8 @@ mod tests {
     let tok = uppercase_tokenizer();
     let unk = tok.token_to_id("<unk>");
 
-    let result =
-      tokenize_with_word_map(&tok, "hi 1000 world", 3, true, true, unk, &[], &Lang::En)
-        .expect("ok");
+    let result = tokenize_with_word_map(&tok, "hi 1000 world", 3, true, true, unk, &[], &Lang::En)
+      .expect("ok");
     // Words: hi (2), |, wildcards (4), |, world (5). 2 + 1 + 4 + 1 + 5 = 13.
     assert_eq!(result.token_ids.len(), 13);
     // Three distinct word indices represented (0, 1, 2).

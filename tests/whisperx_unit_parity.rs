@@ -41,8 +41,10 @@ use core::sync::atomic::AtomicBool;
 use tokenizers::Tokenizer;
 
 use whispery::{
+  __bench::{
+    LogProbsTV, WILDCARD_TOKEN_ID, WordSegment, align_to_word_segments, tokenize_with_word_map,
+  },
   Lang,
-  __bench::{LogProbsTV, WILDCARD_TOKEN_ID, WordSegment, align_to_word_segments, tokenize_with_word_map},
 };
 
 /// Inline wav2vec2-base-960h tokenizer JSON, already patched with
@@ -104,8 +106,7 @@ const DEFAULT_DURATION_S: f32 = 5.0;
 
 /// Build the bundled wav2vec2 tokenizer.
 fn load_tokenizer() -> Tokenizer {
-  Tokenizer::from_bytes(TOKENIZER_JSON.as_bytes())
-    .expect("bundled tokenizer.json must parse")
+  Tokenizer::from_bytes(TOKENIZER_JSON.as_bytes()).expect("bundled tokenizer.json must parse")
 }
 
 /// Ergonomic wrapper around a successfully aligned word: the surface
@@ -137,7 +138,11 @@ fn build_synthetic_emission(num_frames: usize, tokens: &[i32]) -> LogProbsTV {
     data[ti * VOCAB_SIZE + BLANK_ID as usize] = -1.0;
   }
   if tokens.is_empty() {
-    return LogProbsTV { t: num_frames, v: VOCAB_SIZE, data };
+    return LogProbsTV {
+      t: num_frames,
+      v: VOCAB_SIZE,
+      data,
+    };
   }
   // We distribute over `tokens.len() + 1` slots so the first peak
   // doesn't sit at frame 0 (matches WhisperX's `+ 1` denominator).
@@ -146,7 +151,11 @@ fn build_synthetic_emission(num_frames: usize, tokens: &[i32]) -> LogProbsTV {
     // Pathological — fewer frames than tokens. The trellis would
     // reject it as `audio too short`. Leave blank-only and let the
     // caller see the error.
-    return LogProbsTV { t: num_frames, v: VOCAB_SIZE, data };
+    return LogProbsTV {
+      t: num_frames,
+      v: VOCAB_SIZE,
+      data,
+    };
   }
   // Donor vocab id used for wildcard peaks. Wildcard's emission is
   // max(non_blank logprobs); peaking this id at the wildcard's
@@ -172,7 +181,11 @@ fn build_synthetic_emission(num_frames: usize, tokens: &[i32]) -> LogProbsTV {
       data[t * VOCAB_SIZE + BLANK_ID as usize] = -3.0;
     }
   }
-  LogProbsTV { t: num_frames, v: VOCAB_SIZE, data }
+  LogProbsTV {
+    t: num_frames,
+    v: VOCAB_SIZE,
+    data,
+  }
 }
 
 /// Run align() end-to-end on `text` with `num_frames` frames over
@@ -266,7 +279,10 @@ fn unknown_word_gets_timestamps() {
       result.iter().map(|w| &w.word).collect::<Vec<_>>()
     )
   });
-  assert!(four_three.start_s < four_three.end_s, "'43' must have valid range");
+  assert!(
+    four_three.start_s < four_three.end_s,
+    "'43' must have valid range"
+  );
   assert!(four_three.score >= 0.0, "'43' must have a score");
 }
 
