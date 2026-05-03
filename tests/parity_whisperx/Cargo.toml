@@ -12,7 +12,19 @@ description = "Manual parity harness: dump whispery alignment output to JSON for
 # exercises. Pinned by path because this is in-tree tooling, not a
 # downstream consumer.
 whispery     = { path = "../..", default-features = false, features = ["runner", "alignment", "bench-internals", "parity-dump-emission"] }
-whisper-rs   = { version = "0.13", default-features = false }
+# `silero` (the Rust VAD crate) is the system-under-test for the
+# `whispery-silero-runner` binary in `src/bin/silero_runner.rs`. Path
+# dep deliberately points at the in-tree silero crate at
+# `findit-studio/silero` rather than crates.io, so this harness
+# exercises the just-shipped 0.3.0 fixes (the silence-counter
+# off-by-one correction and the `OnceLock`-based ffmpeg-init pattern).
+# The `bundled` feature ships the `silero_vad.onnx` bytes inside the
+# binary — byte-identical to what the snakers4/silero-vad checkout's
+# `data/silero_vad.onnx` contains — so the Rust runner and the
+# `whisperx_silero_runner.py --backend onnx` runner feed the SAME
+# ONNX bytes through ORT. That isolates segmenter logic from runtime
+# drift between PyTorch JIT and ORT.
+silero       = { path = "../../../silero", features = ["bundled"] }
 # `ffmpeg-next` is used in the parity runner's audio loader so that:
 #   1. The harness mirrors production callers of whispery, which feed
 #      samples through `ffmpeg-next` (whispery itself is Sans-I/O and

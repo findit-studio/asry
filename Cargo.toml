@@ -18,7 +18,7 @@ smallvec  = { version = "1", default-features = false }
 
 # Runner feature deps. All optional — Plan A's core compiles
 # `--no-default-features` without these.
-whisper-rs        = { version = "0.13", optional = true, default-features = false }
+whisper-rs        = { version = "0.16", optional = true, default-features = false }
 crossbeam-channel = { version = "0.5", optional = true, default-features = false, features = ["std"] }
 num_cpus          = { version = "1",   optional = true }
 
@@ -30,9 +30,9 @@ ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, fea
 # tokenizers: HuggingFace WordPiece/BPE/Unigram tokenizer used to
 # read wav2vec2's tokenizer.json. ^0.20 ships pure-Rust without
 # pulling onig.
-tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
 # ndarray: tensor reshaping for the wav2vec2 input/output shapes.
-ndarray = { version = "0.16", optional = true, default-features = false, features = ["std"] }
+ndarray = { version = "0.17", optional = true, default-features = false, features = ["std"] }
 
 # Optional features (Plan A scope only).
 serde           = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
@@ -50,7 +50,7 @@ criterion  = { version = "0.8", default-features = false, features = ["html_repo
 smol_str   = "0.3"
 tempfile   = "3"
 hound      = "3"          # WAV decoding for end-to-end tests
-sha2       = "0.10"       # build.rs SHA-256 verification
+sha2       = "0.11"       # build.rs SHA-256 verification
 # serde_json is dev-only — exercised in `#[cfg(feature = "serde")]`
 # round-trip tests for the per-options serde encoding (silero's
 # pattern). Production never serialises options at runtime; the
@@ -58,8 +58,8 @@ sha2       = "0.10"       # build.rs SHA-256 verification
 serde_json = "1"
 
 [build-dependencies]
-sha2 = "0.10"
-ureq = { version = "2", default-features = false, features = ["tls"] }
+sha2 = "0.11"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 # Build-time JSON parser for the bundled wav2vec2-base-960h
 # tokenizer. Decoding once at build.rs and emitting Rust
 # constants into OUT_DIR means the runtime crate never sees

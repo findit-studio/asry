@@ -21,9 +21,6 @@ impl VadSegment {
   /// and confuse downstream consumers. silero never produces
   /// zero-duration segments; the panic surfaces programmer error
   /// at the boundary.
-  ///
-  /// `panic!` in `const fn` is stable on Rust ≥ 1.57; the crate's
-  /// MSRV (≥ 1.85) covers this.
   pub const fn new(start_sample: u64, end_sample: u64) -> Self {
     if end_sample <= start_sample {
       panic!("VadSegment::new requires end_sample > start_sample");

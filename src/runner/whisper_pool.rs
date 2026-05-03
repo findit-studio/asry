@@ -398,7 +398,7 @@ pub(super) fn full_params_from(
   p.set_n_threads(params.n_threads());
   p.set_no_context(params.no_context());
   p.set_suppress_blank(params.suppress_blank());
-  p.set_suppress_non_speech_tokens(params.suppress_non_speech_tokens());
+  p.set_suppress_nst(params.suppress_non_speech_tokens());
 
   if let Some(lang) = params.language_hint() {
     // `FullParams<'a, _>::set_language` requires the `&str`'s
@@ -446,37 +446,32 @@ pub(super) fn full_params_from(
 /// a truly empty result and trips the retry ladder via the
 /// log_prob_threshold check.
 ///
-/// whisper-rs 0.13.2 does not expose a per-segment `avg_logprob`
-/// accessor (the plan referenced `full_get_segment_avg_logprob`,
-/// which does not exist on `WhisperState`). We reconstruct it
-/// faithfully: per segment, average `WhisperTokenData::plog` (the
-/// per-token log-probability returned by whisper.cpp) across all
-/// tokens in that segment; then average those segment means. This
-/// matches whisper.cpp's own internal computation of the value
-/// it gates `logprob_thold` against.
+/// whisper-rs does not expose a per-segment `avg_logprob` accessor.
+/// We reconstruct it faithfully: per segment, average
+/// `WhisperTokenData::plog` (the per-token log-probability returned
+/// by whisper.cpp) across all tokens in that segment; then average
+/// those segment means. This matches whisper.cpp's own internal
+/// computation of the value it gates `logprob_thold` against.
 pub(super) fn compute_avg_logprob(state: &WhisperState) -> f32 {
-  let n = match state.full_n_segments() {
-    Ok(n) => n,
-    Err(_) => return f32::MIN,
-  };
+  let n = state.full_n_segments();
   if n <= 0 {
     return f32::MIN;
   }
   let mut seg_sum = 0.0f64;
   let mut seg_count = 0i32;
   for i in 0..n {
-    let n_tok = match state.full_n_tokens(i) {
-      Ok(n_tok) => n_tok,
-      Err(_) => continue,
+    let Some(segment) = state.get_segment(i) else {
+      continue;
     };
+    let n_tok = segment.n_tokens();
     if n_tok <= 0 {
       continue;
     }
     let mut tok_sum = 0.0f64;
     let mut tok_count = 0i32;
     for j in 0..n_tok {
-      if let Ok(td) = state.full_get_token_data(i, j) {
-        tok_sum += td.plog as f64;
+      if let Some(token) = segment.get_token(j) {
+        tok_sum += token.token_data().plog as f64;
         tok_count += 1;
       }
     }
@@ -508,17 +503,16 @@ pub(super) fn compute_avg_logprob(state: &WhisperState) -> f32 {
 pub(super) fn compute_compression_ratio(state: &WhisperState) -> f32 {
   use std::collections::HashSet;
 
-  let n = match state.full_n_segments() {
-    Ok(n) => n,
-    Err(_) => return 0.0,
-  };
+  let n = state.full_n_segments();
   if n <= 0 {
     return 0.0;
   }
   let mut text = String::new();
   for i in 0..n {
-    if let Ok(s) = state.full_get_segment_text(i) {
-      text.push_str(&s);
+    if let Some(segment) = state.get_segment(i) {
+      if let Ok(s) = segment.to_str() {
+        text.push_str(s);
+      }
     }
   }
   let raw = text.len();
@@ -594,7 +588,7 @@ pub(super) fn run_with_temperature_ladder(
     // segments, the loop would exhaust, and the chunk would
     // surface as `AllTemperaturesFailed`. Detect the empty
     // outcome here and return an empty `AsrResult` instead.
-    if state.full_n_segments().unwrap_or(0) == 0 {
+    if state.full_n_segments() == 0 {
       return build_asr_result(state, temperature, p);
     }
 
@@ -621,56 +615,55 @@ pub(super) fn run_with_temperature_ladder(
 
 /// Compose an [`AsrResult`] from a successful `WhisperState::full` call.
 ///
-/// Two whisper-rs 0.13.2 API points deviate from the plan's literal
-/// snippet:
+/// `full_lang_id_from_state` returns a bare `c_int`; a negative id
+/// means "no detection" and we fall back to the language hint (or
+/// `Lang::Other("")`).
 ///
-/// - The accessor for the auto-detected language is
-///   `WhisperState::full_lang_id_from_state` (not `full_lang_id`); it
-///   returns `Result<c_int, WhisperError>` rather than a bare `c_int`.
-///   We treat any `Err` and any negative id as "no detection" and
-///   fall back to the language hint (or `Lang::Other("")`) — the same
-///   behaviour the plan prescribed for `id < 0`.
-///
-/// - whisper-rs 0.13.2 (which depends on whisper-rs-sys 0.11.1, whose
-///   bundled whisper.cpp predates `whisper_full_get_segment_no_speech_prob`)
-///   does not expose a per-segment `no_speech_prob` accessor on
-///   `WhisperState`. We default to `0.0` (the same fallback the plan's
-///   literal `.unwrap_or(0.0)` produced when the segment was missing);
-///   downstream `AsrResult::no_speech_prob` consumers tolerate `0.0`,
-///   and the runner's retry ladder gates on `avg_logprob` /
-///   `compression_ratio` rather than `no_speech_prob`. Once we move to
-///   whisper-rs ≥ 0.15 (sys ≥ 0.14, whisper.cpp v1.7+) we can wire the
-///   real value.
+/// `no_speech_prob` is averaged across segments via
+/// `WhisperSegment::no_speech_probability()`; the value defaults to
+/// `0.0` when there are no segments. Downstream `AsrResult::no_speech_prob`
+/// consumers tolerate `0.0`, and the runner's retry ladder gates on
+/// `avg_logprob` / `compression_ratio` rather than `no_speech_prob`.
 fn build_asr_result(
   state: &WhisperState,
   final_temperature: f32,
   params: &AsrParams,
 ) -> Result<AsrResult, WorkFailure> {
-  let n = state.full_n_segments().unwrap_or(0);
+  let n = state.full_n_segments();
   let mut text = String::new();
+  let mut nsp_sum = 0.0f32;
+  let mut nsp_count: i32 = 0;
   for i in 0..n {
-    if let Ok(s) = state.full_get_segment_text(i) {
-      text.push_str(&s);
+    if let Some(segment) = state.get_segment(i) {
+      if let Ok(s) = segment.to_str() {
+        text.push_str(s);
+      }
+      nsp_sum += segment.no_speech_probability();
+      nsp_count += 1;
     }
   }
 
   let avg_logprob = compute_avg_logprob(state);
-  // See doc comment: whisper-rs 0.13.2 has no per-segment
-  // no_speech_prob accessor. Default to 0.0.
-  let no_speech_prob: f32 = 0.0;
+  let no_speech_prob: f32 = if nsp_count > 0 {
+    nsp_sum / nsp_count as f32
+  } else {
+    0.0
+  };
 
-  let language = match state.full_lang_id_from_state() {
-    Ok(id) if id >= 0 => match whisper_rs::get_lang_str(id) {
+  let lang_id = state.full_lang_id_from_state();
+  let language = if lang_id >= 0 {
+    match whisper_rs::get_lang_str(lang_id) {
       Some(code) => Lang::from_iso639_1(code),
       None => params
         .language_hint()
         .cloned()
         .unwrap_or(Lang::Other(SmolStr::new(""))),
-    },
-    _ => params
+    }
+  } else {
+    params
       .language_hint()
       .cloned()
-      .unwrap_or(Lang::Other(SmolStr::new(""))),
+      .unwrap_or(Lang::Other(SmolStr::new("")))
   };
 
   Ok(AsrResult::new(

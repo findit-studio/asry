@@ -273,7 +273,8 @@ fn download(url: &str, dest: &std::path::Path) -> std::io::Result<()> {
   let resp = ureq::get(url)
     .call()
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
-  let mut reader = resp.into_reader();
+  // ureq 3: response → body → reader (was a single `into_reader()` call in ureq 2).
+  let mut reader = resp.into_body().into_reader();
   let mut writer = fs::File::create(dest)?;
   let mut buf = vec![0u8; 64 * 1024];
   loop {

@@ -10,6 +10,7 @@
 //!   the caller's first `push_samples` call.
 
 use core::num::NonZeroU32;
+use mediatime::Timebase;
 
 /// Internal analysis sample rate. All audio fed to whispery must
 /// already be resampled to this rate (caller's responsibility).
@@ -19,6 +20,7 @@ pub const SAMPLE_RATE_HZ: u32 = 16_000;
 /// input — only used at compile time on statically-nonzero values,
 /// so the panic is unreachable in practice. Avoids depending on
 /// `Option::unwrap` const stability.
+#[cfg_attr(not(tarpaulin), inline(always))]
 const fn nz(n: u32) -> NonZeroU32 {
   match NonZeroU32::new(n) {
     Some(n) => n,
@@ -32,7 +34,7 @@ const SAMPLE_RATE_NZ: NonZeroU32 = nz(SAMPLE_RATE_HZ);
 /// machine, the sample buffer, and the alignment pipeline. Not part
 /// of whispery's public output surface — every emitted `TimeRange`
 /// is in the caller's external timebase.
-pub const ANALYSIS_TIMEBASE: mediatime::Timebase = mediatime::Timebase::new(1, SAMPLE_RATE_NZ);
+pub const ANALYSIS_TIMEBASE: Timebase = Timebase::new(1, SAMPLE_RATE_NZ);
 
 #[cfg(test)]
 mod tests {
