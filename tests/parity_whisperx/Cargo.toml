@@ -55,3 +55,13 @@ path = "src/main.rs"
 [[bin]]
 name = "whispery-trellis-diff"
 path = "src/bin/trellis_diff.rs"
+
+# `whispery-silero-runner` — the Rust side of the silero VAD parity
+# track. Loads a 16 kHz mono WAV via the same `ffmpeg-next` loader the
+# alignment parity runner uses, drives `silero::detect_speech` with
+# WhisperX-style defaults (threshold 0.5, max_speech_duration_s 30),
+# and emits JSON in the same schema as `python/whisperx_silero_runner.py`
+# so `python/score_vad.py` can compute IoU between them.
+[[bin]]
+name = "whispery-silero-runner"
+path = "src/bin/silero_runner.rs"
