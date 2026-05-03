@@ -1221,8 +1221,7 @@ mod tests {
     let log_probs = lp(t, v, data);
     let tokens = alloc::vec![1_i32, 2_i32, 3_i32];
     let abort = AtomicBool::new(false);
-    let trellis = get_trellis(&log_probs, &tokens, 0, &abort, &Lang::En)
-      .expect("trellis builds");
+    let trellis = get_trellis(&log_probs, &tokens, 0, &abort, &Lang::En).expect("trellis builds");
 
     let path = backtrack_beam(
       &trellis,
@@ -1250,8 +1249,7 @@ mod tests {
     // sequence, which the predecessor-only ranking would NOT
     // guarantee on this construction (it would skip token 2
     // entirely in some construction variants).
-    let visited: alloc::collections::BTreeSet<usize> =
-      coords.iter().map(|(j, _)| *j).collect();
+    let visited: alloc::collections::BTreeSet<usize> = coords.iter().map(|(j, _)| *j).collect();
     assert!(
       visited.contains(&0) && visited.contains(&1) && visited.contains(&2),
       "transition-scored backtrack must visit every token; got {:?}",
