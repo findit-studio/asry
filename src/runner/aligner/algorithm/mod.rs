@@ -5,4 +5,4 @@ pub(crate) mod encode;
 pub(crate) mod normalize;
 pub(crate) mod silence_mask;
 pub(crate) mod tokenize;
-pub(crate) mod viterbi;
+pub(crate) mod trellis_beam;

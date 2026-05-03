@@ -88,7 +88,7 @@ pub mod __bench {
   pub use crate::runner::aligner::algorithm::{
     encode::LogProbsTV,
     normalize::{scalar, zero_mean_unit_var_normalize},
-    viterbi::ctc_viterbi,
+    trellis_beam::align_to_word_segments,
   };
 
   #[cfg(target_arch = "aarch64")]

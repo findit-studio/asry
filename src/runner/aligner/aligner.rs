@@ -349,7 +349,7 @@ impl Aligner {
         compose::{build_speech_frames, compose_words},
         encode::encode_log_softmax,
         tokenize::tokenize_with_word_map,
-        viterbi::ctc_viterbi,
+        trellis_beam::align_to_word_segments,
       },
       types::AlignmentFailureKind,
     };
@@ -448,6 +448,7 @@ impl Aligner {
       self.normalizer.use_word_delimiter(),
       self.vocab_uppercase_only,
       self.unk_token_id,
+      normalized.wildcard_chars_per_word(),
       &self.language,
     )?;
 
@@ -484,9 +485,29 @@ impl Aligner {
         samples,
         &speech_mask,
       );
+
+    // wav2vec2's CNN front-end has a minimum input length (the
+    // receptive field of the first stride-conv) of 400 samples
+    // at 16 kHz. WhisperX's `align()` pads with zeros to 400 if
+    // the slice is shorter (`alignment.py:243-247`). Without
+    // this padding, the model's first conv produces a degenerate
+    // output for very short segments — typical for a 1-2 word
+    // segment after Whisper splits on a brief utterance — and
+    // the encoder either errors out or emits T=0 frames. We
+    // append zeros to the silence-mask-normalised buffer; the
+    // padded samples are zero (silent) by construction, so the
+    // existing speech-mask doesn't need updating to track them.
+    let padded_samples: alloc::borrow::Cow<'_, [f32]> = if normalized_samples.len() < 400 {
+      let mut buf = alloc::vec::Vec::with_capacity(400);
+      buf.extend_from_slice(&normalized_samples);
+      buf.resize(400, 0.0_f32);
+      alloc::borrow::Cow::Owned(buf)
+    } else {
+      alloc::borrow::Cow::Borrowed(&normalized_samples[..])
+    };
     let log_probs = encode_log_softmax(
       &mut self.session,
-      &normalized_samples,
+      &padded_samples,
       run_options,
       &self.language,
     )?;
@@ -525,14 +546,19 @@ impl Aligner {
       return Err(timed_out());
     }
 
-    // Steps 5-6: CTC lattice + Viterbi. The DP checks
-    // `abort_flag` once per frame row so a pathological (long
-    // chunk × long token sequence) lattice can't run past the
-    // alignment worker's `align_timeout` and starve every
-    // chunk queued behind it on the single worker.
-    let path = ctc_viterbi(
+    // Steps 5-6: WhisperX-bit-exact trellis + beam-search
+    // backtrack + char→word grouping. Returns
+    // `Vec<WordSegment>` directly; the legacy
+    // `state_per_frame` lattice encoding is gone. Same
+    // cooperative-cancellation contract as before — the DP
+    // checks `abort_flag` periodically so a hallucinated long
+    // token sequence can't run past `align_timeout` and starve
+    // every chunk queued behind it on the single worker.
+    let word_segments = align_to_word_segments(
       &log_probs,
       &tokenized.token_ids,
+      &tokenized.word_idx_per_token,
+      tokenized.separator_token_id,
       self.blank_token_id,
       abort_flag,
       &self.language,
@@ -549,9 +575,7 @@ impl Aligner {
     // the result rather than emit fabricated timings.
     let speech_frames = build_speech_frames(log_probs.t, self.hop_samples, sub_segments);
     Ok(compose_words(
-      &path,
-      &log_probs,
-      &tokenized.word_idx_per_token,
+      &word_segments,
       normalized.original_words(),
       &speech_frames,
       chunk_first_sample_in_stream,
@@ -561,6 +585,7 @@ impl Aligner {
       // validator's 2-frame overshoot tolerance can't leak
       // into emitted word timestamps).
       samples.len() as u64,
+      log_probs.t,
       samples_to_output_range,
       self.min_speech_coverage,
       self.max_intra_silent_run,

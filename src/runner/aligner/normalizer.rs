@@ -38,14 +38,49 @@ pub struct NormalizedText<'a> {
   /// slice. Step 9 of the alignment algorithm uses this map to
   /// recover `Word.text`.
   original_words: Vec<Cow<'a, str>>,
+  /// Per-word count of "wildcard chars" — surface-form chars
+  /// that are NOT pronounced (boundary punctuation the
+  /// normaliser stripped) but still occupy frames in the
+  /// audio. WhisperX includes these as wildcard tokens
+  /// (`*` placeholder + token id `-1`) so the word's range
+  /// extends through the punctuation's frames.
+  ///
+  /// Empty (zero-length) means "no wildcard padding needed";
+  /// the value is interpreted as 0 wildcards for every word.
+  /// Specific normalisers fill it in to claw back the
+  /// punctuation frames they stripped.
+  wildcard_chars_per_word: Vec<u32>,
 }
 
 impl<'a> NormalizedText<'a> {
   /// Construct from a normalised text + original-word slices.
+  /// `wildcard_chars_per_word` defaults to empty (no wildcard
+  /// padding) when the normaliser doesn't track it.
   pub const fn new(normalized: String, original_words: Vec<Cow<'a, str>>) -> Self {
     Self {
       normalized,
       original_words,
+      wildcard_chars_per_word: Vec::new(),
+    }
+  }
+
+  /// Construct with explicit per-word wildcard counts. Length
+  /// must match `original_words`. Panics on length mismatch
+  /// because the count is structurally tied to word indexing.
+  pub fn with_wildcards(
+    normalized: String,
+    original_words: Vec<Cow<'a, str>>,
+    wildcard_chars_per_word: Vec<u32>,
+  ) -> Self {
+    assert_eq!(
+      original_words.len(),
+      wildcard_chars_per_word.len(),
+      "wildcard_chars_per_word must align 1:1 with original_words"
+    );
+    Self {
+      normalized,
+      original_words,
+      wildcard_chars_per_word,
     }
   }
 
@@ -57,6 +92,13 @@ impl<'a> NormalizedText<'a> {
   /// Surface forms in normalised-word-index order.
   pub fn original_words(&self) -> &[Cow<'a, str>] {
     &self.original_words
+  }
+
+  /// Per-word wildcard char counts, or empty if the normaliser
+  /// didn't track them. See [`Self::with_wildcards`] /
+  /// [`Self::new`] for how this is populated.
+  pub fn wildcard_chars_per_word(&self) -> &[u32] {
+    &self.wildcard_chars_per_word
   }
 }
 

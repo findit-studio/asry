@@ -121,6 +121,7 @@ impl TextNormalizer for EnglishNormalizer {
   fn normalize<'a>(&self, text: &'a str) -> Result<NormalizedText<'a>, NormalizationError> {
     let mut normalized = String::with_capacity(text.len());
     let mut original_words: Vec<Cow<'a, str>> = Vec::new();
+    let mut wildcards_per_word: Vec<u32> = Vec::new();
 
     for (word_start, word) in token_spans(text) {
       let stripped = strip_word_punct(word);
@@ -135,6 +136,19 @@ impl TextNormalizer for EnglishNormalizer {
       // emits per-piece surface slices so each emitted Word
       // carries its own substring.
       let original_slice: &'a str = &text[word_start..word_start + word.len()];
+
+      // Wildcards: count of source chars that get stripped
+      // (not pronounced as part of the word's audio range
+      // strictly, but still occupying frames on the timeline).
+      // Boundary punctuation that `strip_word_punct` removed
+      // contributes; internal punctuation that the tokeniser
+      // skips later (currently just `.` for abbreviations) is
+      // also unspoken and contributes too. WhisperX includes
+      // these as `*` placeholders + token id `-1`; whispery
+      // mirrors by appending wildcard tokens to the word's
+      // token group at tokenisation time so the word's frame
+      // range extends through the punctuation's frames.
+      let boundary_stripped: u32 = (word.chars().count() - stripped.chars().count()) as u32;
 
       // Split on internal separators (`Hello-World` →
       // `["Hello", "World"]`). Each piece is a real word the
@@ -156,16 +170,27 @@ impl TextNormalizer for EnglishNormalizer {
       // punct) so each `piece_orig` is a borrow into the input
       // text — surface form is preserved per piece.
       if stripped.contains(is_internal_separator) {
-        for piece_orig in stripped
+        let pieces: Vec<&str> = stripped
           .split(is_internal_separator)
           .filter(|p| !p.is_empty())
-        {
+          .collect();
+        let last_idx = pieces.len().saturating_sub(1);
+        for (pi, piece_orig) in pieces.iter().enumerate() {
           let piece_lower = lowercase_for_match(piece_orig);
           if !normalized.is_empty() {
             normalized.push(' ');
           }
           normalized.push_str(&piece_lower);
-          original_words.push(Cow::Borrowed(piece_orig));
+          original_words.push(Cow::Borrowed(*piece_orig));
+          // The original word's stripped boundary punctuation
+          // belongs to the LAST piece (the punct sits after the
+          // last hyphen-piece in the source text). Pieces
+          // before the last one only carry the implicit hyphen
+          // separator's frames; we don't emit a wildcard for
+          // it because the hyphen is treated as a real word
+          // boundary by whispery (per-piece surface forms).
+          let count = if pi == last_idx { boundary_stripped } else { 0 };
+          wildcards_per_word.push(count);
         }
       } else {
         // No internal separator — the word is one piece.
@@ -177,13 +202,18 @@ impl TextNormalizer for EnglishNormalizer {
         }
         normalized.push_str(&lower);
         original_words.push(Cow::Borrowed(original_slice));
+        wildcards_per_word.push(boundary_stripped);
       }
     }
 
     if original_words.is_empty() {
       return Err(NormalizationError::EmptyText);
     }
-    Ok(NormalizedText::new(normalized, original_words))
+    Ok(NormalizedText::with_wildcards(
+      normalized,
+      original_words,
+      wildcards_per_word,
+    ))
   }
 }
 
@@ -191,14 +221,12 @@ impl TextNormalizer for EnglishNormalizer {
 /// Equivalent to `text.split_whitespace()` but yields starting
 /// byte offsets so callers can reconstruct borrowed slices.
 fn token_spans(text: &str) -> impl Iterator<Item = (usize, &str)> + '_ {
-  let mut idx = 0;
   let mut iter = text.split_whitespace();
   core::iter::from_fn(move || {
     let token = iter.next()?;
     // text.split_whitespace() returns slices that point into
     // `text`; recover the offset by subtracting base ptrs.
     let token_start = (token.as_ptr() as usize).saturating_sub(text.as_ptr() as usize);
-    idx = token_start + token.len();
     Some((token_start, token))
   })
 }
