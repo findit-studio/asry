@@ -704,6 +704,29 @@ fn run_inject_mode(args: Args, inject_path: PathBuf) -> Result<()> {
       Ok("0") | Ok("")
     );
   let use_raw_segments = !use_per_sentence;
+  if use_raw_segments {
+    // Fail loud if the inject JSON doesn't carry `raw_asr_segments[]`.
+    // Falling back silently to per-sentence `segments[]` is the
+    // bug that put 03_dual_speaker at median 0.196 / 70 below-0.5
+    // (whispery re-aligning WhisperX's POST-alignment sub-chunks
+    // independently amplifies the inherent ORT-vs-PyTorch
+    // numerical drift). Caller must either fix the inject JSON
+    // or set `WHISPERY_PARITY_USE_PER_SENTENCE_SEGMENTS=1` to
+    // explicitly opt into per-sentence mode (with the
+    // understanding that parity numbers degrade).
+    if injected.get("raw_asr_segments").is_none() {
+      bail!(
+        "inject JSON has no `raw_asr_segments[]`. Default parity mode aligns \
+         against the un-broken ASR segments WhisperX itself feeds to its own \
+         `align()`; per-sentence mode (the legacy `segments[]` view) is a \
+         downstream derivation that diverges from WhisperX's own forced \
+         alignment by 60–250 ms per word. Either re-run \
+         `whisperx_runner.py` so the JSON includes `raw_asr_segments[]`, or \
+         set `WHISPERY_PARITY_USE_PER_SENTENCE_SEGMENTS=1` and accept the \
+         degraded parity bar."
+      );
+    }
+  }
   let segments: Vec<InjectedSegment> = if use_raw_segments
     && let Some(segs) = injected.get("raw_asr_segments").and_then(|v| v.as_array())
   {

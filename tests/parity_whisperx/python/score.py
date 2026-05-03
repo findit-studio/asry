@@ -9,11 +9,23 @@ Approach:
 3. For each matched pair, compute the time-range IoU.
 4. Emit a JSON summary on stdout and a human-readable summary on stderr.
 
-Exit code 0 iff median IoU >= 0.7. The 0.7 bar is a deliberately loose
-"functionally equivalent" threshold — same wav2vec2 weights via
-different runtimes and different ASR pipelines will not produce
-bit-exact ranges, but they should rarely disagree by more than a CTC
-hop (~20 ms) on what's actually the same word.
+Exit code 0 iff ALL of:
+- median IoU >= 0.95
+- mean IoU >= 0.95
+- below_0.5 == 0
+
+The bar reflects the achievable baseline when both runners align the
+same audio + text + segment anchors (median 0.995-0.999, mean
+0.983-0.998, 0 below-0.5 outliers across the 5-fixture set, 854 word
+pairs). Loosening it would mask the kind of silent regression that
+once put 03_dual_speaker at median 0.196 / 70 below-0.5 because the
+parity runner was feeding whispery WhisperX's POST-alignment
+sub-segments instead of the raw ASR segments WhisperX itself aligns
+against. See `tests/parity_whisperx/README.md` for context.
+
+Override via `--threshold` (median floor) and `--allow-below-0-5`
+(maximum allowed outlier count) for diagnostic / experimental runs.
+The defaults are the production parity bar.
 
 Usage:
     uv run python score.py <whispery.json> <whisperx.json>
@@ -159,8 +171,20 @@ def main() -> int:
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.7,
-        help="Median IoU threshold for exit-code 0 (default: 0.7).",
+        default=0.95,
+        help="Median IoU floor for exit-code 0 (default: 0.95).",
+    )
+    parser.add_argument(
+        "--mean-threshold",
+        type=float,
+        default=0.95,
+        help="Mean IoU floor for exit-code 0 (default: 0.95).",
+    )
+    parser.add_argument(
+        "--allow-below-0-5",
+        type=int,
+        default=0,
+        help="Maximum allowed pairs with IoU < 0.5 (default: 0).",
     )
     args = parser.parse_args()
 
@@ -209,6 +233,15 @@ def main() -> int:
         for wa, wb, iou in matched_sorted[:5]
     ]
 
+    median = iou_stats.get("median", 0.0)
+    mean = iou_stats.get("mean", 0.0)
+    below_0_5 = iou_stats.get("below_0.5", 0)
+    passed = bool(
+        len(matched) > 0
+        and median >= args.threshold
+        and mean >= args.mean_threshold
+        and below_0_5 <= args.allow_below_0_5
+    )
     summary = {
         "whispery_word_count": len(rows_a),
         "whisperx_word_count": len(rows_b),
@@ -218,9 +251,9 @@ def main() -> int:
         "iou": iou_stats,
         "worst_5": worst,
         "threshold_median_iou": args.threshold,
-        "passed": bool(
-            iou_stats.get("median", 0.0) >= args.threshold and len(matched) > 0
-        ),
+        "threshold_mean_iou": args.mean_threshold,
+        "threshold_max_below_0_5": args.allow_below_0_5,
+        "passed": passed,
     }
 
     serialized = json.dumps(summary, indent=2)
@@ -229,7 +262,6 @@ def main() -> int:
     else:
         args.out.write_text(serialized + "\n")
 
-    median = iou_stats.get("median", 0.0)
     print(
         f"\n[parity score] {name_a} ({len(rows_a)} words) vs "
         f"{name_b} ({len(rows_b)} words)",
@@ -265,7 +297,8 @@ def main() -> int:
 
     pass_str = "PASS" if summary["passed"] else "FAIL"
     print(
-        f"  {pass_str} (median IoU {median:.3f} vs threshold {args.threshold})",
+        f"  {pass_str} (median {median:.3f}≥{args.threshold} mean "
+        f"{mean:.3f}≥{args.mean_threshold} below_0.5={below_0_5}≤{args.allow_below_0_5})",
         file=sys.stderr,
     )
     return 0 if summary["passed"] else 1
