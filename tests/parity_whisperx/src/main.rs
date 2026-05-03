@@ -671,22 +671,39 @@ fn run_inject_mode(args: Args, inject_path: PathBuf) -> Result<()> {
     text: String,
   }
 
-  // The parity runner's default mode is per-sentence
-  // `segments[]` — that's what WhisperX itself ends up with
-  // after `align()` plus its `PunktSentenceTokenizer` break-up.
+  // The parity runner's default mode is `raw_asr_segments[]` —
+  // the un-broken ASR segments WhisperX itself feeds to its own
+  // `align()`. Using these gives apples-to-apples parity: both
+  // implementations align the SAME audio + text + segment
+  // anchors, so any disagreement is the algorithm itself.
   //
-  // The `WHISPERY_PARITY_USE_RAW_SEGMENTS=1` env var switches
-  // to `raw_asr_segments[]` (the un-broken ASR segments
-  // WhisperX feeds to `align()`). Useful for diagnosing
-  // hallucinated-repetition cases where the per-sentence
-  // breakdown is a downstream derivation; on those clips the
-  // raw mode produces a more apples-to-apples comparison
-  // (both implementations align the same audio + text). On
-  // clips without hallucination, per-sentence is closer to
-  // what WhisperX's downstream consumers see.
-  let use_raw_segments = std::env::var("WHISPERY_PARITY_USE_RAW_SEGMENTS")
+  // Earlier the default was per-sentence `segments[]` (the
+  // POST-alignment WhisperX output, run through its
+  // `PunktSentenceTokenizer` break-up). That mode hands whispery
+  // dramatically smaller chunks than WhisperX itself aligned
+  // against — by the time the segments[] view is built,
+  // WhisperX has already done its own forced alignment, then
+  // SPLIT into 10–25× more segments. Asking whispery to
+  // re-align each tiny sub-chunk independently exercises the
+  // wav2vec2 encoder on inputs WhisperX never inferenced on,
+  // and amplifies ORT-vs-PyTorch numerical drift into per-word
+  // 60–250 ms shifts. Median IoU dropped to 0.196 on
+  // 03_dual_speaker.
+  //
+  // To opt back into per-sentence mode (e.g., to compare what
+  // a downstream WhisperX consumer actually sees, or to debug
+  // hallucinated-repetition splitting), set
+  // `WHISPERY_PARITY_USE_PER_SENTENCE_SEGMENTS=1`. This is the
+  // legacy `WHISPERY_PARITY_USE_RAW_SEGMENTS=0` behaviour
+  // (which is also still honoured for backwards compat).
+  let use_per_sentence = std::env::var("WHISPERY_PARITY_USE_PER_SENTENCE_SEGMENTS")
     .map(|v| v != "0" && !v.is_empty())
-    .unwrap_or(false);
+    .unwrap_or(false)
+    || matches!(
+      std::env::var("WHISPERY_PARITY_USE_RAW_SEGMENTS").as_deref(),
+      Ok("0") | Ok("")
+    );
+  let use_raw_segments = !use_per_sentence;
   let segments: Vec<InjectedSegment> = if use_raw_segments
     && let Some(segs) = injected.get("raw_asr_segments").and_then(|v| v.as_array())
   {
