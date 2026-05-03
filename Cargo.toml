@@ -79,6 +79,16 @@ alignment = ["runner", "dep:ort", "dep:tokenizers", "dep:ndarray"]
 # never enable in shipping builds. Requires `alignment` for the
 # wav2vec2-pipeline symbols it exposes.
 bench-internals = ["alignment"]
+# Relaxes `tokenize_with_word_map`'s default fail-closed-on-pronounced-
+# symbol policy so non-alphanumeric OOV chars also become wildcards
+# (matching WhisperX's `*`-placeholder behaviour 1:1). Default policy
+# drops the chunk on `&` / `,` / etc. that aren't on the skippable-
+# internal-punct whitelist; under this feature they all wildcard.
+# Trade-off: full WhisperX parity at the cost of whispery's stricter
+# guard against silently aligning pronounced symbols (`&` in `AT&T`)
+# to whichever vocab item happens to win the frame. Off by default;
+# opt in only if downstream consumers expect WhisperX-1:1 behaviour.
+whisperx-strict-tokenizer = ["alignment"]
 
 [lib]
 name = "whispery"
@@ -113,3 +123,8 @@ required-features = ["runner"]
 name              = "alignment_e2e"
 path              = "tests/alignment_e2e.rs"
 required-features = ["alignment"]
+
+[[test]]
+name              = "whisperx_unit_parity"
+path              = "tests/whisperx_unit_parity.rs"
+required-features = ["bench-internals"]

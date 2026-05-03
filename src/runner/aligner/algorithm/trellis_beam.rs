@@ -52,7 +52,9 @@ use crate::{
 /// `align()`'s `tokens = [model_dictionary.get(c, -1) for c in
 /// text_clean]`. Stored as `i32` because the vocab id space is
 /// `u32` but `-1` carries the wildcard signal.
-pub(crate) const WILDCARD_TOKEN_ID: i32 = -1;
+///
+/// `pub` for the `feature = "bench-internals"` re-export.
+pub const WILDCARD_TOKEN_ID: i32 = -1;
 
 /// Beam width WhisperX's `align()` invokes
 /// `backtrack_beam` with: 2. Larger widths add cost without
@@ -100,8 +102,11 @@ impl CharSegment {
 }
 
 /// One word-level segment, the output of `merge_words`.
+///
+/// `pub` for the `feature = "bench-internals"` re-export — out-of-
+/// tree code only sees this through doc-hidden `whispery::__bench`.
 #[derive(Debug, Clone)]
-pub(crate) struct WordSegment {
+pub struct WordSegment {
   /// Word index in `original_words` / `word_idx_per_token`.
   pub word_index: usize,
   /// First frame the word covers (inclusive).

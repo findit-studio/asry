@@ -11,8 +11,12 @@ use crate::{
 };
 
 /// Result of tokenising the normalised text.
+///
+/// `pub` for the `feature = "bench-internals"` re-export at the
+/// crate root — out-of-tree code only sees this type through the
+/// doc-hidden `whispery::__bench` namespace.
 #[derive(Debug)]
-pub(crate) struct TokenizedText {
+pub struct TokenizedText {
   /// Vocab indices in tokenisation order (Y in spec terms),
   /// stored as `i32` because the wildcard sentinel
   /// `WILDCARD_TOKEN_ID = -1` is allowed: an alphanumeric char
@@ -68,15 +72,23 @@ pub(crate) struct TokenizedText {
 /// `clean_char.append('*')` placeholder + `tokens =
 /// [model_dictionary.get(c, -1) for c in text_clean]` flow.
 ///
-/// **Whispery-specific guard:** non-alphanumeric chars (e.g. `&`
-/// in `AT&T`) that aren't on the whitelist of skippable internal
-/// punctuation still drop the whole chunk's alignment. WhisperX
-/// would silently align them as wildcards too, but those chars
-/// represent semantic content the model can't reasonably align
-/// (the `&` in `AT&T` is "and"); silently aligning to whichever
-/// vocab item happens to win the frame would produce honest-looking
-/// but wrong word ranges. Whispery fails closed at chunk
-/// granularity instead.
+/// **Whispery-specific guard (default policy):** non-alphanumeric
+/// chars (e.g. `&` in `AT&T`) that aren't on the whitelist of
+/// skippable internal punctuation still drop the whole chunk's
+/// alignment. WhisperX would silently align them as wildcards too,
+/// but those chars represent semantic content the model can't
+/// reasonably align (the `&` in `AT&T` is "and"); silently aligning
+/// to whichever vocab item happens to win the frame would produce
+/// honest-looking but wrong word ranges. Whispery fails closed at
+/// chunk granularity instead.
+///
+/// **`whisperx-strict-tokenizer` feature (relaxed policy):** when
+/// the `whisperx-strict-tokenizer` Cargo feature is enabled, this
+/// guard is removed and non-alphanumeric pronounced OOV chars
+/// become wildcards too — matching WhisperX's
+/// `clean_char.append('*')` behaviour 1:1. Opt in only if downstream
+/// consumers expect WhisperX-bit-equivalent output and accept the
+/// silent-misalignment risk on pronounced symbols.
 ///
 /// Internal punctuation that's never pronounced as a separate
 /// sound and is safe to strip before encoding so the
@@ -90,6 +102,7 @@ fn is_skippable_internal_punct(c: char) -> bool {
 /// just become a wildcard token. Mirrors the policy in the
 /// [`tokenize_with_word_map`] doc-comment.
 ///
+/// **Default policy (no `whisperx-strict-tokenizer`):**
 /// Wildcard targets:
 /// - Alphanumeric chars (any letter or digit) the model
 ///   dictionary doesn't have.
@@ -97,15 +110,32 @@ fn is_skippable_internal_punct(c: char) -> bool {
 ///   from a custom one, we'd rather wildcard than drop).
 ///
 /// Chunk-drop targets:
-/// - Pronounced symbols (`&`, `@`, `%`, ...) — the audio
+/// - Pronounced symbols (`&`, `@`, `%`, `,`, ...) — the audio
 ///   contains a real word the wav2vec2 model could in theory
 ///   align, but we have no honest way to know which vocab item
 ///   it's pronounced as.
+///
+/// **Relaxed policy (`whisperx-strict-tokenizer` enabled):**
+/// EVERY OOV char becomes a wildcard. This matches WhisperX's
+/// `clean_char.append('*')` 1:1 — same per-frame ambiguity but
+/// preserves alignment continuity at the cost of honesty about
+/// pronounced symbols.
 fn allow_wildcard(c: char) -> bool {
-  c.is_alphanumeric() || c == '\'' || c == '\u{2019}'
+  if cfg!(feature = "whisperx-strict-tokenizer") {
+    // Relaxed policy: everything wildcards, mirroring WhisperX's
+    // `clean_char.append('*')` for any char not in the model
+    // dictionary.
+    true
+  } else {
+    c.is_alphanumeric() || c == '\'' || c == '\u{2019}'
+  }
 }
 
-pub(crate) fn tokenize_with_word_map(
+/// `pub` for the `feature = "bench-internals"` re-export at the
+/// crate root. Out-of-tree code only reaches this through
+/// `whispery::__bench`, which is doc-hidden and gated on the
+/// `bench-internals` feature.
+pub fn tokenize_with_word_map(
   tokenizer: &Tokenizer,
   normalized: &str,
   word_count: usize,
@@ -470,6 +500,10 @@ mod tests {
   /// WhisperX would silently align it; whispery fails closed
   /// because the `&` is pronounced as "and" and aligning to
   /// whichever vocab item wins the frame produces a wrong range.
+  ///
+  /// Skipped under `whisperx-strict-tokenizer` because that
+  /// feature deliberately relaxes the chunk-drop policy.
+  #[cfg(not(feature = "whisperx-strict-tokenizer"))]
   #[test]
   fn ampersand_oov_drops_chunk() {
     let tok = uppercase_tokenizer();
