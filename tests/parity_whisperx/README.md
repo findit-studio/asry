@@ -177,4 +177,94 @@ Both runners emit JSON in this shape:
   not a "bit-exact" one. Tighten it (e.g. `--threshold 0.85`) once
   whispery's alignment is stable on a wider corpus.
 
+## Encoder export trade-off (advanced)
+
+whispery defaults to the community ONNX export at
+`onnx-community/wav2vec2-base-960h-ONNX`, which is what `build.rs`
+fetches into `target/whispery-test-fixtures/wav2vec2-base-960h.onnx`.
+A re-export from PyTorch eager is provided for parity-strict users via
+`python/export_wav2vec2_onnx.py`.
+
+**Punchline: the community ONNX is already bit-near-exact with
+PyTorch eager.** When the audio loader is held constant (both consume
+the same `np.float32` waveform from the WAV), max emission diff on
+the 01_dialogue/seg-3 hallucination is **2.44e-3 nats** (mean 2.10e-4,
+0 cells > 1e-2). Re-exporting yields **2.27e-3** — a wash. There is
+no encoder gap to close.
+
+The community export and the re-export produce **identical IoU
+scores** on the 5-fixture suite (confirmed 2026-05). Both yield:
+
+| Fixture                | Median IoU | below 0.5 |
+|------------------------|------------|-----------|
+| `01_dialogue/`         | 0.996      | 19        |
+| `02_pyannote_sample/`  | 0.997      | 0         |
+| `03_dual_speaker/`     | 0.995      | 0         |
+| `04_three_speaker/`    | 0.999      | 0         |
+| `05_four_speaker/`     | 0.996      | 0         |
+
+The 19 below-0.5 outliers in `01_dialogue` correspond to a Whisper
+hallucination ("no, no, no..." × 112) where whispery's per-word
+alignments line up one-token offset against WhisperX's. The
+score function pairs words by sequence position, so each off-by-one
+pair scores IoU=0; the underlying timings differ by ~80 ms (one CTC
+token width). This is a scoring-methodology artifact, not an encoder
+divergence.
+
+The previously-published "1.45 nat encoder divergence on seg 20" was
+in fact an **audio-loader divergence**, not an encoder divergence.
+WhisperX's `load_audio` runs ffmpeg → s16le → `np.float32 / 32768.0`,
+which is a lossy round-trip for f32-encoded WAV files (this corpus is
+all f32-encoded). whispery's `hound`-based loader reads f32 samples
+directly. The ~30-PPM input mismatch propagates through 12 transformer
+layers and produces ~1.45 nat divergence on numerically sensitive
+frames. When the WhisperX side dumps emissions with the same float
+audio whispery sees, the encoder agrees to ~2.4e-3 nats. The trellis
+is robust enough on this corpus that the audio-loader divergence
+rarely flips path decisions, so the IoU score is unchanged.
+
+If you need bit-near parity with PyTorch eager on the encoder
+(e.g. for a custom corpus where path-flip behaviour differs), use
+`python/export_wav2vec2_onnx.py` to regenerate the ONNX:
+
+```bash
+# One-time: separate venv pinned at transformers 4.49 (the parity
+# venv pins transformers 5.x for whisperX, which has a mask-shape
+# bug that crashes torch.onnx.export tracing).
+uv venv /tmp/wav2vec2-export-venv --python 3.12
+uv pip install --python /tmp/wav2vec2-export-venv/bin/python \
+    torch==2.6.0 transformers==4.49.0 onnx onnxscript numpy
+
+# Run.
+/tmp/wav2vec2-export-venv/bin/python \
+    tests/parity_whisperx/python/export_wav2vec2_onnx.py
+```
+
+The script writes:
+
+- `wav2vec2-base-960h.repro.onnx` — legacy `torch.onnx.export`
+  (jit-trace, opset 17, `do_constant_folding=False`). Variable-length
+  input axis. ~378 MB. Confirmed: max emission diff vs
+  `Wav2Vec2ForCTC` PyTorch eager on this corpus is **2.27e-3 nats**
+  when the input audio matches.
+
+- `wav2vec2-base-960h.dynamo.onnx` — new FX-based exporter
+  (`dynamo=True`, opset 18). On torch 2.6 + transformers 4.49 this
+  path falls back to TorchScript graph capture (the wav2vec2 conv
+  stack divides input length by 320, which torch.export's symbolic
+  shape solver can't satisfy) and produces a **fixed-shape** graph
+  baked at the export time's dummy length (80,000 samples). Not
+  usable for variable-length inference. Kept as a diagnostic; see
+  the docstring of `export_wav2vec2_onnx.py`.
+
+Wire either into a parity run via:
+
+```bash
+WAV2VEC2_ONNX_PATH=/path/to/wav2vec2-base-960h.repro.onnx \
+    ./tests/parity_whisperx/run.sh /path/to/fixture
+```
+
+Production whispery (the `cargo build` path) continues to use the
+community export. Re-export is opt-in.
+
 [whisperx]: https://github.com/m-bain/whisperX
