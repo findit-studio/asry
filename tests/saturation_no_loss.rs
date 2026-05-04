@@ -72,10 +72,10 @@ fn saturation_emits_all_chunks_in_order() {
   runner.drain().expect("drain");
 
   let mut chunk_ids = Vec::new();
-  while let Some(t) = runner.poll_transcript() {
+  while let Some(t) = runner.poll_transcript().expect("poll_transcript") {
     chunk_ids.push(t.chunk_id().as_u64());
   }
-  while let Some((id, _err)) = runner.poll_error() {
+  while let Some((id, _err)) = runner.poll_error().expect("poll_error") {
     chunk_ids.push(id.as_u64());
   }
   chunk_ids.sort();

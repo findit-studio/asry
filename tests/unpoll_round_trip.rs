@@ -65,7 +65,7 @@ fn parked_command_resumes_after_worker_drain() {
   runner.drain().unwrap();
 
   let mut count = 0;
-  while runner.poll_transcript().is_some() {
+  while runner.poll_transcript().expect("poll_transcript").is_some() {
     count += 1;
   }
   assert_eq!(count, 4, "all 4 saturation-routed chunks must emit");

@@ -120,7 +120,7 @@ fn end_to_end_jfk_quote() {
   runner.drain().expect("drain");
 
   let mut texts = Vec::new();
-  while let Some(t) = runner.poll_transcript() {
+  while let Some(t) = runner.poll_transcript().expect("poll_transcript") {
     texts.push(t);
   }
   assert!(!texts.is_empty(), "expected at least one transcript");
@@ -191,7 +191,7 @@ fn multi_chunk_synthetic_stream() {
   runner.drain().expect("drain");
 
   let mut count = 0;
-  while let Some(_t) = runner.poll_transcript() {
+  while let Some(_t) = runner.poll_transcript().expect("poll_transcript") {
     count += 1;
   }
   assert_eq!(

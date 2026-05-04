@@ -7,6 +7,7 @@
 use alloc::vec::Vec;
 use core::time::Duration;
 
+use crate::core::AsrParamsOverride;
 use crate::types::VadSegment;
 
 /// Half-open range in 16 kHz analysis sample indices, stream-relative
@@ -86,6 +87,22 @@ pub(crate) struct MergedChunk {
   pub range: SampleRange,
   /// Sub-VAD-segments composing the chunk, with origin tags.
   pub subs: Vec<SubRange>,
+  /// Per-packet `AsrParamsOverride` snapshot taken at the moment
+  /// this chunk's accumulation *started* — i.e., when the first
+  /// `SubRange` was fed to the cut machine. NOT the override at
+  /// emission time.
+  ///
+  /// Reason: a chunk can accumulate across multiple
+  /// `process_packet` calls when a VAD segment doesn't close the
+  /// chunk in a single packet (silence-flush threshold or
+  /// `chunk_size` wasn't crossed). With "override at emit time",
+  /// audio pushed under packet A's override could be transcribed
+  /// under packet B's override (or none) just because B was the
+  /// packet whose silence happened to close the segment. Codex
+  /// round-30 flagged this. Binding to start-time is the
+  /// "first override wins" semantic users intend when they
+  /// stamp an override with audio.
+  pub override_at_start: Option<AsrParamsOverride>,
 }
 
 /// Internal state of the cut machine.
@@ -109,6 +126,15 @@ pub(crate) struct Cut {
   current_end: u64,
   /// Sub-ranges accumulated for the current chunk.
   current_subs: Vec<SubRange>,
+  /// Per-packet `AsrParamsOverride` snapshot captured the instant
+  /// the currently-accumulating chunk *started* (when
+  /// `current_start` transitioned `None → Some`). Carries the
+  /// override forward so it can be attached to the
+  /// `MergedChunk.override_at_start` when the chunk emits, even
+  /// if accumulation spans multiple `process_packet` calls.
+  /// `None` between chunks AND when no override was active at
+  /// start; `current_start.is_some()` disambiguates.
+  current_override_at_start: Option<AsrParamsOverride>,
 }
 
 impl Cut {
@@ -129,6 +155,7 @@ impl Cut {
       current_start: None,
       current_end: 0,
       current_subs: Vec::new(),
+      current_override_at_start: None,
     }
   }
 
@@ -194,7 +221,18 @@ impl Cut {
   /// Push a VAD segment through the cut state machine. Returns
   /// `Some(MergedChunk)` if this push closed an accumulating
   /// chunk; `None` otherwise.
-  pub(crate) fn push_segment(&mut self, seg: VadSegment) -> Vec<MergedChunk> {
+  ///
+  /// `current_override` is the per-packet `AsrParamsOverride`
+  /// stamped on the dispatch for the duration of this
+  /// `process_packet` call. It's snapshotted onto a chunk's
+  /// state when accumulation starts and travels with the
+  /// emitted `MergedChunk.override_at_start`. Pass `None` when
+  /// no override is in effect.
+  pub(crate) fn push_segment(
+    &mut self,
+    seg: VadSegment,
+    current_override: Option<&AsrParamsOverride>,
+  ) -> Vec<MergedChunk> {
     let len = seg.sample_count();
     let vad_seq = self.next_vad_seq;
     self.next_vad_seq += 1;
@@ -232,7 +270,7 @@ impl Cut {
             total_parts: n,
           },
         };
-        if let Some(chunk) = self.feed_sub(sub) {
+        if let Some(chunk) = self.feed_sub(sub, current_override) {
           emitted.push(chunk);
         }
       }
@@ -241,7 +279,7 @@ impl Cut {
         range: SampleRange::new(seg.start_sample(), seg.end_sample()),
         origin: SubOrigin::Vad { vad_seq },
       };
-      if let Some(chunk) = self.feed_sub(sub) {
+      if let Some(chunk) = self.feed_sub(sub, current_override) {
         emitted.push(chunk);
       }
     }
@@ -249,18 +287,32 @@ impl Cut {
   }
 
   /// Flush the accumulating chunk on EOF. Returns the partial
-  /// chunk if any was being accumulated.
+  /// chunk if any was being accumulated. The chunk's
+  /// `override_at_start` is the snapshot captured when this
+  /// chunk's accumulation began — NOT the override at flush time.
   pub(crate) fn flush(&mut self) -> Option<MergedChunk> {
     let start = self.current_start.take()?;
     let subs = core::mem::take(&mut self.current_subs);
+    let override_at_start = self.current_override_at_start.take();
     Some(MergedChunk {
       range: SampleRange::new(start, self.current_end),
       subs,
+      override_at_start,
     })
   }
 
   /// Feed one sub-range through the merge logic.
-  fn feed_sub(&mut self, sub: SubRange) -> Option<MergedChunk> {
+  ///
+  /// `current_override` is snapshotted when this sub starts a new
+  /// chunk (i.e., transitions `current_start` from `None` to
+  /// `Some`), or after an emit resets the accumulator and this
+  /// sub becomes the seed of the next chunk. Carrying
+  /// `Option<&...>` avoids cloning when we don't need to.
+  fn feed_sub(
+    &mut self,
+    sub: SubRange,
+    current_override: Option<&AsrParamsOverride>,
+  ) -> Option<MergedChunk> {
     let mut emitted = None;
 
     // Step 0: silence-flush. If a chunk is accumulating and the
@@ -276,18 +328,26 @@ impl Cut {
       let gap = sub.range.start.saturating_sub(self.current_end);
       if gap > threshold && self.current_end > cs {
         let subs = core::mem::take(&mut self.current_subs);
+        let override_at_start = self.current_override_at_start.take();
         emitted = Some(MergedChunk {
           range: SampleRange::new(cs, self.current_end),
           subs,
+          override_at_start,
         });
         self.current_start = None;
       }
     }
 
     // Step 3: initialise current_start AND current_end if absent.
+    // This is also where we capture the override snapshot for
+    // the new accumulation. Two cases get here: (a) very first
+    // sub of a chunk (was None forever); (b) we just emitted
+    // above (silence-flush) and this sub seeds the next chunk.
+    // Either way, the override active right now is what binds.
     if self.current_start.is_none() {
       self.current_start = Some(sub.range.start);
       self.current_end = sub.range.start;
+      self.current_override_at_start = current_override.cloned();
     }
     let cs = self.current_start.expect("just initialised");
 
@@ -300,12 +360,18 @@ impl Cut {
       && self.current_end > cs
     {
       let subs = core::mem::take(&mut self.current_subs);
+      let prev_override = self.current_override_at_start.take();
       emitted = Some(MergedChunk {
         range: SampleRange::new(cs, self.current_end),
         subs,
+        override_at_start: prev_override,
       });
       self.current_start = Some(sub.range.start);
       self.current_end = sub.range.start;
+      // The next chunk is seeded by this sub right now, so its
+      // override-at-start is the same `current_override` we were
+      // passed.
+      self.current_override_at_start = current_override.cloned();
     }
 
     // Step 5: extend the current chunk with sub.
@@ -333,7 +399,7 @@ mod tests {
   #[test]
   fn single_segment_under_chunk_does_not_flush_until_eof() {
     let mut c = cut(30);
-    let emitted = c.push_segment(VadSegment::new(0, 16_000));
+    let emitted = c.push_segment(VadSegment::new(0, 16_000), None);
     assert!(emitted.is_empty(), "no chunk yet, segment is short");
     let final_chunk = c.flush().unwrap();
     assert_eq!(final_chunk.range, SampleRange::new(0, 16_000));
@@ -348,9 +414,9 @@ mod tests {
   fn segments_summing_under_chunk_merge_into_one() {
     let mut c = cut(30);
     // chunk_size = 30s = 480_000 samples
-    c.push_segment(VadSegment::new(0, 100_000));
-    c.push_segment(VadSegment::new(120_000, 200_000));
-    c.push_segment(VadSegment::new(220_000, 300_000));
+    c.push_segment(VadSegment::new(0, 100_000), None);
+    c.push_segment(VadSegment::new(120_000, 200_000), None);
+    c.push_segment(VadSegment::new(220_000, 300_000), None);
     let final_chunk = c.flush().unwrap();
     assert_eq!(final_chunk.range, SampleRange::new(0, 300_000));
     assert_eq!(final_chunk.subs.len(), 3);
@@ -361,10 +427,10 @@ mod tests {
     let mut c = cut(30);
     // Three 200_000-sample segments, each within chunk_size, but
     // their union (start 0 → end 600_000+) exceeds 480_000.
-    let r1 = c.push_segment(VadSegment::new(0, 200_000));
-    let r2 = c.push_segment(VadSegment::new(210_000, 400_000));
+    let r1 = c.push_segment(VadSegment::new(0, 200_000), None);
+    let r2 = c.push_segment(VadSegment::new(210_000, 400_000), None);
     // Adding the 3rd: 600_000 - 0 = 600_000 > 480_000 → flush.
-    let r3 = c.push_segment(VadSegment::new(410_000, 600_000));
+    let r3 = c.push_segment(VadSegment::new(410_000, 600_000), None);
     assert!(r1.is_empty());
     assert!(r2.is_empty());
     assert_eq!(r3.len(), 1);
@@ -384,7 +450,7 @@ mod tests {
     // Per-index: start = [0, 29000/3 = 9666, 2*29000/3 = 19333]
     //            end   = [9666, 19333, 29000]
     // Each part length: 9666, 9667, 9667 — all ≤ 10_000.
-    let emitted = c.push_segment(VadSegment::new(0, 29_000));
+    let emitted = c.push_segment(VadSegment::new(0, 29_000), None);
     assert_eq!(
       emitted.len(),
       2,
@@ -435,7 +501,7 @@ mod tests {
     let mut c = Cut::new(Duration::from_millis(625), None); // 10_000 samples
     let parts_wanted: u64 = 300;
     let len = parts_wanted * 10_000;
-    let emitted = c.push_segment(VadSegment::new(0, len));
+    let emitted = c.push_segment(VadSegment::new(0, len), None);
     // n_full = len.div_ceil(10_000) = 300 → 299 chunks emit, the
     // last accumulates and only emerges from flush().
     assert_eq!(emitted.len(), (parts_wanted - 1) as usize);
@@ -473,11 +539,11 @@ mod tests {
     // chunk_size = 30 s, silence threshold = 1 s (16_000 samples).
     let mut c = Cut::new(Duration::from_secs(30), Some(Duration::from_secs(1)));
     // First segment ends at 16_000.
-    let r1 = c.push_segment(VadSegment::new(0, 16_000));
+    let r1 = c.push_segment(VadSegment::new(0, 16_000), None);
     assert!(r1.is_empty());
     // Second segment starts at 48_000 — gap of 32_000 (2 s) > 1 s.
     // Should flush chunk 0 and start chunk 1.
-    let r2 = c.push_segment(VadSegment::new(48_000, 64_000));
+    let r2 = c.push_segment(VadSegment::new(48_000, 64_000), None);
     assert_eq!(r2.len(), 1);
     assert_eq!(r2[0].range, SampleRange::new(0, 16_000));
     let final_chunk = c.flush().unwrap();
@@ -491,9 +557,9 @@ mod tests {
   fn silence_flush_threshold_keeps_short_gap_merged() {
     // chunk_size = 30 s, silence threshold = 2 s.
     let mut c = Cut::new(Duration::from_secs(30), Some(Duration::from_secs(2)));
-    let r1 = c.push_segment(VadSegment::new(0, 16_000));
+    let r1 = c.push_segment(VadSegment::new(0, 16_000), None);
     // Gap of 16_000 samples (1 s) — under threshold.
-    let r2 = c.push_segment(VadSegment::new(32_000, 48_000));
+    let r2 = c.push_segment(VadSegment::new(32_000, 48_000), None);
     assert!(r1.is_empty());
     assert!(r2.is_empty());
     let final_chunk = c.flush().unwrap();
@@ -511,9 +577,9 @@ mod tests {
   #[test]
   fn silence_flush_none_preserves_whisperx_batching() {
     let mut c = Cut::new(Duration::from_secs(30), None);
-    let r1 = c.push_segment(VadSegment::new(0, 16_000));
+    let r1 = c.push_segment(VadSegment::new(0, 16_000), None);
     // 5 s gap — would trip a silence-flush threshold, but None.
-    let r2 = c.push_segment(VadSegment::new(96_000, 112_000));
+    let r2 = c.push_segment(VadSegment::new(96_000, 112_000), None);
     assert!(r1.is_empty());
     assert!(r2.is_empty());
     let final_chunk = c.flush().unwrap();
@@ -535,8 +601,9 @@ mod tests {
       current_start: None,
       current_end: 0,
       current_subs: Vec::new(),
+      current_override_at_start: None,
     };
-    let emitted = c.push_segment(VadSegment::new(0, 29));
+    let emitted = c.push_segment(VadSegment::new(0, 29), None);
     // n=3, parts: [0,9), [9,19), [19,29) → each length 10. None
     // exceeds chunk_size_samples=10. Two emit, third stays.
     assert_eq!(emitted.len(), 2);

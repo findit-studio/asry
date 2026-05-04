@@ -64,7 +64,7 @@ fn tiny_timeout_emits_worker_hang_failures() {
   runner.drain().unwrap();
 
   let mut got_hang = false;
-  while let Some((_id, err)) = runner.poll_error() {
+  while let Some((_id, err)) = runner.poll_error().expect("poll_error") {
     if matches!(err, WorkFailure::WorkerHangTimeout { .. }) {
       got_hang = true;
     }

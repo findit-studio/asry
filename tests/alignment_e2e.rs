@@ -109,7 +109,7 @@ fn jfk_alignment_emits_words_within_transcript_range() {
   runner.drain().expect("drain");
 
   let mut transcripts = Vec::new();
-  while let Some(t) = runner.poll_transcript() {
+  while let Some(t) = runner.poll_transcript().expect("poll_transcript") {
     transcripts.push(t);
   }
   assert!(!transcripts.is_empty(), "expected at least one transcript");

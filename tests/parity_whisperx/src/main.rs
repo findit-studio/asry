@@ -533,7 +533,7 @@ fn main() -> Result<()> {
   // a single flat word list too.
   let mut all_words: Vec<serde_json::Value> = Vec::new();
   let mut transcript_count = 0usize;
-  while let Some(t) = runner.poll_transcript() {
+  while let Some(t) = runner.poll_transcript().expect("poll_transcript") {
     transcript_count += 1;
     for w in t.words() {
       let r = w.range();
@@ -562,7 +562,7 @@ fn main() -> Result<()> {
 
   // Drain stray errors so we know if any chunk silently produced
   // no words. They go to stderr so JSON on stdout stays clean.
-  while let Some((chunk_id, failure)) = runner.poll_error() {
+  while let Some((chunk_id, failure)) = runner.poll_error().expect("poll_error") {
     eprintln!(
       "[whispery-parity] chunk {:?} failed: {failure:?}",
       chunk_id

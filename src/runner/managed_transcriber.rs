@@ -42,6 +42,18 @@ pub struct ManagedTranscriber {
   buffer_cap_samples: usize,
   pending_transcripts: VecDeque<Transcript>,
   pending_errors: VecDeque<(ChunkId, WorkFailure)>,
+  /// One-shot fatal-error slot. `poll_transcript` and
+  /// `poll_error` call `drive_one_step` to drain worker /
+  /// dispatch queues; if that step returns `Err`, we stash the
+  /// error here rather than dropping it. The next poll call
+  /// drains the local pending buffers first (so already-arrived
+  /// transcripts and chunk-level errors aren't lost), then
+  /// surfaces the fatal once the buffers are empty. Codex
+  /// round-30 flagged the prior `let _ = self.drive_one_step()`
+  /// as silently dropping `WhisperPoolShutdown` and
+  /// `Backpressure`, making a dead pool look like an empty
+  /// stream.
+  pending_fatal: Option<RunnerError>,
 
   /// Alignment pool (single worker). `None` when `with_alignment`
   /// was not called or the supplied set was empty.
@@ -579,6 +591,7 @@ impl ManagedTranscriberBuilder {
       buffer_cap_samples: self.buffer_cap_samples,
       pending_transcripts: VecDeque::new(),
       pending_errors: VecDeque::new(),
+      pending_fatal: None,
       #[cfg(feature = "alignment")]
       alignment_pool,
       #[cfg(feature = "alignment")]
@@ -753,48 +766,93 @@ impl ManagedTranscriber {
   }
 
   /// Pop the next available `Transcript`, draining the dispatch
-  /// loop along the way. Returns `None` only when no transcript is
-  /// currently available; the caller must keep calling until the
-  /// returned `Option` is `None` and `core.is_idle()` is true to
-  /// know the stream has fully drained.
-  pub fn poll_transcript(&mut self) -> Option<Transcript> {
-    // Drive once so any pending results land in the core's event
-    // queue. Errors here would be silent loss; surface via
-    // poll_error in the caller's next call (the queue still has
-    // any `Event::Error` events).
-    let _ = self.drive_one_step();
+  /// loop along the way.
+  ///
+  /// Returns:
+  /// - `Ok(Some(transcript))` — a transcript was available
+  /// - `Ok(None)` — no transcript currently available; call
+  ///    again when more progress is expected (or check
+  ///    [`is_idle`](Self::is_idle))
+  /// - `Err(RunnerError)` — a fatal worker / dispatch failure
+  ///   surfaced (e.g. `WhisperPoolShutdown`,
+  ///   `Backpressure`). Already-buffered transcripts AND
+  ///   chunk-level errors drain ahead of the fatal, so callers
+  ///   never lose a result they could have observed.
+  ///
+  /// Codex round-30: previously this returned plain
+  /// `Option<Transcript>` and `let _ = self.drive_one_step()`
+  /// silently dropped fatals — a dead pool looked like an empty
+  /// stream. Surfacing via `Result` forces callers to handle
+  /// the fatal.
+  pub fn poll_transcript(&mut self) -> Result<Option<Transcript>, RunnerError> {
+    self.drive_or_record_fatal();
 
     if let Some(tr) = self.pending_transcripts.pop_front() {
-      return Some(tr);
+      return Ok(Some(tr));
     }
-    loop {
-      match self.core.poll_event()? {
-        Event::Transcript(tr) => return Some(tr),
+    while let Some(ev) = self.core.poll_event() {
+      match ev {
+        Event::Transcript(tr) => return Ok(Some(tr)),
         Event::Error { chunk_id, error } => {
           self.pending_errors.push_back((chunk_id, error));
           // Continue: maybe a Transcript is right behind it.
         }
       }
     }
+    // No transcript anywhere. Surface the stashed fatal if any.
+    if let Some(err) = self.pending_fatal.take() {
+      return Err(err);
+    }
+    Ok(None)
   }
 
-  /// Pop the next available `(ChunkId, WorkFailure)` error, draining
-  /// the dispatch loop along the way.
-  pub fn poll_error(&mut self) -> Option<(ChunkId, WorkFailure)> {
-    let _ = self.drive_one_step();
+  /// Pop the next available `(ChunkId, WorkFailure)` error,
+  /// draining the dispatch loop along the way.
+  ///
+  /// Result shape mirrors [`poll_transcript`](Self::poll_transcript):
+  /// the per-chunk `WorkFailure` (transient, one chunk failed)
+  /// is the success payload; structural runner errors (worker
+  /// pool dead, backpressure rejected) come back via `Err`.
+  ///
+  /// Buffered transcripts encountered while scanning for an
+  /// error are stashed onto `pending_transcripts`, so the next
+  /// `poll_transcript` will see them.
+  pub fn poll_error(&mut self) -> Result<Option<(ChunkId, WorkFailure)>, RunnerError> {
+    self.drive_or_record_fatal();
 
     if let Some(pair) = self.pending_errors.pop_front() {
-      return Some(pair);
+      return Ok(Some(pair));
     }
-    // Drain a few events looking for an error. We don't loop
-    // forever: if the next event is a Transcript, push it onto a
-    // queue and surface only errors here.
-    loop {
-      match self.core.poll_event()? {
-        Event::Error { chunk_id, error } => return Some((chunk_id, error)),
+    while let Some(ev) = self.core.poll_event() {
+      match ev {
+        Event::Error { chunk_id, error } => return Ok(Some((chunk_id, error))),
         Event::Transcript(tr) => {
           self.pending_transcripts.push_back(tr);
         }
+      }
+    }
+    if let Some(err) = self.pending_fatal.take() {
+      return Err(err);
+    }
+    Ok(None)
+  }
+
+  /// Run `drive_one_step` and stash any error in
+  /// `pending_fatal`. The first error wins (subsequent errors
+  /// during further polls are dropped — a fatal pool is a
+  /// fatal pool, the second error is rarely more useful than
+  /// the first). Returns the boolean `progress` flag from the
+  /// step, or `false` if the step errored (we don't know
+  /// whether progress was made before the error, but
+  /// downstream is observing buffered events anyway).
+  fn drive_or_record_fatal(&mut self) -> bool {
+    match self.drive_one_step() {
+      Ok(progress) => progress,
+      Err(err) => {
+        if self.pending_fatal.is_none() {
+          self.pending_fatal = Some(err);
+        }
+        false
       }
     }
   }

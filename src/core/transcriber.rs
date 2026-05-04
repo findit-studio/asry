@@ -596,7 +596,9 @@ impl Transcriber {
       });
     }
 
-    let merged_chunks = self.cut.push_segment(seg);
+    let merged_chunks = self
+      .cut
+      .push_segment(seg, self.dispatch.current_override.as_ref());
     self.vad_watermark = seg.end_sample();
     let emitted_any = !merged_chunks.is_empty();
     for chunk in merged_chunks {
@@ -1718,5 +1720,69 @@ mod tests {
     // was rejected, the cut accumulator is empty.
     t.signal_eof().unwrap();
     assert!(t.is_idle());
+  }
+
+  /// Codex round-30 regression: a chunk whose accumulation begins
+  /// in packet A (under override O_A) but whose VAD-driven close
+  /// only happens in packet B (under override O_B or none) must
+  /// emit RunAsr with O_A's params, not O_B's. The cut state
+  /// machine snapshots the override on accumulation start, and
+  /// the snapshot rides on `MergedChunk.override_at_start` until
+  /// the dispatch consumes it.
+  ///
+  /// Pre-fix: dispatch.on_emit read `current_override` directly,
+  /// so the override active at the *closing* packet won —
+  /// language hints / prompts / strategy overrides got attached
+  /// to the wrong audio.
+  #[test]
+  fn override_binds_to_packet_that_started_chunk_not_packet_that_closed_it() {
+    use crate::core::AsrParamsOverride;
+    use crate::core::command::Command;
+
+    // chunk_size = 2 s (32 000 samples). One short VAD seg won't
+    // close the chunk on its own; only EOF (or a chunk_size-
+    // crossing follow-up segment) will.
+    let config = TranscriberOptions::default()
+      .with_chunk_size(Duration::from_secs(2))
+      .with_max_in_flight(4);
+    let mut t = Transcriber::new(config);
+
+    // Packet A: stamp override O_A, push audio + a half-chunk
+    // VAD segment. Cut accumulator now holds chunk 0 with
+    // `override_at_start = O_A`.
+    let o_a = AsrParamsOverride::new().with_initial_temperature(Some(0.7));
+    t.set_runtime_override(Some(o_a.clone()));
+    t.push_samples(ts(0), &[0.0; 50_000]).unwrap();
+    t.push_vad_segment(VadSegment::new(0, 16_000)).unwrap();
+    // Clear override at the end of "packet A" the way the runner
+    // would.
+    t.set_runtime_override(None);
+    // No emit yet — chunk is still accumulating below chunk_size.
+    assert!(
+      t.poll_command().is_none(),
+      "chunk should not emit during packet A — only half a chunk"
+    );
+
+    // Packet B: stamp a *different* override O_B. Pre-fix code
+    // would let O_B leak onto chunk 0 when EOF closes it.
+    let o_b = AsrParamsOverride::new().with_initial_temperature(Some(0.3));
+    t.set_runtime_override(Some(o_b));
+    t.signal_eof().unwrap();
+    t.set_runtime_override(None);
+
+    // Drain the RunAsr for chunk 0; its params must reflect O_A.
+    let cmd = t
+      .poll_command()
+      .expect("EOF flush should emit chunk 0's RunAsr");
+    let Command::RunAsr { params, chunk_id, .. } = &cmd else {
+      panic!("expected RunAsr; got {cmd:?}");
+    };
+    assert_eq!(chunk_id.as_u64(), 0);
+    assert!(
+      (params.initial_temperature() - 0.7).abs() < 1e-6,
+      "chunk 0 must keep packet A's override (temp=0.7); got temp={}",
+      params.initial_temperature()
+    );
+    let _ = o_a; // captured semantically via initial_temperature
   }
 }

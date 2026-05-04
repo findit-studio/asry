@@ -340,14 +340,17 @@ impl Dispatch {
   /// promotes the chunk to `in_flight` immediately (and emits a
   /// `RunAsr` command) or queues it on `cut_pending` if the
   /// effective cap is saturated.
+  ///
+  /// The chunk arrives with its `override_at_start` already
+  /// populated by the cut state machine (snapshotted when this
+  /// chunk's accumulation began, NOT now). We forward that
+  /// snapshot rather than reading `self.current_override` —
+  /// otherwise a chunk whose audio was pushed under packet A's
+  /// override but whose VAD-driven close happened in packet B
+  /// would silently get B's override (Codex round-30 finding).
   pub(crate) fn on_emit(&mut self, chunk: MergedChunk, chunk_id: ChunkId, buffer: &SampleBuffer) {
-    // Snapshot the override active for the current
-    // `process_packet` call. Chunks queued here in `cut_pending`
-    // and promoted later (a different packet's pump) will use
-    // this snapshot, not whatever override is current at promote
-    // time.
-    let extracted =
-      ExtractedChunk::extract_from(chunk_id, chunk, buffer, self.current_override.clone());
+    let override_at_start = chunk.override_at_start.clone();
+    let extracted = ExtractedChunk::extract_from(chunk_id, chunk, buffer, override_at_start);
     if self.can_promote(chunk_id) {
       self.promote_extracted(extracted);
     } else {
@@ -850,6 +853,7 @@ mod tests {
         range: SampleRange::new(start, end),
         origin: SubOrigin::Vad { vad_seq: 0 },
       }],
+      override_at_start: None,
     }
   }
 
@@ -902,11 +906,16 @@ mod tests {
   }
 
   /// Adversarial regression for the per-packet override binding
-  /// fix: a chunk extracted under override O1, but promoted in a
-  /// later "process_packet" with override O2 set, must still
-  /// emit RunAsr with O1's params. Stamping the override on
-  /// `ExtractedChunk::override_at_creation` is what makes this
-  /// hold.
+  /// fix: a chunk emitted by the cut state machine under
+  /// override O1 (snapshotted on `MergedChunk.override_at_start`),
+  /// but promoted in a later "process_packet" with override O2
+  /// set, must still emit RunAsr with O1's params.
+  ///
+  /// Codex round-30 expanded this contract from "override at
+  /// emit time" to "override at chunk-accumulation-start time" —
+  /// the chunk reaches `on_emit` already carrying its origin
+  /// override, and dispatch reads from there rather than its
+  /// own `current_override`.
   #[test]
   fn extracted_chunk_keeps_override_through_deferred_promote() {
     let mut d = Dispatch::new(
@@ -920,10 +929,18 @@ mod tests {
     let b = make_buffer_with_samples(20_000);
 
     // "Packet 1" — override O1 sets initial_temperature = 0.7.
+    // Both chunks were accumulated while O1 was active so the
+    // cut state machine stamped O1 on each `MergedChunk`.
     let o1 = AsrParamsOverride::new().with_initial_temperature(Some(0.7));
+    let mut chunk0 = fake_chunk(0, 4_000);
+    chunk0.override_at_start = Some(o1.clone());
+    let mut chunk1 = fake_chunk(4_000, 8_000);
+    chunk1.override_at_start = Some(o1.clone());
+    // `current_override` here represents what the runner has
+    // stamped on the dispatch for THIS packet — same as O1.
     d.current_override = Some(o1.clone());
-    d.on_emit(fake_chunk(0, 4_000), ChunkId::from_raw(0), &b);
-    d.on_emit(fake_chunk(4_000, 8_000), ChunkId::from_raw(1), &b);
+    d.on_emit(chunk0, ChunkId::from_raw(0), &b);
+    d.on_emit(chunk1, ChunkId::from_raw(1), &b);
 
     // Chunk 0 promoted (max_in_flight=1); chunk 1 in cut_pending.
     assert_eq!(d.in_flight.len(), 1);
@@ -945,7 +962,7 @@ mod tests {
 
     // "Packet 2" — different override, O2 sets temperature = 0.3.
     // Chunk 1 will be promoted from cut_pending below; it must
-    // *not* pick up O2.
+    // *not* pick up O2 (its `override_at_creation` is already O1).
     let o2 = AsrParamsOverride::new().with_initial_temperature(Some(0.3));
     d.current_override = Some(o2);
     let mut buf_mut = make_buffer_with_samples(20_000);
