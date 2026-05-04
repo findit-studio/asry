@@ -142,16 +142,23 @@ pub fn tokenize_with_word_map(
   use_word_delimiter: bool,
   uppercase_input: bool,
   unk_token_id: Option<u32>,
-  // Per-word count of wildcard tokens to append AFTER the word's
-  // encoded chars. Mirrors WhisperX's `*` placeholder for
-  // unpronounced (boundary) punctuation: each wildcard claims
-  // one or more frames of the audio so the word's CTC range
-  // extends through the punctuation's silence/breath frames.
-  // Empty slice means "zero wildcards for every word"
-  // (legacy / non-English-normaliser path); whispery's
+  // Per-word `(prefix, suffix)` count of wildcard tokens to
+  // inject around the word's encoded chars. Prefix wildcards
+  // are pushed BEFORE the encoded chars; suffix wildcards
+  // (plus any internal-skipped chars discovered during this
+  // pass) are pushed AFTER. Mirrors WhisperX's `*` placeholder
+  // for unpronounced boundary punctuation IN SOURCE ORDER, so
+  // leading punctuation like `"hello` keeps its `*` before the
+  // letters and trailing `hello"` keeps it after — Codex
+  // round-28 flagged that an earlier total-count design pushed
+  // every wildcard at the end of the word, making leading vs
+  // trailing punctuation indistinguishable in the CTC graph.
+  //
+  // Empty slice means "zero wildcards for every word" (legacy
+  // / non-English-normaliser path); whispery's
   // [`crate::EnglishNormalizer`] populates it from the
   // boundary-punctuation strip count.
-  wildcard_chars_per_word: &[u32],
+  wildcard_boundary_per_word: &[(u32, u32)],
   language: &Lang,
 ) -> Result<TokenizedText, WorkFailure> {
   let mut token_ids: Vec<i32> = Vec::with_capacity(normalized.len() + word_count * 2);
@@ -172,12 +179,12 @@ pub fn tokenize_with_word_map(
       language: language.clone(),
     });
   }
-  if !wildcard_chars_per_word.is_empty() && wildcard_chars_per_word.len() != word_count {
+  if !wildcard_boundary_per_word.is_empty() && wildcard_boundary_per_word.len() != word_count {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::TokenizationFailed,
       message: alloc::format!(
-        "wildcard_chars_per_word.len() = {} != word_count = {}",
-        wildcard_chars_per_word.len(),
+        "wildcard_boundary_per_word.len() = {} != word_count = {}",
+        wildcard_boundary_per_word.len(),
         word_count
       ),
       language: language.clone(),
@@ -191,7 +198,18 @@ pub fn tokenize_with_word_map(
   let mut per_word_tokens: Vec<Vec<i32>> = Vec::with_capacity(words.len());
   let mut tmp_buf = String::with_capacity(8);
   for (wi, word) in words.iter().enumerate() {
+    let (prefix_wildcards, suffix_wildcards) = wildcard_boundary_per_word
+      .get(wi)
+      .copied()
+      .unwrap_or((0, 0));
     let mut word_tokens: Vec<i32> = Vec::with_capacity(word.len());
+    // Push prefix wildcards BEFORE the encoded chars so leading
+    // punctuation like `"hello` aligns its `*` placeholders
+    // ahead of `h, e, l, l, o`. The CTC graph then matches the
+    // source order, mirroring WhisperX's approach.
+    for _ in 0..prefix_wildcards {
+      word_tokens.push(WILDCARD_TOKEN_ID);
+    }
     let mut internal_skipped = 0_u32;
     for ch in word.chars() {
       if is_skippable_internal_punct(ch) {
@@ -252,20 +270,22 @@ pub fn tokenize_with_word_map(
         }
       }
     }
-    // Append wildcards for boundary-stripped punctuation +
-    // internal punctuation that we just skipped. They sit at
-    // the END of this word's tokens (closest WhisperX-equivalent
-    // is "the unspoken `*`-placeholders that follow the word's
-    // letters") so the word's frame range extends through the
-    // punctuation's silence frames. WhisperX interleaves these
-    // with the letter tokens (a `*` per source-text char,
-    // wherever it sits); whispery's normaliser drops them
-    // before tokenisation so we can only stack them at the end.
-    // Functionally similar at coarse granularity: word range
-    // covers the same TOTAL number of chars worth of frames.
-    let boundary_count = wildcard_chars_per_word.get(wi).copied().unwrap_or(0);
-    let total_wildcards = (boundary_count + internal_skipped) as usize;
-    for _ in 0..total_wildcards {
+    // Append SUFFIX wildcards: trailing-punct strips from the
+    // normaliser plus any internal-skipped chars discovered in
+    // this pass (currently just `.` for abbreviations). The
+    // suffix bucket sits AFTER the encoded chars so trailing
+    // punctuation like `hello"` keeps its `*` after the
+    // letters. Internal-skipped chars also land in the suffix
+    // bucket — placing them exactly in source order would
+    // require interleaving wildcards mid-word during
+    // encoding, which the current per-char tokeniser flow
+    // doesn't support. The suffix-leaning approximation is
+    // strictly better than the previous all-at-end design for
+    // the common leading-vs-trailing case Codex round-28
+    // flagged; internal punct (rare) takes the same hit it
+    // already had.
+    let total_suffix = (suffix_wildcards + internal_skipped) as usize;
+    for _ in 0..total_suffix {
       word_tokens.push(WILDCARD_TOKEN_ID);
     }
     per_word_tokens.push(word_tokens);
@@ -366,7 +386,7 @@ mod tests {
       /* use_word_delimiter: */ true,
       /* uppercase_input: */ true,
       /* unk_token_id: */ unk,
-      /* wildcard_chars_per_word: */ &[],
+      /* wildcard_boundary_per_word: */ &[],
       &Lang::En,
     )
     .expect("tokenisation must succeed with uppercase projection");
@@ -422,7 +442,7 @@ mod tests {
       /* use_word_delimiter: */ true,
       /* uppercase_input: */ true,
       /* unk_token_id: */ unk,
-      /* wildcard_chars_per_word: */ &[],
+      /* wildcard_boundary_per_word: */ &[],
       &Lang::En,
     )
     .expect("U.S.A. must tokenise via per-char strip");
@@ -570,7 +590,7 @@ mod tests {
       /* use_word_delimiter: */ true,
       true,
       unk,
-      /* wildcard_chars_per_word: */ &[],
+      /* wildcard_boundary_per_word: */ &[],
       &Lang::En,
     )
     .expect("ok");
@@ -589,7 +609,7 @@ mod tests {
       /* use_word_delimiter: */ false,
       true,
       unk,
-      /* wildcard_chars_per_word: */ &[],
+      /* wildcard_boundary_per_word: */ &[],
       &Lang::En,
     )
     .expect("ok");
@@ -604,11 +624,12 @@ mod tests {
   /// index, so `merge_words` in the trellis layer extends the
   /// word's frame range through the wildcard's frames.
   #[test]
-  fn wildcard_chars_per_word_appends_trailing_wildcards() {
+  fn trailing_wildcards_land_after_encoded_chars() {
     let tok = uppercase_tokenizer();
     let unk = tok.token_to_id("<unk>");
 
-    // "hello" with 1 wildcard reported → 5 letters + 1 wildcard.
+    // "hello" with 1 SUFFIX wildcard reported → 5 letters + 1 wildcard.
+    // Trailing punctuation case: `hello"` → letters then wildcard.
     let result = tokenize_with_word_map(
       &tok,
       "hello",
@@ -616,20 +637,94 @@ mod tests {
       true,
       true,
       unk,
-      /* wildcard_chars_per_word: */ &[1],
+      /* wildcard_boundary_per_word: */ &[(0, 1)],
       &Lang::En,
     )
     .expect("ok");
     assert_eq!(result.token_ids.len(), 6);
-    assert_eq!(result.token_ids[5], WILDCARD_TOKEN_ID);
+    assert_eq!(
+      result.token_ids[5], WILDCARD_TOKEN_ID,
+      "suffix wildcard must land at the END"
+    );
+    assert!(
+      result.token_ids[..5].iter().all(|&id| id != WILDCARD_TOKEN_ID),
+      "no leading wildcards expected when prefix=0; got tokens {:?}",
+      result.token_ids
+    );
     assert_eq!(result.word_idx_per_token, alloc::vec![Some(0); 6]);
+  }
+
+  /// Codex round-28 regression: leading punctuation like `"hello`
+  /// must place its wildcard BEFORE the encoded letters, not
+  /// after them. Without this distinction, `"hello` (prefix=1)
+  /// and `hello"` (suffix=1) would produce identical token
+  /// sequences `[h,e,l,l,o,*]` — making the CTC graph push the
+  /// `*` into the trailing-frames zone for both cases and
+  /// biasing word-end timing.
+  #[test]
+  fn leading_wildcards_land_before_encoded_chars() {
+    let tok = uppercase_tokenizer();
+    let unk = tok.token_to_id("<unk>");
+
+    let result = tokenize_with_word_map(
+      &tok,
+      "hello",
+      1,
+      true,
+      true,
+      unk,
+      /* wildcard_boundary_per_word: prefix=1, suffix=0: */ &[(1, 0)],
+      &Lang::En,
+    )
+    .expect("ok");
+    assert_eq!(result.token_ids.len(), 6);
+    assert_eq!(
+      result.token_ids[0],
+      WILDCARD_TOKEN_ID,
+      "prefix wildcard must land at the START; got tokens {:?}",
+      result.token_ids
+    );
+    assert!(
+      result.token_ids[1..].iter().all(|&id| id != WILDCARD_TOKEN_ID),
+      "no trailing wildcards expected when suffix=0; got tokens {:?}",
+      result.token_ids
+    );
+    assert_eq!(result.word_idx_per_token, alloc::vec![Some(0); 6]);
+  }
+
+  /// Paired punctuation: `(hello)` → prefix=1, suffix=1 → both
+  /// ends carry exactly one wildcard, matching source order.
+  #[test]
+  fn paired_wildcards_bracket_encoded_chars() {
+    let tok = uppercase_tokenizer();
+    let unk = tok.token_to_id("<unk>");
+
+    let result = tokenize_with_word_map(
+      &tok,
+      "hello",
+      1,
+      true,
+      true,
+      unk,
+      /* wildcard_boundary_per_word: */ &[(1, 1)],
+      &Lang::En,
+    )
+    .expect("ok");
+    assert_eq!(result.token_ids.len(), 7);
+    assert_eq!(result.token_ids[0], WILDCARD_TOKEN_ID, "prefix at start");
+    assert_eq!(result.token_ids[6], WILDCARD_TOKEN_ID, "suffix at end");
+    assert!(
+      result.token_ids[1..6].iter().all(|&id| id != WILDCARD_TOKEN_ID),
+      "interior must be encoded chars only; got {:?}",
+      result.token_ids
+    );
   }
 
   /// Wildcards-per-word length must match the word_count or
   /// the function surfaces TokenizationFailed (configuration
   /// bug — caller wired the normaliser's output incorrectly).
   #[test]
-  fn wildcard_chars_per_word_length_mismatch_errors() {
+  fn wildcard_boundary_per_word_length_mismatch_errors() {
     let tok = uppercase_tokenizer();
     let unk = tok.token_to_id("<unk>");
 
@@ -640,7 +735,7 @@ mod tests {
       true,
       true,
       unk,
-      &[1, 2, 3], // length 3 but word_count = 2
+      &[(1, 0), (2, 1), (3, 0)], // length 3 but word_count = 2
       &Lang::En,
     )
     .expect_err("length mismatch must surface TokenizationFailed");

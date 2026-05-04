@@ -204,7 +204,7 @@ fn run_align(text: &str, num_frames: usize, duration_s: f32) -> Vec<AlignedWord>
     /* use_word_delimiter: */ true,
     /* uppercase_input: */ true,
     /* unk_token_id: */ unk,
-    /* wildcard_chars_per_word: */ &[],
+    /* wildcard_boundary_per_word: */ &[],
     &Lang::En,
   )
   .expect("tokenize must succeed (or chunk-drop, in which case empty)");

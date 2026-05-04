@@ -121,7 +121,7 @@ impl TextNormalizer for EnglishNormalizer {
   fn normalize<'a>(&self, text: &'a str) -> Result<NormalizedText<'a>, NormalizationError> {
     let mut normalized = String::with_capacity(text.len());
     let mut original_words: Vec<Cow<'a, str>> = Vec::new();
-    let mut wildcards_per_word: Vec<u32> = Vec::new();
+    let mut wildcards_per_word: Vec<(u32, u32)> = Vec::new();
 
     for (word_start, word) in token_spans(text) {
       let stripped = strip_word_punct(word);
@@ -137,18 +137,28 @@ impl TextNormalizer for EnglishNormalizer {
       // carries its own substring.
       let original_slice: &'a str = &text[word_start..word_start + word.len()];
 
-      // Wildcards: count of source chars that get stripped
-      // (not pronounced as part of the word's audio range
-      // strictly, but still occupying frames on the timeline).
-      // Boundary punctuation that `strip_word_punct` removed
-      // contributes; internal punctuation that the tokeniser
-      // skips later (currently just `.` for abbreviations) is
-      // also unspoken and contributes too. WhisperX includes
-      // these as `*` placeholders + token id `-1`; whispery
-      // mirrors by appending wildcard tokens to the word's
-      // token group at tokenisation time so the word's frame
-      // range extends through the punctuation's frames.
-      let boundary_stripped: u32 = (word.chars().count() - stripped.chars().count()) as u32;
+      // Wildcards: count of source chars stripped from each
+      // boundary (prefix vs suffix). Source-order placement
+      // matters — WhisperX inserts a `*` placeholder per source
+      // char at its actual position, so leading punctuation
+      // like `"hello` keeps its `*` BEFORE the letters and
+      // trailing punctuation like `hello"` keeps its `*` AFTER.
+      // Codex round-28 flagged that an earlier total-count
+      // design pushed every wildcard at the end of the word's
+      // encoded chars, making leading vs trailing punctuation
+      // indistinguishable in the CTC graph and biasing
+      // word-end frames.
+      //
+      // Internal punctuation that the tokeniser skips later
+      // (currently just `.` for abbreviations) still counts as
+      // a SUFFIX-style wildcard (it can't be placed exactly in
+      // source order without inlining wildcards mid-word; we
+      // treat it as suffix-leaning, matching the previous
+      // total-count behaviour for that subset).
+      let trimmed_left = word.trim_start_matches(is_word_punct);
+      let prefix_stripped: u32 = (word.chars().count() - trimmed_left.chars().count()) as u32;
+      let suffix_stripped: u32 =
+        (trimmed_left.chars().count() - stripped.chars().count()) as u32;
 
       // Split on internal separators (`Hello-World` →
       // `["Hello", "World"]`). Each piece is a real word the
@@ -182,15 +192,17 @@ impl TextNormalizer for EnglishNormalizer {
           }
           normalized.push_str(&piece_lower);
           original_words.push(Cow::Borrowed(*piece_orig));
-          // The original word's stripped boundary punctuation
-          // belongs to the LAST piece (the punct sits after the
-          // last hyphen-piece in the source text). Pieces
-          // before the last one only carry the implicit hyphen
-          // separator's frames; we don't emit a wildcard for
-          // it because the hyphen is treated as a real word
-          // boundary by whispery (per-piece surface forms).
-          let count = if pi == last_idx { boundary_stripped } else { 0 };
-          wildcards_per_word.push(count);
+          // Source-position-aware split: the FIRST piece
+          // inherits the original word's prefix-stripped count
+          // (leading punctuation sits before piece 0 in the
+          // source text); the LAST piece inherits the
+          // suffix-stripped count (trailing punctuation sits
+          // after the last piece). Middle pieces get (0, 0)
+          // — the hyphen separator is treated as a real word
+          // boundary, not a wildcard frame.
+          let prefix = if pi == 0 { prefix_stripped } else { 0 };
+          let suffix = if pi == last_idx { suffix_stripped } else { 0 };
+          wildcards_per_word.push((prefix, suffix));
         }
       } else {
         // No internal separator — the word is one piece.
@@ -202,7 +214,7 @@ impl TextNormalizer for EnglishNormalizer {
         }
         normalized.push_str(&lower);
         original_words.push(Cow::Borrowed(original_slice));
-        wildcards_per_word.push(boundary_stripped);
+        wildcards_per_word.push((prefix_stripped, suffix_stripped));
       }
     }
 

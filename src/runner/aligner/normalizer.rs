@@ -38,49 +38,55 @@ pub struct NormalizedText<'a> {
   /// slice. Step 9 of the alignment algorithm uses this map to
   /// recover `Word.text`.
   original_words: Vec<Cow<'a, str>>,
-  /// Per-word count of "wildcard chars" — surface-form chars
-  /// that are NOT pronounced (boundary punctuation the
-  /// normaliser stripped) but still occupy frames in the
-  /// audio. WhisperX includes these as wildcard tokens
-  /// (`*` placeholder + token id `-1`) so the word's range
-  /// extends through the punctuation's frames.
+  /// Per-word `(prefix, suffix)` count of "wildcard chars" —
+  /// surface-form chars that are NOT pronounced (boundary
+  /// punctuation the normaliser stripped) but still occupy
+  /// frames in the audio. WhisperX includes these as wildcard
+  /// tokens (`*` placeholder + token id `-1`) IN SOURCE ORDER,
+  /// so leading punctuation like `"hello` keeps its `*` BEFORE
+  /// the encoded chars while trailing punctuation like `hello"`
+  /// keeps its `*` AFTER. Codex round-28 flagged that an earlier
+  /// design carrying only a TOTAL count caused
+  /// `tokenize_with_word_map` to push every wildcard at the end
+  /// of the word's encoded chars, making leading and trailing
+  /// punctuation indistinguishable in the CTC graph.
   ///
-  /// Empty (zero-length) means "no wildcard padding needed";
-  /// the value is interpreted as 0 wildcards for every word.
-  /// Specific normalisers fill it in to claw back the
-  /// punctuation frames they stripped.
-  wildcard_chars_per_word: Vec<u32>,
+  /// `(prefix, suffix) = (left_stripped_count, right_stripped_count)`.
+  /// Empty (zero-length) means "no wildcard padding tracked";
+  /// every word interpreted as `(0, 0)`.
+  wildcard_boundary_per_word: Vec<(u32, u32)>,
 }
 
 impl<'a> NormalizedText<'a> {
   /// Construct from a normalised text + original-word slices.
-  /// `wildcard_chars_per_word` defaults to empty (no wildcard
+  /// `wildcard_boundary_per_word` defaults to empty (no wildcard
   /// padding) when the normaliser doesn't track it.
   pub const fn new(normalized: String, original_words: Vec<Cow<'a, str>>) -> Self {
     Self {
       normalized,
       original_words,
-      wildcard_chars_per_word: Vec::new(),
+      wildcard_boundary_per_word: Vec::new(),
     }
   }
 
-  /// Construct with explicit per-word wildcard counts. Length
-  /// must match `original_words`. Panics on length mismatch
-  /// because the count is structurally tied to word indexing.
+  /// Construct with explicit per-word `(prefix, suffix)` wildcard
+  /// counts. Length must match `original_words`. Panics on length
+  /// mismatch because the count is structurally tied to word
+  /// indexing.
   pub fn with_wildcards(
     normalized: String,
     original_words: Vec<Cow<'a, str>>,
-    wildcard_chars_per_word: Vec<u32>,
+    wildcard_boundary_per_word: Vec<(u32, u32)>,
   ) -> Self {
     assert_eq!(
       original_words.len(),
-      wildcard_chars_per_word.len(),
-      "wildcard_chars_per_word must align 1:1 with original_words"
+      wildcard_boundary_per_word.len(),
+      "wildcard_boundary_per_word must align 1:1 with original_words"
     );
     Self {
       normalized,
       original_words,
-      wildcard_chars_per_word,
+      wildcard_boundary_per_word,
     }
   }
 
@@ -94,11 +100,12 @@ impl<'a> NormalizedText<'a> {
     &self.original_words
   }
 
-  /// Per-word wildcard char counts, or empty if the normaliser
-  /// didn't track them. See [`Self::with_wildcards`] /
-  /// [`Self::new`] for how this is populated.
-  pub fn wildcard_chars_per_word(&self) -> &[u32] {
-    &self.wildcard_chars_per_word
+  /// Per-word `(prefix, suffix)` wildcard char counts, or empty
+  /// if the normaliser didn't track them. See
+  /// [`Self::with_wildcards`] / [`Self::new`] for how this is
+  /// populated.
+  pub fn wildcard_boundary_per_word(&self) -> &[(u32, u32)] {
+    &self.wildcard_boundary_per_word
   }
 }
 

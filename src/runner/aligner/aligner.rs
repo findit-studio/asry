@@ -459,7 +459,7 @@ impl Aligner {
       self.normalizer.use_word_delimiter(),
       self.vocab_uppercase_only,
       self.unk_token_id,
-      normalized.wildcard_chars_per_word(),
+      normalized.wildcard_boundary_per_word(),
       &self.language,
     )?;
 
