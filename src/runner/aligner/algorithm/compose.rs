@@ -609,9 +609,7 @@ mod tests {
     // avoid a divide-by-zero. Pin both branches.
     assert_eq!(effective_samples_per_frame(0, 0, 320), 320.0);
     assert_eq!(effective_samples_per_frame(0, 1, 320), 320.0);
-    assert!(
-      (effective_samples_per_frame(480_000, 1499, 320) - (480_000.0 / 1498.0)).abs() < 1e-9
-    );
+    assert!((effective_samples_per_frame(480_000, 1499, 320) - (480_000.0 / 1498.0)).abs() < 1e-9);
   }
 
   #[test]
@@ -676,8 +674,9 @@ mod tests {
     // Pin the divergence: at least ONE frame index `f`
     // disagrees between the two masks across the segment's
     // neighborhood.
-    let any_disagreement = (740..=760)
-      .any(|f| mask_eff.get(f).copied().unwrap_or(false) != mask_nom.get(f).copied().unwrap_or(false));
+    let any_disagreement = (740..=760).any(|f| {
+      mask_eff.get(f).copied().unwrap_or(false) != mask_nom.get(f).copied().unwrap_or(false)
+    });
     assert!(
       any_disagreement,
       "effective vs nominal mappings must disagree on at least one frame in [740, 760] \
