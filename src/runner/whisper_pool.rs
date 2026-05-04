@@ -1150,8 +1150,7 @@ mod tests {
         message,
       }) => {
         assert!(
-          message.contains("language hint")
-            && message.contains("lowercase ASCII"),
+          message.contains("language hint") && message.contains("lowercase ASCII"),
           "expected charset-violation diagnostic; got {message:?}"
         );
       }
@@ -1219,8 +1218,9 @@ mod tests {
   /// before the intern table sees it.
   #[test]
   fn full_params_from_rejects_high_cardinality_language_hint() {
-    let p = AsrParams::default()
-      .with_language_hint(Some(Lang::Other(SmolStr::from("very-long-attacker-string"))));
+    let p = AsrParams::default().with_language_hint(Some(Lang::Other(SmolStr::from(
+      "very-long-attacker-string",
+    ))));
     let flag = Arc::new(AtomicBool::new(false));
     let res = full_params_from(&p, 0.0, flag);
     match res {
