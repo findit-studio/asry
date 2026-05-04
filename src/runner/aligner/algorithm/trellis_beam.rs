@@ -476,14 +476,17 @@ pub fn backtrack_beam(
   // cost Codex round-22 flagged: each branch now pushes ONE node
   // + an index, regardless of how long the path has grown.
   //
-  // Capacity: each iteration creates at most `beam_width * 2` new
-  // nodes (stay + change for each surviving beam). With T outer
-  // iterations + the seed, the final arena holds at most
-  // `1 + beam_width * 2 * T` nodes (~96 KB at T=1500 / beam=2;
-  // ~1 MB at T=10000). The trellis budget already caps `T *
-  // num_tokens` at 32 M cells, so the arena grows linearly within
-  // that bound.
-  let mut arena: Vec<BeamNode> = Vec::with_capacity(1 + beam_width * 2 * t);
+  // Pre-reserve: NONE. The trellis budget caps `T * num_tokens`
+  // at 32 M cells, NOT `T` alone — a degenerate `num_tokens = 1`
+  // pass-through can therefore drive `T` up to 32 M frames. A
+  // pre-reserve of `1 + beam_width * 2 * T` nodes at that scale
+  // would allocate ~3 GB up-front, before the per-iteration
+  // abort check fires (Codex round-26). Push-driven growth is
+  // amortised O(1) and bounded by the same per-iteration abort
+  // flag the loop already honours; for typical T ≈ 1500 the
+  // doubling churn is ~400 KB total, dwarfed by the trellis
+  // itself.
+  let mut arena: Vec<BeamNode> = Vec::new();
   arena.push(BeamNode {
     token_index: final_j,
     time_index: final_t,

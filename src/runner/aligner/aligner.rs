@@ -34,7 +34,6 @@ pub struct Aligner {
   tokenizer: Tokenizer,
   language: Lang,
   normalizer: DynTextNormalizer,
-  sample_rate: u32,
   hop_samples: u32,
   blank_token_id: u32,
   /// `<unk>` / `[UNK]` token id, when the tokenizer exposes one.
@@ -149,7 +148,6 @@ impl Aligner {
       tokenizer,
       language,
       normalizer,
-      sample_rate: 16_000,
       hop_samples: 320,
       blank_token_id,
       unk_token_id,
@@ -166,9 +164,19 @@ impl Aligner {
     &self.language
   }
 
-  /// Audio sample rate the model expects (16 kHz for wav2vec2).
+  /// Audio sample rate the model expects. Hardcoded to 16 kHz
+  /// for wav2vec2; non-16 kHz models are not supported in v1
+  /// (the silence mask, frame timebase, and stride checks all
+  /// assume `SAMPLE_RATE_HZ`). Codex round-26 flagged that
+  /// the previous `set_sample_rate` / `with_sample_rate`
+  /// overrides mutated `self.sample_rate` but were never read
+  /// downstream — a caller setting a non-16 kHz value got
+  /// plausible-but-wrong masks and word timestamps instead of
+  /// a configuration error. The setters were removed; the
+  /// getter survives as informational ("what does this aligner
+  /// expect").
   pub const fn sample_rate(&self) -> u32 {
-    self.sample_rate
+    SAMPLE_RATE_HZ
   }
 
   /// Frame stride in 16 kHz samples (320 = 20 ms by default).
@@ -179,30 +187,6 @@ impl Aligner {
   /// CTC blank-token id detected at construction time.
   pub const fn blank_token_id(&self) -> u32 {
     self.blank_token_id
-  }
-
-  /// Set [`Self::sample_rate`].
-  ///
-  /// # Panics
-  ///
-  /// Panics if `value == 0`. A zero sample rate would make the
-  /// frame-timebase math collapse and downstream PTS conversions
-  /// produce nonsense ranges; failing fast at the construction
-  /// boundary is correct.
-  pub const fn set_sample_rate(&mut self, value: u32) {
-    assert!(value > 0, "sample_rate must be > 0");
-    self.sample_rate = value;
-  }
-
-  /// Builder-style override for [`Self::sample_rate`].
-  ///
-  /// # Panics
-  ///
-  /// Panics if `value == 0`. See [`Self::set_sample_rate`].
-  pub const fn with_sample_rate(mut self, value: u32) -> Self {
-    assert!(value > 0, "sample_rate must be > 0");
-    self.sample_rate = value;
-    self
   }
 
   /// Set [`Self::hop_samples`].
