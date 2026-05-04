@@ -964,8 +964,7 @@ fn inject_wordlevel_model_type(bytes: &[u8]) -> Option<alloc::vec::Vec<u8>> {
 
   // Inject the discriminator fields right after `{`.
   let injection = b"\n        \"type\": \"WordLevel\",\n        \"unk_token\": \"<unk>\",";
-  let mut out: alloc::vec::Vec<u8> =
-    alloc::vec::Vec::with_capacity(bytes.len() + injection.len());
+  let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(bytes.len() + injection.len());
   out.extend_from_slice(&bytes[..=model_open]);
   out.extend_from_slice(injection);
   out.extend_from_slice(&bytes[model_open + 1..]);
@@ -1113,11 +1112,7 @@ fn has_top_level_key(bytes: &[u8], start: usize, end: usize, key: &[u8]) -> bool
     match c {
       b'"' => {
         let key_end = i + 1 + key.len();
-        if depth == 0
-          && key_end < end
-          && &bytes[i + 1..key_end] == key
-          && bytes[key_end] == b'"'
-        {
+        if depth == 0 && key_end < end && &bytes[i + 1..key_end] == key && bytes[key_end] == b'"' {
           let mut j = key_end + 1;
           while j < end && (bytes[j] as char).is_ascii_whitespace() {
             j += 1;

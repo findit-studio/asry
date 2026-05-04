@@ -1736,8 +1736,7 @@ mod tests {
   /// to the wrong audio.
   #[test]
   fn override_binds_to_packet_that_started_chunk_not_packet_that_closed_it() {
-    use crate::core::AsrParamsOverride;
-    use crate::core::command::Command;
+    use crate::core::{AsrParamsOverride, command::Command};
 
     // chunk_size = 2 s (32 000 samples). One short VAD seg won't
     // close the chunk on its own; only EOF (or a chunk_size-
@@ -1774,7 +1773,10 @@ mod tests {
     let cmd = t
       .poll_command()
       .expect("EOF flush should emit chunk 0's RunAsr");
-    let Command::RunAsr { params, chunk_id, .. } = &cmd else {
+    let Command::RunAsr {
+      params, chunk_id, ..
+    } = &cmd
+    else {
       panic!("expected RunAsr; got {cmd:?}");
     };
     assert_eq!(chunk_id.as_u64(), 0);

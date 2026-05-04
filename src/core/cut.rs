@@ -7,8 +7,7 @@
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use crate::core::AsrParamsOverride;
-use crate::types::VadSegment;
+use crate::{core::AsrParamsOverride, types::VadSegment};
 
 /// Half-open range in 16 kHz analysis sample indices, stream-relative
 /// (i.e., absolute since stream start, not relative to the live
