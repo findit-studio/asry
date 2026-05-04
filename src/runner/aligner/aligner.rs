@@ -698,7 +698,12 @@ impl Aligner {
       log_probs.t,
       self.hop_samples,
     );
-    let speech_frames = build_speech_frames(log_probs.t, samples_per_frame, sub_segments);
+    let speech_frames = build_speech_frames(
+      log_probs.t,
+      samples_per_frame,
+      samples.len() as u64,
+      sub_segments,
+    );
     Ok(compose_words(
       &word_segments,
       normalized.original_words(),

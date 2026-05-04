@@ -197,7 +197,20 @@ impl WhisperPoolOptions {
   // --- Mutating setters ----------------------------------------
 
   /// Set [`Self::worker_count`].
+  ///
+  /// # Panics
+  ///
+  /// Panics if `value == 0`. Codex round-24 flagged that a
+  /// pool built with zero workers spawns no worker threads
+  /// but still accepts work via the channel — chunks enter
+  /// `in_flight` with no receiver capable of producing
+  /// results, stalling the pump/drain loop until the
+  /// configured timeout fires. Failing fast at the setter
+  /// catches the explicit programmer-error case; the
+  /// `serde`-deserialised path is caught at
+  /// [`WhisperPool::new`].
   pub const fn set_worker_count(&mut self, value: usize) {
+    assert!(value > 0, "worker_count must be > 0; a zero-worker pool cannot complete work");
     self.worker_count = value;
   }
 
@@ -244,7 +257,12 @@ impl WhisperPoolOptions {
   // --- Builder-style (consuming) -------------------------------
 
   /// Builder-style override for [`Self::worker_count`].
+  ///
+  /// # Panics
+  ///
+  /// Panics if `value == 0`. See [`Self::set_worker_count`].
   pub const fn with_worker_count(mut self, value: usize) -> Self {
+    assert!(value > 0, "worker_count must be > 0; a zero-worker pool cannot complete work");
     self.worker_count = value;
     self
   }
@@ -691,6 +709,20 @@ impl WhisperPool {
   /// flash_attn / GPU device / model path explicitly (the public
   /// `ManagedTranscriberBuilder::build` hands one in).
   pub(super) fn new(ctx: WhisperContext, config: &WhisperPoolOptions) -> Result<Self, RunnerError> {
+    // Defensive: the setter / builder panic on `worker_count == 0`,
+    // but a config deserialised via serde bypasses both. A zero-
+    // worker pool spawns no worker threads while still accepting
+    // work via the channel — chunks enter `in_flight` with no
+    // receiver capable of producing results, stalling the
+    // pump/drain loop until timeout. Codex round-24 flagged this.
+    if config.worker_count() == 0 {
+      return Err(RunnerError::WhisperContextLoad {
+        message: alloc::string::String::from(
+          "WhisperPoolOptions.worker_count must be > 0; a zero-worker \
+           pool cannot complete work and would stall the pump loop.",
+        ),
+      });
+    }
     let ctx = Arc::new(ctx);
     let (work_tx, work_rx) = bounded::<AsrWorkItem>(config.max_queued_chunks());
     let (result_tx, result_rx) = bounded::<AsrResultMsg>(config.max_queued_chunks() + 16);
@@ -1048,5 +1080,18 @@ mod tests {
     // a non-Send field.
     assert_send::<crossbeam_channel::Sender<AsrWorkItem>>();
     assert_send::<crossbeam_channel::Receiver<AsrResultMsg>>();
+  }
+
+  #[test]
+  #[should_panic(expected = "worker_count must be > 0")]
+  fn set_worker_count_zero_panics() {
+    let mut opts = WhisperPoolOptions::new("/tmp/model.bin");
+    opts.set_worker_count(0);
+  }
+
+  #[test]
+  #[should_panic(expected = "worker_count must be > 0")]
+  fn with_worker_count_zero_panics() {
+    let _ = WhisperPoolOptions::new("/tmp/model.bin").with_worker_count(0);
   }
 }

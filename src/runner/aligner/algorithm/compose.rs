@@ -85,12 +85,24 @@ pub(crate) fn effective_samples_per_frame(
 /// to feed both functions the same `samples_per_frame` value via
 /// [`effective_samples_per_frame`].
 ///
+/// `n_samples` is the chunk's input audio length in 16 kHz samples.
+/// Sub-segment bounds are clamped to `[0, n_samples]` before any
+/// overlap math — Codex round-24 flagged that without this clamp,
+/// a VAD segment overshooting the chunk end could "credit" the
+/// trailing frame's interval (which can extend past the audio for
+/// the WhisperX effective ratio's last frame: `[(T-1)*spf, T*spf)`
+/// where `T*spf` is just past `n_samples`) with phantom-sample
+/// overlap, marking a frame as speech against samples that don't
+/// exist. [`build_speech_mask`] already does this clamp; the two
+/// helpers are now in agreement on the contract.
+///
 /// `sub_segments` must be in chunk-local sample-index space — the
 /// caller (alignment worker) wraps the segment range PTS in a
 /// 1/16000 timebase so `start_pts` == `start_sample`.
 pub(crate) fn build_speech_frames(
   n_frames: usize,
   samples_per_frame: f64,
+  n_samples: u64,
   sub_segments: &[mediatime::TimeRange],
 ) -> alloc::vec::Vec<bool> {
   if !samples_per_frame.is_finite() || samples_per_frame <= 0.0 {
@@ -119,10 +131,20 @@ pub(crate) fn build_speech_frames(
   // the 30 s edge case), well within the half-frame margin.
   let spf_int = samples_per_frame.floor() as i64;
   let min_overlap_samples = ((spf_int + 1) / 2).max(1);
+  let n_samples_i64 = n_samples as i64;
   let mut overlap_per_frame = alloc::vec![0_i64; n_frames];
   for seg in sub_segments {
-    let seg_start = seg.start_pts().max(0);
-    let seg_end = seg.end_pts().max(0);
+    // Clamp to `[0, n_samples]` before computing overlap. Without
+    // this, a VAD segment whose `end_pts > n_samples` would credit
+    // the trailing frame's interval with phantom-sample overlap.
+    // The trailing frame's interval `[(T-1)*spf, T*spf)` has
+    // `T*spf > n_samples` for the WhisperX effective ratio
+    // (`spf = n_samples/(T-1)` → `T*spf = n_samples * T/(T-1)`),
+    // so an unclamped overshoot directly bites the most-likely
+    // boundary frame. Matches `build_speech_mask`'s `i64.clamp(0,
+    // n_samples_i64)` contract.
+    let seg_start = seg.start_pts().clamp(0, n_samples_i64);
+    let seg_end = seg.end_pts().clamp(0, n_samples_i64);
     if seg_end <= seg_start {
       continue;
     }
@@ -536,20 +558,23 @@ mod tests {
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
     let segs = alloc::vec![TimeRange::new(320, 960, tb_16k)];
     let mask = build_speech_frames(
-      /* n_frames: */ 5, /* samples_per_frame: */ 320.0, &segs,
+      /* n_frames: */ 5,
+      /* samples_per_frame: */ 320.0,
+      /* n_samples: */ 1600,
+      &segs,
     );
     assert_eq!(mask, alloc::vec![false, true, true, false, false]);
   }
 
   #[test]
   fn build_speech_frames_handles_no_segments() {
-    let mask = build_speech_frames(4, 320.0, &[]);
+    let mask = build_speech_frames(4, 320.0, 1280, &[]);
     assert_eq!(mask, alloc::vec![false; 4]);
   }
 
   #[test]
   fn build_speech_frames_hop_one_with_no_segments_is_all_silence() {
-    let mask = build_speech_frames(8, 1.0, &[]);
+    let mask = build_speech_frames(8, 1.0, 8, &[]);
     assert_eq!(mask, alloc::vec![false; 8]);
   }
 
@@ -560,11 +585,11 @@ mod tests {
 
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
     let segs = alloc::vec![TimeRange::new(0, 1, tb_16k)];
-    let mask = build_speech_frames(4, 3.0, &segs);
+    let mask = build_speech_frames(4, 3.0, 12, &segs);
     assert_eq!(mask, alloc::vec![false; 4]);
 
     let segs_at = alloc::vec![TimeRange::new(0, 2, tb_16k)];
-    let mask_at = build_speech_frames(4, 3.0, &segs_at);
+    let mask_at = build_speech_frames(4, 3.0, 12, &segs_at);
     assert_eq!(mask_at[0], true);
   }
 
@@ -576,12 +601,12 @@ mod tests {
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
     let segs_at = alloc::vec![TimeRange::new(0, 160, tb_16k)];
     assert_eq!(
-      build_speech_frames(2, 320.0, &segs_at),
+      build_speech_frames(2, 320.0, 640, &segs_at),
       alloc::vec![true, false]
     );
     let segs_under = alloc::vec![TimeRange::new(0, 159, tb_16k)];
     assert_eq!(
-      build_speech_frames(2, 320.0, &segs_under),
+      build_speech_frames(2, 320.0, 640, &segs_under),
       alloc::vec![false, false]
     );
   }
@@ -597,9 +622,48 @@ mod tests {
       TimeRange::new(160, 240, tb_16k),
     ];
     assert_eq!(
-      build_speech_frames(2, 320.0, &segs),
+      build_speech_frames(2, 320.0, 640, &segs),
       alloc::vec![true, false]
     );
+  }
+
+  #[test]
+  fn build_speech_frames_clamps_overshoot_seg_to_chunk_end() {
+    // Codex round-24 regression: when a sub-segment's end_pts
+    // overshoots `n_samples`, `build_speech_frames` previously
+    // counted phantom samples past the chunk end as overlap,
+    // marking the trailing frame as speech against audio that
+    // doesn't exist. The clamp to `[0, n_samples]` (matching
+    // `build_speech_mask`) eliminates this asymmetry.
+    use core::num::NonZeroU32;
+    use mediatime::{TimeRange, Timebase};
+    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+
+    // n_samples=320, n_frames=2, spf=320 → frames cover
+    // [0, 320) and [320, 640). Real audio only exists in the
+    // first frame's interval. A seg at [320, 480] is entirely
+    // past the chunk end. Without clamping the overlap math
+    // would credit frame 1 with min(480, 640) - max(320, 320)
+    // = 160 samples (=min_overlap_samples threshold), marking
+    // it as speech. With clamping, seg becomes [320, 320] →
+    // empty, no overlap, frame 1 stays silent.
+    let segs = alloc::vec![TimeRange::new(320, 480, tb_16k)];
+    let mask = build_speech_frames(/* n_frames: */ 2, 320.0, /* n_samples: */ 320, &segs);
+    assert_eq!(
+      mask,
+      alloc::vec![false, false],
+      "out-of-range seg must not credit phantom samples"
+    );
+
+    // Partial overshoot: seg [200, 480] → clamps to [200, 320]
+    // (120 samples in real audio). Frame 0 covers [0, 320), so
+    // overlap is min(320, 320) - max(200, 0) = 120 < 160
+    // threshold → still silent. Without clamping, the unclamped
+    // seg would let frame 1 inherit phantom overlap from
+    // [320, 480) and might trip the threshold.
+    let partial = alloc::vec![TimeRange::new(200, 480, tb_16k)];
+    let mask_partial = build_speech_frames(2, 320.0, 320, &partial);
+    assert_eq!(mask_partial[1], false, "frame 1 must not be speech (no real audio)");
   }
 
   #[test]
@@ -654,8 +718,8 @@ mod tests {
     // small per-frame drift across many frames can shift
     // boundary frames between the two mappings.
     let mid_segment = alloc::vec![TimeRange::new(240_000, 240_640, tb_16k)];
-    let mask_eff = build_speech_frames(total_frames, samples_per_frame, &mid_segment);
-    let mask_nom = build_speech_frames(total_frames, 320.0, &mid_segment);
+    let mask_eff = build_speech_frames(total_frames, samples_per_frame, n_samples, &mid_segment);
+    let mask_nom = build_speech_frames(total_frames, 320.0, n_samples, &mid_segment);
 
     // 240_000 samples / 320.4272 ≈ frame 749.0. Effective
     // mapping: frame 749 covers ~[240000, 240320), frame 750
