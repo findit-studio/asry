@@ -210,7 +210,10 @@ impl WhisperPoolOptions {
   /// `serde`-deserialised path is caught at
   /// [`WhisperPool::new`].
   pub const fn set_worker_count(&mut self, value: usize) {
-    assert!(value > 0, "worker_count must be > 0; a zero-worker pool cannot complete work");
+    assert!(
+      value > 0,
+      "worker_count must be > 0; a zero-worker pool cannot complete work"
+    );
     self.worker_count = value;
   }
 
@@ -262,7 +265,10 @@ impl WhisperPoolOptions {
   ///
   /// Panics if `value == 0`. See [`Self::set_worker_count`].
   pub const fn with_worker_count(mut self, value: usize) -> Self {
-    assert!(value > 0, "worker_count must be > 0; a zero-worker pool cannot complete work");
+    assert!(
+      value > 0,
+      "worker_count must be > 0; a zero-worker pool cannot complete work"
+    );
     self.worker_count = value;
     self
   }

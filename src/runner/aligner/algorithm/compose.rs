@@ -558,9 +558,7 @@ mod tests {
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
     let segs = alloc::vec![TimeRange::new(320, 960, tb_16k)];
     let mask = build_speech_frames(
-      /* n_frames: */ 5,
-      /* samples_per_frame: */ 320.0,
-      /* n_samples: */ 1600,
+      /* n_frames: */ 5, /* samples_per_frame: */ 320.0, /* n_samples: */ 1600,
       &segs,
     );
     assert_eq!(mask, alloc::vec![false, true, true, false, false]);
@@ -648,7 +646,9 @@ mod tests {
     // it as speech. With clamping, seg becomes [320, 320] →
     // empty, no overlap, frame 1 stays silent.
     let segs = alloc::vec![TimeRange::new(320, 480, tb_16k)];
-    let mask = build_speech_frames(/* n_frames: */ 2, 320.0, /* n_samples: */ 320, &segs);
+    let mask = build_speech_frames(
+      /* n_frames: */ 2, 320.0, /* n_samples: */ 320, &segs,
+    );
     assert_eq!(
       mask,
       alloc::vec![false, false],
@@ -663,7 +663,10 @@ mod tests {
     // [320, 480) and might trip the threshold.
     let partial = alloc::vec![TimeRange::new(200, 480, tb_16k)];
     let mask_partial = build_speech_frames(2, 320.0, 320, &partial);
-    assert_eq!(mask_partial[1], false, "frame 1 must not be speech (no real audio)");
+    assert_eq!(
+      mask_partial[1], false,
+      "frame 1 must not be speech (no real audio)"
+    );
   }
 
   #[test]
