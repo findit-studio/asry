@@ -43,7 +43,13 @@ pub struct AsrParams {
   initial_temperature: f32,
   #[cfg_attr(feature = "serde", serde(default = "default_temperature_increment"))]
   temperature_increment: f32,
-  #[cfg_attr(feature = "serde", serde(default = "default_max_attempts"))]
+  #[cfg_attr(
+    feature = "serde",
+    serde(
+      default = "default_max_attempts",
+      deserialize_with = "deserialize_nonzero_max_attempts"
+    )
+  )]
   max_attempts: u8,
   #[cfg_attr(feature = "serde", serde(default = "default_log_prob_threshold"))]
   log_prob_threshold: f32,
@@ -80,6 +86,25 @@ const fn default_temperature_increment() -> f32 {
 #[cfg(feature = "serde")]
 const fn default_max_attempts() -> u8 {
   6
+}
+/// Validate `max_attempts` at the serde boundary. The setters
+/// already panic on `0`, but a deserialized config bypasses
+/// them. Surface the violation as a typed deserialization
+/// error instead of letting a misconfigured serde value silently
+/// drop every ASR result. Codex round-33.
+#[cfg(feature = "serde")]
+fn deserialize_nonzero_max_attempts<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  use serde::de::Error as _;
+  let v = u8::deserialize(deserializer)?;
+  if v == 0 {
+    return Err(D::Error::custom(
+      "max_attempts must be > 0; use 1 for a single attempt with no retries",
+    ));
+  }
+  Ok(v)
 }
 #[cfg(feature = "serde")]
 const fn default_log_prob_threshold() -> f32 {
@@ -224,7 +249,22 @@ impl AsrParams {
   }
 
   /// Set [`Self::max_attempts`].
+  ///
+  /// # Panics
+  ///
+  /// Panics if `value == 0`. The retry ladder iterates
+  /// `for _attempt in 0..max_attempts`, so `0` would skip
+  /// `state.full(...)` entirely and return
+  /// [`AsrFailureKind::AllTemperaturesFailed`](crate::types::AsrFailureKind::AllTemperaturesFailed)
+  /// for every chunk — total ASR data loss with no model
+  /// inference attempted (Codex round-33). Use `1` for
+  /// "single attempt, no temperature retries"; the temperature
+  /// ladder needs at least one pass.
   pub const fn set_max_attempts(&mut self, value: u8) {
+    assert!(
+      value > 0,
+      "max_attempts must be > 0 (got 0); use 1 for a single attempt with no retries"
+    );
     self.max_attempts = value;
   }
 
@@ -295,7 +335,16 @@ impl AsrParams {
   }
 
   /// Builder-style override for [`Self::max_attempts`].
+  ///
+  /// # Panics
+  ///
+  /// Panics if `value == 0`. See
+  /// [`Self::set_max_attempts`].
   pub const fn with_max_attempts(mut self, value: u8) -> Self {
+    assert!(
+      value > 0,
+      "max_attempts must be > 0 (got 0); use 1 for a single attempt with no retries"
+    );
     self.max_attempts = value;
     self
   }
@@ -717,6 +766,39 @@ mod tests {
     let back: AsrParams = serde_json::from_str(&json).expect("deserialize");
     assert!((back.initial_temperature() - 0.7).abs() < 1e-9);
     assert_eq!(back.max_attempts(), 3);
+  }
+
+  /// Codex round-33: `max_attempts = 0` would silently drop
+  /// every chunk's ASR (the retry ladder iterates `0..0` and
+  /// returns `AllTemperaturesFailed`). The setters panic; the
+  /// `with_*` builder panics symmetrically.
+  #[test]
+  #[should_panic(expected = "max_attempts must be > 0")]
+  fn set_max_attempts_zero_panics() {
+    let mut p = AsrParams::default();
+    p.set_max_attempts(0);
+  }
+
+  #[test]
+  #[should_panic(expected = "max_attempts must be > 0")]
+  fn with_max_attempts_zero_panics() {
+    let _ = AsrParams::default().with_max_attempts(0);
+  }
+
+  /// Codex round-33: deserialized config must fail loudly on
+  /// `max_attempts: 0` rather than producing a runner that
+  /// silently drops every chunk.
+  #[cfg(feature = "serde")]
+  #[test]
+  fn deserialize_rejects_zero_max_attempts() {
+    let json = r#"{"max_attempts": 0}"#;
+    let res: Result<AsrParams, _> = serde_json::from_str(json);
+    assert!(res.is_err(), "max_attempts=0 must be rejected");
+    let err = res.err().unwrap().to_string();
+    assert!(
+      err.contains("max_attempts must be > 0"),
+      "expected diagnostic, got {err:?}"
+    );
   }
 
   /// Partial config — `{}` deserialises to defaults thanks to

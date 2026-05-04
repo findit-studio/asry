@@ -879,10 +879,25 @@ impl ManagedTranscriber {
 }
 
 impl ManagedTranscriber {
-  /// True iff every queue is empty (core idle AND no pending
-  /// transcripts/errors locally buffered).
+  /// True iff every queue is empty (core idle, no pending
+  /// transcripts/errors locally buffered, and no fatal worker
+  /// error stashed for the next poll).
+  ///
+  /// Codex round-33: previously this ignored `pending_fatal`. A
+  /// `drive_one_step` failure stashed during one poll could be
+  /// shadowed by `is_idle() == true` on the next call, so a
+  /// caller that only polls "until idle" would stop and never
+  /// see the structural failure (worker pool dead, backpressure
+  /// rejected). Including the slot here closes the gap — callers
+  /// must continue polling (which surfaces the fatal as `Err`)
+  /// before they can observe a true-idle state.
   pub fn is_idle(&self) -> bool {
-    self.core.is_idle() && self.pending_transcripts.is_empty() && self.pending_errors.is_empty()
+    is_idle_inner(
+      self.core.is_idle(),
+      self.pending_transcripts.is_empty(),
+      self.pending_errors.is_empty(),
+      self.pending_fatal.is_none(),
+    )
   }
 
   /// Live buffer length in samples (proxy from the core).
@@ -925,6 +940,49 @@ fn merge_overrides(base: &AsrParams, ovr: &AsrParamsOverride) -> AsrParams {
     out.set_initial_prompt(prompt.clone());
   }
   out
+}
+
+/// Pure boolean reduction backing [`ManagedTranscriber::is_idle`].
+/// Extracted as a free function so the all-conjuncts contract
+/// (each input's "empty / quiescent" state must hold) is testable
+/// without standing up a real `WhisperContext` + worker pool.
+const fn is_idle_inner(
+  core_idle: bool,
+  pending_transcripts_empty: bool,
+  pending_errors_empty: bool,
+  pending_fatal_none: bool,
+) -> bool {
+  core_idle && pending_transcripts_empty && pending_errors_empty && pending_fatal_none
+}
+
+#[cfg(test)]
+mod is_idle_tests {
+  use super::is_idle_inner;
+
+  /// All four conjuncts true → idle.
+  #[test]
+  fn all_true_is_idle() {
+    assert!(is_idle_inner(true, true, true, true));
+  }
+
+  /// Codex round-33: a stashed fatal MUST keep the runner
+  /// non-idle so the caller keeps polling and observes the Err.
+  #[test]
+  fn pending_fatal_blocks_idle() {
+    assert!(
+      !is_idle_inner(true, true, true, /* pending_fatal_none = */ false),
+      "pending_fatal=Some must keep is_idle false"
+    );
+  }
+
+  /// Pre-existing conjuncts also block idle (regression guard
+  /// against accidentally dropping any of them in a refactor).
+  #[test]
+  fn any_other_false_blocks_idle() {
+    assert!(!is_idle_inner(false, true, true, true));
+    assert!(!is_idle_inner(true, false, true, true));
+    assert!(!is_idle_inner(true, true, false, true));
+  }
 }
 
 #[cfg(test)]
