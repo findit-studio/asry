@@ -132,27 +132,56 @@ pub(crate) fn build_speech_frames(
   let spf_int = samples_per_frame.floor() as i64;
   let min_overlap_samples = ((spf_int + 1) / 2).max(1);
   let n_samples_i64 = n_samples as i64;
-  let mut overlap_per_frame = alloc::vec![0_i64; n_frames];
-  for seg in sub_segments {
-    // Clamp to `[0, n_samples]` before computing overlap. Without
-    // this, a VAD segment whose `end_pts > n_samples` would credit
-    // the trailing frame's interval with phantom-sample overlap.
-    // The trailing frame's interval `[(T-1)*spf, T*spf)` has
-    // `T*spf > n_samples` for the WhisperX effective ratio
-    // (`spf = n_samples/(T-1)` → `T*spf = n_samples * T/(T-1)`),
-    // so an unclamped overshoot directly bites the most-likely
-    // boundary frame. Matches `build_speech_mask`'s `i64.clamp(0,
-    // n_samples_i64)` contract.
-    let seg_start = seg.start_pts().clamp(0, n_samples_i64);
-    let seg_end = seg.end_pts().clamp(0, n_samples_i64);
-    if seg_end <= seg_start {
-      continue;
+
+  // Coalesce overlapping/adjacent sub-segments into a non-overlapping
+  // union BEFORE per-frame accumulation. Codex round-27 flagged that
+  // the previous implementation summed each sub-segment's per-frame
+  // intersection independently, so two overlapping ranges (e.g.
+  // [0, 100] and [50, 150] inside frame 0's [0, 320) interval)
+  // contributed `100 + 100 = 200` to the frame's overlap counter
+  // even though their UNION only covers 150 samples. With
+  // `min_overlap_samples = 160` the frame would clear the threshold
+  // (raw sum 200 ≥ 160) despite its union being below it (150 <
+  // 160), disagreeing with `build_speech_mask`'s union semantics
+  // and letting `compose_words` retain words whose audio is
+  // mostly masked silence.
+  //
+  // The contract is "≥50 % of the frame's samples are inside the
+  // VAD speech UNION", which matches the per-sample boolean OR in
+  // `build_speech_mask`. Coalescing upfront keeps the per-frame
+  // accumulator's semantics intact while still using the simple
+  // `seg ∩ frame` overlap computation downstream.
+  //
+  // Clamp `seg.start_pts()` / `seg.end_pts()` to `[0, n_samples]`
+  // here for the same reason `build_speech_mask` does (Codex
+  // round-24): a VAD segment whose `end_pts > n_samples` would
+  // credit the trailing frame's interval with phantom-sample
+  // overlap.
+  let mut clamped_segs: alloc::vec::Vec<(i64, i64)> = sub_segments
+    .iter()
+    .map(|s| (s.start_pts().clamp(0, n_samples_i64), s.end_pts().clamp(0, n_samples_i64)))
+    .filter(|(s, e)| e > s)
+    .collect();
+  clamped_segs.sort_by_key(|&(s, _)| s);
+  let mut merged_segs: alloc::vec::Vec<(i64, i64)> =
+    alloc::vec::Vec::with_capacity(clamped_segs.len());
+  for (s, e) in clamped_segs {
+    match merged_segs.last_mut() {
+      // Touching (`s == last.1`) or overlapping (`s < last.1`)
+      // → extend the existing range.
+      Some(last) if s <= last.1 => {
+        if e > last.1 {
+          last.1 = e;
+        }
+      }
+      _ => merged_segs.push((s, e)),
     }
-    // Iterate every frame that touches the segment and
-    // accumulate the per-frame overlap. Adjacent VAD segments
-    // cumulatively contribute to the same frame, which matches
-    // the spirit of the old "any overlap" rule for cases where
-    // VAD splits a single voiced span across two segments.
+  }
+
+  let mut overlap_per_frame = alloc::vec![0_i64; n_frames];
+  for &(seg_start, seg_end) in &merged_segs {
+    // Iterate every frame that touches the (now non-overlapping)
+    // segment and accumulate the per-frame overlap.
     let frame_start = ((seg_start as f64) / samples_per_frame).floor() as i64;
     let frame_start = frame_start.max(0) as usize;
     let frame_end = ((seg_end as f64) / samples_per_frame).ceil() as i64;
@@ -667,6 +696,78 @@ mod tests {
       mask_partial[1], false,
       "frame 1 must not be speech (no real audio)"
     );
+  }
+
+  #[test]
+  fn build_speech_frames_uses_union_not_sum_for_overlapping_segments() {
+    // Codex round-27 regression: previously
+    // `build_speech_frames` summed each sub-segment's per-frame
+    // intersection independently, double-counting overlapping
+    // ranges. Two overlapping segs whose UNION sat below the
+    // half-frame threshold could still trip it via raw sum.
+    //
+    // Frame 0 covers `[0, 320)`, threshold = 160 samples (≥50%).
+    // - Seg A = `[0, 100]` → 100-sample overlap with frame 0.
+    // - Seg B = `[50, 150]` → 100-sample overlap with frame 0.
+    // - Sum = 200 ≥ 160 → would-classify-speech (wrong).
+    // - Union = `[0, 150]` → 150 < 160 → correct: silent.
+    use core::num::NonZeroU32;
+    use mediatime::{TimeRange, Timebase};
+    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+
+    let overlapping = alloc::vec![
+      TimeRange::new(0, 100, tb_16k),
+      TimeRange::new(50, 150, tb_16k),
+    ];
+    let mask = build_speech_frames(/* n_frames: */ 1, 320.0, /* n_samples: */ 320, &overlapping);
+    assert_eq!(
+      mask,
+      alloc::vec![false],
+      "overlapping segs must be coalesced to their union; sum 200 vs union 150 (< 160 threshold)"
+    );
+
+    // Sanity counter-test: two segs whose UNION crosses the
+    // threshold MUST classify speech. Picks ranges that
+    // overlap but whose merged extent comfortably exceeds 160.
+    let union_speech = alloc::vec![
+      TimeRange::new(0, 100, tb_16k),
+      TimeRange::new(80, 200, tb_16k), // union = [0, 200] = 200 samples
+    ];
+    let mask_speech = build_speech_frames(1, 320.0, 320, &union_speech);
+    assert_eq!(mask_speech, alloc::vec![true]);
+
+    // Triple-overlap stress: three segs all overlapping the
+    // same prefix. Sum can be ≥ 3× union; union must still win.
+    let triple = alloc::vec![
+      TimeRange::new(0, 80, tb_16k),
+      TimeRange::new(20, 100, tb_16k),
+      TimeRange::new(40, 120, tb_16k),
+    ];
+    let mask_triple = build_speech_frames(1, 320.0, 320, &triple);
+    // Union = [0, 120] = 120 < 160 → silent.
+    assert_eq!(
+      mask_triple,
+      alloc::vec![false],
+      "triple-overlap union (120) < threshold (160) must classify silent regardless of summed sum"
+    );
+  }
+
+  #[test]
+  fn build_speech_frames_treats_adjacent_segments_as_contiguous() {
+    // Adjacent (touching) segments [0, 80] and [80, 160] form a
+    // contiguous union [0, 160] = exactly the threshold → speech.
+    // The coalesce logic merges on `s <= last.1` so touching
+    // segments are treated as one continuous range, matching the
+    // existing per-sample boolean OR in `build_speech_mask`.
+    use core::num::NonZeroU32;
+    use mediatime::{TimeRange, Timebase};
+    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    let touching = alloc::vec![
+      TimeRange::new(0, 80, tb_16k),
+      TimeRange::new(80, 160, tb_16k),
+    ];
+    let mask = build_speech_frames(1, 320.0, 320, &touching);
+    assert_eq!(mask, alloc::vec![true]);
   }
 
   #[test]
