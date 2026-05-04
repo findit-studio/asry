@@ -406,7 +406,46 @@ pub(super) fn full_params_from(
   params: &AsrParams,
   attempt_temperature: f32,
   abort_flag: Arc<AtomicBool>,
-) -> FullParams<'static, 'static> {
+) -> Result<FullParams<'static, 'static>, WorkFailure> {
+  // whisper-rs's `FullParams::set_language` and `set_initial_prompt`
+  // build a `CString` via `CString::new(...).expect("...")`. An
+  // interior NUL byte therefore PANICS the worker thread mid-
+  // inference rather than returning an error. Public callers reach
+  // these strings through `AsrParamsOverride::with_initial_prompt`
+  // / `with_language_hint` and through `Lang::Other`, all of which
+  // accept `SmolStr` / arbitrary content without validation. Codex
+  // round-31 flagged this — a single bad input would shut down
+  // single-worker pools and leave chunks stranded in multi-worker
+  // pools (no `WorkFailure` ever sent, drain hangs).
+  //
+  // Validate before we cross the FFI boundary and convert the
+  // failure into an in-band `BackendError` for THIS chunk. The
+  // pool stays alive; subsequent chunks transcribe normally.
+  if let Some(lang) = params.language_hint()
+    && lang.as_str().contains('\0')
+  {
+    return Err(WorkFailure::AsrFailed {
+      kind: AsrFailureKind::BackendError,
+      message: alloc::format!(
+        "language hint contains an interior NUL byte ({} bytes total); whisper-rs's set_language \
+         would panic. Reject before FFI.",
+        lang.as_str().len()
+      ),
+    });
+  }
+  if let Some(prompt) = params.initial_prompt()
+    && prompt.as_str().contains('\0')
+  {
+    return Err(WorkFailure::AsrFailed {
+      kind: AsrFailureKind::BackendError,
+      message: alloc::format!(
+        "initial_prompt of len {} contains an interior NUL byte; whisper-rs's set_initial_prompt \
+         would panic. Reject before FFI.",
+        prompt.as_str().len()
+      ),
+    });
+  }
+
   let strategy = match params.strategy() {
     SamplingStrategy::Greedy { best_of } => WhisperStrategy::Greedy { best_of },
     SamplingStrategy::BeamSearch {
@@ -462,7 +501,7 @@ pub(super) fn full_params_from(
   // abort_flag is shared with the watchdog thread.
   p.set_abort_callback_safe(move || abort_flag.load(Ordering::Relaxed));
 
-  p
+  Ok(p)
 }
 
 /// Mean of per-segment `avg_logprob` across the just-decoded chunk.
@@ -584,7 +623,7 @@ pub(super) fn run_with_temperature_ladder(
   let max = p.max_attempts() as usize;
 
   for _attempt in 0..max {
-    let full = full_params_from(p, temperature, job.abort_flag.clone());
+    let full = full_params_from(p, temperature, job.abort_flag.clone())?;
     let outcome = state.full(full, job.samples.as_ref());
     if let Err(e) = outcome {
       // Distinguish abort (watchdog timeout) from a real backend
@@ -1003,7 +1042,7 @@ mod tests {
   fn full_params_from_greedy_is_finite() {
     let p = AsrParams::default().with_strategy(SamplingStrategy::Greedy { best_of: 1 });
     let flag = Arc::new(AtomicBool::new(false));
-    let _full = full_params_from(&p, 0.4, flag);
+    let _full = full_params_from(&p, 0.4, flag).expect("valid params");
     // FullParams' fields aren't all readable; the assertion is that
     // the build does not panic and the abort closure compiles.
     // Recording-mock tests verify temperature_inc=0.0 and the
@@ -1014,7 +1053,57 @@ mod tests {
   fn full_params_from_with_language_hint_does_not_panic() {
     let p = AsrParams::default().with_language_hint(Some(Lang::En));
     let flag = Arc::new(AtomicBool::new(false));
-    let _full = full_params_from(&p, 0.0, flag);
+    let _full = full_params_from(&p, 0.0, flag).expect("valid params");
+  }
+
+  /// Codex round-31 regression: an interior NUL in the language
+  /// hint must be rejected as an in-band `WorkFailure::AsrFailed`
+  /// rather than panicking inside `whisper-rs`'s `set_language`
+  /// (which uses `CString::new(...).expect("...")`). Reaches here
+  /// via `Lang::Other("xx\0yy")` which the public surface accepts
+  /// without validation.
+  #[test]
+  fn full_params_from_rejects_interior_nul_in_language_hint() {
+    let p = AsrParams::default().with_language_hint(Some(Lang::Other(SmolStr::from("xx\0yy"))));
+    let flag = Arc::new(AtomicBool::new(false));
+    let res = full_params_from(&p, 0.0, flag);
+    match res {
+      Err(WorkFailure::AsrFailed {
+        kind: AsrFailureKind::BackendError,
+        message,
+      }) => {
+        assert!(
+          message.contains("language hint") && message.contains("NUL"),
+          "expected NUL diagnostic; got {message:?}"
+        );
+      }
+      other => panic!("expected AsrFailed/BackendError; got {other:?}"),
+    }
+  }
+
+  /// Codex round-31 regression: an interior NUL in `initial_prompt`
+  /// must be rejected as an in-band `WorkFailure::AsrFailed`
+  /// rather than panicking inside `whisper-rs`'s
+  /// `set_initial_prompt`. Reaches here via the public
+  /// `AsrParamsOverride::with_initial_prompt(Some(SmolStr::new(...)))`
+  /// which accepts arbitrary content.
+  #[test]
+  fn full_params_from_rejects_interior_nul_in_initial_prompt() {
+    let p = AsrParams::default().with_initial_prompt(Some(SmolStr::from("hint\0poison")));
+    let flag = Arc::new(AtomicBool::new(false));
+    let res = full_params_from(&p, 0.0, flag);
+    match res {
+      Err(WorkFailure::AsrFailed {
+        kind: AsrFailureKind::BackendError,
+        message,
+      }) => {
+        assert!(
+          message.contains("initial_prompt") && message.contains("NUL"),
+          "expected NUL diagnostic; got {message:?}"
+        );
+      }
+      other => panic!("expected AsrFailed/BackendError; got {other:?}"),
+    }
   }
 
   /// Internal-only variant testable without a live `WhisperState`.
