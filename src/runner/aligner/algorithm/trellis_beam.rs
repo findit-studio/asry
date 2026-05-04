@@ -387,29 +387,35 @@ fn max_non_blank_logprob(log_probs: &LogProbsTV, t_idx: usize, blank_v: usize) -
   best
 }
 
-/// One point on the WhisperX-style alignment path.
+/// One node in the beam search arena.
+///
+/// Replaces the previous `BeamState { ..., path: Vec<PathPoint> }`
+/// design. The path is reconstructed at the end of `backtrack_beam`
+/// by walking the `prev` chain. Codex round-22 flagged the cloning
+/// approach as O(T²) in path-copy cost — each iteration cloned
+/// `path` (up to length `T`) for every stay/change branch
+/// (`beam_width × 2` branches per iteration × `T` iterations × O(T)
+/// clone cost). With this representation each branch is O(1)
+/// (push one `BeamNode` + its `prev` index), and the total arena
+/// size is bounded by `~beam_width * 2 * T` entries (≤ ~96 KB at
+/// T=1500, ≤ 1 MB at T=10000).
 #[derive(Debug, Clone)]
-struct PathPoint {
-  /// Index into `tokens` / `text_clean`.
-  token_index: usize,
-  /// Frame index this point covers.
-  time_index: usize,
-  /// Linear-space probability (`exp(logprob)`) the path emitted
-  /// at this frame. Stay frames use `emission[t, blank_id].exp()`;
-  /// change frames use `emission[t, tokens[j]].exp()` (or the
-  /// wildcard max for wildcard tokens). Matches WhisperX's
-  /// `Point.score`.
-  score: f32,
-}
-
-/// One state in the beam search.
-struct BeamState {
+struct BeamNode {
   token_index: usize,
   time_index: usize,
-  /// Cumulative score (the trellis cell value at the current
-  /// (t, j)). Used to rank beams.
+  /// Cumulative trellis-cell score at `(time_index, token_index)`.
+  /// Used to rank beams.
   score: f32,
-  path: Vec<PathPoint>,
+  /// Per-frame emission probability (linear-space
+  /// `exp(logprob)`) for THIS node's frame. Mirrors the previous
+  /// `PathPoint::score` field. Stay nodes use
+  /// `emission[t, blank_id].exp()`; change nodes use
+  /// `emission[t, tokens[j]].exp()` (or wildcard max).
+  point_score: f32,
+  /// Index of the predecessor `BeamNode` in the arena, or `None`
+  /// for the seed node. Walking this chain (then reversing)
+  /// reproduces the path the previous `BeamState::path` Vec held.
+  prev: Option<u32>,
 }
 
 /// Run WhisperX `backtrack_beam` with `beam_width=2`. Returns the
@@ -463,18 +469,30 @@ pub fn backtrack_beam(
       language: language.clone(),
     });
   }
-  let init = BeamState {
+  // All beam nodes ever created live in this arena. Active beams
+  // are indices into it. A node's `prev` field links to its
+  // predecessor (or None for the seed). Replacing the previous
+  // `Vec<PathPoint>`-per-state design avoids the O(T²) path-clone
+  // cost Codex round-22 flagged: each branch now pushes ONE node
+  // + an index, regardless of how long the path has grown.
+  //
+  // Capacity: each iteration creates at most `beam_width * 2` new
+  // nodes (stay + change for each surviving beam). With T outer
+  // iterations + the seed, the final arena holds at most
+  // `1 + beam_width * 2 * T` nodes (~96 KB at T=1500 / beam=2;
+  // ~1 MB at T=10000). The trellis budget already caps `T *
+  // num_tokens` at 32 M cells, so the arena grows linearly within
+  // that bound.
+  let mut arena: Vec<BeamNode> = Vec::with_capacity(1 + beam_width * 2 * t);
+  arena.push(BeamNode {
     token_index: final_j,
     time_index: final_t,
     score: final_score,
-    path: alloc::vec![PathPoint {
-      token_index: final_j,
-      time_index: final_t,
-      score: log_probs.at(final_t, blank_id as usize).exp(),
-    }],
-  };
-  let mut beams = alloc::vec![init];
-  let mut next_beams: Vec<BeamState> = Vec::with_capacity(beam_width * 2);
+    point_score: log_probs.at(final_t, blank_id as usize).exp(),
+    prev: None,
+  });
+  let mut active: Vec<u32> = alloc::vec![0_u32];
+  let mut next_active: Vec<u32> = Vec::with_capacity(beam_width * 2);
 
   // Iterate until every beam has reached token 0 (or the beam list
   // empties). WhisperX's loop predicate `beams[0].token_index > 0`
@@ -482,7 +500,7 @@ pub fn backtrack_beam(
   // abort check covers pathological cases where a wide trellis
   // produces enough live beams to extend the loop noticeably.
   let mut iters = 0_usize;
-  while !beams.is_empty() && beams[0].token_index > 0 {
+  while !active.is_empty() && arena[active[0] as usize].token_index > 0 {
     iters += 1;
     if iters % 64 == 0 && abort_flag.load(Ordering::Relaxed) {
       return Err(WorkFailure::WorkerHangTimeout {
@@ -490,10 +508,14 @@ pub fn backtrack_beam(
         elapsed: core::time::Duration::ZERO,
       });
     }
-    next_beams.clear();
-    for beam in &beams {
-      let t_curr = beam.time_index;
-      let j_curr = beam.token_index;
+    next_active.clear();
+    for &beam_idx in &active {
+      // Snapshot the fields we need; the `&arena[..]` borrow
+      // must end before we `arena.push()` below.
+      let (t_curr, j_curr) = {
+        let beam = &arena[beam_idx as usize];
+        (beam.time_index, beam.token_index)
+      };
       if t_curr == 0 {
         continue;
       }
@@ -553,49 +575,47 @@ pub fn backtrack_beam(
 
       // Stay branch.
       if stay_score.is_finite() {
-        let mut new_path = beam.path.clone();
-        new_path.push(PathPoint {
-          token_index: j_curr,
-          time_index: t_curr - 1,
-          score: p_stay_lp.exp(),
-        });
-        next_beams.push(BeamState {
+        let new_idx = arena.len() as u32;
+        arena.push(BeamNode {
           token_index: j_curr,
           time_index: t_curr - 1,
           score: stay_score,
-          path: new_path,
+          point_score: p_stay_lp.exp(),
+          prev: Some(beam_idx),
         });
+        next_active.push(new_idx);
       }
       // Change branch (only valid when j > 0 and the change
       // score is finite).
       if j_curr > 0 && change_score.is_finite() {
-        let mut new_path = beam.path.clone();
-        new_path.push(PathPoint {
-          token_index: j_curr - 1,
-          time_index: t_curr - 1,
-          score: p_change_lp.exp(),
-        });
-        next_beams.push(BeamState {
+        let new_idx = arena.len() as u32;
+        arena.push(BeamNode {
           token_index: j_curr - 1,
           time_index: t_curr - 1,
           score: change_score,
-          path: new_path,
+          point_score: p_change_lp.exp(),
+          prev: Some(beam_idx),
         });
+        next_active.push(new_idx);
       }
     }
 
-    // Sort by `score` desc and keep the top `beam_width`.
+    // Sort active by score desc and keep the top `beam_width`.
     // `f32` doesn't impl Ord; sort by total_cmp() reversed for
     // descending. This matches Python's stable
     // `sorted(..., reverse=True)`.
-    next_beams.sort_by(|a, b| b.score.total_cmp(&a.score));
-    if next_beams.len() > beam_width {
-      next_beams.truncate(beam_width);
+    next_active.sort_by(|&a, &b| {
+      arena[b as usize]
+        .score
+        .total_cmp(&arena[a as usize].score)
+    });
+    if next_active.len() > beam_width {
+      next_active.truncate(beam_width);
     }
-    core::mem::swap(&mut beams, &mut next_beams);
+    core::mem::swap(&mut active, &mut next_active);
   }
 
-  if beams.is_empty() {
+  if active.is_empty() {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::NoAlignmentPath,
       message: String::from("beam search emptied before reaching token 0"),
@@ -603,37 +623,50 @@ pub fn backtrack_beam(
     });
   }
 
-  let mut best = beams.swap_remove(0);
-  // WhisperX appends remaining leading blanks at token 0 to fill
-  // the path back to t=0 (visualisation only — they all land at
-  // token 0 with blank emissions, so they don't affect any later
-  // segment-grouping).
-  while best.time_index > 0 {
-    let t_curr = best.time_index;
-    let prob = log_probs.at(t_curr - 1, blank_id as usize).exp();
-    best.path.push(PathPoint {
-      token_index: best.token_index,
-      time_index: t_curr - 1,
+  // Reconstruct the path in ascending-time order. Two parts:
+  //
+  //   (a) WhisperX's leading-blank fill: frames [0, winner.t)
+  //       emit blank at token-0 (visualisation only — the
+  //       trailing leading-blanks always land at token 0 with
+  //       blank emissions, so they don't affect any later
+  //       segment-grouping).
+  //
+  //   (b) The chain walk from `winner` (smallest time) back to
+  //       the seed (largest time). Walking `prev` from winner
+  //       yields nodes in ASCENDING time order because each
+  //       branch was created with `time_index = parent.time_index
+  //       - 1`, so `parent.time_index = child.time_index + 1`.
+  //
+  // Total: O(T) work, O(T) allocation, no per-branch path-vector
+  // cloning. Codex round-22 flagged the previous O(T²) clone cost.
+  let winner_idx = active[0] as usize;
+  let winner_t = arena[winner_idx].time_index;
+  let winner_token = arena[winner_idx].token_index;
+  let mut path: Vec<PathPointPublic> = Vec::with_capacity(t);
+
+  // (a) Leading blank fill: [0, winner_t)
+  for ti in 0..winner_t {
+    let prob = log_probs.at(ti, blank_id as usize).exp();
+    path.push(PathPointPublic {
+      token_index: winner_token,
+      time_index: ti,
       score: prob,
     });
-    best.time_index = t_curr - 1;
   }
 
-  // The path is built from final → initial; reverse it so frame 0
-  // comes first, frame T-1 last. Convert to public PathPointPublic
-  // so callers don't need to see BeamState.
-  best.path.reverse();
-  Ok(
-    best
-      .path
-      .into_iter()
-      .map(|p| PathPointPublic {
-        token_index: p.token_index,
-        time_index: p.time_index,
-        score: p.score,
-      })
-      .collect(),
-  )
+  // (b) Chain walk: [winner_t, winner_t + 1, ..., final_t]
+  let mut cur: Option<u32> = Some(active[0]);
+  while let Some(idx) = cur {
+    let node = &arena[idx as usize];
+    path.push(PathPointPublic {
+      token_index: node.token_index,
+      time_index: node.time_index,
+      score: node.point_score,
+    });
+    cur = node.prev;
+  }
+
+  Ok(path)
 }
 
 /// Public-facing path point. Same shape as the internal
