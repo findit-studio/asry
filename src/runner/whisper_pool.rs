@@ -55,6 +55,11 @@ static INTERNED_LANG_STRS: LazyLock<Mutex<HashMap<String, &'static str>>> =
 /// Return a `&'static str` for `s`, allocating + leaking once per
 /// distinct value. Subsequent calls with the same `s` return the
 /// same pointer — bounded leak, see [`INTERNED_LANG_STRS`].
+///
+/// **Caller contract**: pre-validate `s` via
+/// [`validate_language_code`]. Without that, `Lang::Other(SmolStr)`
+/// could feed unique adversarial strings here and grow the
+/// intern table without bound (one leak per unique hint).
 fn intern_lang_str(s: &str) -> &'static str {
   let mut map = INTERNED_LANG_STRS
     .lock()
@@ -65,6 +70,39 @@ fn intern_lang_str(s: &str) -> &'static str {
   let leaked: &'static str = Box::leak(Box::<str>::from(s));
   map.insert(s.to_string(), leaked);
   leaked
+}
+
+/// Maximum byte length accepted for a language hint. Whisper.cpp's
+/// recognized set is 2-3 letter ISO codes; 8 bytes covers every
+/// real code with comfortable headroom for future regional
+/// variants while still bounding the intern table.
+const MAX_LANGUAGE_CODE_LEN: usize = 8;
+
+/// Validate a language hint before it's interned and shipped into
+/// `whisper-rs::FullParams::set_language`.
+///
+/// Returns `Err(reason)` for an empty string, anything longer
+/// than [`MAX_LANGUAGE_CODE_LEN`], or anything containing a byte
+/// outside `[a-z]`. The reason is a `'static` slogan suitable
+/// for inclusion in an in-band [`WorkFailure::AsrFailed`]
+/// message; intentionally does NOT echo the offending bytes
+/// back to the caller because the language hint can be set
+/// from public input.
+///
+/// Codex round-32: prevents `Lang::Other(...)` from feeding
+/// unique adversarial strings into [`intern_lang_str`], whose
+/// leak-on-first-sight design has no eviction policy.
+fn validate_language_code(s: &str) -> Result<(), &'static str> {
+  if s.is_empty() {
+    return Err("language code is empty");
+  }
+  if s.len() > MAX_LANGUAGE_CODE_LEN {
+    return Err("language code longer than 8 bytes (whisper.cpp codes are 2–3 ASCII letters)");
+  }
+  if !s.bytes().all(|b| b.is_ascii_lowercase()) {
+    return Err("language code must be lowercase ASCII letters [a-z] only");
+  }
+  Ok(())
 }
 
 /// Configuration for the runner's whisper worker pool.
@@ -418,20 +456,30 @@ pub(super) fn full_params_from(
   // single-worker pools and leave chunks stranded in multi-worker
   // pools (no `WorkFailure` ever sent, drain hangs).
   //
-  // Validate before we cross the FFI boundary and convert the
+  // Round-32 added shape validation for the language hint:
+  // `intern_lang_str` allocates+leaks one `&'static str` per
+  // distinct hint and never evicts. `Lang::Other(SmolStr)` is
+  // public, so a tenant or caller producing unique high-cardinality
+  // hints would grow process memory without bound. Restrict the
+  // alphabet to ISO-639-shaped lowercase ASCII letters, length
+  // 1..=8. Whisper.cpp's recognized language set fits well inside
+  // that envelope; anything outside is either a typo or hostile
+  // input and would not match a real language anyway.
+  //
+  // Validate before crossing the FFI boundary and convert the
   // failure into an in-band `BackendError` for THIS chunk. The
   // pool stays alive; subsequent chunks transcribe normally.
-  if let Some(lang) = params.language_hint()
-    && lang.as_str().contains('\0')
-  {
-    return Err(WorkFailure::AsrFailed {
-      kind: AsrFailureKind::BackendError,
-      message: alloc::format!(
-        "language hint contains an interior NUL byte ({} bytes total); whisper-rs's set_language \
-         would panic. Reject before FFI.",
-        lang.as_str().len()
-      ),
-    });
+  if let Some(lang) = params.language_hint() {
+    if let Err(reason) = validate_language_code(lang.as_str()) {
+      return Err(WorkFailure::AsrFailed {
+        kind: AsrFailureKind::BackendError,
+        message: alloc::format!(
+          "language hint rejected: {reason}. whisper-rs/whisper.cpp would either panic in \
+           CString::new or fall back to detect; either way refusing to leak an unbounded \
+           intern entry."
+        ),
+      });
+    }
   }
   if let Some(prompt) = params.initial_prompt()
     && prompt.as_str().contains('\0')
@@ -939,6 +987,30 @@ fn worker_loop(
     drop(cancel_tx);
     let _ = watchdog.join();
 
+    // Codex round-32: post-watchdog abort-flag check.
+    // `run_with_temperature_ladder` only consults `abort_flag`
+    // when `state.full(...)` returned `Err`. If the watchdog
+    // fired DURING inference but whisper.cpp finished before
+    // observing the next abort-callback poll, we get an
+    // apparently-successful `AsrResult` that violates the
+    // configured per-job timeout. Rewrite it to
+    // `WorkerHangTimeout` here, matching the alignment worker's
+    // post-run check (`alignment_pool.rs` does the same).
+    //
+    // This also makes timeout-streak recycling honest:
+    // `was_timeout` below is now derived from the rewritten
+    // outcome, so a long sequence of "succeeded after timeout"
+    // results still trips the streak threshold and forces
+    // state recreation.
+    let outcome = if job.abort_flag.load(Ordering::Relaxed) {
+      Err(WorkFailure::WorkerHangTimeout {
+        kind: WorkerKind::Asr,
+        elapsed: started_at.elapsed(),
+      })
+    } else {
+      outcome
+    };
+
     let was_timeout = matches!(outcome, Err(WorkFailure::WorkerHangTimeout { .. }));
 
     let _ = result_tx.send((job.chunk_id, outcome));
@@ -1062,6 +1134,11 @@ mod tests {
   /// (which uses `CString::new(...).expect("...")`). Reaches here
   /// via `Lang::Other("xx\0yy")` which the public surface accepts
   /// without validation.
+  ///
+  /// Round-32 narrowed the validation to lowercase-ASCII-only
+  /// (Codex flagged the unbounded intern leak). NUL bytes are
+  /// non-ASCII-letter and therefore still rejected, but via the
+  /// charset check rather than a NUL-specific check.
   #[test]
   fn full_params_from_rejects_interior_nul_in_language_hint() {
     let p = AsrParams::default().with_language_hint(Some(Lang::Other(SmolStr::from("xx\0yy"))));
@@ -1073,10 +1150,84 @@ mod tests {
         message,
       }) => {
         assert!(
-          message.contains("language hint") && message.contains("NUL"),
-          "expected NUL diagnostic; got {message:?}"
+          message.contains("language hint")
+            && message.contains("lowercase ASCII"),
+          "expected charset-violation diagnostic; got {message:?}"
         );
       }
+      other => panic!("expected AsrFailed/BackendError; got {other:?}"),
+    }
+  }
+
+  // --- Codex round-32: language hint shape validation ---
+
+  #[test]
+  fn validate_language_code_accepts_iso_shapes() {
+    assert!(validate_language_code("en").is_ok());
+    assert!(validate_language_code("es").is_ok());
+    assert!(validate_language_code("zh").is_ok());
+    assert!(validate_language_code("yue").is_ok()); // Cantonese
+    assert!(validate_language_code("haw").is_ok()); // Hawaiian
+    assert!(validate_language_code("a").is_ok()); // single letter (degenerate but bounded)
+    assert!(validate_language_code("abcdefgh").is_ok()); // 8 chars
+  }
+
+  #[test]
+  fn validate_language_code_rejects_empty() {
+    let err = validate_language_code("").unwrap_err();
+    assert!(err.contains("empty"), "got {err}");
+  }
+
+  #[test]
+  fn validate_language_code_rejects_overlong() {
+    let err = validate_language_code("abcdefghi").unwrap_err(); // 9 chars
+    assert!(err.contains("longer than"), "got {err}");
+    let err2 = validate_language_code(&"x".repeat(64)).unwrap_err();
+    assert!(err2.contains("longer than"), "got {err2}");
+  }
+
+  #[test]
+  fn validate_language_code_rejects_uppercase() {
+    let err = validate_language_code("EN").unwrap_err();
+    assert!(err.contains("lowercase ASCII"), "got {err}");
+  }
+
+  #[test]
+  fn validate_language_code_rejects_dash_or_digits() {
+    // Even regional variants like "zh-tw" are rejected: whisper.cpp
+    // doesn't recognize them and this keeps the intern table truly
+    // bounded to ~26^8 worst case (in practice ≪50 named codes).
+    assert!(validate_language_code("zh-tw").is_err());
+    assert!(validate_language_code("zh1").is_err());
+  }
+
+  #[test]
+  fn validate_language_code_rejects_non_ascii() {
+    // UTF-8 multibyte: "français" — definitely a language name,
+    // but not a code. Reject; the user should pass `Lang::Fr`.
+    assert!(validate_language_code("français").is_err());
+    // Control chars including NUL.
+    assert!(validate_language_code("a\0b").is_err());
+    assert!(validate_language_code("a\nb").is_err());
+  }
+
+  /// Codex round-32 regression: a high-cardinality
+  /// `Lang::Other(SmolStr)` from a malicious or buggy caller
+  /// must NOT reach `intern_lang_str` (which leaks one
+  /// `&'static str` per distinct value forever). Validation
+  /// rejects the request as an in-band chunk failure long
+  /// before the intern table sees it.
+  #[test]
+  fn full_params_from_rejects_high_cardinality_language_hint() {
+    let p = AsrParams::default()
+      .with_language_hint(Some(Lang::Other(SmolStr::from("very-long-attacker-string"))));
+    let flag = Arc::new(AtomicBool::new(false));
+    let res = full_params_from(&p, 0.0, flag);
+    match res {
+      Err(WorkFailure::AsrFailed {
+        kind: AsrFailureKind::BackendError,
+        ..
+      }) => {}
       other => panic!("expected AsrFailed/BackendError; got {other:?}"),
     }
   }
