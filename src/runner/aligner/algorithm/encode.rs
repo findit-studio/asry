@@ -412,38 +412,63 @@ pub(crate) fn log_softmax_with_finite_guard(
         language: language.clone(),
       });
     }
+    // Shifted log-sum-exp computed in f64. We do NOT add `max`
+    // back into f32 to form `log_z` and then subtract it again,
+    // because for a row with a large common offset (e.g.
+    // `[1e20, 1e20]`) `sum.ln()` rounds away when added to `max`
+    // in f32 — `max + sum.ln() as f32 = 1e20 + 0.69 ≈ 1e20` in
+    // f32 — and every `lp = x - log_z` then collapses to `0.0`
+    // instead of the correct `-ln(2)`. The output passes the
+    // finiteness checks but is no longer a log-probability,
+    // hiding the backend numeric skew as plausible-looking
+    // alignment input. Codex round-22 flagged this; the fix is
+    // to keep the subtraction of `max` in shifted f64 space and
+    // only cast the final `lp` to f32 (where `lp = (x - max) -
+    // sum.ln()` is bounded between `-inf..=0` and never needs
+    // `max` to fold in).
     let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let max_f64 = max as f64;
     let mut sum = 0.0_f64;
     for &x in row {
-      sum += ((x - max) as f64).exp();
+      sum += ((x as f64) - max_f64).exp();
     }
-    let log_z = max + (sum.ln() as f32);
-    if !log_z.is_finite() {
+    let log_z_shifted = sum.ln();
+    if !log_z_shifted.is_finite() {
+      // `sum == 0.0` (whole row was -inf, or every shifted exp
+      // underflowed) → ln(0) = -inf. `sum < 0` is impossible
+      // here. `sum.ln() == NaN` is impossible from non-negative
+      // f64 input. So this branch fires only on the all-(-inf)
+      // case, which the existing all-`NEG_INFINITY` regression
+      // also covers.
       return Err(WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::ModelInferenceFailed,
         message: alloc::format!(
-          "log-softmax normaliser non-finite at frame {t_idx}: log_z={log_z}, max={max}, sum={sum}"
+          "log-softmax shifted normaliser non-finite at frame {t_idx}: \
+           sum.ln()={log_z_shifted}, max={max}"
         ),
         language: language.clone(),
       });
     }
-    // Each output log-probability must also be finite. A finite
-    // input row + finite `log_z` can still produce a non-finite
-    // `x - log_z` when `x` and `log_z` straddle f32's limits
-    // (e.g. row `[f32::MAX, -f32::MAX]` → log_z = f32::MAX,
-    // `-f32::MAX - f32::MAX` overflows to `-inf`). Without this
-    // check the `-inf` lands in `data`; Viterbi sees it as a
-    // valid-but-very-low log-prob and can return
-    // `NoAlignmentPath` (a *recoverable* outcome), silently
-    // hiding what is actually a backend numeric failure as
-    // `words: []`.
+    // Per-output log-probability. `lp_f64 = (x - max) - sum.ln()`
+    // is bounded in `(-∞, 0]` for any finite input row (since
+    // `(x - max) <= 0` and `sum.ln() >= 0` whenever any row
+    // element equals `max`). We still keep the per-element
+    // finiteness check because pathological inputs like
+    // `[f32::MAX, -f32::MAX]` can underflow `lp_f64 as f32` to
+    // `-inf`; surfacing that as `ModelInferenceFailed` keeps the
+    // backend-numeric-failure path typed (a `-inf` slipping into
+    // `data` would be visible to Viterbi as a valid-but-very-low
+    // log-prob, masking the bug as `NoAlignmentPath` /
+    // `words: []`).
     for &x in row {
-      let lp = x - log_z;
+      let lp_f64 = ((x as f64) - max_f64) - log_z_shifted;
+      let lp = lp_f64 as f32;
       if !lp.is_finite() {
         return Err(WorkFailure::AlignmentFailed {
           kind: AlignmentFailureKind::ModelInferenceFailed,
           message: alloc::format!(
-            "log-softmax output non-finite at frame {t_idx}: x={x}, log_z={log_z}, lp={lp}"
+            "log-softmax output non-finite at frame {t_idx}: \
+             x={x}, max={max}, sum_ln={log_z_shifted}, lp={lp}"
           ),
           language: language.clone(),
         });
@@ -650,6 +675,41 @@ mod tests {
     assert!(out.iter().all(|x| x.is_finite()));
     let sum: f32 = out.iter().map(|x| x.exp()).sum();
     assert!((sum - 1.0).abs() < 1e-5);
+  }
+
+  #[test]
+  fn log_softmax_large_common_offset_normalises_to_unit_exp_sum() {
+    // Codex round-22 regression: the previous implementation
+    // computed `log_z = max + sum.ln() as f32`. For a row with
+    // a large common offset like `[1e20, 1e20]`, `sum.ln() =
+    // ln(2) ≈ 0.69` rounds away when added to `max = 1e20` in
+    // f32 — `1e20 + 0.69 ≈ 1e20` — so each `lp = x - log_z`
+    // collapsed to `0.0` instead of the correct `-ln(2)`. The
+    // outputs passed the finiteness check but were no longer
+    // log-probabilities, hiding a backend numeric failure as
+    // plausible alignment output. The fix keeps the
+    // subtraction of `max` in f64 (`lp_f64 = (x as f64 -
+    // max_f64) - sum.ln()`) so the shifted log-prob is correct
+    // regardless of `max`'s magnitude.
+    use crate::types::Lang;
+    let raw = alloc::vec![1.0e20_f32, 1.0e20_f32];
+    let out = log_softmax_with_finite_guard(&raw, 1, 2, &Lang::En).expect("ok");
+    assert_eq!(out.len(), 2);
+    assert!(out.iter().all(|x| x.is_finite()));
+    // Exp-sum should be 1.0 (i.e. softmax probabilities sum to 1).
+    let exp_sum: f32 = out.iter().map(|x| x.exp()).sum();
+    assert!(
+      (exp_sum - 1.0).abs() < 1e-5,
+      "exp(lp) sum must equal 1, got {exp_sum}; lps = {out:?}"
+    );
+    // Each lp should be log(0.5) = -ln(2) ≈ -0.6931.
+    for lp in &out {
+      assert!(
+        (lp - (-(2.0_f32).ln())).abs() < 1e-4,
+        "expected ~{}, got {lp}",
+        -(2.0_f32).ln()
+      );
+    }
   }
 
   // --- ORT output dims validation ---
