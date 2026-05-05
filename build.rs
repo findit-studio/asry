@@ -37,6 +37,36 @@ const TOKENIZER_W2V_FILENAME: &str = "wav2vec2-base-960h-tokenizer.json";
 const TOKENIZER_W2V_SHA256: &str =
   "df57f576f5ef16a454ae2776dcc777ffef0bc824113043043b7218c829fc7405";
 
+// Multi-language alignment models. The upstream `jonatasgrosman/`
+// HF repos ship PyTorch weights only — no ONNX. We re-export
+// once via `tests/parity_whisperx/python/fetch_align_model.py`
+// and mirror the result under `FinDIT-Studio/...-onnx`. From
+// build.rs's perspective, that mirror is just another
+// SHA-verified direct-download — same shape as English.
+const MODEL_W2V_JA_URL: &str =
+  "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-japanese-onnx/resolve/main/model.onnx";
+const MODEL_W2V_JA_FILENAME: &str = "jonatasgrosman--wav2vec2-large-xlsr-53-japanese.onnx";
+const MODEL_W2V_JA_SHA256: &str =
+  "1157d2e1078392f6469e87993d879e3af569fb9754a443c539dd5886cfbd4c5e";
+const TOKENIZER_W2V_JA_URL: &str =
+  "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-japanese-onnx/resolve/main/tokenizer.json";
+const TOKENIZER_W2V_JA_FILENAME: &str =
+  "jonatasgrosman--wav2vec2-large-xlsr-53-japanese-tokenizer.json";
+const TOKENIZER_W2V_JA_SHA256: &str =
+  "f6390130dea2fc0902dfe5e7b66b249f49d99c26ae08f14265dcd8d67121c4c2";
+
+const MODEL_W2V_ZH_URL: &str =
+  "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-chinese-zh-cn-onnx/resolve/main/model.onnx";
+const MODEL_W2V_ZH_FILENAME: &str = "jonatasgrosman--wav2vec2-large-xlsr-53-chinese-zh-cn.onnx";
+const MODEL_W2V_ZH_SHA256: &str =
+  "4e92f1d33b6bf89b709d5e4512a0c98dcaafd37a9bf7928452b05b01edb83029";
+const TOKENIZER_W2V_ZH_URL: &str =
+  "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-chinese-zh-cn-onnx/resolve/main/tokenizer.json";
+const TOKENIZER_W2V_ZH_FILENAME: &str =
+  "jonatasgrosman--wav2vec2-large-xlsr-53-chinese-zh-cn-tokenizer.json";
+const TOKENIZER_W2V_ZH_SHA256: &str =
+  "7bb5c156e0ea01980f42ae1904193834132019ae8a6276a9957805cd5a6b37f5";
+
 fn main() {
   println!("cargo:rerun-if-changed=build.rs");
   println!("cargo:rerun-if-changed=assets/wav2vec2_base_960h_tokenizer.json");
@@ -231,36 +261,50 @@ fn fetch_wav2vec2_fixtures(models_dir: &std::path::Path) {
     tokenizer_path.display()
   );
 
-  // Multi-language fixtures (Ja, Zh, ...) are exported by an
-  // external `fetch_align_model.py` script, NOT downloaded by
-  // build.rs. We just probe for them and emit env vars when
-  // present, so multi-lang tests skip-when-fixture-absent
-  // identically to the single-language path above.
-  detect_extra_align_fixture(models_dir, "WHISPERY_W2V_JA",
-    "jonatasgrosman--wav2vec2-large-xlsr-53-japanese");
-  detect_extra_align_fixture(models_dir, "WHISPERY_W2V_ZH",
-    "jonatasgrosman--wav2vec2-large-xlsr-53-chinese-zh-cn");
+  // Multi-language fixtures (Ja, Zh, ...). Mirror copies live in
+  // FinDIT-Studio's HF org as ONNX exports; build.rs fetches +
+  // SHA-verifies them under the same WHISPERY_FETCH_W2V opt-in
+  // as English. Each pair is independent — a Ja-only build
+  // skips the Zh fetch by env-var.
+  fetch_extra_align_fixture(models_dir, "WHISPERY_W2V_JA",
+    MODEL_W2V_JA_URL, MODEL_W2V_JA_FILENAME, MODEL_W2V_JA_SHA256,
+    TOKENIZER_W2V_JA_URL, TOKENIZER_W2V_JA_FILENAME, TOKENIZER_W2V_JA_SHA256);
+  fetch_extra_align_fixture(models_dir, "WHISPERY_W2V_ZH",
+    MODEL_W2V_ZH_URL, MODEL_W2V_ZH_FILENAME, MODEL_W2V_ZH_SHA256,
+    TOKENIZER_W2V_ZH_URL, TOKENIZER_W2V_ZH_FILENAME, TOKENIZER_W2V_ZH_SHA256);
 }
 
-/// Detect a multi-language alignment fixture pair (an `.onnx` file
-/// and a `<stem>-tokenizer.json`) under `models_dir`. When both
-/// exist, export `<env_prefix>_MODEL` and `<env_prefix>_TOKENIZER`
-/// so `option_env!()` in tests can find them. When missing, do
-/// nothing — the test path skips.
-fn detect_extra_align_fixture(
+/// Fetch + SHA-verify a multi-language alignment fixture pair
+/// (`.onnx` + `tokenizer.json`) into `models_dir`, then emit
+/// `<env_prefix>_MODEL` and `<env_prefix>_TOKENIZER` env vars so
+/// `option_env!()` in tests can find them.
+///
+/// On any fetch / verification failure, this function logs and
+/// returns silently — tests guard the fixtures with `option_env!`,
+/// so a partial-fixture state just makes the corresponding test
+/// skip rather than fail the build.
+fn fetch_extra_align_fixture(
   models_dir: &std::path::Path,
   env_prefix: &str,
-  stem: &str,
+  model_url: &str,
+  model_filename: &str,
+  model_sha: &str,
+  tokenizer_url: &str,
+  tokenizer_filename: &str,
+  tokenizer_sha: &str,
 ) {
-  let model_path = models_dir.join(format!("{stem}.onnx"));
-  let tokenizer_path = models_dir.join(format!("{stem}-tokenizer.json"));
-  if !model_path.exists() || !tokenizer_path.exists() {
+  let model_path = models_dir.join(model_filename);
+  if !fetch_with_sha(model_url, &model_path, model_sha) {
     return;
   }
   println!(
     "cargo:rustc-env={env_prefix}_MODEL={}",
     model_path.display()
   );
+  let tokenizer_path = models_dir.join(tokenizer_filename);
+  if !fetch_with_sha(tokenizer_url, &tokenizer_path, tokenizer_sha) {
+    return;
+  }
   println!(
     "cargo:rustc-env={env_prefix}_TOKENIZER={}",
     tokenizer_path.display()
