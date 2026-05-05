@@ -156,6 +156,31 @@ impl SampleBuffer {
       });
     }
 
+    // Codex round-37: empty-packet stream-advance fix. An empty
+    // packet with `delta_pts_out > 0` (a "heartbeat" or
+    // VAD-only call at a slightly future PTS within the gap
+    // tolerance) used to commit the anchor, zero-fill the gap,
+    // and advance `absolute_sample_offset` despite carrying no
+    // actual audio. The next real packet at the originally
+    // expected PTS would then appear as `PtsRegression`, leaving
+    // the caller no recovery path. Make empty packets a true
+    // no-op for non-zero deltas: validate timebase / EOF / regression
+    // (already done above) but skip the anchor commit, the
+    // zero-fill, and the offset advance. An empty packet at
+    // `delta == 0` was already a no-op (delta_samples = 0 and
+    // packet.len() = 0); we preserve the first-push anchor commit
+    // for that case so callers can establish a timebase via an
+    // empty exactly-on-time push.
+    if packet.is_empty() && delta_samples > 0 {
+      // Specifically NOT committing `would_be_first_push` here:
+      // if the very first push is an empty heartbeat at a
+      // future PTS, the anchor isn't established and a later
+      // push will set it from its own `starts_at`. That's the
+      // right semantic — a "heartbeat at future PTS" doesn't
+      // claim an anchor.
+      return Ok(());
+    }
+
     // All checks passed. Commit the anchor on first push, then
     // zero-fill any tolerated gap and append the packet.
     if would_be_first_push {
@@ -508,5 +533,106 @@ mod tests {
     assert_eq!(b.buffered_samples(), 0);
     // Next push at 50_000_000 must succeed without PtsRegression.
     b.append(ts_at_48k(50_000_000), &[2.0; 1000], 0).unwrap();
+  }
+
+  // --- Codex round-37: empty packet must not advance the stream ---
+
+  /// An empty packet at a forward PTS within gap-tolerance MUST
+  /// NOT zero-fill or advance `absolute_sample_offset`. Pre-fix,
+  /// such a "heartbeat" call would commit phantom audio and
+  /// reject the next real packet at the originally-expected PTS
+  /// as `PtsRegression`. Post-fix, the next real packet is
+  /// accepted.
+  #[test]
+  fn empty_packet_at_forward_delta_does_not_advance_stream() {
+    let mut b = SampleBuffer::new(1_000_000, 16_000);
+    // First push: 1000 real samples at PTS 0 — establishes anchor.
+    b.append(ts_at_48k(0), &[1.0; 1000], 0).unwrap();
+    let offset_before = b.absolute_sample_offset();
+    let buffered_before = b.buffered_samples();
+    let next_expected = b.next_expected_starts_at().unwrap();
+
+    // Empty packet "heartbeat" at a forward PTS — within
+    // gap-tolerance but no audio carried.
+    let heartbeat_pts = next_expected.pts() + 100; // ~33 ms forward in 48k
+    let r = b.append(ts_at_48k(heartbeat_pts), &[], 0);
+    assert!(
+      r.is_ok(),
+      "empty heartbeat must succeed; got {r:?}"
+    );
+
+    // Critical: the heartbeat MUST NOT have advanced state.
+    assert_eq!(
+      b.absolute_sample_offset(),
+      offset_before,
+      "empty heartbeat must not advance absolute_sample_offset"
+    );
+    assert_eq!(
+      b.buffered_samples(),
+      buffered_before,
+      "empty heartbeat must not zero-fill the live buffer"
+    );
+
+    // The next real packet at the originally-expected PTS must
+    // succeed (pre-fix this was rejected as PtsRegression).
+    let r2 = b.append(next_expected, &[2.0; 500], 0);
+    assert!(
+      r2.is_ok(),
+      "next real packet at original expected PTS must succeed; got {r2:?}"
+    );
+    assert_eq!(b.absolute_sample_offset(), 1500);
+  }
+
+  /// An empty FIRST packet establishes the stream anchor at its
+  /// own `starts_at` (delta == 0 by definition for the first
+  /// push, since there is no expected next yet). A subsequent
+  /// empty-at-forward-delta call is then a no-op, and a real
+  /// packet at the originally-expected PTS still succeeds.
+  /// This documents that "heartbeat then real audio" sequences
+  /// don't trip PtsRegression after the round-37 fix.
+  #[test]
+  fn empty_first_packet_anchors_then_forward_heartbeat_is_noop() {
+    let mut b = SampleBuffer::new(1_000_000, 16_000);
+    // Empty first push at PTS 50_000. Anchor commits there
+    // (first push always has delta == 0 since there's no prior
+    // anchor; the empty-packet bail only fires for delta > 0).
+    let r = b.append(ts_at_48k(50_000), &[], 0);
+    assert!(r.is_ok(), "empty first push must succeed; got {r:?}");
+    assert!(
+      b.output_timebase().is_some(),
+      "empty first push commits timebase (delta == 0 for first push)"
+    );
+    let next_expected = b.next_expected_starts_at().unwrap();
+    assert_eq!(next_expected.pts(), 50_000);
+    let offset_before = b.absolute_sample_offset();
+
+    // Empty heartbeat at a forward PTS (within tolerance):
+    // must NOT advance the stream.
+    let r = b.append(ts_at_48k(50_100), &[], 0);
+    assert!(r.is_ok(), "empty heartbeat must succeed; got {r:?}");
+    assert_eq!(
+      b.absolute_sample_offset(),
+      offset_before,
+      "empty heartbeat at forward delta must not advance offset"
+    );
+
+    // Real packet at the originally-expected PTS succeeds.
+    let r = b.append(next_expected, &[1.0; 500], 0);
+    assert!(r.is_ok(), "real packet at expected PTS must succeed; got {r:?}");
+    assert_eq!(b.absolute_sample_offset(), 500);
+  }
+
+  /// Empty packet at exactly the expected next PTS (delta == 0)
+  /// remains a true no-op as before. Ensures the fix doesn't
+  /// regress the well-defined heartbeat-on-time case.
+  #[test]
+  fn empty_packet_at_zero_delta_is_noop() {
+    let mut b = SampleBuffer::new(1_000_000, 16_000);
+    b.append(ts_at_48k(0), &[1.0; 1000], 0).unwrap();
+    let next_expected = b.next_expected_starts_at().unwrap();
+    let offset_before = b.absolute_sample_offset();
+    let r = b.append(next_expected, &[], 0);
+    assert!(r.is_ok());
+    assert_eq!(b.absolute_sample_offset(), offset_before);
   }
 }

@@ -645,14 +645,30 @@ pub enum Command {
 /// `initial_prompt` is the override-vs-clear distinction:
 /// `Some(None)` clears the field on the underlying `AsrParams`,
 /// `Some(Some(_))` sets it, and `None` leaves the field
-/// untouched. The serde derive handles both nesting layers
-/// transparently.
+/// untouched.
+///
+/// **Serde wire form for `Option<Option<T>>` fields.** Codex
+/// round-37: the derived `Option<Option<T>>` impl collapses
+/// "field absent" and "field present with null" into the same
+/// outer `None` — so `{"language_hint": null}` would be
+/// indistinguishable from omitting the field, defeating the
+/// "clear this override" intent. Both `language_hint` and
+/// `initial_prompt` carry a custom `deserialize_with` that
+/// preserves the distinction:
+///
+/// - **field absent** → outer `None` (serde uses `default`)
+/// - **field set to JSON `null`** → `Some(None)` (clear)
+/// - **field set to value** → `Some(Some(value))` (set)
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AsrParamsOverride {
   #[cfg_attr(
     feature = "serde",
-    serde(default, skip_serializing_if = "Option::is_none")
+    serde(
+      default,
+      skip_serializing_if = "Option::is_none",
+      deserialize_with = "deserialize_double_option_lang"
+    )
   )]
   language_hint: Option<Option<Lang>>,
   #[cfg_attr(
@@ -667,9 +683,40 @@ pub struct AsrParamsOverride {
   initial_temperature: Option<f32>,
   #[cfg_attr(
     feature = "serde",
-    serde(default, skip_serializing_if = "Option::is_none")
+    serde(
+      default,
+      skip_serializing_if = "Option::is_none",
+      deserialize_with = "deserialize_double_option_smolstr"
+    )
   )]
   initial_prompt: Option<Option<SmolStr>>,
+}
+
+/// Double-option deserializer for `language_hint`. See the
+/// type-level doc on [`AsrParamsOverride`] for the absent / null /
+/// value contract that this helper implements. Codex round-37.
+#[cfg(feature = "serde")]
+fn deserialize_double_option_lang<'de, D>(d: D) -> Result<Option<Option<Lang>>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  // serde's `default` triggers when the FIELD is absent; when
+  // the field is present with `null`, this function is called
+  // and `Option::deserialize` sees the null and returns
+  // `Ok(None)` — which we wrap in `Some(None)` to mean "clear".
+  // Any other value goes through `Lang`'s `Deserialize` impl
+  // and lands in `Some(Some(value))`.
+  Ok(Some(Option::<Lang>::deserialize(d)?))
+}
+
+/// Double-option deserializer for `initial_prompt`. See
+/// [`deserialize_double_option_lang`].
+#[cfg(feature = "serde")]
+fn deserialize_double_option_smolstr<'de, D>(d: D) -> Result<Option<Option<SmolStr>>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  Ok(Some(Option::<SmolStr>::deserialize(d)?))
 }
 
 impl AsrParamsOverride {
@@ -905,6 +952,112 @@ mod tests {
     // `language_hint` / `initial_prompt` round-trip as absent.
     assert!(p.language_hint().is_none());
     assert!(p.initial_prompt().is_none());
+  }
+
+  // --- Codex round-37: AsrParamsOverride double-option serde ---
+
+  /// Field absent → outer `None` (no override on this field).
+  #[cfg(feature = "serde")]
+  #[test]
+  fn asr_params_override_serde_absent_means_no_override() {
+    let ovr: AsrParamsOverride = serde_json::from_str("{}").expect("deserialize empty");
+    assert!(
+      ovr.language_hint().is_none(),
+      "absent field must mean None (no override)"
+    );
+    assert!(
+      ovr.initial_prompt().is_none(),
+      "absent field must mean None (no override)"
+    );
+  }
+
+  /// Field set to JSON `null` → `Some(None)` (clear the override).
+  /// Pre-fix this was indistinguishable from "absent" because
+  /// the derived `Option<Option<T>>` impl collapsed both to
+  /// outer `None`.
+  #[cfg(feature = "serde")]
+  #[test]
+  fn asr_params_override_serde_null_means_clear() {
+    let ovr: AsrParamsOverride =
+      serde_json::from_str(r#"{"language_hint": null}"#).expect("deserialize null");
+    match ovr.language_hint() {
+      Some(None) => {}
+      other => panic!(
+        "JSON null on language_hint must produce Some(None) (clear); got {other:?}"
+      ),
+    }
+
+    let ovr: AsrParamsOverride =
+      serde_json::from_str(r#"{"initial_prompt": null}"#).expect("deserialize null");
+    match ovr.initial_prompt() {
+      Some(None) => {}
+      other => panic!(
+        "JSON null on initial_prompt must produce Some(None) (clear); got {other:?}"
+      ),
+    }
+  }
+
+  /// Field set to a real value → `Some(Some(value))` (set the
+  /// override). Lang's case-insensitive ISO deserializer is
+  /// preserved through the double-option helper.
+  #[cfg(feature = "serde")]
+  #[test]
+  fn asr_params_override_serde_value_means_set() {
+    let ovr: AsrParamsOverride =
+      serde_json::from_str(r#"{"language_hint": "EN"}"#).expect("deserialize value");
+    match ovr.language_hint() {
+      Some(Some(Lang::En)) => {}
+      other => panic!("expected Some(Some(Lang::En)); got {other:?}"),
+    }
+
+    let ovr: AsrParamsOverride = serde_json::from_str(r#"{"initial_prompt": "hint"}"#)
+      .expect("deserialize value");
+    match ovr.initial_prompt() {
+      Some(Some(s)) if s.as_str() == "hint" => {}
+      other => panic!("expected Some(Some(\"hint\")); got {other:?}"),
+    }
+  }
+
+  /// Round-trip the three states through serialize → deserialize:
+  /// absent must stay absent; Some(None) must round-trip via null;
+  /// Some(Some(v)) must round-trip via the value form.
+  #[cfg(feature = "serde")]
+  #[test]
+  fn asr_params_override_serde_round_trips_three_states() {
+    // Absent.
+    let mut ovr_absent = AsrParamsOverride::new();
+    ovr_absent.set_initial_temperature(Some(0.7)); // unrelated field set so JSON isn't empty
+    let json = serde_json::to_string(&ovr_absent).unwrap();
+    assert!(
+      !json.contains("language_hint") && !json.contains("initial_prompt"),
+      "absent fields must skip-serialize; got {json}"
+    );
+    let back: AsrParamsOverride = serde_json::from_str(&json).unwrap();
+    assert!(back.language_hint().is_none());
+    assert!(back.initial_prompt().is_none());
+
+    // Some(None) — clear.
+    let ovr_clear = AsrParamsOverride::new()
+      .with_language_hint(Some(None))
+      .with_initial_prompt(Some(None));
+    let json = serde_json::to_string(&ovr_clear).unwrap();
+    assert!(json.contains("\"language_hint\":null"), "got {json}");
+    assert!(json.contains("\"initial_prompt\":null"), "got {json}");
+    let back: AsrParamsOverride = serde_json::from_str(&json).unwrap();
+    assert!(matches!(back.language_hint(), Some(None)));
+    assert!(matches!(back.initial_prompt(), Some(None)));
+
+    // Some(Some(_)) — set.
+    let ovr_set = AsrParamsOverride::new()
+      .with_language_hint(Some(Some(Lang::En)))
+      .with_initial_prompt(Some(Some(SmolStr::new("hint"))));
+    let json = serde_json::to_string(&ovr_set).unwrap();
+    let back: AsrParamsOverride = serde_json::from_str(&json).unwrap();
+    assert!(matches!(back.language_hint(), Some(Some(Lang::En))));
+    assert!(
+      matches!(back.initial_prompt(), Some(Some(s)) if s.as_str() == "hint"),
+      "got {:?}", back.initial_prompt()
+    );
   }
 
   /// `SamplingStrategy` snake_case external representation,
