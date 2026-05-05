@@ -2,10 +2,15 @@
 a 16 kHz mono WAV; emit JSON in the same schema whispery's runner uses,
 with `runner = "whisperx"`. Pair with `score.py` for IoU comparison.
 
-Pinned to CPU + int8 compute_type for determinism: GPU CTranslate2 has
-floating-point non-determinism (cuBLAS algorithm selection) that would
-add noise to the parity numbers without changing the actual alignment
-model.
+Defaults: CPU + float32. On Apple Silicon (M-series), fp32 is
+~2× faster than int8 because NEON/AMX matrix units are tuned
+for fp32; the int8 advantage on x86 (VNNI / AVX-512 VNNI) does
+not apply here. Pass `--compute-type int8` for bit-stable
+parity output (small transcript deltas between compute types
+move ~4 word pairs across the harness's IoU 0.5 threshold).
+CUDA boxes should override to `--compute-type float16` or
+`int8_float16`. CPU keeps parity numbers deterministic across
+runs — no cuBLAS algorithm-selection drift.
 
 Usage:
     uv run python whisperx_runner.py <wav_path> --out <json_path>
@@ -62,12 +67,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--whisper-model",
-        default="tiny.en",
+        default="large-v3-turbo",
         help=(
-            "faster-whisper model name (default: tiny.en). For non-English "
-            "audio, pass a multilingual model (e.g. 'tiny', 'small') and "
-            "set --language to auto so detection picks the right alignment "
-            "model from whisperx's DEFAULT_ALIGN_MODELS_HF."
+            "faster-whisper model name (default: large-v3-turbo, matching "
+            "production whispery). Any other faster-whisper checkpoint name "
+            "(tiny, base, small, medium, large-v2, large-v3, ...) works too."
         ),
     )
     parser.add_argument(
@@ -88,8 +92,15 @@ def main() -> int:
     )
     parser.add_argument(
         "--compute-type",
-        default="int8",
-        help="ctranslate2 compute_type (default: int8 for cpu).",
+        default="float32",
+        help=(
+            "ctranslate2 compute_type (default: float32 — fastest CPU path "
+            "on Apple Silicon, where NEON/AMX matrix units favor fp32 over "
+            "int8 by ~2×). Use `int8` for bit-stable parity output across "
+            "runs (the harness's strict below_0.5=0 threshold is sensitive "
+            "to small transcription deltas between compute types). On CUDA, "
+            "`float16` / `int8_float16` are usually optimal."
+        ),
     )
     parser.add_argument(
         "--batch-size",

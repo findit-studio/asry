@@ -2,7 +2,7 @@
 # WhisperX vs whispery alignment parity harness.
 #
 # Requires:
-# - `<crate>/models/{ggml-tiny.en.bin, wav2vec2-base-960h.onnx,
+# - `<crate>/models/{ggml-large-v3-turbo.bin, wav2vec2-base-960h.onnx,
 #   wav2vec2-base-960h-tokenizer.json}` (run `WHISPERY_FETCH_MODEL=1
 #   WHISPERY_FETCH_W2V=1 cargo test --features alignment` once to populate)
 # - `uv` on PATH (https://docs.astral.sh/uv/)
@@ -89,23 +89,26 @@ cd "$SCRIPT_DIR/python"
 echo "[run.sh] running whisperx_runner.py ..."
 # Multilingual mode: pass `WHISPERY_PARITY_LANGUAGE=auto` (or any
 # specific code: ja/zh/...) to enable language detection and
-# load whisperx's matching wav2vec2 ONNX. Default keeps the
-# legacy English-locked behaviour for the dia 5-fixture suite
-# whose tiny.en model can only ASR English.
+# load whisperx's matching wav2vec2 ONNX. Default is `en` to keep
+# the dia 5-fixture suite running unchanged.
 WHISPERX_LANG="${WHISPERY_PARITY_LANGUAGE:-en}"
-WHISPERX_MODEL="${WHISPERY_PARITY_WHISPER_MODEL:-tiny.en}"
-# tiny.en is English-only by design; the .en checkpoints don't
-# carry the multilingual decoder. Auto/non-en runs need a
-# multilingual base model — bump to `tiny` (or larger) when
-# the user requests anything other than `en`.
-if [ "$WHISPERX_LANG" != "en" ] && [ "$WHISPERX_MODEL" = "tiny.en" ]; then
-  WHISPERX_MODEL="tiny"
-  echo "[run.sh] non-English language ($WHISPERX_LANG); auto-bumped whisper model to '$WHISPERX_MODEL' (tiny.en is English-only)"
-fi
+# Production whispery uses `large-v3-turbo` (multilingual,
+# higher accuracy than tiny). The same checkpoint covers the
+# English dia suite AND non-English fixtures, so no auto-bump
+# branch is needed.
+WHISPERX_MODEL="${WHISPERY_PARITY_WHISPER_MODEL:-large-v3-turbo}"
+# Wall-clock the WhisperX phase so the score JSON can record an
+# end-to-end real-time factor (process_s / audio_s). Uses bash's
+# `EPOCHREALTIME` (sub-second resolution); falls back to the `date`
+# `+%s.%N` form on environments without it.
+T_WX_START=${EPOCHREALTIME:-$(date +%s.%N)}
 uv run python whisperx_runner.py "$ABS_CLIP" \
   --whisper-model "$WHISPERX_MODEL" \
   --language "$WHISPERX_LANG" \
   --out "$WHISPERX_OUT"
+T_WX_END=${EPOCHREALTIME:-$(date +%s.%N)}
+WHISPERX_PROCESS_S=$(awk "BEGIN { printf \"%.3f\", $T_WX_END - $T_WX_START }")
+echo "[run.sh] whisperx phase: ${WHISPERX_PROCESS_S}s wall-clock"
 
 # 3) Rust runner in inject mode. Reads WhisperX's transcript and
 # feeds it into whispery's aligner directly — no whisper.cpp.
@@ -130,6 +133,7 @@ fi
 
 cd "$ROOT"
 echo "[run.sh] running whispery-parity-runner (--inject-from) ..."
+T_WY_START=${EPOCHREALTIME:-$(date +%s.%N)}
 cargo run \
   --release \
   --manifest-path tests/parity_whisperx/Cargo.toml \
@@ -138,6 +142,9 @@ cargo run \
   -- "$ABS_CLIP" \
   --inject-from "$WHISPERX_OUT" \
   --out "$WHISPERY_OUT"
+T_WY_END=${EPOCHREALTIME:-$(date +%s.%N)}
+WHISPERY_PROCESS_S=$(awk "BEGIN { printf \"%.3f\", $T_WY_END - $T_WY_START }")
+echo "[run.sh] whispery phase: ${WHISPERY_PROCESS_S}s wall-clock"
 
 # 4) Score. Captures the score's exit code and propagates it; this
 # is what the `run.sh` user actually cares about.

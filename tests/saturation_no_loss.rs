@@ -19,7 +19,7 @@ use whispery::{
   runner::{ManagedTranscriber, WhisperPoolOptions},
 };
 
-const MODEL_PATH: Option<&str> = option_env!("WHISPERY_TINY_EN_MODEL");
+const MODEL_PATH: Option<&str> = option_env!("WHISPERY_WHISPER_MODEL");
 
 // TODO(plan-b followup): Same drain-hang root cause as the other
 // real-model E2E tests (runner_e2e.rs, unpoll_round_trip.rs,

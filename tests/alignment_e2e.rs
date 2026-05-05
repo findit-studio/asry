@@ -2,7 +2,7 @@
 //! a real tiny whisper model, and the canned ~11 s JFK WAV.
 //!
 //! Skipped when WHISPERY_W2V_MODEL / WHISPERY_W2V_TOKENIZER /
-//! WHISPERY_TINY_EN_MODEL / WHISPERY_JFK_WAV are not set (CI
+//! WHISPERY_WHISPER_MODEL / WHISPERY_JFK_WAV are not set (CI
 //! offline mode).
 
 #![cfg(feature = "alignment")]
@@ -19,7 +19,7 @@ use whispery::{
   runner::{Aligner, AlignerKey, AlignmentFallback, AlignmentSetBuilder, EnglishNormalizer},
 };
 
-const MODEL_PATH: Option<&str> = option_env!("WHISPERY_TINY_EN_MODEL");
+const MODEL_PATH: Option<&str> = option_env!("WHISPERY_WHISPER_MODEL");
 const WAV_PATH: Option<&str> = option_env!("WHISPERY_JFK_WAV");
 const W2V_MODEL_PATH: Option<&str> = option_env!("WHISPERY_W2V_MODEL");
 const W2V_TOKENIZER_PATH: Option<&str> = option_env!("WHISPERY_W2V_TOKENIZER");

@@ -51,8 +51,9 @@ struct Args {
   /// Path to a 16 kHz mono WAV (s16le or f32le).
   wav_path: PathBuf,
 
-  /// `ggml-tiny.en.bin` (or any English whisper.cpp model). Defaults
-  /// to env `WHISPER_MODEL_PATH`, then to the build.rs fixture dir.
+  /// `ggml-large-v3-turbo.bin` (or any whisper.cpp GGML/GGUF
+  /// model). Defaults to env `WHISPER_MODEL_PATH`, then to the
+  /// build.rs fixture dir.
   #[arg(long)]
   whisper_model: Option<PathBuf>,
 
@@ -460,7 +461,7 @@ fn main() -> Result<()> {
   let whisper_model = resolve_model(
     args.whisper_model,
     "WHISPER_MODEL_PATH",
-    "ggml-tiny.en.bin",
+    "ggml-large-v3-turbo.bin",
   )?;
   let w2v_model = resolve_model(
     args.w2v_model,
@@ -501,7 +502,15 @@ fn main() -> Result<()> {
   // therefore deterministic for a given input.
   let pool = WhisperPoolOptions::new(&whisper_model)
     .with_worker_count(1)
-    .with_max_queued_chunks(8);
+    .with_max_queued_chunks(8)
+    // Apple Silicon: route the whisper.cpp encoder through Metal.
+    // The BLAS-only path on macOS reproducibly hits
+    // `whisper_full_with_state: failed to encode` on
+    // `large-v3-turbo` (the production checkpoint); Metal sidesteps
+    // that. No-op on platforms where the `metal` cargo feature is
+    // not enabled — whisper-rs ignores `use_gpu = true` in that
+    // case.
+    .with_use_gpu(true);
 
   let mut runner = ManagedTranscriber::from_options(pool)
     .context("build ManagedTranscriber from WhisperPoolOptions")?

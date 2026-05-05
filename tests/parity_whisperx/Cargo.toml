@@ -11,7 +11,12 @@ description = "Manual parity harness: dump whispery alignment output to JSON for
 # `whispery` carries the `runner` + `alignment` features that this binary
 # exercises. Pinned by path because this is in-tree tooling, not a
 # downstream consumer.
-whispery     = { path = "../..", default-features = false, features = ["runner", "alignment", "bench-internals", "parity-dump-emission"] }
+# `metal` + `coreml` opt into Apple Silicon GPU + ANE acceleration
+# in whisper.cpp via whisper-rs. Both required to bypass the BLAS-
+# only `whisper_full_with_state: failed to encode` path; no-op on
+# non-Apple platforms (whisper-rs gates them in its own build.rs).
+whispery     = { path = "../..", default-features = false, features = ["runner", "alignment", "bench-internals", "parity-dump-emission", "metal", "coreml", "whisper-cpp-bindings"] }
+whisper-cpp  = { path = "../../crates/whisper-cpp", default-features = false, features = ["metal", "coreml"] }
 # `silero` (the Rust VAD crate) is the system-under-test for the
 # `whispery-silero-runner` binary in `src/bin/silero_runner.rs`. Path
 # dep deliberately points at the in-tree silero crate at
@@ -47,10 +52,39 @@ serde_json   = "1"
 clap         = { version = "4", features = ["derive"] }
 sha2         = "0.10"
 anyhow       = "1"
+# Direct whisper-rs dep for the `whisper-minimal` smoke binary —
+# bisects whispery's pool wiring vs. raw whisper-rs to localise the
+# `whisper_full_with_state: failed to encode` bug. Mirror whispery's
+# Apple-Silicon feature opt-ins.
+whisper-rs   = { version = "0.16", default-features = false, features = ["metal", "coreml"] }
+hound        = "3"
+
+# candle-whisper backend evaluation: pure-Rust Transformer ML
+# stack with Metal support. Used by `src/bin/candle_whisper.rs`
+# to benchmark vs. whisper-rs / whisper-cli on the same audio.
+candle-core         = { version = "0.10", default-features = false, features = ["metal"] }
+candle-nn           = { version = "0.10", default-features = false, features = ["metal"] }
+candle-transformers = { version = "0.10", default-features = false, features = ["metal"] }
+hf-hub              = { version = "0.4",  default-features = false, features = ["ureq", "rustls-tls"] }
+byteorder           = "1"
+rand                = "0.9"
+tokenizers          = { version = "0.23", default-features = false, features = ["onig"] }
 
 [[bin]]
 name = "whispery-parity-runner"
 path = "src/main.rs"
+
+[[bin]]
+name = "whisper-minimal"
+path = "src/bin/whisper_minimal.rs"
+
+[[bin]]
+name = "candle-whisper"
+path = "src/bin/candle_whisper.rs"
+
+[[bin]]
+name = "whispery-whisper-cpp"
+path = "src/bin/whispery_whisper_cpp.rs"
 
 [[bin]]
 name = "whispery-trellis-diff"

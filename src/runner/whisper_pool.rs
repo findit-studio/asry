@@ -1,5 +1,13 @@
 //! Whisper worker pool.
 
+// Permitted unsafe: a single, narrowly-scoped C-FFI trampoline
+// that works around a whisper-rs 0.16.0 soundness bug in
+// `set_abort_callback_safe` (see `attach_abort_callback`'s
+// long doc-comment). The trampoline + the leaked
+// `Box<Arc<AtomicBool>>` are the only `unsafe` blocks in this
+// file and the only ones the `unsafe_code` lint flags.
+#![allow(unsafe_code)]
+
 use alloc::sync::Arc;
 use core::{sync::atomic::Ordering, time::Duration};
 use std::{
@@ -682,10 +690,72 @@ fn finalize_chunk(
   // Pin temperature_inc; whisper.cpp's internal ladder runs
   // exactly once at the runner-supplied temperature.
   full.set_temperature_inc(0.0);
-  // Worker-hang watchdog. The closure is `Send + 'static`; the
-  // abort_flag is shared with the watchdog thread.
-  full.set_abort_callback_safe(move || abort_flag.load(Ordering::Relaxed));
+  // Worker-hang watchdog. We CANNOT use whisper-rs 0.16.0's
+  // `set_abort_callback_safe`: its trampoline is generic over the
+  // closure type `F` but the user_data pointer it stores is
+  // `*mut Box<dyn FnMut() -> bool>` — the cast `user_data as *mut
+  // F` reinterprets a fat-pointer-on-heap as the closure layout
+  // and returns garbage. On `large-v3-turbo` (and `tiny.en`) this
+  // surfaces as `whisper_full_with_state: failed to encode` /
+  // `GenericError(-6)` because the corrupted abort signal fires
+  // immediately during the first encode pass.
+  //
+  // Filed upstream and fixed locally by going through the
+  // `unsafe` `set_abort_callback` + `set_abort_callback_user_data`
+  // pair with our own properly-typed trampoline. The user data is
+  // a leaked `Box<Arc<AtomicBool>>` — we cannot reclaim it because
+  // FullParams is cloned per decode attempt and whisper.cpp keeps
+  // the pointer for the duration of `state.full`. The leak is
+  // bounded by the `FullParamsCache` (one CString set per unique
+  // params tuple) and is in the same equivalence class as the
+  // existing CString leaks documented on
+  // `FullParamsCache::get_clone`.
+  attach_abort_callback(&mut full, abort_flag);
   full
+}
+
+/// C trampoline for `set_abort_callback` whose user_data layout
+/// matches what we store in [`attach_abort_callback`]: a leaked
+/// `Box<Arc<AtomicBool>>`. Reads the flag atomically and returns
+/// its current value to whisper.cpp.
+///
+/// # Safety
+/// `user_data` MUST point to a valid `Arc<AtomicBool>` heap
+/// allocation, NOT moved or dropped while whisper.cpp may invoke
+/// this callback. Caller of [`attach_abort_callback`] guarantees
+/// this by leaking the `Box<Arc<AtomicBool>>`.
+unsafe extern "C" fn abort_trampoline(user_data: *mut core::ffi::c_void) -> bool {
+  // SAFETY: caller of attach_abort_callback leaked exactly this
+  // shape. user_data is non-null and points to a live
+  // Arc<AtomicBool>.
+  let flag: &Arc<AtomicBool> = unsafe { &*(user_data as *const Arc<AtomicBool>) };
+  flag.load(Ordering::Relaxed)
+}
+
+/// Wire whispery's worker-hang `abort_flag` into whisper.cpp's
+/// per-encode abort hook, working around the
+/// [whisper-rs 0.16.0 `set_abort_callback_safe` UB][bug] (see the
+/// long comment in `finalize_chunk`).
+///
+/// The user data is a leaked `Box<Arc<AtomicBool>>`. The
+/// `FullParamsCache` keeps unique configs to O(1) so this leak
+/// stays bounded to one `Arc<AtomicBool>` per cache entry. Each
+/// `Arc::clone` is cheap; the leaked outer Box keeps the storage
+/// alive for the trampoline.
+///
+/// [bug]: https://codeberg.org/tazz4843/whisper-rs/issues — the
+/// trampoline reinterprets `*mut Box<dyn FnMut>` as `*mut F`
+/// (closure type), reading a fat-pointer-on-heap as raw closure
+/// layout. Manifests as `whisper_full_with_state: failed to
+/// encode` on every model.
+fn attach_abort_callback(full: &mut FullParams<'static, 'static>, flag: Arc<AtomicBool>) {
+  let leaked = Box::into_raw(Box::new(flag));
+  // SAFETY: `leaked` outlives the FullParams (Box::into_raw =
+  // permanent leak); trampoline matches the layout used here.
+  unsafe {
+    full.set_abort_callback(Some(abort_trampoline));
+    full.set_abort_callback_user_data(leaked as *mut core::ffi::c_void);
+  }
 }
 
 /// Build a `FullParams` for one decoding attempt. The runner's outer

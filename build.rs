@@ -1,6 +1,7 @@
-//! Build script: fetch the tiny whisper test fixture (ggml-tiny.en.bin)
-//! into `target/whispery-test-fixtures/` once, with SHA-256
-//! verification, and re-run when the env vars below change.
+//! Build script: fetch the production whisper checkpoint
+//! (ggml-large-v3-turbo.bin, ~1.6 GB) into the in-tree
+//! `models/` directory once, with SHA-256 verification, and
+//! re-run when the env vars below change.
 
 use std::{
   fs,
@@ -9,12 +10,15 @@ use std::{
 };
 
 const MODEL_URL: &str =
-  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin";
-const MODEL_FILENAME: &str = "ggml-tiny.en.bin";
+  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin";
+const MODEL_FILENAME: &str = "ggml-large-v3-turbo.bin";
 // Verified SHA-256 from huggingface.co/ggerganov/whisper.cpp at the
-// time of writing. If the upstream rotates, update this constant and
-// re-run the test fetch.
-const MODEL_SHA256: &str = "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f";
+// time of writing (matches HF's `x-linked-etag` header for the LFS
+// blob). If the upstream rotates, update this constant and re-run
+// the test fetch. The whispery product runs `large-v3-turbo`, so the
+// build.rs fixture matches what we ship — no separate "tiny for tests,
+// large for prod" split.
+const MODEL_SHA256: &str = "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69";
 
 const WAV_URL: &str = "https://github.com/ggerganov/whisper.cpp/raw/master/samples/jfk.wav";
 const WAV_FILENAME: &str = "jfk.wav";
@@ -43,25 +47,21 @@ const TOKENIZER_W2V_SHA256: &str =
 // and mirror the result under `FinDIT-Studio/...-onnx`. From
 // build.rs's perspective, that mirror is just another
 // SHA-verified direct-download — same shape as English.
-const MODEL_W2V_JA_URL: &str =
-  "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-japanese-onnx/resolve/main/model.onnx";
+const MODEL_W2V_JA_URL: &str = "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-japanese-onnx/resolve/main/model.onnx";
 const MODEL_W2V_JA_FILENAME: &str = "jonatasgrosman--wav2vec2-large-xlsr-53-japanese.onnx";
 const MODEL_W2V_JA_SHA256: &str =
   "1157d2e1078392f6469e87993d879e3af569fb9754a443c539dd5886cfbd4c5e";
-const TOKENIZER_W2V_JA_URL: &str =
-  "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-japanese-onnx/resolve/main/tokenizer.json";
+const TOKENIZER_W2V_JA_URL: &str = "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-japanese-onnx/resolve/main/tokenizer.json";
 const TOKENIZER_W2V_JA_FILENAME: &str =
   "jonatasgrosman--wav2vec2-large-xlsr-53-japanese-tokenizer.json";
 const TOKENIZER_W2V_JA_SHA256: &str =
   "f6390130dea2fc0902dfe5e7b66b249f49d99c26ae08f14265dcd8d67121c4c2";
 
-const MODEL_W2V_ZH_URL: &str =
-  "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-chinese-zh-cn-onnx/resolve/main/model.onnx";
+const MODEL_W2V_ZH_URL: &str = "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-chinese-zh-cn-onnx/resolve/main/model.onnx";
 const MODEL_W2V_ZH_FILENAME: &str = "jonatasgrosman--wav2vec2-large-xlsr-53-chinese-zh-cn.onnx";
 const MODEL_W2V_ZH_SHA256: &str =
   "4e92f1d33b6bf89b709d5e4512a0c98dcaafd37a9bf7928452b05b01edb83029";
-const TOKENIZER_W2V_ZH_URL: &str =
-  "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-chinese-zh-cn-onnx/resolve/main/tokenizer.json";
+const TOKENIZER_W2V_ZH_URL: &str = "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-chinese-zh-cn-onnx/resolve/main/tokenizer.json";
 const TOKENIZER_W2V_ZH_FILENAME: &str =
   "jonatasgrosman--wav2vec2-large-xlsr-53-chinese-zh-cn-tokenizer.json";
 const TOKENIZER_W2V_ZH_SHA256: &str =
@@ -151,7 +151,7 @@ fn main() {
     if let Ok(true) = verify_sha256(&model_path, MODEL_SHA256) {
       // Already-good cached file — nothing to do.
       println!(
-        "cargo:rustc-env=WHISPERY_TINY_EN_MODEL={}",
+        "cargo:rustc-env=WHISPERY_WHISPER_MODEL={}",
         model_path.display()
       );
       fetch_jfk_wav(&fixture_dir);
@@ -178,7 +178,7 @@ fn main() {
   match verify_sha256(&model_path, MODEL_SHA256) {
     Ok(true) => {
       println!(
-        "cargo:rustc-env=WHISPERY_TINY_EN_MODEL={}",
+        "cargo:rustc-env=WHISPERY_WHISPER_MODEL={}",
         model_path.display()
       );
       fetch_jfk_wav(&fixture_dir);
@@ -266,12 +266,26 @@ fn fetch_wav2vec2_fixtures(models_dir: &std::path::Path) {
   // SHA-verifies them under the same WHISPERY_FETCH_W2V opt-in
   // as English. Each pair is independent — a Ja-only build
   // skips the Zh fetch by env-var.
-  fetch_extra_align_fixture(models_dir, "WHISPERY_W2V_JA",
-    MODEL_W2V_JA_URL, MODEL_W2V_JA_FILENAME, MODEL_W2V_JA_SHA256,
-    TOKENIZER_W2V_JA_URL, TOKENIZER_W2V_JA_FILENAME, TOKENIZER_W2V_JA_SHA256);
-  fetch_extra_align_fixture(models_dir, "WHISPERY_W2V_ZH",
-    MODEL_W2V_ZH_URL, MODEL_W2V_ZH_FILENAME, MODEL_W2V_ZH_SHA256,
-    TOKENIZER_W2V_ZH_URL, TOKENIZER_W2V_ZH_FILENAME, TOKENIZER_W2V_ZH_SHA256);
+  fetch_extra_align_fixture(
+    models_dir,
+    "WHISPERY_W2V_JA",
+    MODEL_W2V_JA_URL,
+    MODEL_W2V_JA_FILENAME,
+    MODEL_W2V_JA_SHA256,
+    TOKENIZER_W2V_JA_URL,
+    TOKENIZER_W2V_JA_FILENAME,
+    TOKENIZER_W2V_JA_SHA256,
+  );
+  fetch_extra_align_fixture(
+    models_dir,
+    "WHISPERY_W2V_ZH",
+    MODEL_W2V_ZH_URL,
+    MODEL_W2V_ZH_FILENAME,
+    MODEL_W2V_ZH_SHA256,
+    TOKENIZER_W2V_ZH_URL,
+    TOKENIZER_W2V_ZH_FILENAME,
+    TOKENIZER_W2V_ZH_SHA256,
+  );
 }
 
 /// Fetch + SHA-verify a multi-language alignment fixture pair

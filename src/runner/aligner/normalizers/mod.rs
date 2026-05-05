@@ -14,8 +14,7 @@ pub use chinese::ChineseNormalizer;
 pub use english::EnglishNormalizer;
 pub use japanese::JapaneseNormalizer;
 
-use crate::runner::aligner::normalizer::TextNormalizer;
-use crate::types::Lang;
+use crate::{runner::aligner::normalizer::TextNormalizer, types::Lang};
 
 /// Pick a built-in normalizer best suited to the given language,
 /// or `None` if whispery doesn't yet ship one whose vocabulary
@@ -54,9 +53,7 @@ use crate::types::Lang;
 /// normalizer (e.g., feeding Arabic text through the
 /// `EnglishNormalizer`) would bake in bugs that only surface
 /// during alignment as nonsensical IoU.
-pub fn default_normalizer_for(
-  lang: &Lang,
-) -> Option<alloc::boxed::Box<dyn TextNormalizer>> {
+pub fn default_normalizer_for(lang: &Lang) -> Option<alloc::boxed::Box<dyn TextNormalizer>> {
   use alloc::boxed::Box;
   match lang {
     // Chinese: char-level segmentation, no word delimiter.

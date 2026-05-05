@@ -16,7 +16,7 @@ use whispery::{
   runner::{ManagedTranscriber, WhisperPoolOptions},
 };
 
-const MODEL_PATH: Option<&str> = option_env!("WHISPERY_TINY_EN_MODEL");
+const MODEL_PATH: Option<&str> = option_env!("WHISPERY_WHISPER_MODEL");
 const WAV_PATH: Option<&str> = option_env!("WHISPERY_JFK_WAV");
 
 /// Decode a 16 kHz mono WAV into a Vec<f32> in [-1.0, 1.0].
@@ -73,7 +73,7 @@ fn end_to_end_jfk_quote() {
   let model_path = match MODEL_PATH {
     Some(p) => p,
     None => {
-      eprintln!("[runner_e2e] WHISPERY_TINY_EN_MODEL not set; skipping");
+      eprintln!("[runner_e2e] WHISPERY_WHISPER_MODEL not set; skipping");
       return;
     }
   };
