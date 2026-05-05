@@ -593,6 +593,15 @@ pub(super) fn full_params_from(
   p.set_print_realtime(false);
   p.set_print_timestamps(false);
 
+  // Codex round-38: forward `no_speech_threshold` to whisper.cpp.
+  // The runner ALSO gates on this threshold post-decode (see
+  // `run_with_temperature_ladder`), but forwarding keeps the C++
+  // side's internal logic aligned with the configured value in
+  // case whisper.cpp acts on it for any internal decision (the
+  // upstream comment says "as of v1.3.0 not implemented", but the
+  // setter is the documented forward path and costs nothing).
+  p.set_no_speech_thold(params.no_speech_threshold());
+
   // Pin temperature; disable internal ladder.
   p.set_temperature(attempt_temperature);
   p.set_temperature_inc(0.0);
@@ -649,6 +658,34 @@ pub(super) fn compute_avg_logprob(state: &WhisperState) -> f32 {
   } else {
     (seg_sum / seg_count as f64) as f32
   }
+}
+
+/// Mean of per-segment `no_speech_probability()` across the
+/// just-decoded chunk. Returns `0.0` for an empty state — the
+/// runner's no-segment short-circuit already handles that case
+/// before this is consulted.
+///
+/// Codex round-38: the runner uses this to honor the
+/// documented `no_speech_threshold` knob, which previously was
+/// a public no-op (only `avg_logprob` and `compression_ratio`
+/// gated acceptance).
+pub(super) fn compute_avg_no_speech_prob(state: &WhisperState) -> f32 {
+  let n = state.full_n_segments();
+  if n <= 0 {
+    return 0.0;
+  }
+  let mut sum = 0.0_f32;
+  let mut count = 0_i32;
+  for i in 0..n {
+    if let Some(segment) = state.get_segment(i) {
+      sum += segment.no_speech_probability();
+      count += 1;
+    }
+  }
+  if count == 0 {
+    return 0.0;
+  }
+  sum / count as f32
 }
 
 /// Concatenate all segments' text and compute whisperx's
@@ -722,8 +759,34 @@ pub(super) fn run_with_temperature_ladder(
   let mut temperature = p.initial_temperature();
   let max = p.max_attempts() as usize;
 
+  // Codex round-38: build the FullParams template ONCE per
+  // chunk and clone it for each attempt. whisper-rs's
+  // `set_language` and `set_initial_prompt` leak a `CString`
+  // per call (`CString::into_raw()` with no `Drop`), so the
+  // previous "build per attempt" pattern leaked
+  // `O(n_attempts × n_chunks)` C strings. Cloning shares the
+  // single template's pointer across all attempts of a chunk,
+  // dropping the leak to `O(n_chunks)` — a 6× reduction at the
+  // default `max_attempts = 6`. Inter-chunk dedup would require
+  // a per-(language, prompt) cache and is more involved because
+  // `set_abort_callback_safe` captures the per-job `abort_flag`;
+  // deferred.
+  //
+  // `FullParams: Clone` (`derive(Clone)` in whisper-rs 0.16)
+  // shallow-copies the inner `whisper_full_params` struct,
+  // which holds `*const c_char` pointers — both the template
+  // and its clones share the same leaked CString allocation.
+  // Since whisper.cpp reads through the pointer during
+  // `state.full(...)` and the leaked memory has static lifetime
+  // (it's leaked!), aliasing across the clones is safe.
+  let template = full_params_from(p, temperature, job.abort_flag.clone())?;
+
   for _attempt in 0..max {
-    let full = full_params_from(p, temperature, job.abort_flag.clone())?;
+    let mut full = template.clone();
+    // Each attempt uses its own temperature; everything else
+    // (language, prompt, abort callback, no_speech_thold, etc.)
+    // is shared via the clone.
+    full.set_temperature(temperature);
     let outcome = state.full(full, job.samples.as_ref());
     if let Err(e) = outcome {
       // Distinguish abort (watchdog timeout) from a real backend
@@ -757,9 +820,31 @@ pub(super) fn run_with_temperature_ladder(
 
     let logprob = compute_avg_logprob(state);
     let cratio = compute_compression_ratio(state);
+    let nsp = compute_avg_no_speech_prob(state);
 
     let logprob_ok = logprob >= p.log_prob_threshold();
     let cratio_ok = cratio <= p.compression_ratio_threshold();
+
+    // Codex round-38: implement the documented
+    // `no_speech_threshold` knob. Mirrors WhisperX / OpenAI
+    // Whisper's "silent chunk" detection: when the mean
+    // no_speech probability across segments exceeds the
+    // configured threshold AND the average logprob is too low
+    // to trust the transcript, the chunk is treated as silence
+    // — empty `AsrResult`, no temperature retries (temperature
+    // can't conjure speech the model already evaluated as
+    // absent). The `avg_logprob` conjunct mirrors WhisperX:
+    // a high no_speech_prob alone with confident text isn't
+    // enough to discard.
+    if nsp > p.no_speech_threshold() && !logprob_ok {
+      return Ok(AsrResult::new(
+        SmolStr::new(""),
+        p.language_hint().cloned().unwrap_or(Lang::Other(SmolStr::new(""))),
+        logprob,
+        nsp,
+        temperature,
+      ));
+    }
 
     if logprob_ok && cratio_ok {
       return build_asr_result(state, temperature, p);

@@ -380,11 +380,24 @@ impl ManagedTranscriber {
   /// Loops:
   ///   1. drive_one_step — if Ok(true), made progress; loop again.
   ///   2. else if no command is parked, exit (genuine idle).
-  ///   3. else wait_for_progress, then loop.
+  ///   3. else if `deadline` is `Some(d)` and now ≥ d, exit
+  ///      (caller will inspect idle state and decide).
+  ///   4. else wait_for_progress, then loop.
   ///
-  /// Used by both `process_packet` (after pushing inputs) and
-  /// `drain` (until idle).
-  fn pump_until_idle_or_progress(&mut self) -> Result<(), RunnerError> {
+  /// Used by both `process_packet` (deadline = `None`, classic
+  /// "drive until idle") and `drain` (deadline = `Some(now +
+  /// drain_timeout)` so the timeout is honored even when a
+  /// command is parked behind a stuck worker).
+  ///
+  /// Codex round-38: previously this loop had no deadline, so a
+  /// parked command + stuck worker (e.g., `state.full` not
+  /// returning) made `drain` ignore its configured timeout and
+  /// hang forever — exactly the symptom the `#[ignore]`'d
+  /// saturation tests document.
+  fn pump_until_idle_or_progress(
+    &mut self,
+    deadline: Option<std::time::Instant>,
+  ) -> Result<(), RunnerError> {
     loop {
       if self.drive_one_step()? {
         continue;
@@ -397,6 +410,16 @@ impl ManagedTranscriber {
         None => return Ok(()),
         Some(cmd) => {
           self.core.unpoll_command(cmd);
+          // Honor the deadline before blocking on the next
+          // worker. Without this check, `wait_for_progress`'s
+          // bounded `ready_timeout` would still loop forever
+          // — `drive_one_step` returns `Ok(false)` indefinitely
+          // while a worker is stuck inside `state.full`.
+          if let Some(dl) = deadline
+            && std::time::Instant::now() >= dl
+          {
+            return Ok(());
+          }
           self.wait_for_progress()?;
         }
       }
@@ -707,7 +730,7 @@ impl ManagedTranscriber {
     let result = push_result.and_then(|()| self.push_vads_internal(vad_segments));
 
     // Step 5: pump the dispatch loop until idle or saturation.
-    let drive_result = result.and_then(|()| self.pump_until_idle_or_progress());
+    let drive_result = result.and_then(|()| self.pump_until_idle_or_progress(None));
 
     // Step 6: clear the override stamp. Chunks already in
     // `cut_pending` keep the override they captured at extract
@@ -781,7 +804,7 @@ impl ManagedTranscriber {
   /// then drives the dispatch loop one more time. Idempotent.
   pub fn signal_eof(&mut self) -> Result<(), RunnerError> {
     self.core.signal_eof()?;
-    self.pump_until_idle_or_progress()?;
+    self.pump_until_idle_or_progress(None)?;
     Ok(())
   }
 
@@ -895,8 +918,14 @@ impl ManagedTranscriber {
   pub fn drain(&mut self) -> Result<(), RunnerError> {
     let started = std::time::Instant::now();
     let timeout = self.drain_timeout;
+    let deadline = started + timeout;
     loop {
-      self.pump_until_idle_or_progress()?;
+      // Codex round-38: thread the deadline through the pump so
+      // a parked command behind a stuck worker can't ignore the
+      // configured timeout. Pre-fix, `pump_until_idle_or_progress`
+      // looped forever while a command was parked, never giving
+      // `drain` a chance to honor `drain_timeout`.
+      self.pump_until_idle_or_progress(Some(deadline))?;
       // Surface a stashed fatal eagerly so the caller sees the
       // structural failure before `drain` can return Ok.
       if let Some(err) = self.pending_fatal.take() {
@@ -905,7 +934,7 @@ impl ManagedTranscriber {
       if self.is_idle() {
         return Ok(());
       }
-      if started.elapsed() > timeout {
+      if std::time::Instant::now() >= deadline {
         return Err(RunnerError::DrainTimeout {
           timeout,
           in_flight: self.core.in_flight_chunk_count(),
