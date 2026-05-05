@@ -381,17 +381,29 @@ impl serde::Serialize for Lang {
 
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for Lang {
-  /// Deserialize from the lowercase ISO-639-1 string code.
-  /// Routes through [`Lang::from_iso639_1`] so input matching a
-  /// named variant canonicalises to that variant rather than
-  /// landing in `Other` (preserving the type's canonicalisation
-  /// invariant). Unknown codes pass through `Lang::Other` after
-  /// shape validation: the input must be lowercase ASCII letters
-  /// of length 1..=8 (matching the alignment-stage validation in
-  /// `runner/whisper_pool.rs`'s `validate_language_code`). This
-  /// bounds the heap that `Other` could pin and keeps
-  /// `intern_lang_str` from leaking adversarial high-cardinality
-  /// strings into the language-string intern table.
+  /// Deserialize from an ISO-639-1 string code, **case-insensitive**.
+  ///
+  /// Accepts any ASCII-letter case (`"en"`, `"EN"`, `"En"`,
+  /// `"eN"` all canonicalise to `Lang::En`); whisper.cpp's
+  /// language codes are conventionally lowercase but the ISO
+  /// standard treats them as case-insensitive, and human-edited
+  /// configs naturally use mixed case. The accepted alphabet
+  /// after lowercasing is `[a-z]{1,8}` — matches the
+  /// alignment-stage validation in `runner/whisper_pool.rs`'s
+  /// `validate_language_code` (round-32) so an "EN" config
+  /// produces a Lang that the FFI layer happily accepts.
+  ///
+  /// Routes through [`Lang::from_iso639_1`] *after* lowercasing
+  /// so input matching a named variant canonicalises to that
+  /// variant rather than landing in `Other`. Unknown codes pass
+  /// through `Lang::Other(SmolStr::new(lowered))` — the inner
+  /// string is always lowercase, preserving the canonicalisation
+  /// invariant across the serde boundary AND keeping the
+  /// language-string intern table bounded.
+  ///
+  /// Round-trip asymmetry note: `"EN"` deserialises to
+  /// `Lang::En` which then *serialises* as `"en"`. This is
+  /// intentional — the on-disk canonical form is lowercase.
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
   where
     D: serde::Deserializer<'de>,
@@ -409,12 +421,18 @@ impl<'de> serde::Deserialize<'de> for Lang {
         s.len()
       )));
     }
-    if !s.bytes().all(|b| b.is_ascii_lowercase()) {
+    if !s.bytes().all(|b| b.is_ascii_alphabetic()) {
       return Err(D::Error::custom(
-        "Lang code must be lowercase ASCII letters [a-z] only",
+        "Lang code must be ASCII letters [a-zA-Z] only (no digits, dashes, or non-ASCII)",
       ));
     }
-    Ok(Lang::from_iso639_1(s))
+    // Avoid the lowercasing allocation when input is already canonical.
+    if s.bytes().all(|b| b.is_ascii_lowercase()) {
+      Ok(Lang::from_iso639_1(s))
+    } else {
+      let lowered: alloc::string::String = s.to_ascii_lowercase();
+      Ok(Lang::from_iso639_1(&lowered))
+    }
   }
 }
 
@@ -609,13 +627,33 @@ mod tests {
     assert!(matches!(lang, Lang::Yue));
   }
 
+  /// Case-insensitive deserialization (UX win — users editing
+  /// configs naturally use mixed case): `"EN"`, `"En"`, `"eN"`,
+  /// `"en"` all canonicalise to `Lang::En`. The on-disk
+  /// canonical form is lowercase (so re-serialization always
+  /// emits `"en"`), but reading is permissive.
   #[cfg(feature = "serde")]
   #[test]
-  fn serde_rejects_uppercase() {
-    let res: Result<Lang, _> = serde_json::from_str("\"En\"");
-    assert!(res.is_err(), "uppercase must be rejected; got {res:?}");
-    let err = res.err().unwrap().to_string();
-    assert!(err.contains("lowercase ASCII"), "got {err:?}");
+  fn serde_accepts_any_case_for_named_variant() {
+    for input in ["\"en\"", "\"EN\"", "\"En\"", "\"eN\""] {
+      let lang: Lang = serde_json::from_str(input).expect(input);
+      assert_eq!(lang, Lang::En, "input {input} must canonicalise to Lang::En");
+      // Re-serialisation always emits the lowercase form.
+      assert_eq!(serde_json::to_string(&lang).unwrap(), "\"en\"");
+    }
+  }
+
+  /// Mixed-case unknown codes also canonicalise — `"XX"`
+  /// deserialises to `Lang::Other(SmolStr::new("xx"))`,
+  /// preserving the canonicalisation invariant (no
+  /// `Lang::Other("XX")` ever exists in the type).
+  #[cfg(feature = "serde")]
+  #[test]
+  fn serde_lowercases_unknown_code_into_other() {
+    let lang: Lang = serde_json::from_str("\"XX\"").expect("deserialize");
+    assert_eq!(lang, Lang::Other(SmolStr::new("xx")));
+    let lang: Lang = serde_json::from_str("\"Xx\"").expect("deserialize");
+    assert_eq!(lang, Lang::Other(SmolStr::new("xx")));
   }
 
   #[cfg(feature = "serde")]
@@ -643,16 +681,20 @@ mod tests {
     assert!(res.is_err(), "digits must be rejected");
   }
 
-  /// Old derive-shaped JSON (`"En"` or `{"Other":"xx"}`) must
-  /// fail with the new custom impl. Documents the breaking
-  /// wire-format change for migrators.
+  /// Old derive-shaped JSON for `Other` (`{"Other":"xx"}`) must
+  /// fail with the new custom impl — it's an externally-tagged
+  /// object, not a string. Documents the breaking wire-format
+  /// change for migrators.
+  ///
+  /// Note: legacy `"En"` (Rust variant name) is now ACCEPTED as
+  /// a side-effect of case-insensitive deserialization. That's a
+  /// happy accident for migration — old configs that happened to
+  /// use the variant-name form continue to work, just with the
+  /// canonical lowercase form on round-trip. No special handling
+  /// needed.
   #[cfg(feature = "serde")]
   #[test]
-  fn serde_rejects_legacy_derive_format() {
-    // Old: Rust variant name with capitalised first letter.
-    let res: Result<Lang, _> = serde_json::from_str("\"En\"");
-    assert!(res.is_err(), "legacy variant-name encoding must be rejected");
-    // Old: Other was an externally-tagged map.
+  fn serde_rejects_legacy_other_as_map() {
     let res: Result<Lang, _> = serde_json::from_str(r#"{"Other":"xx"}"#);
     assert!(res.is_err(), "legacy Other-as-map encoding must be rejected");
   }
