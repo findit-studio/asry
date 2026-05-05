@@ -1,14 +1,22 @@
 //! Inference state, segments, and tokens.
 //!
-//! `State` borrows from `Context` so the model outlives every
-//! per-call buffer it backs. The state is single-threaded by
-//! design (whisper.cpp scratch buffers + KV cache are not
-//! thread-safe); we mark it `!Sync` implicitly by holding a raw
-//! pointer.
+//! `State` owns an [`Arc`] of its parent [`Context`], which keeps
+//! the model alive for the state's lifetime. We picked Arc-
+//! ownership over a `'ctx` borrow because the realistic usage
+//! pattern (worker pools storing per-thread state across jobs)
+//! is hard to express with a lifetime — the borrow checker can't
+//! see that the parent Arc lives in the same stack frame as the
+//! State without explicit annotation. Arc-owned lets `State` be
+//! `'static` and storable in `Option<State>` / channels.
+//!
+//! The state is single-threaded by design (whisper.cpp scratch
+//! buffers + KV cache are not thread-safe); we mark it `!Sync`
+//! implicitly by holding a raw pointer.
 
 #![allow(unsafe_code)]
 
-use core::{marker::PhantomData, ptr::NonNull, str};
+use alloc::sync::Arc;
+use core::{ptr::NonNull, str};
 
 use crate::{
   context::Context,
@@ -17,23 +25,33 @@ use crate::{
   sys,
 };
 
-/// Per-call inference state. Tied to its [`Context`] via lifetime.
-pub struct State<'ctx> {
+/// Per-call inference state. Owns an [`Arc<Context>`] so the
+/// model outlives every per-call buffer.
+pub struct State {
   ptr: NonNull<sys::whisper_state>,
-  // Carries the borrow that ties our lifetime to the Context.
-  // `&'ctx Context` would also work; PhantomData keeps the field
-  // count zero-sized in case we ever need to stash extra non-FFI
-  // bookkeeping here.
-  _marker: PhantomData<&'ctx Context>,
+  // Keeps the parent Context alive. No `'ctx` lifetime: makes
+  // State `'static` for storage in `Option<State>` / channels /
+  // the long-lived worker structs whispery uses.
+  ctx: Arc<Context>,
 }
 
-impl<'ctx> State<'ctx> {
+// SAFETY: the `whisper_state` pointer is owned exclusively by us
+// (no aliases). whisper.cpp permits passing a state across
+// threads as long as no two threads call `whisper_full` on it
+// concurrently — that's the same guarantee `Send` requires. The
+// Arc<Context> is itself Send.
+unsafe impl Send for State {}
+
+impl State {
   /// Internal constructor used by [`Context::create_state`].
-  pub(crate) fn from_raw(ptr: NonNull<sys::whisper_state>, _ctx: &'ctx Context) -> Self {
-    Self {
-      ptr,
-      _marker: PhantomData,
-    }
+  pub(crate) fn from_raw(ptr: NonNull<sys::whisper_state>, ctx: Arc<Context>) -> Self {
+    Self { ptr, ctx }
+  }
+
+  /// Borrow the parent context. Useful when calling sites need
+  /// the same Arc to construct sibling state objects.
+  pub fn context(&self) -> &Arc<Context> {
+    &self.ctx
   }
 
   /// Run the encoder + decoder over `samples` (16 kHz mono f32).
@@ -43,14 +61,15 @@ impl<'ctx> State<'ctx> {
   /// [`State::segment`]. **Panic-free.** Returns
   /// [`WhisperError::SamplesOverflow`] when `samples.len()` does
   /// not fit in the C `int` whisper.cpp expects.
-  pub fn full(&mut self, ctx: &Context, params: &Params, samples: &[f32]) -> WhisperResult<()> {
+  pub fn full(&mut self, params: &Params, samples: &[f32]) -> WhisperResult<()> {
     let len = i32::try_from(samples.len()).map_err(|_| WhisperError::SamplesOverflow {
       samples: samples.len(),
     })?;
     // SAFETY:
-    // - `ctx.as_raw()` is a non-null whisper_context (NonNull
-    //   invariant on Context).
-    // - `self.ptr` is the matching state — same lifetime tying.
+    // - `self.ctx.as_raw()` is a non-null whisper_context
+    //   (NonNull invariant on Context); kept alive by the Arc we
+    //   own.
+    // - `self.ptr` is the matching state.
     // - `params.as_raw()` is a fully-initialised
     //   `whisper_full_params` whose owned CStrings live as long
     //   as `params`.
@@ -58,7 +77,7 @@ impl<'ctx> State<'ctx> {
     //   (slice invariant).
     let rc = unsafe {
       sys::whisper_full_with_state(
-        ctx.as_raw(),
+        self.ctx.as_raw(),
         self.ptr.as_ptr(),
         params.as_raw(),
         samples.as_ptr(),
@@ -89,12 +108,39 @@ impl<'ctx> State<'ctx> {
     Some(Segment {
       state: self.ptr,
       idx,
-      _marker: PhantomData,
+      _marker: core::marker::PhantomData,
     })
+  }
+
+  /// Detected (or forced) language id for the most recent
+  /// [`State::full`] call. Use [`lang_str`] to convert the id
+  /// back to its ISO code; whisper.cpp returns `-1` if no
+  /// language was set or detected.
+  pub fn lang_id(&self) -> i32 {
+    // SAFETY: pointer invariant; pure read.
+    unsafe { sys::whisper_full_lang_id_from_state(self.ptr.as_ptr()) }
   }
 }
 
-impl Drop for State<'_> {
+/// Convert a whisper.cpp language id (the value returned by
+/// [`State::lang_id`]) back to its ISO code (e.g. `"en"`,
+/// `"zh"`). Returns `None` if the id is out of range or the
+/// returned string is not valid UTF-8.
+pub fn lang_str(lang_id: i32) -> Option<&'static str> {
+  // SAFETY: whisper_lang_str is a pure C accessor returning a
+  // pointer into a static `const char *` table baked into
+  // libwhisper. The returned slice lives forever; we only need
+  // to verify it's a valid pointer + UTF-8.
+  let raw = unsafe { sys::whisper_lang_str(lang_id) };
+  if raw.is_null() {
+    return None;
+  }
+  // SAFETY: NUL-terminated; static lifetime per whisper.cpp.
+  let bytes = unsafe { core::ffi::CStr::from_ptr(raw).to_bytes() };
+  str::from_utf8(bytes).ok()
+}
+
+impl Drop for State {
   fn drop(&mut self) {
     // SAFETY: ptr is non-null and produced by whisper_init_state.
     unsafe { sys::whisper_free_state(self.ptr.as_ptr()) }
@@ -110,7 +156,7 @@ impl Drop for State<'_> {
 pub struct Segment<'a> {
   state: NonNull<sys::whisper_state>,
   idx: i32,
-  _marker: PhantomData<&'a ()>,
+  _marker: core::marker::PhantomData<&'a ()>,
 }
 
 impl<'a> Segment<'a> {
@@ -143,6 +189,37 @@ impl<'a> Segment<'a> {
     // for any valid model vocabulary.
     let bytes = unsafe { core::ffi::CStr::from_ptr(raw).to_bytes() };
     str::from_utf8(bytes).map_err(WhisperError::from)
+  }
+
+  /// `no_speech_prob` for this segment — whisper.cpp's gate for
+  /// the silent-segment shortcut. Higher = more confident the
+  /// segment is silence.
+  pub fn no_speech_prob(&self) -> f32 {
+    // SAFETY: idx in-range; pure read.
+    unsafe {
+      sys::whisper_full_get_segment_no_speech_prob_from_state(self.state.as_ptr(), self.idx)
+    }
+  }
+
+  /// Number of tokens decoded inside this segment.
+  pub fn n_tokens(&self) -> i32 {
+    // SAFETY: idx in-range; pure read.
+    unsafe { sys::whisper_full_n_tokens_from_state(self.state.as_ptr(), self.idx) }
+  }
+
+  /// Borrow token `tok_idx` of this segment. Returns `None` if
+  /// `tok_idx` is out of range.
+  pub fn token(&self, tok_idx: i32) -> Option<Token> {
+    if tok_idx < 0 || tok_idx >= self.n_tokens() {
+      return None;
+    }
+    // SAFETY: indices in-range; whisper.cpp returns a value-
+    // typed `whisper_token_data`. We project into our private
+    // `Token` view via `Token::from_raw`.
+    let raw = unsafe {
+      sys::whisper_full_get_token_data_from_state(self.state.as_ptr(), self.idx, tok_idx)
+    };
+    Some(Token::from_raw(raw))
   }
 }
 

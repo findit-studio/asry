@@ -18,12 +18,15 @@ smallvec  = { version = "1", default-features = false }
 
 # Runner feature deps. All optional — Plan A's core compiles
 # `--no-default-features` without these.
-whisper-rs        = { version = "0.16", optional = true, default-features = false }
-# In-house whisper.cpp bindings, gated by the
-# `whisper-cpp-bindings` feature. Path dep — co-located in this
-# repo under `crates/whisper-cpp/`. Replaces whisper-rs once the
-# whisper_pool.rs migration lands; today coexists behind the flag
-# so we can validate parity before flipping the default.
+#
+# The whisper.cpp wrapper is the in-house `whisper-cpp` crate
+# under `crates/whisper-cpp/`. It replaced `whisper-rs 0.16` after
+# we reproduced two soundness bugs in that crate's safe API
+# (`set_abort_callback_safe` UB → `failed to encode` on every
+# decode; `set_initial_prompt` / `set_language` `CString::into_raw`
+# leak with no `Drop`). The new bindings own + drop every CString
+# and route the abort callback through a properly-typed C
+# trampoline.
 whisper-cpp       = { path = "crates/whisper-cpp", optional = true, default-features = false }
 crossbeam-channel = { version = "0.5", optional = true, default-features = false, features = ["std"] }
 num_cpus          = { version = "1",   optional = true }
@@ -77,27 +80,17 @@ serde_json = "1"
 default  = ["std", "runner"]
 std      = ["mediatime/std", "smol_str/std", "serde?/std"]
 serde    = ["dep:serde", "dep:humantime-serde", "smol_str/serde", "mediatime/serde"]
-runner   = ["dep:whisper-rs", "dep:crossbeam-channel", "dep:num_cpus", "std"]
+runner   = ["dep:whisper-cpp", "dep:crossbeam-channel", "dep:num_cpus", "std"]
 alignment = ["runner", "dep:ort", "dep:tokenizers", "dep:ndarray"]
-# Apple-only GPU acceleration for whisper.cpp via whisper-rs's
-# pass-through features. `metal` runs the encoder on the unified-
-# memory Metal backend (works on every Apple Silicon Mac);
-# `coreml` additionally dispatches the encoder to ANE if the user
-# has built a CoreML companion model. Both default OFF — the
-# crate compiles BLAS-only on every platform without these
-# features. Enable both on Apple Silicon for production: the
-# whisper.cpp BLAS path on macOS hits an `whisper_full_with_state:
-# failed to encode` error on `large-v3-turbo`, and Metal sidesteps
-# it (and is dramatically faster).
-metal  = ["runner", "whisper-rs/metal"]
-coreml = ["runner", "whisper-rs/coreml"]
-# Opt-in: route ASR through the in-house `whisper-cpp` bindings
-# crate instead of `whisper-rs`. Currently scaffolding only — the
-# full `runner::whisper_pool` migration is staged behind this flag
-# and lands incrementally so each step can be parity-tested. Pulls
-# the whisper-cpp crate's `metal` + `coreml` defaults so an Apple
-# Silicon build keeps Metal acceleration via the new crate.
-whisper-cpp-bindings = ["runner", "dep:whisper-cpp", "whisper-cpp/metal", "whisper-cpp/coreml"]
+# Apple-only GPU acceleration for whisper.cpp. `metal` runs the
+# encoder on the unified-memory Metal backend (works on every
+# Apple Silicon Mac); `coreml` additionally dispatches the encoder
+# to ANE if the caller has produced a CoreML companion `.mlmodelc`.
+# Both default OFF — the crate compiles BLAS-only on every
+# platform without these features. Enable both on Apple Silicon
+# for production.
+metal  = ["runner", "whisper-cpp/metal"]
+coreml = ["runner", "whisper-cpp/coreml"]
 # Re-exports `pub(crate)` alignment internals (scalar/NEON normaliser
 # variants, raw `ctc_viterbi`, `LogProbsTV`) under `whispery::__bench`
 # so the SIMD baseline bench can call them directly. Doc-hidden;

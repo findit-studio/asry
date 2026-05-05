@@ -27,7 +27,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   );
 
   let t_load = Instant::now();
-  let ctx = Context::new(&model, ContextParams::new().with_use_gpu(true))?;
+  let ctx = std::sync::Arc::new(Context::new(
+    &model,
+    ContextParams::new().with_use_gpu(true),
+  )?);
   eprintln!(
     "[smoke] context loaded in {:.3}s",
     t_load.elapsed().as_secs_f64()
@@ -50,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .silence_print_toggles();
 
   let t_full = Instant::now();
-  state.full(&ctx, &params, &samples)?;
+  state.full(&params, &samples)?;
   let full_s = t_full.elapsed().as_secs_f64();
   eprintln!("[smoke] full() in {full_s:.3}s | rtf={:.3}", full_s / dur_s);
 

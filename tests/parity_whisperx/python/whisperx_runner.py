@@ -92,14 +92,14 @@ def main() -> int:
     )
     parser.add_argument(
         "--compute-type",
-        default="float32",
+        default="int8",
         help=(
-            "ctranslate2 compute_type (default: float32 — fastest CPU path "
-            "on Apple Silicon, where NEON/AMX matrix units favor fp32 over "
-            "int8 by ~2×). Use `int8` for bit-stable parity output across "
-            "runs (the harness's strict below_0.5=0 threshold is sensitive "
-            "to small transcription deltas between compute types). On CUDA, "
-            "`float16` / `int8_float16` are usually optimal."
+            "ctranslate2 compute_type (default: int8 — bit-stable across "
+            "runs, lets the harness assert below_0.5=0). Pass `float32` "
+            "for ~2× faster CPU decode on Apple Silicon at the cost of "
+            "small transcript deltas (a handful of pairs may drop below "
+            "the IoU 0.5 threshold). CUDA boxes should use `float16` or "
+            "`int8_float16`."
         ),
     )
     parser.add_argument(

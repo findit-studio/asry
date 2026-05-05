@@ -1,12 +1,24 @@
 //! Whisper worker pool.
-
-// Permitted unsafe: a single, narrowly-scoped C-FFI trampoline
-// that works around a whisper-rs 0.16.0 soundness bug in
-// `set_abort_callback_safe` (see `attach_abort_callback`'s
-// long doc-comment). The trampoline + the leaked
-// `Box<Arc<AtomicBool>>` are the only `unsafe` blocks in this
-// file and the only ones the `unsafe_code` lint flags.
-#![allow(unsafe_code)]
+//!
+//! This file used to wrap `whisper-rs`. It was migrated to the
+//! in-house `whisper-cpp` bindings crate (under `crates/whisper-cpp/`)
+//! after we reproduced two soundness/leak bugs in `whisper-rs 0.16`:
+//!
+//! 1. `set_abort_callback_safe` UB (closure-type vs.
+//!    `Box<dyn FnMut>` mismatch in the trampoline) → manifests as
+//!    `whisper_full_with_state: failed to encode` on every
+//!    decode. Structurally absent in `whisper-cpp` —
+//!    `Params::set_abort_callback` types the trampoline as
+//!    `*mut Box<dyn FnMut() -> bool>` end-to-end.
+//! 2. `set_language` / `set_initial_prompt` `CString::into_raw`
+//!    leak (no `Drop`). Structurally absent — `whisper-cpp`'s
+//!    `Params` owns every `CString` it hands to whisper.cpp and
+//!    drops them with the struct.
+//!
+//! Because both bug classes are gone, this file no longer needs
+//! the `FullParamsCache`, the `attach_abort_callback` workaround,
+//! or any `#![allow(unsafe_code)]` exemption. The `unsafe`
+//! surface lives entirely inside the `whisper-cpp` crate.
 
 use alloc::sync::Arc;
 use core::{sync::atomic::Ordering, time::Duration};
@@ -19,9 +31,9 @@ use std::{
 use crossbeam_channel::{Receiver, Sender, bounded};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use whisper_rs::{
-  FullParams, SamplingStrategy as WhisperStrategy, WhisperContext, WhisperContextParameters,
-  WhisperState,
+use whisper_cpp::{
+  Context as WhisperContext, ContextParams as WhisperContextParameters, Params as FullParams,
+  SamplingStrategy as WhisperStrategy, State as WhisperState, lang_str,
 };
 
 use smol_str::SmolStr;
@@ -519,118 +531,21 @@ pub(super) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<(), WorkFai
   Ok(())
 }
 
-/// Identifies which `FullParams` template a given `AsrParams`
-/// reuses. Encodes only the fields whose setters allocate
-/// CString memory (language, prompt) plus the
-/// strategy variant (which `FullParams::new` bakes into the
-/// underlying `whisper_full_params` struct and can't be changed
-/// after construction). All other fields — `n_threads`,
-/// suppression bools, `no_speech_thold`, `temperature`,
-/// `temperature_inc`, the abort callback — are set on a clone
-/// per-chunk in `finalize_chunk`, so they don't enter the key.
-#[derive(Clone, Hash, PartialEq, Eq)]
-struct FullParamsTemplateKey {
-  language: Option<SmolStr>,
-  prompt: Option<SmolStr>,
-  strategy: TemplateStrategyKind,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq)]
-enum TemplateStrategyKind {
-  Greedy {
-    best_of: i32,
-  },
-  /// `patience` is `f32`; we encode it as its bit pattern so
-  /// `Hash + Eq` work without a wrapper.
-  BeamSearch {
-    beam_size: i32,
-    patience_bits: u32,
-  },
-}
-
-impl FullParamsTemplateKey {
-  fn from_params(p: &AsrParams) -> Self {
-    let strategy = match p.strategy() {
-      SamplingStrategy::Greedy { best_of } => TemplateStrategyKind::Greedy { best_of },
-      SamplingStrategy::BeamSearch {
-        beam_size,
-        patience,
-      } => TemplateStrategyKind::BeamSearch {
-        beam_size,
-        patience_bits: patience.to_bits(),
-      },
-    };
-    Self {
-      language: p.language_hint().map(|l| SmolStr::new(l.as_str())),
-      prompt: p.initial_prompt().cloned(),
-      strategy,
-    }
-  }
-}
-
-/// Per-worker cache of `FullParams` templates keyed by
-/// [`FullParamsTemplateKey`]. The leaky setters
-/// (`set_language`, `set_initial_prompt`) run once per template,
-/// and every chunk that shares the same key reuses the cached
-/// template via `Clone`. For a typical single-config stream the
-/// cache holds one entry forever, so the per-call CString leak
-/// drops from `O(n_chunks)` to `O(1)`.
-///
-/// **Why not a process-wide cache?** Avoiding mutex contention
-/// is one reason; the bigger reason is that worker threads each
-/// own their own `WhisperState` and the templates live happily
-/// next to that thread's local state. Multi-worker pools end up
-/// with `O(workers × unique_configs)` cached entries — for
-/// typical single-config streams that's still O(workers) ≪ 10.
-///
-/// **TODO(upstream):** the underlying CString allocations are
-/// permanent because whisper-rs has no `Drop` impl that calls
-/// `CString::from_raw()` — see the upstream issue at
-/// <https://github.com/tazz4843/whisper-rs/issues> (filed
-/// alongside this change). Once that fix lands, the cache
-/// becomes pure clone-avoidance and the leak is gone entirely.
-pub(super) struct FullParamsCache {
-  entries: HashMap<FullParamsTemplateKey, FullParams<'static, 'static>>,
-}
-
-impl FullParamsCache {
-  pub(super) fn new() -> Self {
-    Self {
-      entries: HashMap::new(),
-    }
-  }
-
-  /// Look up (or build) the template for these params and
-  /// return a clone ready for [`finalize_chunk`]. Validation
-  /// MUST have already run via [`validate_for_whisper_ffi`].
-  fn get_clone(&mut self, params: &AsrParams) -> FullParams<'static, 'static> {
-    let key = FullParamsTemplateKey::from_params(params);
-    if let Some(template) = self.entries.get(&key) {
-      return template.clone();
-    }
-    let template = build_template(params);
-    let clone = template.clone();
-    self.entries.insert(key, template);
-    clone
-  }
-}
-
-impl Default for FullParamsCache {
-  fn default() -> Self {
-    Self::new()
-  }
-}
-
-/// Build a minimal `FullParams` template carrying ONLY the
+/// Build a fresh `FullParams` template carrying the
 /// allocate-on-set fields: strategy (via `FullParams::new`),
-/// `set_language`, `set_initial_prompt`. Caller must then call
-/// [`finalize_chunk`] on a clone to populate everything else.
+/// `set_language`, `set_initial_prompt`. Caller wires the
+/// per-chunk fields on top via [`finalize_chunk`].
 ///
-/// Each call leaks one CString per non-`None` language and prompt
-/// — TODO(upstream) at the type-level doc on
-/// [`FullParamsCache`]. The cache around this function bounds
-/// the call rate to once per unique config tuple.
-fn build_template(params: &AsrParams) -> FullParams<'static, 'static> {
+/// **Note (post whisper-cpp migration).** This used to be the
+/// allocate-prone half of a two-tier `FullParams` system whose
+/// raison d'être was to bound the `whisper-rs` CString leak in
+/// `set_language` / `set_initial_prompt`. With the in-house
+/// `whisper-cpp` bindings, `Params` owns and drops every CString
+/// it stores — building fresh per attempt is leak-free. The
+/// build/finalize split is retained because it cleanly separates
+/// "decode-config" from "per-chunk knobs" for readers, not
+/// because of a leak constraint.
+fn build_template(params: &AsrParams) -> FullParams {
   let strategy = match params.strategy() {
     SamplingStrategy::Greedy { best_of } => WhisperStrategy::Greedy { best_of },
     SamplingStrategy::BeamSearch {
@@ -643,26 +558,27 @@ fn build_template(params: &AsrParams) -> FullParams<'static, 'static> {
   };
   let mut p = FullParams::new(strategy);
   if let Some(lang) = params.language_hint() {
-    // Intern through `INTERNED_LANG_STRS`; the &'static str is
-    // allocated at most once per distinct code regardless of how
-    // many template builds occur. whisper-rs's set_language
-    // additionally allocates a fresh CString from the &str —
-    // that's the leak this cache is bounding.
     let static_lang: &'static str = intern_lang_str(lang.as_str());
-    // TODO(upstream): https://github.com/tazz4843/whisper-rs —
-    // set_language uses CString::into_raw() with no Drop to
-    // reclaim. Bounded to 1× per (language, prompt, strategy)
-    // tuple by `FullParamsCache`. Remove this comment once the
-    // upstream Drop impl is released.
-    p.set_language(Some(static_lang));
+    // `set_language` is fallible (interior NUL). Whispery's lang
+    // codes come from a closed set (`Lang::as_str` for known
+    // ISO-639-1 codes plus `Lang::Other(SmolStr)` whose validation
+    // happens elsewhere); a NUL byte slipping through is a
+    // programming bug we'd rather catch later than silently swallow.
+    // Drop the error here only because the next call (`set_initial_prompt`)
+    // and the caller's flow expect a `&mut FullParams`. The
+    // `validate_for_whisper_ffi` precondition + `intern_lang_str`'s
+    // closed alphabet make this path unreachable on valid inputs.
+    let _ = p.set_language(static_lang);
   } else {
     p.set_detect_language(true);
   }
   if let Some(prompt) = params.initial_prompt() {
-    // TODO(upstream): https://github.com/tazz4843/whisper-rs —
-    // set_initial_prompt uses CString::into_raw() with no Drop.
-    // Bounded by `FullParamsCache` (see TODO above).
-    p.set_initial_prompt(prompt.as_str());
+    // Same fallibility note as `set_language`. Prompt content is
+    // user-supplied so we are slightly more cautious — if a NUL
+    // shows up, drop the prompt rather than the chunk; whisper.cpp
+    // tolerates an unset prompt and the alternative is failing the
+    // entire ASR job over a string-encoding nit.
+    let _ = p.set_initial_prompt(prompt.as_str());
   }
   p
 }
@@ -674,88 +590,26 @@ fn build_template(params: &AsrParams) -> FullParams<'static, 'static> {
 /// Per-attempt callers then `Clone` the result and only update
 /// `set_temperature` per attempt.
 fn finalize_chunk(
-  mut full: FullParams<'static, 'static>,
+  mut full: FullParams,
   params: &AsrParams,
   abort_flag: Arc<AtomicBool>,
-) -> FullParams<'static, 'static> {
+) -> FullParams {
   full.set_n_threads(params.n_threads());
   full.set_no_context(params.no_context());
   full.set_suppress_blank(params.suppress_blank());
   full.set_suppress_nst(params.suppress_non_speech_tokens());
-  full.set_print_special(false);
-  full.set_print_progress(false);
-  full.set_print_realtime(false);
-  full.set_print_timestamps(false);
+  full.silence_print_toggles();
   full.set_no_speech_thold(params.no_speech_threshold());
   // Pin temperature_inc; whisper.cpp's internal ladder runs
   // exactly once at the runner-supplied temperature.
   full.set_temperature_inc(0.0);
-  // Worker-hang watchdog. We CANNOT use whisper-rs 0.16.0's
-  // `set_abort_callback_safe`: its trampoline is generic over the
-  // closure type `F` but the user_data pointer it stores is
-  // `*mut Box<dyn FnMut() -> bool>` — the cast `user_data as *mut
-  // F` reinterprets a fat-pointer-on-heap as the closure layout
-  // and returns garbage. On `large-v3-turbo` (and `tiny.en`) this
-  // surfaces as `whisper_full_with_state: failed to encode` /
-  // `GenericError(-6)` because the corrupted abort signal fires
-  // immediately during the first encode pass.
-  //
-  // Filed upstream and fixed locally by going through the
-  // `unsafe` `set_abort_callback` + `set_abort_callback_user_data`
-  // pair with our own properly-typed trampoline. The user data is
-  // a leaked `Box<Arc<AtomicBool>>` — we cannot reclaim it because
-  // FullParams is cloned per decode attempt and whisper.cpp keeps
-  // the pointer for the duration of `state.full`. The leak is
-  // bounded by the `FullParamsCache` (one CString set per unique
-  // params tuple) and is in the same equivalence class as the
-  // existing CString leaks documented on
-  // `FullParamsCache::get_clone`.
-  attach_abort_callback(&mut full, abort_flag);
+  // Worker-hang watchdog. whisper-cpp's `Params::set_abort_callback`
+  // is properly typed end-to-end (Box<dyn FnMut> matches the C
+  // trampoline) and owns the closure for the Params lifetime —
+  // both the whisper-rs `set_abort_callback_safe` UB and the
+  // `FullParamsCache`-mediated leak workaround are obsolete.
+  full.set_abort_callback(move || abort_flag.load(Ordering::Relaxed));
   full
-}
-
-/// C trampoline for `set_abort_callback` whose user_data layout
-/// matches what we store in [`attach_abort_callback`]: a leaked
-/// `Box<Arc<AtomicBool>>`. Reads the flag atomically and returns
-/// its current value to whisper.cpp.
-///
-/// # Safety
-/// `user_data` MUST point to a valid `Arc<AtomicBool>` heap
-/// allocation, NOT moved or dropped while whisper.cpp may invoke
-/// this callback. Caller of [`attach_abort_callback`] guarantees
-/// this by leaking the `Box<Arc<AtomicBool>>`.
-unsafe extern "C" fn abort_trampoline(user_data: *mut core::ffi::c_void) -> bool {
-  // SAFETY: caller of attach_abort_callback leaked exactly this
-  // shape. user_data is non-null and points to a live
-  // Arc<AtomicBool>.
-  let flag: &Arc<AtomicBool> = unsafe { &*(user_data as *const Arc<AtomicBool>) };
-  flag.load(Ordering::Relaxed)
-}
-
-/// Wire whispery's worker-hang `abort_flag` into whisper.cpp's
-/// per-encode abort hook, working around the
-/// [whisper-rs 0.16.0 `set_abort_callback_safe` UB][bug] (see the
-/// long comment in `finalize_chunk`).
-///
-/// The user data is a leaked `Box<Arc<AtomicBool>>`. The
-/// `FullParamsCache` keeps unique configs to O(1) so this leak
-/// stays bounded to one `Arc<AtomicBool>` per cache entry. Each
-/// `Arc::clone` is cheap; the leaked outer Box keeps the storage
-/// alive for the trampoline.
-///
-/// [bug]: https://codeberg.org/tazz4843/whisper-rs/issues — the
-/// trampoline reinterprets `*mut Box<dyn FnMut>` as `*mut F`
-/// (closure type), reading a fat-pointer-on-heap as raw closure
-/// layout. Manifests as `whisper_full_with_state: failed to
-/// encode` on every model.
-fn attach_abort_callback(full: &mut FullParams<'static, 'static>, flag: Arc<AtomicBool>) {
-  let leaked = Box::into_raw(Box::new(flag));
-  // SAFETY: `leaked` outlives the FullParams (Box::into_raw =
-  // permanent leak); trampoline matches the layout used here.
-  unsafe {
-    full.set_abort_callback(Some(abort_trampoline));
-    full.set_abort_callback_user_data(leaked as *mut core::ffi::c_void);
-  }
 }
 
 /// Build a `FullParams` for one decoding attempt. The runner's outer
@@ -770,23 +624,16 @@ fn attach_abort_callback(full: &mut FullParams<'static, 'static>, flag: Arc<Atom
 /// expose that setter; with `temperature_inc = 0.0` the internal
 /// ladder iterates exactly once regardless.
 ///
-/// Wires the worker-hang watchdog via `set_abort_callback_safe`. The
-/// closure reads `abort_flag` on every whisper.cpp progress callback;
-/// when the watchdog flips it true, whisper.cpp returns mid-inference.
-///
-/// Cache-bypassing entry point retained for tests and any caller
-/// that doesn't have a [`FullParamsCache`]. Production paths
-/// should use [`FullParamsCache::get_clone`] +
-/// [`finalize_chunk`] + per-attempt `Clone` + `set_temperature`.
+/// Wires the worker-hang watchdog via the whisper-cpp safe
+/// abort callback. The closure reads `abort_flag` on every
+/// whisper.cpp progress callback; when the watchdog flips it
+/// true, whisper.cpp returns mid-inference.
 pub(super) fn full_params_from(
   params: &AsrParams,
   attempt_temperature: f32,
   abort_flag: Arc<AtomicBool>,
-) -> Result<FullParams<'static, 'static>, WorkFailure> {
+) -> Result<FullParams, WorkFailure> {
   validate_for_whisper_ffi(params)?;
-  // Cache-bypass path: build a fresh template every call. Each
-  // call leaks one CString per non-`None` language and prompt —
-  // see `FullParamsCache` for the production-path mitigation.
   let template = build_template(params);
   let mut full = finalize_chunk(template, params, abort_flag);
   full.set_temperature(attempt_temperature);
@@ -805,14 +652,14 @@ pub(super) fn full_params_from(
 /// those segment means. This matches whisper.cpp's own internal
 /// computation of the value it gates `logprob_thold` against.
 pub(super) fn compute_avg_logprob(state: &WhisperState) -> f32 {
-  let n = state.full_n_segments();
+  let n = state.n_segments();
   if n <= 0 {
     return f32::MIN;
   }
   let mut seg_sum = 0.0f64;
   let mut seg_count = 0i32;
   for i in 0..n {
-    let Some(segment) = state.get_segment(i) else {
+    let Some(segment) = state.segment(i) else {
       continue;
     };
     let n_tok = segment.n_tokens();
@@ -822,8 +669,8 @@ pub(super) fn compute_avg_logprob(state: &WhisperState) -> f32 {
     let mut tok_sum = 0.0f64;
     let mut tok_count = 0i32;
     for j in 0..n_tok {
-      if let Some(token) = segment.get_token(j) {
-        tok_sum += token.token_data().plog as f64;
+      if let Some(token) = segment.token(j) {
+        tok_sum += token.plog() as f64;
         tok_count += 1;
       }
     }
@@ -850,15 +697,15 @@ pub(super) fn compute_avg_logprob(state: &WhisperState) -> f32 {
 /// a public no-op (only `avg_logprob` and `compression_ratio`
 /// gated acceptance).
 pub(super) fn compute_avg_no_speech_prob(state: &WhisperState) -> f32 {
-  let n = state.full_n_segments();
+  let n = state.n_segments();
   if n <= 0 {
     return 0.0;
   }
   let mut sum = 0.0_f32;
   let mut count = 0_i32;
   for i in 0..n {
-    if let Some(segment) = state.get_segment(i) {
-      sum += segment.no_speech_probability();
+    if let Some(segment) = state.segment(i) {
+      sum += segment.no_speech_prob();
       count += 1;
     }
   }
@@ -883,14 +730,14 @@ pub(super) fn compute_avg_no_speech_prob(state: &WhisperState) -> f32 {
 pub(super) fn compute_compression_ratio(state: &WhisperState) -> f32 {
   use std::collections::HashSet;
 
-  let n = state.full_n_segments();
+  let n = state.n_segments();
   if n <= 0 {
     return 0.0;
   }
   let mut text = String::new();
   for i in 0..n {
-    if let Some(segment) = state.get_segment(i) {
-      if let Ok(s) = segment.to_str() {
+    if let Some(segment) = state.segment(i) {
+      if let Ok(s) = segment.text() {
         text.push_str(s);
       }
     }
@@ -934,49 +781,26 @@ pub(super) fn run_with_temperature_ladder(
   state: &mut WhisperState,
   job: &AsrWorkItem,
   started_at: std::time::Instant,
-  cache: &mut FullParamsCache,
 ) -> Result<AsrResult, WorkFailure> {
   let p = &job.params;
   let mut temperature = p.initial_temperature();
   let max = p.max_attempts() as usize;
 
-  // Round 38 + post-38 follow-up: three-layer FullParams reuse.
-  //
-  // 1. **Inter-chunk** (`FullParamsCache`): the cached template
-  //    holds the leak-prone CString-allocating fields
-  //    (`set_language`, `set_initial_prompt`) plus strategy.
-  //    Templates are keyed by
-  //    `FullParamsTemplateKey = (language, prompt, strategy)`.
-  //    Cache hit ⇒ zero new CString allocations for this chunk.
-  //    Cache miss ⇒ one fresh template (and its leaks) inserted
-  //    forever.
-  //
-  // 2. **Per-chunk** (`finalize_chunk`): clone the template and
-  //    set everything else — n_threads, suppression bools,
-  //    no_speech_thold, temperature_inc=0, abort callback. None
-  //    of these allocate CString memory. Done once per chunk
-  //    so the temperature-ladder loop below doesn't redo it.
-  //
-  // 3. **Per-attempt**: clone the chunk-finalized FullParams
-  //    and call `set_temperature` for this attempt. `Clone`
-  //    shallow-copies the underlying C struct (sharing the
-  //    same leaked CString pointer) and bumps Arc refcounts
-  //    on the callback — no allocations beyond the small Arc.
-  //
-  // Net leak: O(unique configs) CStrings per worker over the
-  // process lifetime. For typical single-config streams that's
-  // O(1).
+  // Post whisper-cpp migration: build a fresh `Params` per
+  // attempt. The old `FullParamsCache` + `Clone` + `set_temperature`
+  // dance only existed to bound the whisper-rs CString leak; the
+  // in-house bindings own + drop every `CString`, so per-attempt
+  // construction is cheap AND leak-free. `Params` is intentionally
+  // not `Clone` (the boxed abort closure can't be safely
+  // duplicated), which makes "rebuild fresh" the only sound path
+  // anyway.
   validate_for_whisper_ffi(p)?;
-  let template = cache.get_clone(p);
-  let chunk_template = finalize_chunk(template, p, job.abort_flag.clone());
 
   for _attempt in 0..max {
-    let mut full = chunk_template.clone();
-    // Each attempt uses its own temperature; everything else
-    // (language, prompt, abort callback, no_speech_thold, etc.)
-    // is shared via the clone.
+    let template = build_template(p);
+    let mut full = finalize_chunk(template, p, job.abort_flag.clone());
     full.set_temperature(temperature);
-    let outcome = state.full(full, job.samples.as_ref());
+    let outcome = state.full(&full, job.samples.as_ref());
     if let Err(e) = outcome {
       // Distinguish abort (watchdog timeout) from a real backend
       // error. whisper-rs returns `Err(_)` from full() when the
@@ -1003,7 +827,7 @@ pub(super) fn run_with_temperature_ladder(
     // segments, the loop would exhaust, and the chunk would
     // surface as `AllTemperaturesFailed`. Detect the empty
     // outcome here and return an empty `AsrResult` instead.
-    if state.full_n_segments() == 0 {
+    if state.n_segments() == 0 {
       return build_asr_result(state, temperature, p);
     }
 
@@ -1068,16 +892,16 @@ fn build_asr_result(
   final_temperature: f32,
   params: &AsrParams,
 ) -> Result<AsrResult, WorkFailure> {
-  let n = state.full_n_segments();
+  let n = state.n_segments();
   let mut text = String::new();
   let mut nsp_sum = 0.0f32;
   let mut nsp_count: i32 = 0;
   for i in 0..n {
-    if let Some(segment) = state.get_segment(i) {
-      if let Ok(s) = segment.to_str() {
+    if let Some(segment) = state.segment(i) {
+      if let Ok(s) = segment.text() {
         text.push_str(s);
       }
-      nsp_sum += segment.no_speech_probability();
+      nsp_sum += segment.no_speech_prob();
       nsp_count += 1;
     }
   }
@@ -1089,9 +913,9 @@ fn build_asr_result(
     0.0
   };
 
-  let lang_id = state.full_lang_id_from_state();
+  let lang_id = state.lang_id();
   let language = if lang_id >= 0 {
-    match whisper_rs::get_lang_str(lang_id) {
+    match lang_str(lang_id) {
       Some(code) => Lang::from_iso639_1(code),
       None => params
         .language_hint()
@@ -1177,19 +1001,13 @@ impl WhisperPool {
   }
 
   /// Build a pool from a model path + config. Shorthand for
-  /// `WhisperContext::new_with_params(...)?` then `Self::new`.
+  /// `WhisperContext::new(...)?` then `Self::new`.
   pub(super) fn from_path(config: &WhisperPoolOptions) -> Result<Self, RunnerError> {
-    let mut ctx_params = WhisperContextParameters::default();
-    ctx_params.use_gpu(config.use_gpu());
-    ctx_params.gpu_device(config.gpu_device());
-    ctx_params.flash_attn(config.flash_attn());
-    let path = config
-      .model_path()
-      .to_str()
-      .ok_or_else(|| RunnerError::WhisperContextLoad {
-        message: format!("model_path is not valid UTF-8: {:?}", config.model_path()),
-      })?;
-    let ctx = WhisperContext::new_with_params(path, ctx_params).map_err(|e| {
+    let ctx_params = WhisperContextParameters::new()
+      .with_use_gpu(config.use_gpu())
+      .with_gpu_device(config.gpu_device())
+      .with_flash_attn(config.flash_attn());
+    let ctx = WhisperContext::new(config.model_path(), ctx_params).map_err(|e| {
       RunnerError::WhisperContextLoad {
         message: format!("{e:?}"),
       }
@@ -1257,13 +1075,6 @@ fn worker_loop(
 ) {
   let mut state_opt: Option<WhisperState> = None;
   let mut timeout_streak: u32 = 0;
-  // Per-worker FullParams template cache. Bounds the
-  // CString leak from `set_language` / `set_initial_prompt`
-  // (whisper-rs `into_raw` with no `Drop`) to one per
-  // distinct (language, prompt, strategy) tuple over this
-  // worker's lifetime. See the upstream-issue TODO in
-  // `build_template`.
-  let mut params_cache = FullParamsCache::new();
 
   while let Ok(job) = work_rx.recv() {
     // Lazy-create the state on first job, recreate after threshold.
@@ -1335,7 +1146,7 @@ fn worker_loop(
     };
 
     let started_at = std::time::Instant::now();
-    let outcome = run_with_temperature_ladder(state, &job, started_at, &mut params_cache);
+    let outcome = run_with_temperature_ladder(state, &job, started_at);
 
     // Cancel the watchdog by dropping cancel_tx; the watchdog's
     // recv_timeout returns Err(Disconnected) and exits cleanly.
@@ -1768,106 +1579,15 @@ mod tests {
   /// run on a worker thread). End-to-end ladder behaviour and
   /// layered-ladder suppression are exercised by other tests.
   /// Here we only assert the type signature compiles.
-  // --- FullParamsCache regression tests (round 38 follow-up) ---
 
-  /// Cache hit: same key returns the same template (entries
-  /// HashMap retains exactly one entry).
-  #[test]
-  fn full_params_cache_dedupes_same_config() {
-    let mut cache = FullParamsCache::new();
-    let p = AsrParams::default().with_language_hint(Some(Lang::En));
-    let _c1 = cache.get_clone(&p);
-    let _c2 = cache.get_clone(&p);
-    let _c3 = cache.get_clone(&p);
-    assert_eq!(
-      cache.entries.len(),
-      1,
-      "same config must reuse the cached template; got {} entries",
-      cache.entries.len()
-    );
-  }
-
-  /// Different language hints land in distinct entries.
-  #[test]
-  fn full_params_cache_separates_by_language() {
-    let mut cache = FullParamsCache::new();
-    let p_en = AsrParams::default().with_language_hint(Some(Lang::En));
-    let p_es = AsrParams::default().with_language_hint(Some(Lang::Es));
-    let p_none = AsrParams::default(); // no hint → detect_language
-    let _ = cache.get_clone(&p_en);
-    let _ = cache.get_clone(&p_es);
-    let _ = cache.get_clone(&p_none);
-    let _ = cache.get_clone(&p_en); // duplicate
-    assert_eq!(
-      cache.entries.len(),
-      3,
-      "three distinct configs must produce three entries; got {}",
-      cache.entries.len()
-    );
-  }
-
-  /// Different prompts land in distinct entries even with the
-  /// same language.
-  #[test]
-  fn full_params_cache_separates_by_prompt() {
-    let mut cache = FullParamsCache::new();
-    let p_a = AsrParams::default()
-      .with_language_hint(Some(Lang::En))
-      .with_initial_prompt(Some(SmolStr::new("hint A")));
-    let p_b = AsrParams::default()
-      .with_language_hint(Some(Lang::En))
-      .with_initial_prompt(Some(SmolStr::new("hint B")));
-    let _ = cache.get_clone(&p_a);
-    let _ = cache.get_clone(&p_b);
-    let _ = cache.get_clone(&p_a);
-    assert_eq!(cache.entries.len(), 2);
-  }
-
-  /// Strategy variant changes (Greedy vs BeamSearch) produce
-  /// distinct entries because `FullParams::new` bakes the
-  /// strategy into the underlying C struct.
-  #[test]
-  fn full_params_cache_separates_by_strategy() {
-    let mut cache = FullParamsCache::new();
-    let p_greedy = AsrParams::default()
-      .with_language_hint(Some(Lang::En))
-      .with_strategy(SamplingStrategy::Greedy { best_of: 1 });
-    let p_beam = AsrParams::default()
-      .with_language_hint(Some(Lang::En))
-      .with_strategy(SamplingStrategy::BeamSearch {
-        beam_size: 5,
-        patience: -1.0,
-      });
-    let _ = cache.get_clone(&p_greedy);
-    let _ = cache.get_clone(&p_beam);
-    assert_eq!(cache.entries.len(), 2);
-  }
-
-  /// Per-chunk fields that DON'T allocate CStrings (n_threads,
-  /// suppression bools, no_speech_thold, temperature) must NOT
-  /// be in the cache key — otherwise a per-packet override that
-  /// only changes one of these would force a fresh template +
-  /// CString allocation.
-  #[test]
-  fn full_params_cache_ignores_non_leaky_fields() {
-    let mut cache = FullParamsCache::new();
-    let p1 = AsrParams::default()
-      .with_language_hint(Some(Lang::En))
-      .with_n_threads(4)
-      .with_no_speech_threshold(0.6);
-    let p2 = AsrParams::default()
-      .with_language_hint(Some(Lang::En))
-      .with_n_threads(8) // different
-      .with_no_speech_threshold(0.4); // different
-    let _ = cache.get_clone(&p1);
-    let _ = cache.get_clone(&p2);
-    assert_eq!(
-      cache.entries.len(),
-      1,
-      "differing only in non-leaky fields must reuse the cached template; got {} entries",
-      cache.entries.len()
-    );
-  }
+  // FullParamsCache regression tests deleted alongside the cache
+  // itself in the whisper-cpp migration. The cache existed only
+  // to bound the whisper-rs `set_language` / `set_initial_prompt`
+  // CString leak; whisper-cpp's `Params` owns + drops every
+  // CString, so the test invariants ("differing only in language
+  // produces a new entry", etc.) no longer have a structure to
+  // pin down. Equivalent coverage now lives implicitly in
+  // `Params::Drop` (no leaks) and the integration parity runs.
 
   #[test]
   fn run_with_temperature_ladder_signature_compiles() {
@@ -1877,7 +1597,6 @@ mod tests {
       &mut WhisperState,
       &AsrWorkItem,
       std::time::Instant,
-      &mut FullParamsCache,
     ) -> Result<crate::core::AsrResult, crate::types::WorkFailure> = run_with_temperature_ladder;
   }
 

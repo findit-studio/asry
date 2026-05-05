@@ -230,6 +230,28 @@ impl Params {
   }
 }
 
+// Manual `Debug` because the boxed abort callback is `dyn FnMut`
+// (no `Debug` impl). We elide it; the rest of the params surface
+// renders fine via the bindgen-derived `Debug` on
+// `whisper_full_params`.
+impl core::fmt::Debug for Params {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("Params")
+      .field("raw", &self.raw)
+      .field("language", &self._language)
+      .field("initial_prompt", &self._initial_prompt)
+      .field(
+        "abort_callback",
+        &self
+          ._abort_callback
+          .as_ref()
+          .map(|_| "<installed>")
+          .unwrap_or("<none>"),
+      )
+      .finish()
+  }
+}
+
 unsafe extern "C" fn abort_trampoline(user_data: *mut c_void) -> bool {
   // SAFETY: `user_data` is the pointer we stored in
   // `set_abort_callback`. It points to a live

@@ -15,7 +15,7 @@ description = "Manual parity harness: dump whispery alignment output to JSON for
 # in whisper.cpp via whisper-rs. Both required to bypass the BLAS-
 # only `whisper_full_with_state: failed to encode` path; no-op on
 # non-Apple platforms (whisper-rs gates them in its own build.rs).
-whispery     = { path = "../..", default-features = false, features = ["runner", "alignment", "bench-internals", "parity-dump-emission", "metal", "coreml", "whisper-cpp-bindings"] }
+whispery     = { path = "../..", default-features = false, features = ["runner", "alignment", "bench-internals", "parity-dump-emission", "metal", "coreml"] }
 whisper-cpp  = { path = "../../crates/whisper-cpp", default-features = false, features = ["metal", "coreml"] }
 # `silero` (the Rust VAD crate) is the system-under-test for the
 # `whispery-silero-runner` binary in `src/bin/silero_runner.rs`. Path

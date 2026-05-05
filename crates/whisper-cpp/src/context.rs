@@ -10,6 +10,7 @@
 
 #![allow(unsafe_code)]
 
+use alloc::sync::Arc;
 use core::ptr::NonNull;
 use std::{ffi::CString, path::Path};
 
@@ -136,12 +137,21 @@ impl Context {
   }
 
   /// Create a fresh inference [`State`] tied to this model.
-  pub fn create_state(&self) -> WhisperResult<State<'_>> {
-    // SAFETY: self.ptr is non-null (NonNull invariant) and
-    // outlives the returned State (lifetime tied via 'a).
+  ///
+  /// Takes `Arc<Self>` because the returned `State` owns a clone
+  /// of the Arc — that's what keeps the Context alive across the
+  /// state's lifetime without forcing callers to thread a `'ctx`
+  /// borrow through every storage location. Construct
+  /// `Arc::new(Context::new(...)?)` once per model, then call
+  /// `create_state` per worker.
+  pub fn create_state(self: &Arc<Self>) -> WhisperResult<State> {
+    // SAFETY: self.ptr is non-null (NonNull invariant) and the
+    // Arc clone we hand to State keeps the Context (and therefore
+    // the underlying whisper_context*) alive for the State's
+    // lifetime.
     let raw = unsafe { sys::whisper_init_state(self.ptr.as_ptr()) };
     let state_ptr = NonNull::new(raw).ok_or(WhisperError::StateInit)?;
-    Ok(State::from_raw(state_ptr, self))
+    Ok(State::from_raw(state_ptr, Arc::clone(self)))
   }
 
   /// Internal: hand the raw pointer to siblings in this crate

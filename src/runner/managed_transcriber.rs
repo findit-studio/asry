@@ -5,7 +5,7 @@ use core::time::Duration;
 use std::sync::{Arc, atomic::AtomicBool};
 
 use crossbeam_channel::TrySendError;
-use whisper_rs::WhisperContext;
+use whisper_cpp::Context as WhisperContext;
 
 use crate::{
   core::{AsrParams, AsrParamsOverride, Command, Event, LanguagePolicy, Transcriber},
@@ -645,21 +645,11 @@ impl ManagedTranscriber {
   pub fn from_options(
     pool_options: WhisperPoolOptions,
   ) -> Result<ManagedTranscriberBuilder, RunnerError> {
-    let mut ctx_params = whisper_rs::WhisperContextParameters::default();
-    ctx_params.use_gpu(pool_options.use_gpu());
-    ctx_params.gpu_device(pool_options.gpu_device());
-    ctx_params.flash_attn(pool_options.flash_attn());
-    let path =
-      pool_options
-        .model_path()
-        .to_str()
-        .ok_or_else(|| RunnerError::WhisperContextLoad {
-          message: format!(
-            "model_path is not valid UTF-8: {:?}",
-            pool_options.model_path()
-          ),
-        })?;
-    let ctx = WhisperContext::new_with_params(path, ctx_params).map_err(|e| {
+    let ctx_params = whisper_cpp::ContextParams::new()
+      .with_use_gpu(pool_options.use_gpu())
+      .with_gpu_device(pool_options.gpu_device())
+      .with_flash_attn(pool_options.flash_attn());
+    let ctx = WhisperContext::new(pool_options.model_path(), ctx_params).map_err(|e| {
       RunnerError::WhisperContextLoad {
         message: format!("{e:?}"),
       }

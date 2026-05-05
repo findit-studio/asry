@@ -48,15 +48,18 @@ pub mod runner;
 #[cfg(feature = "runner")]
 pub use runner::{ManagedTranscriber, ManagedTranscriberBuilder, RunnerError, WhisperPoolOptions};
 
-// Re-export whisper-rs types that appear on the runner's public
-// API (so consumers don't need a direct whisper-rs dep just to name
-// them; they may still add it to call non-re-exported methods).
+// Re-export whisper-cpp types that appear on the runner's public
+// API. The aliases preserve whispery's existing
+// `WhisperContext` / `WhisperContextParameters` public symbols
+// (so external callers don't see the migration) while mapping
+// onto the in-house `whisper-cpp` crate.
 //
-// SemVer note: identical to the mediatime situation — re-exporting
-// pins whispery's public API to whisper-rs's semver. We pin to a
-// single major in Cargo.toml.
+// SemVer note: same shape as the mediatime situation —
+// re-exporting pins whispery's public API to whisper-cpp's
+// semver, but whisper-cpp is a path dep we own so the
+// constraint is internal.
 #[cfg(feature = "runner")]
-pub use whisper_rs::{WhisperContext, WhisperContextParameters};
+pub use whisper_cpp::{Context as WhisperContext, ContextParams as WhisperContextParameters};
 
 #[cfg(feature = "alignment")]
 pub use runner::{

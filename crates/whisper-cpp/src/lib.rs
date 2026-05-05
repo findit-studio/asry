@@ -34,6 +34,10 @@
 // holds an FFI surface. The crate-wide deny stays — every safe
 // wrapper above the FFI is `#![deny(unsafe_code)]` clean.
 #![deny(unsafe_code)]
+// `alloc::sync::Arc` reach: lets `state.rs` and `context.rs`
+// import via `use alloc::sync::Arc;` without an `extern crate
+// alloc;` boilerplate at the call site.
+extern crate alloc;
 
 mod context;
 mod error;
@@ -44,4 +48,4 @@ mod sys;
 pub use context::{Context, ContextParams};
 pub use error::{WhisperError, WhisperResult};
 pub use params::{Params, SamplingStrategy};
-pub use state::{Segment, State, Token};
+pub use state::{Segment, State, Token, lang_str};
