@@ -90,6 +90,19 @@ fn main() {
     return;
   }
 
+  // Two distinct directories:
+  // - `models/` (in-tree, gitignored): big ML model files. Lives
+  //   alongside the source so a developer can `ls models/` to
+  //   see what's been downloaded; survives `cargo clean`.
+  // - `target/whispery-test-fixtures/`: transient test data
+  //   (jfk.wav). Cargo-managed; can be wiped without losing
+  //   gigabytes of model weights.
+  let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+  let models_dir = manifest_dir.join("models");
+  if let Err(e) = fs::create_dir_all(&models_dir) {
+    eprintln!("[whispery build.rs] cannot create {:?}: {}", models_dir, e);
+    return;
+  }
   let target_dir = match find_target_dir() {
     Some(p) => p,
     None => {
@@ -102,7 +115,7 @@ fn main() {
     eprintln!("[whispery build.rs] cannot create {:?}: {}", fixture_dir, e);
     return;
   }
-  let model_path = fixture_dir.join(MODEL_FILENAME);
+  let model_path = models_dir.join(MODEL_FILENAME);
 
   if model_path.exists() {
     if let Ok(true) = verify_sha256(&model_path, MODEL_SHA256) {
@@ -112,7 +125,7 @@ fn main() {
         model_path.display()
       );
       fetch_jfk_wav(&fixture_dir);
-      fetch_wav2vec2_fixtures(&fixture_dir);
+      fetch_wav2vec2_fixtures(&models_dir);
       return;
     } else {
       eprintln!(
@@ -139,7 +152,7 @@ fn main() {
         model_path.display()
       );
       fetch_jfk_wav(&fixture_dir);
-      fetch_wav2vec2_fixtures(&fixture_dir);
+      fetch_wav2vec2_fixtures(&models_dir);
     }
     Ok(false) => {
       eprintln!("[whispery build.rs] downloaded model has wrong checksum; aborting");
@@ -173,7 +186,7 @@ fn fetch_jfk_wav(fixture_dir: &std::path::Path) {
   }
 }
 
-fn fetch_wav2vec2_fixtures(fixture_dir: &std::path::Path) {
+fn fetch_wav2vec2_fixtures(models_dir: &std::path::Path) {
   // Opt-in via WHISPERY_FETCH_W2V. Same gate shape as the
   // parent `main`'s WHISPERY_FETCH_MODEL check — default builds
   // never hit the network, even when the alignment feature is
@@ -191,7 +204,7 @@ fn fetch_wav2vec2_fixtures(fixture_dir: &std::path::Path) {
     return;
   }
 
-  let model_path = fixture_dir.join(MODEL_W2V_FILENAME);
+  let model_path = models_dir.join(MODEL_W2V_FILENAME);
   if !fetch_with_sha(MODEL_W2V_URL, &model_path, MODEL_W2V_SHA256) {
     return;
   }
@@ -200,7 +213,7 @@ fn fetch_wav2vec2_fixtures(fixture_dir: &std::path::Path) {
     model_path.display()
   );
 
-  let tokenizer_path = fixture_dir.join(TOKENIZER_W2V_FILENAME);
+  let tokenizer_path = models_dir.join(TOKENIZER_W2V_FILENAME);
   // Previously this path patched the downloaded tokenizer.json
   // before storing it, so the runtime `Aligner::from_paths`
   // only had to handle the patched form. The compat shim now
@@ -223,24 +236,24 @@ fn fetch_wav2vec2_fixtures(fixture_dir: &std::path::Path) {
   // build.rs. We just probe for them and emit env vars when
   // present, so multi-lang tests skip-when-fixture-absent
   // identically to the single-language path above.
-  detect_extra_align_fixture(fixture_dir, "WHISPERY_W2V_JA",
+  detect_extra_align_fixture(models_dir, "WHISPERY_W2V_JA",
     "jonatasgrosman--wav2vec2-large-xlsr-53-japanese");
-  detect_extra_align_fixture(fixture_dir, "WHISPERY_W2V_ZH",
+  detect_extra_align_fixture(models_dir, "WHISPERY_W2V_ZH",
     "jonatasgrosman--wav2vec2-large-xlsr-53-chinese-zh-cn");
 }
 
 /// Detect a multi-language alignment fixture pair (an `.onnx` file
-/// and a `<stem>-tokenizer.json`) under `fixture_dir`. When both
+/// and a `<stem>-tokenizer.json`) under `models_dir`. When both
 /// exist, export `<env_prefix>_MODEL` and `<env_prefix>_TOKENIZER`
 /// so `option_env!()` in tests can find them. When missing, do
 /// nothing — the test path skips.
 fn detect_extra_align_fixture(
-  fixture_dir: &std::path::Path,
+  models_dir: &std::path::Path,
   env_prefix: &str,
   stem: &str,
 ) {
-  let model_path = fixture_dir.join(format!("{stem}.onnx"));
-  let tokenizer_path = fixture_dir.join(format!("{stem}-tokenizer.json"));
+  let model_path = models_dir.join(format!("{stem}.onnx"));
+  let tokenizer_path = models_dir.join(format!("{stem}-tokenizer.json"));
   if !model_path.exists() || !tokenizer_path.exists() {
     return;
   }

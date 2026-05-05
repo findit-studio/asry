@@ -18,12 +18,12 @@ Usage:
     /tmp/wav2vec2-export-venv/bin/python fetch_align_model.py ja \\
         --out-dir /path/to/dest
 
-Output layout (per model):
+Output layout (per model), default `<crate>/models/`:
     <out-dir>/<safe-name>.onnx
     <out-dir>/<safe-name>-tokenizer.json
-where <safe-name> = <hf-org>--<hf-name> with `/` and `_` replaced
-by `-` for filesystem safety. The whispery `Aligner::from_paths`
-accepts both files directly.
+where <safe-name> = <hf-org>--<hf-name>. The whispery
+`Aligner::from_paths` accepts both files directly. Override via
+`--out-dir` or the `WHISPERY_MODELS_DIR` env var.
 
 Environment requirements: this script uses `torch.onnx.export` with
 the legacy tracing exporter. The whisperX parity venv pins
@@ -250,15 +250,19 @@ def main() -> int:
         default=None,
         help="Explicit HuggingFace model path (overrides --lang resolution).",
     )
+    # Default output: `<crate-root>/models/`. The Python script
+    # lives at `<crate>/tests/parity_whisperx/python/`, so resolve
+    # 3 levels up. Override via env or --out-dir.
+    default_out_dir = Path(
+        os.environ.get(
+            "WHISPERY_MODELS_DIR",
+            str(Path(__file__).resolve().parents[3] / "models"),
+        )
+    )
     p.add_argument(
         "--out-dir",
         type=Path,
-        default=Path(
-            os.environ.get(
-                "WHISPERY_TEST_FIXTURES",
-                "/Users/user/.cargo/target/whispery-test-fixtures",
-            )
-        ),
+        default=default_out_dir,
     )
     p.add_argument(
         "--opset",

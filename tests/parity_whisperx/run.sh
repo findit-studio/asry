@@ -2,7 +2,7 @@
 # WhisperX vs whispery alignment parity harness.
 #
 # Requires:
-# - `target/whispery-test-fixtures/{ggml-tiny.en.bin, wav2vec2-base-960h.onnx,
+# - `<crate>/models/{ggml-tiny.en.bin, wav2vec2-base-960h.onnx,
 #   wav2vec2-base-960h-tokenizer.json}` (run `WHISPERY_FETCH_MODEL=1
 #   WHISPERY_FETCH_W2V=1 cargo test --features alignment` once to populate)
 # - `uv` on PATH (https://docs.astral.sh/uv/)

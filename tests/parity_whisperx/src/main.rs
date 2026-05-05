@@ -13,8 +13,8 @@
 //!   1. CLI flags (`--whisper-model`, `--w2v-model`, `--w2v-tokenizer`)
 //!   2. Env vars (`WHISPER_MODEL_PATH`, `WAV2VEC2_ONNX_PATH`,
 //!      `WAV2VEC2_TOKENIZER_PATH`)
-//!   3. Auto-detected fixture dir (CARGO_TARGET_DIR or
-//!      `$HOME/.cargo/target/whispery-test-fixtures/`)
+//!   3. Auto-detected `<whispery-crate>/models/` (canonical) or
+//!      legacy `$CARGO_TARGET_DIR/whispery-test-fixtures/`
 //!
 //! `ORT_DYLIB_PATH` is consumed by `ort` itself in `load-dynamic` mode
 //! (whispery's pinned configuration); the runner doesn't touch it.
@@ -85,10 +85,32 @@ struct Args {
   out: Option<PathBuf>,
 }
 
-fn fixture_dir() -> Option<PathBuf> {
-  // Match the layout build.rs writes to: `<cargo_target_dir>/whispery-test-fixtures/`.
-  // Cargo's default target dir on macOS / Linux is
-  // `$CARGO_TARGET_DIR` -> `$CARGO_HOME/target/` -> `$HOME/.cargo/target/`.
+/// Candidate directories the parity runner searches for ML model
+/// files (whisper ggml, wav2vec2 ONNX, tokenizer.json). First-hit
+/// wins. Order:
+///
+/// 1. `<whispery-crate>/models/` — the canonical in-tree location.
+///    Resolved via `env!("CARGO_MANIFEST_DIR")` which expands at
+///    compile time to the parity runner's own manifest dir
+///    (`tests/parity_whisperx/`); two `..` segments up reach the
+///    whispery crate root, then `models`.
+/// 2. `$CARGO_TARGET_DIR/whispery-test-fixtures/` — legacy layout
+///    used before the `models/` folder existed; kept for users
+///    whose builds still cache there.
+/// 3. `$CARGO_HOME/target/whispery-test-fixtures/` — same legacy
+///    layout under the user's cargo home.
+/// 4. `$HOME/.cargo/target/whispery-test-fixtures/` — final
+///    legacy fallback for the macOS / Linux default.
+fn models_dir() -> Option<PathBuf> {
+  // 1. In-tree `<whispery-crate>/models/`.
+  let in_tree = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    .join("..")
+    .join("..")
+    .join("models");
+  if in_tree.is_dir() {
+    return Some(in_tree);
+  }
+  // 2-4. Legacy `target/whispery-test-fixtures/` locations.
   if let Ok(p) = std::env::var("CARGO_TARGET_DIR") {
     let candidate = PathBuf::from(p).join("whispery-test-fixtures");
     if candidate.is_dir() {
@@ -124,7 +146,7 @@ fn resolve_model(
   if let Ok(p) = std::env::var(env_var) {
     return Ok(PathBuf::from(p));
   }
-  if let Some(dir) = fixture_dir() {
+  if let Some(dir) = models_dir() {
     let candidate = dir.join(fixture_filename);
     if candidate.is_file() {
       return Ok(candidate);

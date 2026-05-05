@@ -21,3 +21,4 @@ Cargo.lock
 
 target/whispery-test-fixtures/
 docs/
+models/
