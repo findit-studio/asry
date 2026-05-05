@@ -431,6 +431,22 @@ impl Transcriber {
     self.buffer.buffered_samples()
   }
 
+  /// Total chunks waiting on a worker result: those in
+  /// `cut_pending` (extracted, not yet promoted) plus those
+  /// `in_flight` (promoted, awaiting whisper / alignment
+  /// result). Excludes chunks whose results have arrived but
+  /// not yet been observed by `poll_event` (those are in
+  /// `pending_events`).
+  ///
+  /// Codex round-35: the runner's `DrainTimeout.in_flight`
+  /// previously reported `buffered_samples()` (a sample count)
+  /// despite the field being documented as "chunks awaiting
+  /// results". A trimmed buffer can read `0` while real chunks
+  /// are still in-flight; this method is the honest count.
+  pub fn in_flight_chunk_count(&self) -> usize {
+    self.dispatch.cut_pending.len() + self.dispatch.in_flight.len()
+  }
+
   /// Output timebase recorded from the first `push_samples` call.
   pub fn output_timebase(&self) -> Option<Timebase> {
     self.buffer.output_timebase()
@@ -620,6 +636,76 @@ impl Transcriber {
         self.cut.pending_start(),
         self.vad_watermark,
       );
+    }
+    Ok(())
+  }
+
+  /// Pre-flight validation for a packet of VAD segments.
+  ///
+  /// Mirrors the per-segment checks that [`Self::push_vad_segment`]
+  /// performs (eof, timebase, high-water, strict-monotonic
+  /// ordering) WITHOUT mutating any state. Designed for callers
+  /// (the runner's `process_packet`) that want all-or-nothing
+  /// atomicity: if `precheck_vad_segments` returns `Ok`, then
+  /// `push_vad_segment(seg)` for each segment in `vad_segments`
+  /// in order is guaranteed to succeed at the validation level.
+  ///
+  /// `samples_to_be_pushed` is the length of the audio packet the
+  /// caller is about to push BEFORE the VADs. The high-water
+  /// projection is conservative (floor): we assume `push_samples`
+  /// will append exactly `samples.len()` samples without zero-fill.
+  /// Real `append` may zero-fill up to `gap_tolerance_samples`
+  /// (giving a higher actual high-water), so this precheck can
+  /// false-reject a VAD whose `end_sample` lies inside the
+  /// to-be-zero-filled gap region — extremely rare, since silero
+  /// only emits VAD segments over real audio. False-accept is
+  /// impossible: anything the precheck approves will also pass
+  /// the runtime check.
+  ///
+  /// Codex round-35: `process_packet` previously committed
+  /// samples first, then pushed VADs one at a time. A failing
+  /// VAD #N left samples + VADs 0..N-1 committed, so the caller
+  /// could not safely retry the packet. Pre-flighting fixes the
+  /// atomicity gap.
+  pub(crate) fn precheck_vad_segments(
+    &self,
+    vad_segments: &[VadSegment],
+    samples_to_be_pushed: usize,
+  ) -> Result<(), TranscriberError> {
+    if vad_segments.is_empty() {
+      return Ok(());
+    }
+    if self.eof_signaled {
+      return Err(TranscriberError::AfterEof);
+    }
+    // After a successful push_samples, output_timebase() is
+    // guaranteed to be Some. It's None now only if (a) no
+    // push_samples has ever happened AND (b) `samples` is empty
+    // (so the upcoming push_samples won't establish the timebase
+    // either).
+    if self.buffer.output_timebase().is_none() && samples_to_be_pushed == 0 {
+      return Err(TranscriberError::OutputTimebaseUnset);
+    }
+
+    // Floor projection: assume zero gap-fill. See type doc.
+    let projected_high_water =
+      self.buffer.absolute_sample_offset() + samples_to_be_pushed as u64;
+    let mut running_watermark = self.vad_watermark;
+
+    for seg in vad_segments {
+      if seg.end_sample() > projected_high_water {
+        return Err(TranscriberError::VadAheadOfAudio {
+          vad_end: seg.end_sample(),
+          buffered: projected_high_water,
+        });
+      }
+      if seg.start_sample() < running_watermark {
+        return Err(TranscriberError::PtsRegression {
+          kind: crate::types::PushKind::VadSegment,
+          advance: seg.start_sample() as i64 - running_watermark as i64,
+        });
+      }
+      running_watermark = seg.end_sample();
     }
     Ok(())
   }
@@ -1786,5 +1872,99 @@ mod tests {
       params.initial_temperature()
     );
     let _ = o_a; // captured semantically via initial_temperature
+  }
+
+  // --- Codex round-35: precheck_vad_segments ---
+
+  #[test]
+  fn precheck_vad_segments_passes_for_valid_packet() {
+    let mut t = fresh();
+    t.push_samples(ts(0), &[0.0; 10_000]).unwrap();
+    let segs = [VadSegment::new(0, 1000), VadSegment::new(2000, 3000)];
+    let r = t.precheck_vad_segments(&segs, 0);
+    assert!(r.is_ok());
+  }
+
+  /// VAD ahead-of-projected-high-water rejects without committing.
+  #[test]
+  fn precheck_vad_segments_rejects_ahead_of_audio() {
+    let mut t = fresh();
+    t.push_samples(ts(0), &[0.0; 1_000]).unwrap();
+    // Segment ends at 5_000, but only 1_000 samples buffered + 0
+    // about-to-push.
+    let segs = [VadSegment::new(0, 5_000)];
+    match t.precheck_vad_segments(&segs, 0) {
+      Err(TranscriberError::VadAheadOfAudio { vad_end: 5_000, buffered: 1_000 }) => {}
+      other => panic!("expected VadAheadOfAudio; got {other:?}"),
+    }
+  }
+
+  /// VAD ordering regression caught by precheck.
+  #[test]
+  fn precheck_vad_segments_rejects_out_of_order() {
+    let mut t = fresh();
+    t.push_samples(ts(0), &[0.0; 10_000]).unwrap();
+    let segs = [
+      VadSegment::new(2_000, 3_000),
+      VadSegment::new(1_000, 1_500), // start < running watermark (3_000)
+    ];
+    match t.precheck_vad_segments(&segs, 0) {
+      Err(TranscriberError::PtsRegression { kind: crate::types::PushKind::VadSegment, .. }) => {}
+      other => panic!("expected PtsRegression; got {other:?}"),
+    }
+  }
+
+  /// Precheck projects the post-push high water using
+  /// `samples_to_be_pushed`, so a VAD targeting samples in the
+  /// upcoming push is accepted.
+  #[test]
+  fn precheck_vad_segments_uses_projected_high_water() {
+    let t = fresh();
+    // Buffer empty, output timebase unset. samples_to_be_pushed=
+    // 1000 means after push, high_water = 1000.
+    let segs = [VadSegment::new(0, 800)];
+    let r = t.precheck_vad_segments(&segs, 1_000);
+    assert!(r.is_ok(), "VAD inside projected high water must pass");
+
+    // VAD past the projected high water is rejected.
+    let segs2 = [VadSegment::new(0, 2_000)];
+    let r2 = t.precheck_vad_segments(&segs2, 1_000);
+    assert!(matches!(
+      r2,
+      Err(TranscriberError::VadAheadOfAudio { buffered: 1_000, .. })
+    ));
+  }
+
+  /// Empty `vad_segments` is always Ok.
+  #[test]
+  fn precheck_vad_segments_empty_is_ok() {
+    let t = fresh();
+    assert!(t.precheck_vad_segments(&[], 0).is_ok());
+    assert!(t.precheck_vad_segments(&[], 1_000).is_ok());
+  }
+
+  /// AfterEof is caught by precheck without mutating state.
+  #[test]
+  fn precheck_vad_segments_rejects_after_eof() {
+    let mut t = fresh();
+    t.push_samples(ts(0), &[0.0; 1_000]).unwrap();
+    t.signal_eof().unwrap();
+    let segs = [VadSegment::new(0, 500)];
+    match t.precheck_vad_segments(&segs, 0) {
+      Err(TranscriberError::AfterEof) => {}
+      other => panic!("expected AfterEof; got {other:?}"),
+    }
+  }
+
+  /// OutputTimebaseUnset caught by precheck when no samples will
+  /// be pushed AND no prior push has set the timebase.
+  #[test]
+  fn precheck_vad_segments_rejects_no_timebase_no_samples() {
+    let t = fresh();
+    let segs = [VadSegment::new(0, 100)];
+    match t.precheck_vad_segments(&segs, 0) {
+      Err(TranscriberError::OutputTimebaseUnset) => {}
+      other => panic!("expected OutputTimebaseUnset; got {other:?}"),
+    }
   }
 }

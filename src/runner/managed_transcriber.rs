@@ -679,17 +679,39 @@ impl ManagedTranscriber {
     // on exit regardless of outcome.
     self.core.set_runtime_override(params_override);
 
-    // Step 2: push samples (may return Backpressure / PtsRegression / etc.)
+    // Step 2: pre-flight VAD validation BEFORE pushing samples.
+    // Codex round-35 caught a partial-commit bug here: the
+    // previous order (push_samples → push_vads loop) left the
+    // samples + earlier VADs committed if a later VAD was
+    // out-of-order or ahead-of-audio. Caller could not safely
+    // retry the packet (the same starts_at would now trip
+    // PtsRegression). The precheck verifies `eof_signaled`,
+    // timebase, ordering, and high-water against a projection
+    // of the buffer's high water AFTER the upcoming push, so
+    // either everything commits or nothing does.
+    let precheck = self
+      .core
+      .precheck_vad_segments(vad_segments, samples.len());
+    if let Err(e) = precheck {
+      // Roll back the override stamp; nothing else mutated.
+      self.core.set_runtime_override(None);
+      return Err(RunnerError::Transcriber(e));
+    }
+
+    // Step 3: push samples (atomic — either fully commits or
+    // returns Err with no commit; see SampleBuffer::append).
     let push_result = self.push_samples_internal(starts_at, samples);
 
-    // Step 3: push VAD segments (only if step 2 succeeded; otherwise
-    // we propagate the push error before mutating cut state).
+    // Step 4: push VAD segments. Per the precheck above, every
+    // segment is guaranteed to satisfy push_vad_segment's
+    // validation; this loop's failure modes are now reduced to
+    // "push_samples failed" (the and_then short-circuits).
     let result = push_result.and_then(|()| self.push_vads_internal(vad_segments));
 
-    // Step 4: pump the dispatch loop until idle or saturation.
+    // Step 5: pump the dispatch loop until idle or saturation.
     let drive_result = result.and_then(|()| self.pump_until_idle_or_progress());
 
-    // Step 5: clear the override stamp. Chunks already in
+    // Step 6: clear the override stamp. Chunks already in
     // `cut_pending` keep the override they captured at extract
     // time — only newly-extracted chunks (in future packets)
     // see `None` here.
@@ -857,19 +879,38 @@ impl ManagedTranscriber {
     }
   }
 
-  /// Block until `core.is_idle()` or `drain_timeout` elapses.
+  /// Block until [`Self::is_idle`] OR `drain_timeout` elapses.
+  ///
+  /// Codex round-35:
+  ///
+  /// - The idle check now goes through [`Self::is_idle`] (the
+  ///   public predicate) rather than the inner `core.is_idle()`.
+  ///   The public predicate also accounts for buffered
+  ///   transcripts/errors AND a stashed `pending_fatal`, so a
+  ///   fatal worker error sitting behind buffered output can no
+  ///   longer race past `drain` and have it return `Ok`.
+  /// - `DrainTimeout.in_flight` now reports the actual chunk
+  ///   count via `core.in_flight_chunk_count()`, matching the
+  ///   field's documented meaning. The previous `buffered_samples()`
+  ///   was a sample count and could read zero (after trim) even
+  ///   while chunks were still working.
   pub fn drain(&mut self) -> Result<(), RunnerError> {
     let started = std::time::Instant::now();
     let timeout = self.drain_timeout;
     loop {
       self.pump_until_idle_or_progress()?;
-      if self.core.is_idle() {
+      // Surface a stashed fatal eagerly so the caller sees the
+      // structural failure before `drain` can return Ok.
+      if let Some(err) = self.pending_fatal.take() {
+        return Err(err);
+      }
+      if self.is_idle() {
         return Ok(());
       }
       if started.elapsed() > timeout {
         return Err(RunnerError::DrainTimeout {
           timeout,
-          in_flight: self.core.buffered_samples(), // proxy; exact count is in dispatch
+          in_flight: self.core.in_flight_chunk_count(),
         });
       }
       // No progress and not idle: wait for a worker.
