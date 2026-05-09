@@ -98,6 +98,7 @@ pub use builder::AlignmentSetBuilder;
 pub use key::{AlignerKey, AlignmentFallback};
 pub use normalizer::{DynTextNormalizer, NormalizationError, NormalizedText, TextNormalizer};
 pub use normalizers::{
-  ChineseNormalizer, EnglishNormalizer, JapaneseNormalizer, default_normalizer_for,
+  ChineseNormalizer, EnglishNormalizer, JapaneseNormalizer, KoreanNormalizer,
+  default_normalizer_for,
 };
 pub use set::{AlignmentLookup, AlignmentSet};

@@ -4,7 +4,7 @@
 
 use crate::runner::aligner::{
   normalizer::{DynTextNormalizer, TextNormalizer},
-  normalizers::{ChineseNormalizer, EnglishNormalizer, JapaneseNormalizer},
+  normalizers::{ChineseNormalizer, EnglishNormalizer, JapaneseNormalizer, KoreanNormalizer},
 };
 
 fn assert_send<T: Send>() {}
@@ -14,6 +14,7 @@ fn all_normalizers_are_send() {
   assert_send::<EnglishNormalizer>();
   assert_send::<ChineseNormalizer>();
   assert_send::<JapaneseNormalizer>();
+  assert_send::<KoreanNormalizer>();
   // The boxed dyn must also be Send (the alignment worker
   // requires it for crossing thread boundaries).
   assert_send::<DynTextNormalizer>();
@@ -44,6 +45,16 @@ fn chinese_word_count_matches_original_words() {
 fn japanese_word_count_matches_original_words() {
   let n = JapaneseNormalizer::new();
   let nt = n.normalize("日本語 USA 勉強").unwrap();
+  assert_eq!(
+    nt.original_words().len(),
+    nt.normalized().split_whitespace().count(),
+  );
+}
+
+#[test]
+fn korean_word_count_matches_original_words() {
+  let n = KoreanNormalizer::new();
+  let nt = n.normalize("안녕 USA 세계").unwrap();
   assert_eq!(
     nt.original_words().len(),
     nt.normalized().split_whitespace().count(),

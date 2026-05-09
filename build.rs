@@ -67,6 +67,32 @@ const TOKENIZER_W2V_ZH_FILENAME: &str =
 const TOKENIZER_W2V_ZH_SHA256: &str =
   "7bb5c156e0ea01980f42ae1904193834132019ae8a6276a9957805cd5a6b37f5";
 
+// Korean alignment fixtures. Mirror of
+// `jonatasgrosman/wav2vec2-large-xlsr-53-korean` re-exported as
+// ONNX. As of branch creation the FinDIT-Studio Korean ONNX
+// repo is not yet uploaded; the SHA-256 constants below are
+// `TODO` placeholders. Until the upload + checksumming step is
+// done, `fetch_with_sha` will fail at the fetch (HTTP 401 — repo
+// missing) or SHA-mismatch step and silently skip — the
+// `WHISPERY_W2V_KO_*` env vars stay unset and the Korean
+// smoke test gracefully short-circuits via `option_env!()`.
+//
+// TODO(ops): upload `jonatasgrosman/wav2vec2-large-xlsr-53-korean`
+// as ONNX to `FinDIT-Studio/wav2vec2-large-xlsr-53-korean-onnx`,
+// then compute checksums via:
+//   curl -sSL <model_url>     | sha256sum
+//   curl -sSL <tokenizer_url> | sha256sum
+// and replace the two `TODO_…` placeholders below with the
+// resulting hex digests.
+const MODEL_W2V_KO_URL: &str =
+  "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-korean-onnx/resolve/main/model.onnx";
+const MODEL_W2V_KO_FILENAME: &str = "jonatasgrosman--wav2vec2-large-xlsr-53-korean.onnx";
+const MODEL_W2V_KO_SHA256: &str = "TODO_MODEL_W2V_KO_SHA256_AFTER_UPLOAD";
+const TOKENIZER_W2V_KO_URL: &str = "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-korean-onnx/resolve/main/tokenizer.json";
+const TOKENIZER_W2V_KO_FILENAME: &str =
+  "jonatasgrosman--wav2vec2-large-xlsr-53-korean-tokenizer.json";
+const TOKENIZER_W2V_KO_SHA256: &str = "TODO_TOKENIZER_W2V_KO_SHA256_AFTER_UPLOAD";
+
 fn main() {
   println!("cargo:rerun-if-changed=build.rs");
   println!("cargo:rerun-if-changed=assets/wav2vec2_base_960h_tokenizer.json");
@@ -286,6 +312,23 @@ fn fetch_wav2vec2_fixtures(models_dir: &std::path::Path) {
     TOKENIZER_W2V_ZH_FILENAME,
     TOKENIZER_W2V_ZH_SHA256,
   );
+  // Ko fixture: SHA-256 is currently `TODO_…` because the
+  // FinDIT-Studio Ko ONNX mirror hasn't been uploaded yet. The
+  // function logs + silently returns false on fetch / SHA
+  // mismatch, so the build stays green and the Ko smoke test
+  // skips via `option_env!()`. Once the upload + checksum step
+  // lands, the placeholders flip to real hex digests and Ko
+  // joins Ja/Zh as a real fixture.
+  fetch_extra_align_fixture(
+    models_dir,
+    "WHISPERY_W2V_KO",
+    MODEL_W2V_KO_URL,
+    MODEL_W2V_KO_FILENAME,
+    MODEL_W2V_KO_SHA256,
+    TOKENIZER_W2V_KO_URL,
+    TOKENIZER_W2V_KO_FILENAME,
+    TOKENIZER_W2V_KO_SHA256,
+  );
 }
 
 /// Fetch + SHA-verify a multi-language alignment fixture pair
@@ -297,6 +340,7 @@ fn fetch_wav2vec2_fixtures(models_dir: &std::path::Path) {
 /// returns silently — tests guard the fixtures with `option_env!`,
 /// so a partial-fixture state just makes the corresponding test
 /// skip rather than fail the build.
+#[allow(clippy::too_many_arguments)]
 fn fetch_extra_align_fixture(
   models_dir: &std::path::Path,
   env_prefix: &str,
@@ -378,7 +422,7 @@ fn find_target_dir() -> Option<PathBuf> {
 fn download(url: &str, dest: &std::path::Path) -> std::io::Result<()> {
   let resp = ureq::get(url)
     .call()
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+    .map_err(|e| std::io::Error::other(format!("{e}")))?;
   // ureq 3: response → body → reader (was a single `into_reader()` call in ureq 2).
   let mut reader = resp.into_body().into_reader();
   let mut writer = fs::File::create(dest)?;

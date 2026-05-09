@@ -1825,4 +1825,65 @@ mod tests {
       .expect("Zh aligner empty-text must short-circuit Ok");
     assert!(result.words().is_empty());
   }
+
+  /// Smoke test: load the Korean wav2vec2 fixture. Mirrors the
+  /// Japanese / Chinese smoke tests above; skips when the
+  /// fixture isn't present so default `cargo test` runs (and CI
+  /// without the FinDIT-Studio mirror upload) stay
+  /// network/disk-free.
+  ///
+  /// Verifies the multi-lang path end-to-end on the loader side:
+  /// `Aligner::from_paths` accepts the jonatasgrosman tokenizer
+  /// shape, the KoreanNormalizer is wired up via
+  /// `default_normalizer_for(Lang::Ko)`, and the empty-input
+  /// short-circuit returns Ok(empty AlignmentResult).
+  #[test]
+  fn korean_aligner_loads_and_short_circuits_on_empty_text() {
+    use core::sync::atomic::AtomicBool;
+
+    use mediatime::{TimeRange, Timebase};
+
+    use crate::runner::aligner::default_normalizer_for;
+
+    let model_path = match option_env!("WHISPERY_W2V_KO_MODEL") {
+      Some(p) => p,
+      None => return,
+    };
+    let tokenizer_path = match option_env!("WHISPERY_W2V_KO_TOKENIZER") {
+      Some(p) => p,
+      None => return,
+    };
+
+    let normalizer = default_normalizer_for(&Lang::Ko).expect("Ko normalizer must exist");
+    let mut aligner = Aligner::from_paths(
+      Lang::Ko,
+      Path::new(model_path),
+      Path::new(tokenizer_path),
+      normalizer,
+    )
+    .expect("Aligner::from_paths(Ko)");
+
+    let samples = alloc::vec![0.0_f32; 16_000];
+    let sub_segments: alloc::vec::Vec<TimeRange> = alloc::vec::Vec::new();
+    let abort = AtomicBool::new(false);
+    let run_options = ort::session::RunOptions::new().expect("RunOptions::new");
+    let result = aligner
+      .align(
+        &samples,
+        &sub_segments,
+        "!!!...",
+        0,
+        |start, end| {
+          TimeRange::new(
+            start as i64,
+            end as i64,
+            Timebase::new(1, core::num::NonZeroU32::new(16_000).unwrap()),
+          )
+        },
+        &abort,
+        &run_options,
+      )
+      .expect("Ko aligner empty-text must short-circuit Ok");
+    assert!(result.words().is_empty());
+  }
 }

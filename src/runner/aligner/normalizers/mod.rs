@@ -1,18 +1,20 @@
 //! Concrete `TextNormalizer` implementations.
 //!
-//! v1 ships English / Chinese / Japanese. Future versions add
-//! more languages by adding files here and re-exporting from
-//! `runner::aligner`.
+//! v1 ships English / Chinese / Japanese / Korean. Future
+//! versions add more languages by adding files here and
+//! re-exporting from `runner::aligner`.
 
 mod chinese;
 mod english;
 mod japanese;
+mod korean;
 #[cfg(test)]
 mod tests;
 
 pub use chinese::ChineseNormalizer;
 pub use english::EnglishNormalizer;
 pub use japanese::JapaneseNormalizer;
+pub use korean::KoreanNormalizer;
 
 use crate::{runner::aligner::normalizer::TextNormalizer, types::Lang};
 
@@ -24,11 +26,11 @@ use crate::{runner::aligner::normalizer::TextNormalizer, types::Lang};
 /// language whisperX has a default model for can plug a matching
 /// normalizer through this function — except those whose script
 /// needs custom rules whispery hasn't shipped yet (Arabic,
-/// Cyrillic, Korean, Devanagari, Hebrew, Telugu, Malayalam,
-/// Georgian, Greek, Thai). For those, `None` is returned and the
-/// caller must `Box::new` a custom `TextNormalizer` impl.
+/// Cyrillic, Devanagari, Hebrew, Telugu, Malayalam, Georgian,
+/// Greek, Thai). For those, `None` is returned and the caller
+/// must `Box::new` a custom `TextNormalizer` impl.
 ///
-/// Three buckets:
+/// Four buckets:
 ///
 /// 1. **English-shape** — Latin script, lowercase a-z + apostrophe,
 ///    `|` word delimiter on the wav2vec2 vocab. Covers en, fr, de,
@@ -47,6 +49,10 @@ use crate::{runner::aligner::normalizer::TextNormalizer, types::Lang};
 ///    over kanji + hiragana + katakana, no word delimiter,
 ///    `JapaneseNormalizer`.
 ///
+/// 4. **Korean Hangul** (`ko`): per-syllable segmentation over
+///    Hangul Jamo / Compatibility Jamo / Syllables, no word
+///    delimiter, `KoreanNormalizer`.
+///
 /// Returning `None` is whispery saying "we don't have a
 /// pre-built normalizer for this language; you must supply one
 /// yourself". This is intentional — silently picking the wrong
@@ -61,6 +67,9 @@ pub fn default_normalizer_for(lang: &Lang) -> Option<alloc::boxed::Box<dyn TextN
 
     // Japanese: kanji/hiragana/katakana char-level, no delimiter.
     Lang::Ja => Some(Box::new(JapaneseNormalizer::new())),
+
+    // Korean: Hangul syllable/jamo char-level, no delimiter.
+    Lang::Ko => Some(Box::new(KoreanNormalizer::new())),
 
     // English-shape Latin script: ASCII lowercase + boundary
     // punctuation strip + `|` word delimiter. Works for any
@@ -102,7 +111,6 @@ pub fn default_normalizer_for(lang: &Lang) -> Option<alloc::boxed::Box<dyn TextN
     // - Arabic (ar): RTL, diacritic-strip, custom punctuation
     // - Hebrew (he): RTL, niqqud handling
     // - Russian (ru), Ukrainian (uk): Cyrillic case-folding
-    // - Korean (ko): Hangul jamo decomposition
     // - Hindi (hi): Devanagari + virama / nukta
     // - Telugu (te), Malayalam (ml): Brahmi-derived scripts
     // - Greek (el): polytonic→monotonic
@@ -134,7 +142,7 @@ mod default_normalizer_tests {
 
   #[test]
   fn cjk_languages_get_per_character_normalizers() {
-    for lang in [Lang::Zh, Lang::Yue, Lang::Ja] {
+    for lang in [Lang::Zh, Lang::Yue, Lang::Ja, Lang::Ko] {
       let n = default_normalizer_for(&lang);
       assert!(n.is_some(), "{lang:?} must resolve to a normalizer");
       assert!(
@@ -146,9 +154,9 @@ mod default_normalizer_tests {
 
   #[test]
   fn unsupported_languages_return_none() {
-    // Arabic, Korean, Hindi, Russian — distinct scripts requiring
-    // custom normalizers whispery hasn't shipped.
-    for lang in [Lang::Ar, Lang::Ko, Lang::Hi, Lang::Ru, Lang::He, Lang::El] {
+    // Arabic, Hindi, Russian, Hebrew, Greek — distinct scripts
+    // requiring custom normalizers whispery hasn't shipped.
+    for lang in [Lang::Ar, Lang::Hi, Lang::Ru, Lang::He, Lang::El] {
       assert!(
         default_normalizer_for(&lang).is_none(),
         "{lang:?} must return None — no built-in normalizer yet",
