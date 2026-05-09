@@ -1,4 +1,0 @@
-[submodule "crates/whisper-cpp/whisper.cpp"]
-	path = crates/whisper-cpp/whisper.cpp
-	url = https://github.com/ggerganov/whisper.cpp.git
-	branch = master

@@ -31,9 +31,9 @@ use std::{
 use crossbeam_channel::{Receiver, Sender, bounded};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use whisper_cpp::{
+use whispercpp::{
   Context as WhisperContext, ContextParams as WhisperContextParameters, Params as FullParams,
-  SamplingStrategy as WhisperStrategy, State as WhisperState, lang_str,
+  SamplingStrategy as WhisperStrategy, State as WhisperState,
 };
 
 use smol_str::SmolStr;
@@ -913,21 +913,16 @@ fn build_asr_result(
     0.0
   };
 
-  let lang_id = state.lang_id();
-  let language = if lang_id >= 0 {
-    match lang_str(lang_id) {
-      Some(code) => Lang::from_iso639_1(code),
-      None => params
-        .language_hint()
-        .cloned()
-        .unwrap_or(Lang::Other(SmolStr::new(""))),
-    }
-  } else {
+  // `detected_lang` returns the typed `Lang` directly. Falls
+  // back to the configured language hint (or `Lang::Other("")`
+  // if none) when whisper.cpp didn't detect or assert a language
+  // for this chunk.
+  let language = state.detected_lang().unwrap_or_else(|| {
     params
       .language_hint()
       .cloned()
       .unwrap_or(Lang::Other(SmolStr::new("")))
-  };
+  });
 
   Ok(AsrResult::new(
     SmolStr::new(text.trim()),

@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use serde_json::json;
-use whisper_cpp::{Context as WhisperCppContext, ContextParams, Params, SamplingStrategy};
+use whispercpp::{Context as WhisperCppContext, ContextParams, Params, SamplingStrategy};
 use whispery::runner::{Aligner, EnglishNormalizer};
 use whispery::{Lang, TimeRange, Timebase};
 
@@ -52,8 +52,10 @@ fn main() -> Result<()> {
 
   // ── 2. Whisper.cpp ASR via the in-house bindings. ────────────
   let t_load = Instant::now();
-  let ctx = WhisperCppContext::new(&model_path, ContextParams::new().with_use_gpu(true))
-    .context("load whisper.cpp model")?;
+  let ctx = std::sync::Arc::new(
+    WhisperCppContext::new(&model_path, ContextParams::new().with_use_gpu(true))
+      .context("load whisper.cpp model")?,
+  );
   eprintln!("[wy-wcpp] context loaded in {:.3}s", t_load.elapsed().as_secs_f64());
 
   let mut state = ctx.create_state().context("create whisper state")?;
@@ -71,7 +73,7 @@ fn main() -> Result<()> {
 
   let t_full = Instant::now();
   state
-    .full(&ctx, &params, &samples)
+    .full(&params, &samples)
     .context("whisper_full")?;
   let asr_s = t_full.elapsed().as_secs_f64();
   eprintln!(

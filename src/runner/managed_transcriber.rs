@@ -5,7 +5,7 @@ use core::time::Duration;
 use std::sync::{Arc, atomic::AtomicBool};
 
 use crossbeam_channel::TrySendError;
-use whisper_cpp::Context as WhisperContext;
+use whispercpp::Context as WhisperContext;
 
 use crate::{
   core::{AsrParams, AsrParamsOverride, Command, Event, LanguagePolicy, Transcriber},
@@ -645,7 +645,7 @@ impl ManagedTranscriber {
   pub fn from_options(
     pool_options: WhisperPoolOptions,
   ) -> Result<ManagedTranscriberBuilder, RunnerError> {
-    let ctx_params = whisper_cpp::ContextParams::new()
+    let ctx_params = whispercpp::ContextParams::new()
       .with_use_gpu(pool_options.use_gpu())
       .with_gpu_device(pool_options.gpu_device())
       .with_flash_attn(pool_options.flash_attn());

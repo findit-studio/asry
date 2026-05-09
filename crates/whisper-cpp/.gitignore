@@ -1,7 +1,0 @@
-# cmake-rs build output for whisper.cpp.
-target/
-
-# Bindgen artefacts emitted into src/. The generated.rs file IS
-# committed (its diff is reviewable across whisper.cpp upgrades);
-# the .d cargo-fingerprint companion is not.
-src/generated.rs.tmp

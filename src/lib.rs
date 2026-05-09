@@ -59,7 +59,7 @@ pub use runner::{ManagedTranscriber, ManagedTranscriberBuilder, RunnerError, Whi
 // semver, but whisper-cpp is a path dep we own so the
 // constraint is internal.
 #[cfg(feature = "runner")]
-pub use whisper_cpp::{Context as WhisperContext, ContextParams as WhisperContextParameters};
+pub use whispercpp::{Context as WhisperContext, ContextParams as WhisperContextParameters};
 
 #[cfg(feature = "alignment")]
 pub use runner::{
