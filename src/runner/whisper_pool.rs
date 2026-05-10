@@ -5,15 +5,15 @@
 //! after we reproduced two soundness/leak bugs in `whisper-rs 0.16`:
 //!
 //! 1. `set_abort_callback_safe` UB (closure-type vs.
-//!    `Box<dyn FnMut>` mismatch in the trampoline) → manifests as
-//!    `whisper_full_with_state: failed to encode` on every
-//!    decode. Structurally absent in `whisper-cpp` —
-//!    `Params::set_abort_callback` types the trampoline as
-//!    `*mut Box<dyn FnMut() -> bool>` end-to-end.
+//! `Box<dyn FnMut>` mismatch in the trampoline) → manifests as
+//! `whisper_full_with_state: failed to encode` on every
+//! decode. Structurally absent in `whisper-cpp` —
+//! `Params::set_abort_callback` types the trampoline as
+//! `*mut Box<dyn FnMut() -> bool>` end-to-end.
 //! 2. `set_language` / `set_initial_prompt` `CString::into_raw`
-//!    leak (no `Drop`). Structurally absent — `whisper-cpp`'s
-//!    `Params` owns every `CString` it hands to whisper.cpp and
-//!    drops them with the struct.
+//! leak (no `Drop`). Structurally absent — `whisper-cpp`'s
+//! `Params` owns every `CString` it hands to whisper.cpp and
+//! drops them with the struct.
 //!
 //! Because both bug classes are gone, this file no longer needs
 //! the `FullParamsCache`, the `attach_abort_callback` workaround,
@@ -54,16 +54,11 @@ const MAX_LANGUAGE_CODE_LEN: usize = 8;
 /// back to the caller because the language hint can be set
 /// from public input.
 ///
-/// Codex round-37 [medium]: the previous design coupled this
-/// validator to a process-lifetime intern table that leaked
-/// `Box::leak`-ed strings on first sight, so a long-running
-/// service taking attacker-controlled hints could grow memory
-/// without bound (≈ 26⁸ distinct strings). The intern table is
-/// gone; whispercpp's `Params::set_language` takes a `&str` and
-/// copies into an owned `CString` — no `'static` lifetime is
-/// required. This validator survives as cheap pre-FFI shape
-/// rejection (whispercpp's own validation against the `g_lang`
-/// table is more thorough but produces a different error type).
+/// Cheap pre-FFI shape rejection. Whispercpp's own validation
+/// against the `g_lang` table is more thorough but produces a
+/// different error type; running this first means callers see
+/// a stable `WorkFailure::AsrFailed { kind: BackendError }`
+/// diagnostic.
 fn validate_language_code(s: &str) -> Result<(), &'static str> {
   if s.is_empty() {
     return Err("language code is empty");
@@ -86,16 +81,17 @@ pub(in crate::runner) struct AsrWorkItem {
   /// Caller-owned cancellation flag. The worker installs this
   /// into `FullParams` via `set_abort_callback`; whisper.cpp
   /// polls it at progress-callback boundaries and unwinds the
-  /// in-flight `state.full` when set. Codex round-37 round-15
-  /// also re-checks it before/after every attempt to surface
+  /// in-flight `state.full` when set. The worker also
+  /// re-checks the flag before/after every attempt to surface
   /// post-success cancellation as `WorkerHangTimeout`.
   pub abort_flag: Arc<AtomicBool>,
 }
 
-/// Worker-emitted result for one chunk. Crate-private.
-///   failure rather than letting whisper.cpp panic / abort.
+/// Pre-FFI validation. Reject malformed params with a typed
+/// `WorkFailure::AsrFailed` instead of letting whisper.cpp
+/// panic / abort.
 pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<(), WorkFailure> {
-  // Codex round-31/32 — language hint shape + NUL.
+  // Language hint shape.
   if let Some(lang) = params.language_hint()
     && let Err(reason) = validate_language_code(lang.as_str())
   {
@@ -103,12 +99,12 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
       kind: AsrFailureKind::BackendError,
       message: alloc::format!(
         "language hint rejected: {reason}. Reject before FFI so callers see a stable \
-         diagnostic; whispercpp's `Params::set_language` would otherwise return \
-         `InputTooLong` / `UnknownLanguage` for the same input."
+ diagnostic; whispercpp's `Params::set_language` would otherwise return \
+ `InputTooLong` / `UnknownLanguage` for the same input."
       ),
     });
   }
-  // Codex round-31 — NUL byte in initial_prompt.
+  // NUL byte in initial_prompt.
   if let Some(prompt) = params.initial_prompt()
     && prompt.as_str().contains('\0')
   {
@@ -116,27 +112,26 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
       kind: AsrFailureKind::BackendError,
       message: alloc::format!(
         "initial_prompt of len {} contains an interior NUL byte; whisper-rs's set_initial_prompt \
-         would panic. Reject before FFI.",
+ would panic. Reject before FFI.",
         prompt.as_str().len()
       ),
     });
   }
-  // Codex round-34 — n_threads.
+  // n_threads.
   if params.n_threads() < 1 {
     return Err(WorkFailure::AsrFailed {
       kind: AsrFailureKind::BackendError,
       message: alloc::format!(
         "n_threads must be >= 1 (got {}); whisper.cpp's std::vector<std::thread>({} - 1) \
-         would underflow / abort. Reject before FFI.",
+ would underflow / abort. Reject before FFI.",
         params.n_threads(),
         params.n_threads(),
       ),
     });
   }
-  // Codex round-37 round-32 [medium]: sampling-strategy fields
-  // are caller-supplied (public Rust + serde) and pre-fix
-  // crossed the FFI unchecked. `best_of <= 0`, `beam_size <= 0`,
-  // and non-finite/negative `patience` either abort the C++
+  // Sampling-strategy fields are caller-supplied (public Rust
+  // + serde). `best_of <= 0`, `beam_size <= 0`, and
+  // non-finite/negative `patience` either abort the C++
   // decoder or produce nonsensical decode behaviour. Reject
   // before `FullParams::new` so callers see a typed
   // `WorkFailure` instead of a backend error.
@@ -147,8 +142,8 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
           kind: AsrFailureKind::BackendError,
           message: alloc::format!(
             "SamplingStrategy::Greedy.best_of must be >= 1 (got {best_of}); \
-             whisper.cpp would either abort or fall back to greedy=1 silently. \
-             Reject before FFI."
+ whisper.cpp would either abort or fall back to greedy=1 silently. \
+ Reject before FFI."
           ),
         });
       }
@@ -162,8 +157,8 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
           kind: AsrFailureKind::BackendError,
           message: alloc::format!(
             "SamplingStrategy::BeamSearch.beam_size must be >= 1 (got {beam_size}); \
-             whisper.cpp's beam-search loop would underflow on a non-positive size. \
-             Reject before FFI."
+ whisper.cpp's beam-search loop would underflow on a non-positive size. \
+ Reject before FFI."
           ),
         });
       }
@@ -176,16 +171,15 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
           kind: AsrFailureKind::BackendError,
           message: alloc::format!(
             "SamplingStrategy::BeamSearch.patience must be a finite positive value \
-             (or the documented `-1.0` whisper.cpp default sentinel); got {patience}. \
-             Reject before FFI."
+ (or the documented `-1.0` whisper.cpp default sentinel); got {patience}. \
+ Reject before FFI."
           ),
         });
       }
     }
   }
-  // Codex round-37 round-33 [medium]: every public `f32` knob
-  // is caller-supplied and pre-fix crossed the FFI unchecked.
-  // NaN / Inf temperatures get plumbed into `set_temperature`
+  // Every public `f32` knob is caller-supplied. NaN / Inf
+  // temperatures get plumbed into `set_temperature`
   // and produce undefined sampling; non-finite thresholds make
   // the post-decode logprob / cratio / no_speech comparisons
   // arbitrary (NaN comparisons are always false), so the
@@ -207,16 +201,16 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
         kind: AsrFailureKind::BackendError,
         message: alloc::format!(
           "AsrParams::{name} must be finite (got {value}); non-finite values are \
-           either undefined to whisper.cpp's sampler or make the post-decode \
-           gates degenerate. Reject before FFI."
+ either undefined to whisper.cpp's sampler or make the post-decode \
+ gates degenerate. Reject before FFI."
         ),
       });
     }
   }
-  // Codex round-37 round-37 [medium]: domain checks on the
+  // domain checks on the
   // already-finite knobs. WhisperX/OpenAI Whisper temperatures
   // are sampling probabilities in `[0, 1]`; thresholds have
-  // their own meaningful domains. Pre-fix a finite-but-
+  // their own meaningful domains. a finite-but-
   // out-of-range value (e.g. `initial_temperature = -2.0`)
   // would silently produce non-parity decodes instead of a
   // typed failure.
@@ -226,7 +220,7 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
       kind: AsrFailureKind::BackendError,
       message: alloc::format!(
         "AsrParams::initial_temperature must be in [0.0, 1.0] (got {init_t}); \
-         WhisperX sampling temperatures are probabilities."
+ WhisperX sampling temperatures are probabilities."
       ),
     });
   }
@@ -236,8 +230,8 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
       kind: AsrFailureKind::BackendError,
       message: alloc::format!(
         "AsrParams::temperature_increment must be in [0.0, 1.0] (got {step}); \
-         a step outside this range either skips meaningful retries or wraps \
-         past the [0, 1] sampler domain."
+ a step outside this range either skips meaningful retries or wraps \
+ past the [0, 1] sampler domain."
       ),
     });
   }
@@ -247,7 +241,7 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
       kind: AsrFailureKind::BackendError,
       message: alloc::format!(
         "AsrParams::no_speech_threshold must be in [0.0, 1.0] (got {nsp}); \
-         it gates against per-segment no-speech probabilities."
+ it gates against per-segment no-speech probabilities."
       ),
     });
   }
@@ -257,8 +251,8 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
       kind: AsrFailureKind::BackendError,
       message: alloc::format!(
         "AsrParams::compression_ratio_threshold must be > 0 (got {cratio}); \
-         WhisperX's gate compares `len(text) / len(zlib(text))` to a positive \
-         ceiling — a non-positive ceiling rejects every transcript."
+ WhisperX's gate compares `len(text) / len(zlib(text))` to a positive \
+ ceiling — a non-positive ceiling rejects every transcript."
       ),
     });
   }
@@ -298,7 +292,7 @@ fn build_template(params: &AsrParams) -> Result<FullParams, WorkFailure> {
     // against whisper.cpp's `g_lang` table and returns
     // `UnknownLanguage` for codes outside the recognised set.
     //
-    // Codex round-37 round-3 [medium]: previously the Result was
+    // previously the Result was
     // dropped here, so a `Lang::Other("zzzz")` that passed the
     // pre-FFI shape check would silently be ignored and ASR
     // would proceed with a stale (or default) language tag. Now
@@ -322,7 +316,7 @@ fn build_template(params: &AsrParams) -> Result<FullParams, WorkFailure> {
     // tolerates an unset prompt; the alternative would be
     // failing the entire ASR job over a string-encoding nit.
     //
-    // Codex round-37 round-25 [medium]: surface the rejection
+    // surface the rejection
     // via a structured stderr line so callers can correlate
     // changed-language-biasing or glossary-regression behaviour
     // back to the dropped prompt instead of silently running
@@ -331,7 +325,7 @@ fn build_template(params: &AsrParams) -> Result<FullParams, WorkFailure> {
     if let Err(e) = p.set_initial_prompt(prompt.as_str()) {
       eprintln!(
         "whispery asr initial_prompt rejected by whisper.cpp; \
-         continuing without prompt prompt_chars={} error={e:?}",
+ continuing without prompt prompt_chars={} error={e:?}",
         prompt.chars().count(),
       );
     }
@@ -448,7 +442,7 @@ pub(super) fn compute_avg_logprob(state: &WhisperState) -> f32 {
 /// runner's no-segment short-circuit already handles that case
 /// before this is consulted.
 ///
-/// Codex round-38: the runner uses this to honor the
+/// : the runner uses this to honor the
 /// documented `no_speech_threshold` knob, which previously was
 /// a public no-op (only `avg_logprob` and `compression_ratio`
 /// gated acceptance).
@@ -484,7 +478,7 @@ pub(super) fn compute_avg_no_speech_prob(state: &WhisperState) -> f32 {
 /// of unique 4-byte shingles. This catches the "yes yes yes yes ..."
 /// failure mode the threshold was designed for.
 ///
-/// Codex round-37 round-20 [high] short-text guard: the shingle
+/// short-text guard: the shingle
 /// proxy degenerates on tiny transcripts where the unique-shingle
 /// count is dominated by the windowing arithmetic, not the model's
 /// repetition pattern. A non-pathological 4-byte transcript like
@@ -515,7 +509,7 @@ pub(super) fn compute_compression_ratio(state: &WhisperState) -> f32 {
 /// [`compute_compression_ratio`] so the short-text guard is
 /// testable without setting up a real `WhisperState`.
 ///
-/// Codex round-37 round-31 [high]: matches WhisperX / OpenAI
+/// matches WhisperX / OpenAI
 /// Whisper's `zlib.compress(text.encode("utf-8"))` byte length
 /// 1:1 via [`miniz_oxide`]. The earlier shingle proxy
 /// mis-rejected legitimately repetitive transcripts (e.g.
@@ -523,7 +517,7 @@ pub(super) fn compute_compression_ratio(state: &WhisperState) -> f32 {
 /// temperature ladder and surfacing as `AllTemperaturesFailed`
 /// for valid ASR text).
 ///
-/// Round-37 round-20's `MIN_RATIO_BYTES` short-text guard is
+/// `MIN_RATIO_BYTES` short-text guard is
 /// preserved so single-word transcripts that zlib still
 /// compresses near 1.0 (deflate header overhead dominates) skip
 /// the gate cleanly, even though the real ratio would already
@@ -589,7 +583,7 @@ pub(in crate::runner) fn run_with_temperature_ladder(
   validate_for_whisper_ffi(p)?;
 
   for _attempt in 0..max {
-    // Codex round-37 round-15 [high]: pre-attempt abort check.
+    // pre-attempt abort check.
     // The caller may have flipped `abort_flag` between
     // attempts (e.g. their cancellation token fired during
     // the previous temperature step's Ok path); without this
@@ -601,13 +595,13 @@ pub(in crate::runner) fn run_with_temperature_ladder(
       });
     }
 
-    // Codex round-37 round-36 [high]: re-validate the
+    // re-validate the
     // per-attempt temperature. `validate_for_whisper_ffi`
     // checks `initial_temperature` and
     // `temperature_increment` are finite, but a finite
     // `initial + N * increment` can still saturate to `inf`
     // on later iterations (e.g. both fields = `f32::MAX`,
-    // `max_attempts >= 2`). Pre-fix the ladder happily
+    // `max_attempts >= 2`). The ladder happily
     // forwarded that to `set_temperature` and into
     // whisper.cpp's sampler — exactly the FFI hardening the
     // earlier rounds were meant to prevent.
@@ -616,13 +610,13 @@ pub(in crate::runner) fn run_with_temperature_ladder(
         kind: AsrFailureKind::BackendError,
         message: alloc::format!(
           "ladder temperature became non-finite ({temperature}) after starting from \
-           initial={} step={}; refuse to forward into whisper.cpp's sampler",
+ initial={} step={}; refuse to forward into whisper.cpp's sampler",
           p.initial_temperature(),
           p.temperature_increment(),
         ),
       });
     }
-    // Codex round-37 round-38 [medium]: stop the ladder at the
+    // stop the ladder at the
     // [0, 1] domain boundary. Even with valid initial /
     // increment values (e.g. `initial=0.9`, `increment=0.2`,
     // `max_attempts=2`), the derived second-attempt
@@ -637,8 +631,8 @@ pub(in crate::runner) fn run_with_temperature_ladder(
         kind: AsrFailureKind::AllTemperaturesFailed,
         message: alloc::format!(
           "temperature ladder exhausted at attempt-derived value {temperature} \
-           outside [0.0, 1.0] (initial={}, step={}); WhisperX caps the \
-           fallback ladder at 1.0",
+ outside [0.0, 1.0] (initial={}, step={}); WhisperX caps the \
+ fallback ladder at 1.0",
           p.initial_temperature(),
           p.temperature_increment(),
         ),
@@ -649,7 +643,7 @@ pub(in crate::runner) fn run_with_temperature_ladder(
     full.set_temperature(temperature);
     let outcome = state.full(&full, job.samples.as_ref());
 
-    // Codex round-37 round-15 [high]: post-call abort check
+    // post-call abort check
     // regardless of `outcome.is_ok()`. The caller can flip
     // `abort_flag` between whisper.cpp's last abort callback
     // and `state.full` returning, OR the backend can return
@@ -695,7 +689,7 @@ pub(in crate::runner) fn run_with_temperature_ladder(
     let logprob_ok = logprob >= p.log_prob_threshold();
     let cratio_ok = cratio <= p.compression_ratio_threshold();
 
-    // Codex round-38: implement the documented
+    // : implement the documented
     // `no_speech_threshold` knob. Mirrors WhisperX / OpenAI
     // Whisper's "silent chunk" detection: when the mean
     // no_speech probability across segments exceeds the
@@ -796,7 +790,7 @@ fn build_asr_result(
   // whisper.cpp's own auto-detection in the auto-detect path
   // (`language_hint = None` originally).
   let segments: alloc::vec::Vec<whispercpp::Segment<'_>> = state.segments_iter().collect();
-  // ctx for token-id → bytes resolution (per Codex round-37: the
+  // ctx for token-id → bytes resolution (per : the
   // dispatcher needs per-token byte offsets to slice DTW per run).
   let ctx_for_dispatch = state.context();
   let runs = crate::align::dispatch(ctx_for_dispatch, &segments, Some(language.clone()));
@@ -823,13 +817,12 @@ mod tests {
     assert_send::<AsrWorkItem>();
   }
 
-  /// Codex round-37 round-20 [high]: short transcripts must not
-  /// trip the compression-ratio threshold. Pre-fix, the
-  /// shingle proxy yielded `4/1 = 4.0` for `"test"` and
-  /// `5/2 = 2.5` for `"hello"` — both above the default 2.4
-  /// gate, causing every temperature attempt to fail and
-  /// surface as `AllTemperaturesFailed`. Post-fix, anything
-  /// shorter than `MIN_RATIO_BYTES` returns 0.0 (always passes).
+  /// Short transcripts must not trip the compression-ratio
+  /// threshold. The shingle proxy would yield `4/1 = 4.0` for
+  /// `"test"` and `5/2 = 2.5` for `"hello"` — both above the
+  /// default 2.4 gate — and cause every temperature attempt to
+  /// fail as `AllTemperaturesFailed`. Anything shorter than
+  /// `MIN_RATIO_BYTES` therefore returns 0.0 (always passes).
   #[test]
   fn compression_ratio_short_transcripts_pass_default_threshold() {
     let threshold = AsrParams::default().compression_ratio_threshold();
@@ -852,7 +845,7 @@ mod tests {
   /// against a fairly long runaway so the real zlib header
   /// overhead is amortised away.
   ///
-  /// Codex round-37 round-31 [high]: the previous shingle-proxy
+  /// the previous shingle-proxy
   /// version of this test used `"yes "×16` (64 bytes); under
   /// real zlib that input scores ~2.37, just under the default
   /// 2.4. The point of the test is that the gate STILL fires
@@ -869,11 +862,10 @@ mod tests {
     );
   }
 
-  /// Codex round-37 round-31 [high] regression: legitimately
+  /// regression: legitimately
   /// repetitive transcripts must NOT be rejected. WhisperX's
   /// real zlib gives `"thank you "×4` (40 bytes) a ratio
-  /// around 1.86, well under the 2.4 default. The pre-fix
-  /// shingle proxy returned 3.9, exhausting the temperature
+  /// around 1.86, well under the 2.4 default. The  /// shingle proxy returned 3.9, exhausting the temperature
   /// ladder and surfacing as `AllTemperaturesFailed` for
   /// otherwise valid ASR text.
   #[test]
@@ -911,11 +903,11 @@ mod tests {
     let _full = full_params_from(&p, 0.0, flag).expect("valid params");
   }
 
-  /// Codex round-37 round-3 [medium]: a `Lang::Other` whose
+  /// a `Lang::Other` whose
   /// content passes the lowercase-ASCII shape check but is NOT
   /// in whisper.cpp's `g_lang` table must surface as
   /// `WorkFailure::AsrFailed/BackendError` rather than being
-  /// silently dropped (pre-fix `let _ = p.set_language(...)`).
+  /// silently dropped (`let _ = p.set_language(...)`).
   /// Without this propagation, callers could see transcripts
   /// in the wrong language while believing their hint was
   /// honoured.
@@ -941,7 +933,7 @@ mod tests {
     }
   }
 
-  /// Codex round-31 regression: an interior NUL in the language
+  /// regression: an interior NUL in the language
   /// hint must be rejected as an in-band `WorkFailure::AsrFailed`
   /// rather than panicking inside `whisper-rs`'s `set_language`
   /// (which uses `CString::new(...).expect("...")`). Reaches here
@@ -971,7 +963,7 @@ mod tests {
     }
   }
 
-  // --- Codex round-32: language hint shape validation ---
+  // --- : language hint shape validation ---
 
   #[test]
   fn validate_language_code_accepts_iso_shapes() {
@@ -1023,14 +1015,12 @@ mod tests {
     assert!(validate_language_code("a\nb").is_err());
   }
 
-  /// Codex round-32 + round-37: a high-cardinality
-  /// `Lang::Other(SmolStr)` from a malicious or buggy caller
-  /// must be rejected as an in-band chunk failure rather than
-  /// reaching FFI. Round-37 removed the process-wide intern
-  /// leak that made cardinality directly unsafe; this validator
-  /// remains as cheap pre-FFI rejection so callers see a stable
-  /// diagnostic instead of whispercpp's `InputTooLong` /
-  /// `UnknownLanguage` variants for the same input shape.
+  /// A high-cardinality `Lang::Other(SmolStr)` from a malicious
+  /// or buggy caller must be rejected as an in-band chunk
+  /// failure rather than reaching FFI. The validator is cheap
+  /// pre-FFI rejection so callers see a stable diagnostic
+  /// instead of whispercpp's `InputTooLong` / `UnknownLanguage`
+  /// variants for the same input shape.
   #[test]
   fn full_params_from_rejects_high_cardinality_language_hint() {
     let p = AsrParams::default().with_language_hint(Some(Lang::Other(SmolStr::from(
@@ -1047,7 +1037,7 @@ mod tests {
     }
   }
 
-  /// Codex round-31 regression: an interior NUL in `initial_prompt`
+  /// regression: an interior NUL in `initial_prompt`
   /// must be rejected as an in-band `WorkFailure::AsrFailed`
   /// rather than panicking inside `whisper-rs`'s
   /// `set_initial_prompt`. Reaches here via the public
@@ -1132,7 +1122,7 @@ mod tests {
   // pin down. Equivalent coverage now lives implicitly in
   // `Params::Drop` (no leaks) and the integration parity runs.
 
-  /// Codex round-37 round-32 [medium]: sampling-strategy
+  /// sampling-strategy
   /// fields must be validated before they reach whisper.cpp.
   /// `best_of=0` would either abort the C++ decoder or fall
   /// back silently; `beam_size=0` underflows the beam loop;
@@ -1192,11 +1182,11 @@ mod tests {
     assert!(
       validate_for_whisper_ffi(&p).is_ok(),
       "-1.0 is whisper.cpp's `use default patience` sentinel and matches \
-       SamplingStrategy::default(); must be accepted",
+ SamplingStrategy::default(); must be accepted",
     );
   }
 
-  /// Codex round-37 round-33 [medium]: every public f32 ASR
+  /// every public f32 ASR
   /// knob must be finite. NaN/Inf temperatures get plumbed
   /// into `set_temperature`; NaN/Inf thresholds make the
   /// post-decode comparisons degenerate (NaN compares always
@@ -1240,7 +1230,7 @@ mod tests {
     }
   }
 
-  /// Codex round-37 round-37 [medium]: domain-check the
+  /// domain-check the
   /// finite f32 knobs. WhisperX temperatures are sampling
   /// probabilities in `[0, 1]`; out-of-range values produce
   /// non-parity decodes silently.

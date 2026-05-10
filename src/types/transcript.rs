@@ -57,7 +57,7 @@ impl Transcript {
   }
 
   /// Bounds of the merged chunk in the caller's output timebase
-  /// (the timebase of the first `push_samples` Timestamp).
+  /// (the timebase of the first `handle_samples` Timestamp).
   pub fn range(&self) -> TimeRange {
     self.range
   }
@@ -122,7 +122,7 @@ pub struct Word {
   /// pass split this word out of a code-switched chunk into a
   /// language-tagged run; `None` when the word came from a
   /// non-dispatched path (e.g. the alignment-disabled placeholder
-  /// or pre-dispatch test fixtures). Codex round-37 [medium]
+  /// or pre-dispatch test fixtures). [medium]
   /// recommended preserving run language so a downstream consumer
   /// can route per-word output by language without reverse-mapping
   /// from text or timing.

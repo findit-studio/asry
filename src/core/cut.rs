@@ -98,7 +98,7 @@ pub(crate) struct MergedChunk {
   /// audio pushed under packet A's override could be transcribed
   /// under packet B's override (or none) just because B was the
   /// packet whose silence happened to close the segment. Codex
-  /// round-30 flagged this. Binding to start-time is the
+  /// This is. Binding to start-time is the
   /// "first override wins" semantic users intend when they
   /// stamp an override with audio.
   pub override_at_start: Option<AsrParamsOverride>,
@@ -191,7 +191,7 @@ impl Cut {
   /// the configured `flush_on_silence_gap` threshold. Returns
   /// `false` if no chunk is accumulating yet.
   ///
-  /// `signal_no_speech_through` calls this to pre-flush whenever a
+  /// `handle_no_speech_through` calls this to pre-flush whenever a
   /// hypothetical future segment at `sample_index` would have
   /// triggered a flush — the caller has already declared that no
   /// such segment is coming, so the partial chunk can yield now
@@ -447,7 +447,7 @@ mod tests {
     let mut c = Cut::new(Duration::from_millis(625), None); // 10_000 samples (no silence-flush) @ 16 kHz
     // len = 29_000, chunk_size = 10_000 → n = 3.
     // Per-index: start = [0, 29000/3 = 9666, 2*29000/3 = 19333]
-    //            end   = [9666, 19333, 29000]
+    // end = [9666, 19333, 29000]
     // Each part length: 9666, 9667, 9667 — all ≤ 10_000.
     let emitted = c.push_segment(VadSegment::new(0, 29_000), None);
     assert_eq!(

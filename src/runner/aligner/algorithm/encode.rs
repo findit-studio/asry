@@ -170,14 +170,14 @@ pub(crate) fn encode_log_softmax(
 ///
 /// Failure classification:
 /// - **Fatal** (`ModelInferenceFailed`) for impossible shapes
-///   the operator should hear about: `V <= 0`, negative `T`,
-///   `T * V` overflow, or shape-vs-buffer-length mismatch.
+/// the operator should hear about: `V <= 0`, negative `T`,
+/// `T * V` overflow, or shape-vs-buffer-length mismatch.
 /// - **Recoverable** (`NoAlignmentPath`) for `T == 0` with an
-///   empty buffer — a chunk shorter than the model's stride
-///   produces zero encoder frames; the ASR transcript should
-///   surface with `words: []` rather than fail the chunk. A
-///   blanket "non-positive dim" rule would turn a data-dependent
-///   short-chunk miss into fatal transcript loss.
+/// empty buffer — a chunk shorter than the model's stride
+/// produces zero encoder frames; the ASR transcript should
+/// surface with `words: []` rather than fail the chunk. A
+/// blanket "non-positive dim" rule would turn a data-dependent
+/// short-chunk miss into fatal transcript loss.
 ///
 /// Pulled out as a helper so unit tests can drive each branch
 /// without an ORT session.
@@ -225,7 +225,7 @@ pub(crate) fn validate_output_dims(
       kind: AlignmentFailureKind::NoAlignmentPath,
       message: String::from(
         "ORT output has zero encoder frames (chunk too short to align); \
-                 transcript will surface with words: []",
+ transcript will surface with words: []",
       ),
       language: language.clone(),
     });
@@ -285,19 +285,19 @@ pub(crate) fn validate_output_dims(
 /// Two-sided check — both bounds matter:
 ///
 /// - **Upper bound** (`T * hop > chunk + 2*hop`): the model
-///   reports more frames than the input could plausibly support.
-///   Either the export uses a smaller stride than `hop_samples`
-///   or the configured `hop_samples` is too small. `compose_words`
-///   would otherwise emit ranges past the chunk's audio
-///   boundary.
+/// reports more frames than the input could plausibly support.
+/// Either the export uses a smaller stride than `hop_samples`
+/// or the configured `hop_samples` is too small. `compose_words`
+/// would otherwise emit ranges past the chunk's audio
+/// boundary.
 /// - **Lower bound** (`T * hop < chunk - 2*hop`): the model
-///   reports far fewer frames than the input should produce.
-///   Either the export uses a *larger* stride than
-///   `hop_samples` or `hop_samples` is too large. `compose_words`
-///   would otherwise emit ranges that compress every word into
-///   the first portion of the chunk — plausible-looking
-///   timestamps that all sit in (e.g.) the first half of the
-///   audio.
+/// reports far fewer frames than the input should produce.
+/// Either the export uses a *larger* stride than
+/// `hop_samples` or `hop_samples` is too large. `compose_words`
+/// would otherwise emit ranges that compress every word into
+/// the first portion of the chunk — plausible-looking
+/// timestamps that all sit in (e.g.) the first half of the
+/// audio.
 ///
 /// `chunk_extent.saturating_sub(slack)` lets very short chunks
 /// (where the slack is comparable to `chunk_extent`) pass without
@@ -320,9 +320,9 @@ pub(crate) fn validate_stride_extent(
       kind: AlignmentFailureKind::ModelInferenceFailed,
       message: alloc::format!(
         "ORT output stride mismatch: T={t} × hop={hop_samples} = {frame_extent} \
-         sample-equivalents exceeds chunk ({chunk_extent} samples) + 2-frame slack \
-         ({upper_bound}); model export uses a smaller stride than `hop_samples` \
-         or `hop_samples` is misconfigured"
+ sample-equivalents exceeds chunk ({chunk_extent} samples) + 2-frame slack \
+ ({upper_bound}); model export uses a smaller stride than `hop_samples` \
+ or `hop_samples` is misconfigured"
       ),
       language: language.clone(),
     });
@@ -332,9 +332,9 @@ pub(crate) fn validate_stride_extent(
       kind: AlignmentFailureKind::ModelInferenceFailed,
       message: alloc::format!(
         "ORT output stride mismatch: T={t} × hop={hop_samples} = {frame_extent} \
-         sample-equivalents below chunk ({chunk_extent} samples) − 2-frame slack \
-         ({lower_bound}); model export uses a larger stride than `hop_samples` \
-         or `hop_samples` is misconfigured"
+ sample-equivalents below chunk ({chunk_extent} samples) − 2-frame slack \
+ ({lower_bound}); model export uses a larger stride than `hop_samples` \
+ or `hop_samples` is misconfigured"
       ),
       language: language.clone(),
     });
@@ -368,8 +368,8 @@ pub(crate) fn validate_vocab_dim(
       kind: AlignmentFailureKind::ModelInferenceFailed,
       message: alloc::format!(
         "ORT output vocab dim V={v} doesn't match tokenizer vocab size {expected_v}; \
-         model and tokenizer are paired incorrectly — Viterbi would otherwise read \
-         posteriors from columns that don't correspond to the tokenizer's tokens"
+ model and tokenizer are paired incorrectly — Viterbi would otherwise read \
+ posteriors from columns that don't correspond to the tokenizer's tokens"
       ),
       language: language.clone(),
     });
@@ -421,7 +421,7 @@ pub(crate) fn log_softmax_with_finite_guard(
     // instead of the correct `-ln(2)`. The output passes the
     // finiteness checks but is no longer a log-probability,
     // hiding the backend numeric skew as plausible-looking
-    // alignment input. Codex round-22 flagged this; the fix is
+    // alignment input. Flagged this; the fix is
     // to keep the subtraction of `max` in shifted f64 space and
     // only cast the final `lp` to f32 (where `lp = (x - max) -
     // sum.ln()` is bounded between `-inf..=0` and never needs
@@ -444,7 +444,7 @@ pub(crate) fn log_softmax_with_finite_guard(
         kind: AlignmentFailureKind::ModelInferenceFailed,
         message: alloc::format!(
           "log-softmax shifted normaliser non-finite at frame {t_idx}: \
-           sum.ln()={log_z_shifted}, max={max}"
+ sum.ln()={log_z_shifted}, max={max}"
         ),
         language: language.clone(),
       });
@@ -468,7 +468,7 @@ pub(crate) fn log_softmax_with_finite_guard(
           kind: AlignmentFailureKind::ModelInferenceFailed,
           message: alloc::format!(
             "log-softmax output non-finite at frame {t_idx}: \
-             x={x}, max={max}, sum_ln={log_z_shifted}, lp={lp}"
+ x={x}, max={max}, sum_ln={log_z_shifted}, lp={lp}"
           ),
           language: language.clone(),
         });
@@ -644,7 +644,7 @@ mod tests {
   /// log-prob: `[f32::MAX, -f32::MAX]` has finite input,
   /// finite max, finite log_z (= f32::MAX), but the second
   /// element's `x - log_z = -f32::MAX - f32::MAX = -inf`.
-  /// Pre-fix the `-inf` was stored in `data`; Viterbi would
+  /// The `-inf` was stored in `data`; Viterbi would
   /// later return `NoAlignmentPath` (recoverable) hiding a
   /// real backend numeric failure as `words: []`. The
   /// per-element finite check now surfaces it as fatal
@@ -679,7 +679,7 @@ mod tests {
 
   #[test]
   fn log_softmax_large_common_offset_normalises_to_unit_exp_sum() {
-    // Codex round-22 regression: the previous implementation
+    // regression: the previous implementation
     // computed `log_z = max + sum.ln() as f32`. For a row with
     // a large common offset like `[1e20, 1e20]`, `sum.ln() =
     // ln(2) ≈ 0.69` rounds away when added to `max = 1e20` in

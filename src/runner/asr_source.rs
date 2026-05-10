@@ -126,7 +126,7 @@ impl AsrSource for WhisperAsrSource {
     };
 
     validate_for_whisper_ffi(chunk.params)?;
-    // Codex round-37 round-33 [medium]: scan samples for
+    // scan samples for
     // finiteness before they reach `state.full`. Without this
     // a single NaN/Inf in public audio poisons the encoder's
     // float math and surfaces as an opaque whisper.cpp backend

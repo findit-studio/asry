@@ -83,7 +83,7 @@ impl Run {
   /// underlying segment's timing source (DTW-derived or segment
   /// envelope); see [`Self::bounds_source`].
   ///
-  /// **Coordinate contract** (Codex round-37 round-27 [medium]):
+  /// **Coordinate contract** ([medium]):
   /// values are **chunk-local** — origin at the start of the
   /// chunk's audio, NOT stream-absolute. The runner's alignment
   /// path
@@ -256,7 +256,7 @@ pub trait SegmentLike {
   /// inside [`Self::text`] and its DTW timestamp (`None` when
   /// DTW is disabled or unavailable for the token).
   ///
-  /// Codex round-37 [high]: this replaced an earlier
+  /// this replaced an earlier
   /// `token_dtw_timestamps() -> Vec<Option<i64>>` whose lack of
   /// byte-position info meant every run carved from a segment
   /// inherited the parent segment's full DTW list. With per-
@@ -333,7 +333,7 @@ const fn cs_to_ms(cs: i64) -> i64 {
 /// byte-ratio — UTF-8 multi-byte CJK/Hangul would otherwise get
 /// disproportionate timing weight).
 ///
-/// Codex round-37: original implementation shared the parent
+/// : original implementation shared the parent
 /// segment's `(t0_ms, t1_ms)` across every run, causing
 /// overlapping pseudo-words. Round 2 added run-scoped DTW
 /// slicing. Round 3 fixed two follow-up issues: byte-based
@@ -413,7 +413,7 @@ pub fn dispatch_segments<S: SegmentLike>(segments: &[S], state_lang: Option<Lang
     for run in &carved {
       let run_dtw = collect_run_dtw(&tokens, run.byte_range.start, run.byte_range.end);
       let mut bounds = extract_raw_bounds(&run_dtw.dtw);
-      // Codex round-37 round-12 [high]: when a boundary-
+      // when a boundary-
       // spanning token would have contributed an ambiguous DTW
       // point (now dropped from `run_dtw.dtw`), the slice is
       // partial — prevent the run from being treated as
@@ -428,8 +428,7 @@ pub fn dispatch_segments<S: SegmentLike>(segments: &[S], state_lang: Option<Lang
 
     // Third pass: emit final bounds, capping each DTW-backed
     // run's exclusive end at the **immediate** next run's
-    // resolved start. Codex round-37 round-14 [high]: pre-fix
-    // this used `find_map` to look ahead for the next DTW run,
+    // resolved start.  // this used `find_map` to look ahead for the next DTW run,
     // skipping intervening Segment-fallback runs — so a
     // `Dtw → Segment → Dtw` carving could extend the first
     // DTW run past the middle run's character-interpolated
@@ -440,8 +439,8 @@ pub fn dispatch_segments<S: SegmentLike>(segments: &[S], state_lang: Option<Lang
     // remain monotonic and non-overlapping regardless of
     // bound source.
     let multi_run = carved.len() > 1;
-    // Codex round-37 round-15 [medium]: defer span subtraction
-    // until AFTER sentinel/overflow validation. Pre-fix this
+    // defer span subtraction
+    // until AFTER sentinel/overflow validation. this
     // computed `seg_t1_cs - seg_t0_cs` unconditionally; with
     // `seg_t0_cs == i64::MIN` the subtraction would panic in
     // debug and wrap in release, feeding bogus interpolation
@@ -457,10 +456,9 @@ pub fn dispatch_segments<S: SegmentLike>(segments: &[S], state_lang: Option<Lang
     for (i, run) in carved.iter().enumerate() {
       let next_lo_cs = if i + 1 < carved.len() {
         let next_raw = &raw_bounds[i + 1];
-        // Codex round-37 round-19 [high]: ONLY use the next
+        // ONLY use the next
         // run's `lo_dtw_cs` when that run is actually
-        // DTW-authoritative (`all_some == true`). Pre-fix
-        // `lo_dtw_cs` could be populated by a partial DTW
+        // DTW-authoritative (`all_some == true`).  // `lo_dtw_cs` could be populated by a partial DTW
         // slice (one missing token, or a boundary-spanning
         // token forced `all_some=false`); the next run would
         // then resolve to character-interpolated Segment
@@ -552,7 +550,7 @@ struct RunDtw {
 /// segment-envelope interpolation rather than treating partial
 /// DTW data as authoritative.
 ///
-/// Codex round-37 round-12 [high]: pre-fix this used a
+/// this used a
 /// non-trivial-overlap predicate, so a single boundary BPE
 /// token could be counted in BOTH adjacent language runs —
 /// each run then reported `BoundsSource::Dtw` with overlapping
@@ -621,7 +619,7 @@ fn extract_raw_bounds(dtw_slice: &[Option<i64>]) -> RawBounds {
 /// first DTW point** rather than always widening to `seg_t1_cs`,
 /// so adjacent DTW runs are monotonic and non-overlapping. When
 /// DTW is unavailable, falls back to character-ratio interpolation
-/// (Codex round-37 round-3: pre-fix this used byte-ratio, which
+/// (: this used byte-ratio, which
 /// over-weighted CJK/Hangul runs because each glyph is 3 bytes).
 fn compute_run_bounds(
   seg_t0_cs: i64,
@@ -640,20 +638,20 @@ fn compute_run_bounds(
   {
     // Exclusive end policy:
     // 1. If a later run also has DTW (or interpolated bounds),
-    //    cap at its preferred lo so adjacent runs remain
-    //    monotone and non-overlapping in audio order.
-    //    Codex round-37 round-20 [high]: pre-fix this clamped
-    //    `next_lo.max(lo + 1)` whenever the cap would have
-    //    collapsed (`next_lo <= lo`). That kept the current
-    //    run as DTW spanning `[lo, lo+1)` while the *next* run
-    //    resolved to its earlier interpolated lo, putting the
-    //    two runs out of audio order. Detect that case and
-    //    fall through to segment interpolation: char-fraction
-    //    bounds are monotone in run index by construction, so
-    //    the resulting Segment-Segment pair stays ordered.
+    // cap at its preferred lo so adjacent runs remain
+    // monotone and non-overlapping in audio order.
+    // this clamped
+    // `next_lo.max(lo + 1)` whenever the cap would have
+    // collapsed (`next_lo <= lo`). That kept the current
+    // run as DTW spanning `[lo, lo+1)` while the *next* run
+    // resolved to its earlier interpolated lo, putting the
+    // two runs out of audio order. Detect that case and
+    // fall through to segment interpolation: char-fraction
+    // bounds are monotone in run index by construction, so
+    // the resulting Segment-Segment pair stays ordered.
     // 2. Otherwise (last DTW run, or solo run), prefer the
-    //    segment's `seg_t1_cs` envelope; if that's not after
-    //    the DTW max, widen by one centisecond quantum.
+    // segment's `seg_t1_cs` envelope; if that's not after
+    // the DTW max, widen by one centisecond quantum.
     let exclusive_hi_opt: Option<i64> = if let Some(next_lo) = next_run_lo_dtw_cs {
       if next_lo <= lo {
         None
@@ -694,7 +692,7 @@ fn compute_run_bounds(
   }
   let lo_frac = run_char_start as f64 / text_char_count as f64;
   let hi_frac = run_char_end as f64 / text_char_count as f64;
-  // Codex round-37 round-16 [medium]: pre-fix this used
+  // this used
   // `seg_t1_cs - seg_t0_cs` directly; non-sentinel extreme
   // bounds (e.g. `t0 = i64::MIN + 1`, `t1 = i64::MAX`) panic in
   // debug and wrap in release before the wholeclip fallback
@@ -707,7 +705,7 @@ fn compute_run_bounds(
   };
   let interp_lo_cs = (seg_t0_cs as f64 + lo_frac * span).round() as i64;
   let mut interp_hi_cs = (seg_t0_cs as f64 + hi_frac * span).round() as i64;
-  // Codex round-37 round-5 [high]: when `lo_frac` and `hi_frac`
+  // when `lo_frac` and `hi_frac`
   // round to the same centisecond (very short multi-run segments,
   // e.g. a 1-char run inside a 50ms parent envelope), the
   // interpolated bounds collapse to `t0 == t1`. Downstream
@@ -761,20 +759,20 @@ fn push_run(
 /// Preference order:
 ///
 /// 1. **DTW**: every token in `dtw_cs` is `Some(_)`, and the
-///    derived min/max range is non-empty. Both endpoints are
-///    converted from centiseconds to milliseconds.
+/// derived min/max range is non-empty. Both endpoints are
+/// converted from centiseconds to milliseconds.
 /// 2. **Segment**: `seg_t0_cs` and `seg_t1_cs` are both
-///    non-sentinel ([`i64::MIN`] indicates "unavailable" per the
-///    [`SegmentLike`] contract). Whisper.cpp's normal output
-///    falls into this branch when DTW is disabled or partially
-///    populated.
+/// non-sentinel ([`i64::MIN`] indicates "unavailable" per the
+/// [`SegmentLike`] contract). Whisper.cpp's normal output
+/// falls into this branch when DTW is disabled or partially
+/// populated.
 /// 3. **Wholeclip**: neither DTW nor segment timing is usable.
-///    Returns `(i64::MIN, i64::MAX)` as sentinels — the caller
-///    must treat them as "unknown" rather than literal times,
-///    and downstream code should fall back to whole-clip timing
-///    (the audio's full duration). This branch is defensive;
-///    real whisper.cpp output should always populate `t0` /
-///    `t1` on emitted segments.
+/// Returns `(i64::MIN, i64::MAX)` as sentinels — the caller
+/// must treat them as "unknown" rather than literal times,
+/// and downstream code should fall back to whole-clip timing
+/// (the audio's full duration). This branch is defensive;
+/// real whisper.cpp output should always populate `t0` /
+/// `t1` on emitted segments.
 fn compute_bounds(
   seg_t0_cs: i64,
   seg_t1_cs: i64,
@@ -785,7 +783,7 @@ fn compute_bounds(
   // interprets the returned pair as a half-open audio range, so a
   // single-token run (or any run whose tokens collapse to one
   // timestamp) yields `lo == hi_point` and the exclusive end must
-  // be widened past `lo`. Codex round-37 [high]: the previous
+  // be widened past `lo`. the previous
   // implementation returned `(min, max, Dtw)` directly, which (a)
   // truncated the last token by treating its start as the
   // exclusive end and (b) degraded zero-width spans to wholeclip
@@ -884,8 +882,7 @@ mod runner_glue {
       // Walk tokens in decode order; for each, look up its raw
       // bytes via `Context::token_to_bytes`, accumulate offsets,
       // and validate that the assembled byte stream equals
-      // `self.seg.text()` (Codex round-37 round-7 [medium]:
-      // pre-fix this assumption was unchecked, so any divergence
+      // `self.seg.text()` ( // this assumption was unchecked, so any divergence
       // — leading-space handling, special-token rendering,
       // tokeniser-side normalisation, etc. — would silently
       // mis-attribute DTW timestamps to the wrong language run
@@ -923,10 +920,10 @@ mod runner_glue {
       if any_token_seen && accumulated.as_slice() != segment_text.as_bytes() {
         std::eprintln!(
           "[whispery] script_dispatch: token-byte stream diverges from segment text \
-           (tokens={} bytes={} segment={} bytes); falling back to segment bounds for this \
-           segment to avoid mis-attributing DTW timestamps. Likely cause: model tokenisation \
-           normalises bytes (leading-space stripping, special-token rendering) the dispatcher \
-           cannot reconstruct from token ids.",
+ (tokens={} bytes={} segment={} bytes); falling back to segment bounds for this \
+ segment to avoid mis-attributing DTW timestamps. Likely cause: model tokenisation \
+ normalises bytes (leading-space stripping, special-token rendering) the dispatcher \
+ cannot reconstruct from token ids.",
           out.len(),
           accumulated.len(),
           segment_text.len(),
@@ -949,7 +946,7 @@ mod runner_glue {
 /// delegates to [`dispatch_segments`].
 ///
 /// `ctx` resolves each token id to its raw text bytes (used by
-/// the dispatcher for run-scoped DTW slicing per Codex round-37);
+/// the dispatcher for run-scoped DTW slicing per );
 /// pass the same `Context` the segments were decoded against.
 /// `state_lang` is the transcriber's current language hint,
 /// passed through unchanged for Latin / ambiguous-script
@@ -1165,10 +1162,10 @@ mod tests {
 
   #[test]
   fn leading_punctuation_attaches_to_first_run() {
-    let segs = vec![seg("  hello", 0, 100, vec![])];
+    let segs = vec![seg(" hello", 0, 100, vec![])];
     let runs = dispatch_segments(&segs, None);
     assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0].text(), "  hello");
+    assert_eq!(runs[0].text(), " hello");
   }
 
   #[test]
@@ -1182,7 +1179,7 @@ mod tests {
   fn dtw_available_uses_dtw_bounds_widened_to_segment_end() {
     // DTW points are start timestamps for each token; the audio
     // slice's exclusive end widens to `seg_t1_cs` (200 cs → 2000 ms)
-    // so the last token's audio isn't truncated. Pre-fix this
+    // so the last token's audio isn't truncated. this
     // returned (700, 1900), which clipped the last token.
     let segs = vec![seg(
       "hello",
@@ -1200,7 +1197,7 @@ mod tests {
   #[test]
   fn dtw_single_token_widens_to_segment_end() {
     // Single token; lo == hi_point. Widens to seg_t1_cs (=200 cs →
-    // 2000 ms). Pre-fix this would return (700, 700), and
+    // 2000 ms). this would return (700, 700), and
     // `run_audio_slice` would degrade it to the full chunk.
     let segs = vec![seg("hi", 50, 200, vec![Some(70)])];
     let runs = dispatch_segments(&segs, None);
@@ -1224,7 +1221,7 @@ mod tests {
 
   #[test]
   fn codeswitch_segment_dtw_runs_are_monotonic_non_overlapping() {
-    // Codex round-37 round-3 [high]: DTW-backed runs in a multi-
+    // DTW-backed runs in a multi-
     // run segment must NOT each widen to `seg_t1_cs`; that would
     // make every earlier run replay the parent segment's tail.
     // The cap-at-next-run policy keeps adjacent DTW runs
@@ -1245,16 +1242,16 @@ mod tests {
     let runs = dispatch_segments(&segs, None);
     assert_eq!(runs.len(), 3);
     // Run 0 (En): DTW lo=70cs; cap at next run's lo=140cs.
-    //   → (700, 1400) ms — does NOT replay through 3000ms.
+    // → (700, 1400) ms — does NOT replay through 3000ms.
     assert_eq!(runs[0].audio_t0_ms(), 700);
     assert_eq!(runs[0].audio_t1_ms(), 1400);
     assert_eq!(runs[0].bounds_source(), BoundsSource::Dtw);
     // Run 1 (Zh): DTW lo=140cs; cap at next run's lo=210cs.
-    //   → (1400, 2100) ms.
+    // → (1400, 2100) ms.
     assert_eq!(runs[1].audio_t0_ms(), 1400);
     assert_eq!(runs[1].audio_t1_ms(), 2100);
     // Run 2 (En last): no next run; widen to seg_t1=300cs.
-    //   → (2100, 3000) ms.
+    // → (2100, 3000) ms.
     assert_eq!(runs[2].audio_t0_ms(), 2100);
     assert_eq!(runs[2].audio_t1_ms(), 3000);
     // Monotonic non-overlap invariant.
@@ -1264,16 +1261,16 @@ mod tests {
 
   #[test]
   fn codeswitch_segment_without_dtw_uses_character_ratio_not_byte_ratio() {
-    // Codex round-37 round-3 [high]: pre-fix the fallback split
+    // the fallback split
     // by *byte* offsets, giving multi-byte CJK runs a 3× share
     // of the audio. With character-ratio interpolation, runs are
     // weighted proportionally to glyph count, matching whisperX's
     // codepoint-based fallback.
     //
     // Text: "hello你好world", char count = 12, span = 250cs:
-    //   En1 [chars 0..5)   → 0/12 .. 5/12   → 0..104cs of span
-    //   Zh  [chars 5..7)   → 5/12 .. 7/12   → 104..146cs of span
-    //   En2 [chars 7..12)  → 7/12 .. 12/12  → 146..250cs of span
+    // En1 [chars 0..5) → 0/12 .. 5/12 → 0..104cs of span
+    // Zh [chars 5..7) → 5/12 .. 7/12 → 104..146cs of span
+    // En2 [chars 7..12) → 7/12 .. 12/12 → 146..250cs of span
     // Plus seg_t0=50cs → (500, 1542), (1542, 1958), (1958, 3000).
     // (Byte-ratio would have given Zh ~6/16 = 37.5% of the audio
     // for only 2/12 = 17% of the glyphs.)
@@ -1313,7 +1310,7 @@ mod tests {
     );
   }
 
-  /// Codex round-37 round-7 [medium] regression: when the
+  /// regression: when the
   /// runner-glue layer detects that the token byte stream
   /// diverges from the segment text (a tokeniser-side
   /// normalisation we can't reconstruct), it neutralises every
@@ -1323,7 +1320,7 @@ mod tests {
   /// for every run and bounds resolution falls through to the
   /// segment envelope. This test simulates the recovered shape
   /// directly via `seg_with_tokens` to lock in the fallback.
-  /// Codex round-37 round-12 [high]: a BPE / sub-word token
+  /// a BPE / sub-word token
   /// whose byte range straddles a script boundary used to be
   /// counted in BOTH adjacent language runs (overlap predicate
   /// without containment check). Both runs would then claim
@@ -1335,10 +1332,10 @@ mod tests {
   fn boundary_spanning_dtw_token_does_not_double_count() {
     // Layout: "hello你好" — bytes [0..5)=En, [5..11)=Zh.
     // Three tokens:
-    //   - "hello" wholly in En run (byte 0..5, dtw=70cs).
-    //   - boundary token straddles En/Zh (byte 4..6, dtw=120cs)
-    //     — its DTW point belongs to NEITHER run cleanly.
-    //   - "你好" wholly in Zh run (byte 5..11, dtw=180cs).
+    // - "hello" wholly in En run (byte 0..5, dtw=70cs).
+    // - boundary token straddles En/Zh (byte 4..6, dtw=120cs)
+    // — its DTW point belongs to NEITHER run cleanly.
+    // - "你好" wholly in Zh run (byte 5..11, dtw=180cs).
     let segs = vec![seg_with_tokens(
       "hello你好",
       50,
@@ -1364,11 +1361,11 @@ mod tests {
     assert!(runs[0].audio_t1_ms() <= runs[1].audio_t0_ms());
   }
 
-  /// Codex round-37 round-14 [high]: when a multi-run segment
+  /// when a multi-run segment
   /// carves runs with mixed bound sources (e.g. Dtw → Segment
   /// → Dtw), the first DTW run must NOT extend past the
   /// intervening fallback run's character-interpolated start.
-  /// Pre-fix `find_map` over later runs with DTW skipped the
+  /// `find_map` over later runs with DTW skipped the
   /// middle Segment run and capped the first run at the third
   /// run's DTW point — so the first run's window overlapped
   /// the middle run's window, sending the same audio to two
@@ -1386,18 +1383,18 @@ mod tests {
     // explicit per-character runs.
     //
     // Let's use a synthetic but easier layout. Spans:
-    //   Run 0 (En "abc", chars 0..3, bytes 0..3): 1 token at
-    //         byte 0, DTW=Some(50). all_some=true → Dtw.
-    //   Run 1 (Zh "你",  chars 3..4, bytes 3..6): 1 token at
-    //         byte 3, DTW=None. partial → Segment.
-    //   Run 2 (En "def", chars 4..7, bytes 6..9): 1 token at
-    //         byte 6, DTW=Some(180). all_some=true → Dtw.
+    // Run 0 (En "abc", chars 0..3, bytes 0..3): 1 token at
+    // byte 0, DTW=Some(50). all_some=true → Dtw.
+    // Run 1 (Zh "你", chars 3..4, bytes 3..6): 1 token at
+    // byte 3, DTW=None. partial → Segment.
+    // Run 2 (En "def", chars 4..7, bytes 6..9): 1 token at
+    // byte 6, DTW=Some(180). all_some=true → Dtw.
     //
     // Segment envelope: 0..200cs.
     // Char-interp for Run 1: chars 3..4 of 7 = 3/7..4/7 of
     // 2000ms = 857..1143ms.
     //
-    // Pre-fix Run 0 cap = Run 2's lo_dtw = 180cs = 1800ms,
+    // Run 0 cap = Run 2's lo_dtw = 180cs = 1800ms,
     // so Run 0 = (500, 1800ms) — extends past Run 1's
     // interpolated start (857ms). Post-fix Run 0 cap = Run 1's
     // interpolated lo = 857ms.
@@ -1441,7 +1438,7 @@ mod tests {
     );
   }
 
-  /// Codex round-37 round-15 [medium]: a `SegmentLike` with
+  /// a `SegmentLike` with
   /// `seg_t0() == i64::MIN` and a finite `seg_t1()` previously
   /// caused `seg_t1_cs - seg_t0_cs` to panic in debug and
   /// wrap in release, feeding bogus interpolation into run
@@ -1449,7 +1446,7 @@ mod tests {
   /// defers the subtraction past the sentinel check.
   #[test]
   fn segment_with_min_t0_does_not_panic_or_wrap() {
-    // Multi-run carving + sentinel t0. Pre-fix this would
+    // Multi-run carving + sentinel t0. this would
     // attempt to subtract i64::MIN from a finite seg_t1_cs
     // for the span_cs computation in dispatch_segments.
     let segs = vec![seg("hello你好", i64::MIN, 200, vec![])];
@@ -1467,7 +1464,7 @@ mod tests {
     }
   }
 
-  /// Codex round-37 round-19 [high]: when the middle run has
+  /// when the middle run has
   /// a partial DTW slice (mixed Some/None), the previous DTW
   /// run must NOT cap at the middle run's stale `lo_dtw_cs` —
   /// the middle run will resolve to character-interpolated
@@ -1481,16 +1478,15 @@ mod tests {
     // Layout: "abc你好def"
     // - Run 0 (En "abc", bytes 0..3): 1 token, DTW=Some(50). all_some=true → Dtw.
     // - Run 1 (Zh "你好", bytes 3..9): 2 tokens, MIXED — token at bytes
-    //   3..6 has DTW=Some(120), token at bytes 6..3 has DTW=None.
-    //   all_some=false → Segment.
+    // 3..6 has DTW=Some(120), token at bytes 6..3 has DTW=None.
+    // all_some=false → Segment.
     // - Run 2 (En "def", bytes 9..12): 1 token, DTW=Some(180).
     //
-    // Pre-fix: Run 0 capped at Run 1's lo_dtw_cs=120cs=1200ms.
-    // Run 1 resolves to char-interp (3/8..7/8 of 200cs envelope).
-    // Run 0's window then extends past Run 1's interpolated start.
-    //
-    // Post-fix: Run 0 capped at Run 1's char-interpolated lo
-    // (3/8 * 2000ms = 750ms), so Run 0.t1 <= Run 1.t0.
+    // Run 0 must be capped against Run 1's char-interpolated
+    // `lo` (3/8 * 2000ms = 750ms), not Run 1's raw `lo_dtw_cs`
+    // (= 1200ms), so Run 0.t1 <= Run 1.t0. Capping against the
+    // raw DTW value would let Run 0's window extend past
+    // Run 1's interpolated start.
     let segs = vec![seg_with_tokens(
       "abc你好def",
       0,
@@ -1529,7 +1525,7 @@ mod tests {
     );
   }
 
-  /// Codex round-37 round-20 [high]: when a DTW-backed run's
+  /// when a DTW-backed run's
   /// `lo` lands *after* the next (non-DTW) run's interpolated
   /// lo, the previous fix kept the DTW run as
   /// `[lo, lo+1)` (saturating cap) while the next run resolved
@@ -1542,9 +1538,9 @@ mod tests {
   fn dtw_lo_after_next_interp_lo_demotes_to_segment() {
     // Layout: "abc你好" (5 chars, env [0, 200] cs).
     // - Run 0 (En "abc", chars 0..3): single token DTW=Some(180).
-    //   all_some=true → would prefer Dtw with `lo = 180cs`.
+    // all_some=true → would prefer Dtw with `lo = 180cs`.
     // - Run 1 (Zh "你好", chars 3..5): partial DTW → Segment.
-    //   Interpolated lo = (3/5)*200 = 120cs.
+    // Interpolated lo = (3/5)*200 = 120cs.
     //
     // 180cs > 120cs: emitting Run 0 as Dtw [180, 181) and
     // Run 1 as Segment [120, 200) puts the runs out of audio
@@ -1656,7 +1652,7 @@ mod tests {
     assert_eq!(runs[0].language(), &Lang::Es);
   }
 
-  /// Codex round-37 round-24 [high]: a Latin span under a
+  /// a Latin span under a
   /// CJK `state_lang` must dispatch to `Lang::En` so genuine
   /// code-switches (e.g. `"hello 你好"` detected as Zh) split
   /// into separate per-language runs instead of collapsing
@@ -1677,7 +1673,7 @@ mod tests {
     );
   }
 
-  /// Codex round-37 round-24 [high] regression: mixed
+  /// regression: mixed
   /// `"hello 你好"` chunk detected as Zh must produce TWO
   /// runs (En "hello" + Zh "你好"), not one collapsed Zh run.
   /// This is the case the README's per-language code-switch
@@ -1708,12 +1704,11 @@ mod tests {
     assert_eq!(runs[0].language(), &Lang::En);
   }
 
-  /// Codex round-37 round-24 [high]: embedded Latin loanwords
-  /// like `"USAで"` under a Ja hint now split into TWO runs
-  /// (En "USA" + Ja "で"). Pre-fix (round 9) this kept one Ja
-  /// run so the JapaneseNormalizer's per-char Latin handling
-  /// could run; round 24 reverted that rule because it
-  /// suppressed legitimate code-switches everywhere it
+  /// embedded Latin loanwords
+  /// like `"USAで"` under a Ja hint split into TWO runs (En
+  /// "USA" + Ja "で"). Folding Latin into the CJK run so the
+  /// JapaneseNormalizer's per-char Latin handling could run
+  /// would suppress legitimate code-switches everywhere it
   /// applied. Callers who prefer the loanword behaviour can
   /// register `Lang::En` against their Ja aligner (or use
   /// `AlignmentFallback::Any`).

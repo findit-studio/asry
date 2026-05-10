@@ -8,7 +8,7 @@
 ///
 /// Carries the invariant `end_sample > start_sample`. The
 /// constructor [`VadSegment::new`] enforces it; the
-/// `Deserialize` impl below also enforces it (Codex round-33:
+/// `Deserialize` impl below also enforces it (:
 /// `derive(Deserialize)` would have skipped construction
 /// validation, letting malformed input wrap `sample_count()`
 /// to a huge value and trip the `Cut::push_segment` hard-split
@@ -61,7 +61,7 @@ impl<'de> serde::Deserialize<'de> for VadSegment {
   /// [`VadSegment::new`]'s `end_sample > start_sample` invariant
   /// check, letting malformed input wrap `sample_count()` to a
   /// huge value and panic deep inside the cut state machine.
-  /// Codex round-33 flagged this; here we re-validate at the
+  /// Flagged this; here we re-validate at the
   /// serde boundary and surface the violation as a typed
   /// deserialization error instead.
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -118,7 +118,7 @@ mod tests {
     VadSegment::new(200, 100);
   }
 
-  /// Codex round-33: serde's derived `Deserialize` skips the
+  /// : serde's derived `Deserialize` skips the
   /// constructor's invariant. A reversed range would wrap
   /// `sample_count()` to ~u64::MAX and trip the cut state
   /// machine's assertions deep in the pipeline. The custom
