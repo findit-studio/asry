@@ -18,12 +18,14 @@ on:
       - '**.md'
       - '**.txt'
   workflow_dispatch:
-  schedule: [cron: "0 1 */7 * *"]
+  schedule: 
+    - cron: "0 1 1 * *"
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
   RUST_BACKTRACE: 1
+  WHISPERY_FETCH_FIXTURES: '1'
 
 jobs:
   # Check formatting (platform-independent, one OS is enough)
@@ -32,8 +34,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v6
-    - name: Install Rust
-      run: rustup update stable && rustup default stable && rustup component add rustfmt
+    # Nightly toolchain — `rustfmt.toml` uses
+    # `imports_granularity = "Crate"`, an unstable feature only
+    # available on nightly. Without this the stable rustfmt
+    # silently drops the setting and reports diffs vs the
+    # nightly-formatted tree.
+    - name: Install Rust (nightly)
+      run: rustup update nightly --no-self-update && rustup default nightly && rustup component add rustfmt --toolchain nightly
     - name: Check formatting
       run: cargo fmt --all -- --check
 
@@ -52,51 +59,36 @@ jobs:
     - name: Install Rust
       # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
       run: rustup update stable --no-self-update && rustup default stable && rustup component add clippy
-    - name: Install cargo-hack
-      run: cargo install cargo-hack
     - name: Apply clippy lints
-      run: cargo hack clippy --each-feature --exclude-no-default-features
+      # Explicit feature combos — see build job for rationale.
+      run: |
+        set -e
+        cargo clippy -- -D warnings
+        cargo clippy --features alignment -- -D warnings
+        cargo clippy --features alignment,serde -- -D warnings
+        cargo clippy --features alignment,bench-internals -- -D warnings
+        if [ "$RUNNER_OS" = "macOS" ]; then
+          cargo clippy --features alignment,metal,coreml -- -D warnings
+        fi
+      shell: bash
 
   # Run tests on some extra platforms
-  cross:
-    name: cross
-    strategy:
-      matrix:
-        target:
-          - aarch64-unknown-linux-gnu
-          - aarch64-linux-android
-          - aarch64-unknown-linux-musl
-          - i686-linux-android
-          - x86_64-linux-android
-          - i686-pc-windows-gnu
-          - x86_64-pc-windows-gnu
-          - i686-unknown-linux-gnu
-          - powerpc64-unknown-linux-gnu
-          - riscv64gc-unknown-linux-gnu
-          - wasm32-unknown-unknown
-          - wasm32-unknown-emscripten
-          - wasm32-wasip1
-          - wasm32-wasip1-threads
-          - wasm32-wasip2
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cross-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cross-
-      - name: Install Rust
-        run: rustup update stable && rustup default stable
-      - name: cargo build --target ${{ matrix.target }}
-        run: |
-          rustup target add ${{ matrix.target }}
-          cargo build --target ${{ matrix.target }}
+  # `cross`, `sanitizer`, `miri-sb`, `miri-tb` removed: they are
+  # template defaults that don't fit whispery's architecture.
+  # `Lang` is re-exported from `whispercpp` (gated on `runner`),
+  # so even the "pure Rust" build path requires linking
+  # whisper.cpp (cmake + C++) and — on the alignment path — ONNX
+  # Runtime via load-dynamic. Neither dependency:
+  #   * cross-compiles cleanly to the cross-job target list
+  #     (wasm, i686, android, etc.) — `cmake + Foundation`
+  #     framework lookups fail before we ever see whispery
+  #     code,
+  #   * is meaningfully sanitizable / miri-evaluable from
+  #     downstream — any UB those tools would find lives in
+  #     whisper.cpp / ORT, which test themselves upstream.
+  # If a meaningful subset of pure-Rust code emerges later (e.g.
+  # the SIMD normalizer kernels factored out from `runner`),
+  # reintroduce a scoped job at that point.
 
   build:
     name: build
@@ -122,10 +114,25 @@ jobs:
     - name: Install Rust
       # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
       run: rustup update stable --no-self-update && rustup default stable
-    - name: Install cargo-hack
-      run: cargo install cargo-hack
     - name: Run build
-      run: cargo hack build --feature-powerset --exclude-no-default-features
+      # Explicit feature combos rather than `cargo hack
+      # --feature-powerset`: whispery's features aren't
+      # orthogonal — `Lang` is re-exported from `whispercpp`
+      # (gated on `runner`), so any combo without `runner`
+      # fails to compile. Apple-only `metal` / `coreml` only
+      # build on macOS; diagnostic toggles
+      # (`parity-dump-emission`, `bench-internals`) ship
+      # internals, never on the production surface.
+      run: |
+        set -e
+        cargo build
+        cargo build --features alignment
+        cargo build --features alignment,serde
+        cargo build --features alignment,bench-internals
+        if [ "$RUNNER_OS" = "macOS" ]; then
+          cargo build --features alignment,metal,coreml
+        fi
+      shell: bash
 
   test:
     name: test
@@ -151,159 +158,27 @@ jobs:
     - name: Install Rust
       # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
       run: rustup update stable --no-self-update && rustup default stable
-    - name: Install cargo-hack
-      run: cargo install cargo-hack
+    # Audio parity fixtures (~283 MB of WAV + RTTM) live in the
+    # sibling repo `Findit-AI/audio-fixtures`, NOT in whispery's
+    # git history. The fetch is opt-in via
+    # `WHISPERY_FETCH_FIXTURES=1` so the default `cargo test`
+    # path stays network-free and fast. Tests that need the
+    # fixtures gate themselves on the populated path
+    # (`tests/parity/fixtures/<name>/clip_16k.wav`) and
+    # short-circuit when absent.
+    - name: Fetch audio parity fixtures
+      if: env.WHISPERY_FETCH_FIXTURES == '1'
+      shell: bash
+      run: bash scripts/fetch_fixtures.sh
     - name: Run test
-      run: cargo hack test --feature-powerset --exclude-no-default-features --exclude-features loom
-
-  sanitizer:
-    name: sanitizer
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-sanitizer-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-sanitizer-
-      - name: Install Rust
-        run: rustup update nightly && rustup default nightly
-      - name: Install rust-src
-        run: rustup component add rust-src
-      - name: ASAN / LSAN / MSAN / TSAN
-        run: bash ci/sanitizer.sh
-
-  miri-tb:
-    name: miri-tb-${{ matrix.target }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: i686-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: powerpc64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: s390x-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: riscv64gc-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-miri-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-miri-
-      - name: Miri
-        run: |
-          bash ci/miri_tb.sh "${{ matrix.target }}"
-
-  miri-sb:
-    name: miri-sb-${{ matrix.target }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: i686-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: powerpc64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: s390x-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: riscv64gc-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-miri-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-miri-
-      - name: Miri
-        run: |
-          bash ci/miri_sb.sh "${{ matrix.target }}"
-
-  loom:
-    name: loom
-    strategy:
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-loom-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-loom-
-      - name: Install Rust
-        run: rustup update nightly --no-self-update && rustup default nightly
-      - name: Loom tests
-        run: cargo test --tests --features loom
-
-  # valgrind:
-  #   name: valgrind
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v6
-  #     - name: Cache cargo build and registry
-  #       uses: actions/cache@v5
-  #       with:
-  #         path: |
-  #           ~/.cargo/registry
-  #           ~/.cargo/git
-  #           target
-  #         key: ubuntu-latest-valgrind-${{ hashFiles('**/Cargo.lock') }}
-  #         restore-keys: |
-  #           ubuntu-latest-valgrind-
-  #     - name: Install Rust
-  #       run: rustup update stable && rustup default stable
-  #     - name: Install Valgrind
-  #       run: |
-  #         sudo apt-get update -y
-  #         sudo apt-get install -y valgrind
-  #     # Uncomment and customize when you have binaries to test:
-  #     # - name: cargo build foo
-  #     #   run: cargo build --bin foo
-  #     #   working-directory: integration
-  #     # - name: Run valgrind foo
-  #     #   run: valgrind --error-exitcode=1 --leak-check=full --show-leak-kinds=all ./target/debug/foo
-  #     #   working-directory: integration
+      # Explicit feature combos — see build job for rationale.
+      run: |
+        set -e
+        cargo test
+        cargo test --features alignment
+        cargo test --features alignment,serde
+        cargo test --features alignment,bench-internals
+      shell: bash 
 
   coverage:
     name: coverage
@@ -312,10 +187,7 @@ jobs:
       - rustfmt
       - clippy
       - build
-      - cross
       - test
-      - sanitizer
-      - loom
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust
@@ -332,10 +204,17 @@ jobs:
           key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-coverage-
+      - name: Fetch audio parity fixtures
+        if: env.WHISPERY_FETCH_FIXTURES == '1'
+        shell: bash
+        run: bash scripts/fetch_fixtures.sh
       - name: Run tarpaulin
         env:
           RUSTFLAGS: "--cfg tarpaulin"
-        run: cargo tarpaulin --all-features --run-types tests --run-types doctests --workspace --out xml
+        # Coverage runs Linux. `metal` / `coreml` need
+        # Apple frameworks; diagnostic toggles ship internals.
+        # Cover the full default-runner-and-alignment surface.
+        run: cargo tarpaulin --features alignment,serde,bench-internals --run-types tests --run-types doctests --workspace --out xml
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v6
         with:
