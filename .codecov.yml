@@ -2,9 +2,11 @@ codecov:
   require_ci_to_pass: false
 
 ignore:
-  - **benches/*
-  - **examples/*
-  - **tests/*
+  # Quoted because `**` at the start of a YAML scalar reads as
+  # an alias indicator (`*name`). Quoting keeps the glob.
+  - "**/benches/*"
+  - "**/examples/*"
+  - "**/tests/*"
 
 coverage:
   status:
