@@ -16,3 +16,9 @@
 
 /target
 Cargo.lock
+
+.claude/
+
+target/whispery-test-fixtures/
+docs/
+models/

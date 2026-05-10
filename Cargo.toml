@@ -1,48 +1,211 @@
 [package]
-name = "template-rs"
-version = "0.0.0"
-edition = "2021"
-repository = "https://github.com/al8n/template-rs"
-homepage = "https://github.com/al8n/template-rs"
-documentation = "https://docs.rs/template-rs"
-description = "A template for creating Rust open-source repo on GitHub"
-license = "MIT OR Apache-2.0"
-rust-version = "1.73"
-
-[[bench]]
-path = "benches/foo.rs"
-name = "foo"
-harness = false
-
-[features]
-default = ["std"]
-alloc = []
-std = []
+name        = "whispery"
+version     = "0.1.0"
+edition      = "2024"
+rust-version = "1.95"
+license     = "MIT OR Apache-2.0"
+description = "Sans-I/O cut/batch/whisper/align state machine for speech-to-text indexing pipelines"
+repository  = "https://github.com/findit-studio/whispery"
+readme      = "README.md"
+keywords    = ["whisper", "asr", "speech-to-text", "indexing", "alignment"]
+categories  = ["multimedia::audio", "science"]
 
 [dependencies]
+mediatime = { version = "0.1.5", default-features = false }
+smol_str  = { version = "0.3", default-features = false }
+thiserror = { version = "2", default-features = false }
+smallvec  = { version = "1", default-features = false }
+# unicode-script: per-character Unicode `Script` property lookup,
+# used by the script-dispatch pass to split mixed-script Whisper
+# segments into language-tagged runs. Pure-Rust, no_std-compatible
+# with default features off, so the `align::script` module is
+# always available regardless of `runner` / `alignment`.
+unicode-script = { version = "0.5", default-features = false }
+
+# Runner feature deps. All optional — Plan A's core compiles
+# `--no-default-features` without these.
+#
+# The whisper.cpp wrapper is the standalone `whispercpp` crate
+# at https://github.com/Findit-AI/whispercpp (workspace also
+# contains the `whispercpp-sys` low-level FFI). It replaced
+# `whisper-rs 0.16` after we reproduced two soundness bugs in
+# that crate's safe API (`set_abort_callback_safe` UB → `failed
+# to encode` on every decode; `set_initial_prompt` /
+# `set_language` `CString::into_raw` leak with no `Drop`).
+#
+# Published as `whispercpp` on crates.io
+# (https://crates.io/crates/whispercpp). Pinned to the crates.io
+# version. To test against unpublished local changes, add a
+# `[patch.crates-io]` entry in this workspace's Cargo.toml
+# rather than threading a `path = "..."` here — that keeps the
+# canonical dep declaration version-only.
+whispercpp = { version = "0.2", optional = true, default-features = false }
+
+# miniz_oxide: pure-Rust DEFLATE used by the runner's
+# compression-ratio gate to match WhisperX/OpenAI Whisper's
+# `zlib.compress(text)` byte length 1:1. Codex round-37 round-31
+# [high]: the prior shingle proxy mis-rejected legitimately
+# repetitive transcripts ("thank you thank you thank you thank
+# you" scored 3.9 vs zlib's 1.86 — well above the default 2.4
+# gate, dropping otherwise valid ASR text). Pure-Rust crate, no
+# C dep, ~30 KB.
+miniz_oxide = { version = "0.8", optional = true, default-features = false, features = ["with-alloc"] }
+
+# Alignment feature deps. All optional — Plan A/B compile without them.
+# ort: ONNX runtime bindings. Pinned to =2.0.0-rc.12 because rc.13+
+# changed Session API in incompatible ways and rc.x versions don't
+# follow semver across rc bumps.
+ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, features = ["std", "ndarray", "load-dynamic", "api-24"] }
+# tokenizers: HuggingFace WordPiece/BPE/Unigram tokenizer used to
+# read wav2vec2's tokenizer.json. ^0.20 ships pure-Rust without
+# pulling onig.
+tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
+# ndarray: tensor reshaping for the wav2vec2 input/output shapes.
+ndarray = { version = "0.17", optional = true, default-features = false, features = ["std"] }
+
+# Optional features (Plan A scope only).
+serde           = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
+# `humantime_serde` formats `Duration` as `"30s"` / `"100ms"` etc.
+# instead of the raw `{ secs, nanos }` numeric struct serde derives
+# by default. Pulled in only when `serde` is on; the conditional
+# `with = "humantime_serde"` attribute on `Duration` fields elects
+# the friendlier encoding for human-edited config files.
+humantime-serde = { version = "1", optional = true, default-features = false }
+arbitrary       = { version = "1", optional = true, features = ["derive"] }
+quickcheck      = { version = "1", optional = true, default-features = false }
 
 [dev-dependencies]
-criterion = "0.8"
-tempfile = "3"
+criterion  = { version = "0.8", default-features = false, features = ["html_reports"] }
+smol_str   = "0.3"
+tempfile   = "3"
+hound      = "3"          # WAV decoding for end-to-end tests
+sha2       = "0.11"       # build.rs SHA-256 verification
+# serde_json is dev-only — exercised in `#[cfg(feature = "serde")]`
+# round-trip tests for the per-options serde encoding (silero's
+# pattern). Production never serialises options at runtime; the
+# encoding is for human-edited config files.
+serde_json = "1"
 
-[profile.bench]
-opt-level = 3
-debug = false
-codegen-units = 1
-lto = 'thin'
-incremental = false
-debug-assertions = false
-overflow-checks = false
-rpath = false
+[build-dependencies]
+sha2 = "0.11"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# Build-time JSON parser for the bundled wav2vec2-base-960h
+# tokenizer. Decoding once at build.rs and emitting Rust
+# constants into OUT_DIR means the runtime crate never sees
+# `serde_json`'s code path for the bundled vocab — alignment
+# starts up with already-parsed `&[(&str, u32)]` slices.
+serde_json = "1"
 
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
-
+# Lint policy. Real correctness lints stay enforced. The allowed
+# entries below are decisions, not aspirations:
+#
+# * `lints.rust.dead_code = "allow"` — `cargo hack
+#   --feature-powerset` runs `cargo clippy/build` under combos
+#   where many crate-internal helpers ARE reachable but only
+#   under different feature flags (test builds, `bench-internals`
+#   re-exports, alternative SIMD targets). Without this the
+#   matrix turns "feature A doesn't use helper X" into a hard
+#   `-Dwarnings` failure for every combo that omits the feature
+#   that DOES use X.
+# * `lints.rust.unexpected_cfgs` — opt in to the `tarpaulin`
+#   cfg so the coverage job's `--cfg tarpaulin` doesn't trip
+#   the new check-cfg lint.
+# * `lints.clippy.*` — style lints we explicitly chose not to
+#   chase across the alignment / SIMD / Sans-I/O code base.
 [lints.rust]
-rust_2018_idioms = "warn"
-single_use_lifetimes = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = [
-  'cfg(all_tests)',
-  'cfg(tarpaulin)',
-] }
+dead_code = "allow"
+# `unused_mut` — three test-mod variables are bound `mut` for
+# parallelism with adjacent test cases that DO mutate them; the
+# uniformity is more readable than per-case `mut`/non-`mut`
+# diffs. Cheap to allow.
+unused_mut = "allow"
+# `unused_unsafe` — the SIMD backends in
+# `src/runner/aligner/algorithm/normalize.rs` deliberately
+# wrap individual `core::arch` intrinsics in inner `unsafe`
+# blocks for self-documentation (each line names its own
+# precondition), even when the enclosing `unsafe fn` would
+# already license the call. The lint flags this; we keep the
+# inner blocks for readability.
+unused_unsafe = "allow"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }
+
+[lints.clippy]
+collapsible_if = "allow"
+empty_line_after_doc_comments = "allow"
+manual_contains = "allow"
+manual_inspect = "allow"
+manual_is_multiple_of = "allow"
+module_inception = "allow"
+needless_range_loop = "allow"
+ptr_arg = "allow"
+same_item_push = "allow"
+too_many_arguments = "allow"
+
+[features]
+default  = ["std", "runner"]
+std      = ["mediatime/std", "smol_str/std", "serde?/std"]
+serde    = ["runner", "dep:serde", "dep:humantime-serde", "smol_str/serde", "mediatime/serde", "whispercpp?/serde"]
+runner   = ["dep:whispercpp", "dep:miniz_oxide", "std"]
+alignment = ["runner", "dep:ort", "dep:tokenizers", "dep:ndarray"]
+# Apple-only GPU acceleration for whisper.cpp. `metal` runs the
+# encoder on the unified-memory Metal backend (works on every
+# Apple Silicon Mac); `coreml` additionally dispatches the encoder
+# to ANE if the caller has produced a CoreML companion `.mlmodelc`.
+# Both default OFF — the crate compiles BLAS-only on every
+# platform without these features. Enable both on Apple Silicon
+# for production.
+metal  = ["runner", "whispercpp/metal"]
+coreml = ["runner", "whispercpp/coreml"]
+# Re-exports `pub(crate)` alignment internals (scalar/NEON normaliser
+# variants, raw `ctc_viterbi`, `LogProbsTV`) under `whispery::__bench`
+# so the SIMD baseline bench can call them directly. Doc-hidden;
+# never enable in shipping builds. Requires `alignment` for the
+# wav2vec2-pipeline symbols it exposes.
+bench-internals = ["alignment"]
+# Relaxes `tokenize_with_word_map`'s default fail-closed-on-pronounced-
+# symbol policy so non-alphanumeric OOV chars also become wildcards
+# (matching WhisperX's `*`-placeholder behaviour 1:1). Default policy
+# drops the chunk on `&` / `,` / etc. that aren't on the skippable-
+# internal-punct whitelist; under this feature they all wildcard.
+# Trade-off: full WhisperX parity at the cost of whispery's stricter
+# guard against silently aligning pronounced symbols (`&` in `AT&T`)
+# to whichever vocab item happens to win the frame. Off by default;
+# opt in only if downstream consumers expect WhisperX-1:1 behaviour.
+whisperx-strict-tokenizer = ["alignment"]
+# Diagnostic-only: write `wy_seg<N>.{emission,trellis}.bin` and a
+# `wy_seg<N>.tokens.json` companion to the directory pointed to by
+# `WHISPERY_PARITY_DUMP_TRELLIS` whenever set on a process running
+# `Aligner::align_chunk`. The dump uses hand-formatted JSON for the
+# tokens companion (no serde_json runtime dep) and `std::fs::File`
+# directly. Do NOT enable in shipping builds — the env hook + dump
+# bytes never check failures.
+parity-dump-emission = ["alignment"]
+
+[lib]
+name = "whispery"
+path = "src/lib.rs"
+
+[[example]]
+name = "core_only"
+path = "examples/core_only.rs"
+
+[[bench]]
+name    = "cut"
+path    = "benches/cut.rs"
+harness = false
+
+[[bench]]
+name    = "dispatch"
+path    = "benches/dispatch.rs"
+harness = false
+
+[[bench]]
+name              = "aligner_simd_baseline"
+path              = "benches/aligner_simd_baseline.rs"
+harness           = false
+required-features = ["bench-internals"]
+
+[[test]]
+name              = "whisperx_unit_parity"
+path              = "tests/whisperx_unit_parity.rs"
+required-features = ["bench-internals"]
