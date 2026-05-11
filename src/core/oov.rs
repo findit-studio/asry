@@ -23,7 +23,7 @@
 //! by identity (kind / char_index / word_index / language).
 //! Length, outer-shape, OR per-position identity mismatch
 //! fails loudly as
-//! `AlignmentFailureKind::TokenizationFailed` instead of
+//! `::TokenizationFailed` instead of
 //! silently mis-aligning a stale-but-same-length payload.
 //! ```
 //!
@@ -207,7 +207,7 @@ impl OovEvent {
 /// The caller produces one decision per event in the same
 /// order. Length / shape mismatches against the chunk's
 /// detected events surface as
-/// [`AlignmentFailureKind::TokenizationFailed`](crate::types::AlignmentFailureKind::TokenizationFailed)
+/// [`::TokenizationFailed`](crate::types::::TokenizationFailed)
 /// — the alignment dispatcher refuses to apply stale or
 /// out-of-shape decisions silently.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -223,7 +223,7 @@ pub enum OovDecision {
   /// transcript still ships in the resulting
   /// [`Transcript`](crate::types::Transcript) but
   /// `Transcript::words()` is empty for this chunk. Surfaces
-  /// as [`AlignmentFailureKind::SemanticOutOfVocab`](crate::types::AlignmentFailureKind::SemanticOutOfVocab)
+  /// as [`::SemanticOutOfVocab`](crate::types::::SemanticOutOfVocab)
   /// in the chunk's failure record. Honest at the cost of
   /// dropped timing.
   FailClosed,

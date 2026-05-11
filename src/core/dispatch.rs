@@ -993,10 +993,7 @@ mod tests {
     d.on_emit(fake_chunk(0, 2_000), ChunkId::from_raw(0), &b);
     d.handle_failure(
       ChunkId::from_raw(0),
-      WorkFailure::AsrFailed {
-        kind: crate::types::AsrFailureKind::AllTemperaturesFailed,
-        message: "x".into(),
-      },
+      WorkFailure::Asr(AsrError::AllTemperaturesFailed(AsrFailure::new("x".into()))),
     )
     .unwrap();
     d.after_inject(&mut b, None, u64::MAX);
@@ -1223,10 +1220,7 @@ mod tests {
       .unwrap();
     let r = d.handle_failure(
       ChunkId::from_raw(1),
-      WorkFailure::AsrFailed {
-        kind: crate::types::AsrFailureKind::AllTemperaturesFailed,
-        message: SmolStr::from("late failure"),
-      },
+      WorkFailure::Asr(AsrError::AllTemperaturesFailed(AsrFailure::new(SmolStr::from("late failure")))),
     );
     assert!(matches!(r, Err(TranscriberError::UnknownChunk(_))));
   }
@@ -1367,10 +1361,7 @@ mod tests {
     // Chunk 0 fails ASR.
     d.handle_failure(
       ChunkId::from_raw(0),
-      WorkFailure::AsrFailed {
-        kind: crate::types::AsrFailureKind::AllTemperaturesFailed,
-        message: "fail".into(),
-      },
+      WorkFailure::Asr(AsrError::AllTemperaturesFailed(AsrFailure::new("fail".into()))),
     )
     .unwrap();
     d.after_inject(&mut b, Some(0), u64::MAX);

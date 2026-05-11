@@ -3,13 +3,18 @@
 //! Two distinct error channels:
 //!
 //! - [`TranscriberError`] is for state-machine push/inject failures
-//! returned synchronously from `Transcriber::push_*` /
-//! `inject_*` / `handle_restart`.
+//!   returned synchronously from `Transcriber::push_*` /
+//!   `inject_*` / `handle_restart`.
 //! - [`WorkFailure`] is for per-chunk inference failures surfaced
-//! asynchronously via `Event::Error { chunk_id, error: WorkFailure }`
-//! (drained by `poll_event`).
+//!   asynchronously via `Event::Error { chunk_id, error: WorkFailure }`
+//!   (drained by `poll_event`).
+//!
+//! Both enums use tuple variants over named payload structs. The
+//! payload structs carry the variant-specific data (private fields
+//! + accessors), so adding a field to one variant doesn't touch
+//! the others' constructors / match arms.
 
-use core::time::Duration;
+use std::time::Duration;
 
 use smol_str::SmolStr;
 
@@ -19,182 +24,347 @@ use crate::types::{ChunkId, Lang};
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum TranscriberError {
   /// PTS regression: caller pushed samples or a VAD segment with a
-  /// timestamp earlier than the current high-water mark. The
-  /// check runs in output-PTS space (not 16 kHz space) to avoid
-  /// spurious regressions on non-integer-ratio output timebases.
-  #[error("PTS regression on {kind:?}: advance = {advance}")]
-  PtsRegression {
-    /// Which input kind regressed.
-    kind: PushKind,
-    /// Negative delta in output-timebase PTS units.
-    advance: i64,
-  },
-
-  /// Forward gap exceeds the configured tolerance. Caller likely
-  /// has a stream restart or a packet drop larger than expected.
-  /// Recover via `Transcriber::handle_restart`.
-  #[error("forward gap {gap_samples} samples exceeds tolerance {tolerance_samples}")]
-  GapExceedsTolerance {
-    /// Size of the forward gap in 16 kHz samples.
-    gap_samples: u64,
-    /// Currently configured tolerance.
-    tolerance_samples: u64,
-  },
-
-  /// Sample buffer would exceed its configured cap. The runner has
-  /// not drained completed chunks fast enough; the caller should
-  /// pause and call `poll_event` until the buffer trims.
-  #[error("sample buffer at capacity ({buffered}/{cap})")]
-  Backpressure {
-    /// Buffered sample count after this push attempt would have
-    /// committed.
-    buffered: usize,
-    /// Configured cap.
-    cap: usize,
-  },
-
-  /// `handle_vad_segment` was called before any `handle_samples`. The
-  /// output timebase is not yet established.
+  /// timestamp earlier than the current high-water mark.
+  #[error("{0}")]
+  PtsRegression(PtsRegression),
+  /// Forward gap exceeds the configured tolerance.
+  #[error("{0}")]
+  GapExceedsTolerance(GapExceedsTolerance),
+  /// Sample buffer would exceed its configured cap.
+  #[error("{0}")]
+  Backpressure(Backpressure),
+  /// `handle_vad_segment` was called before any `handle_samples`.
   #[error("handle_vad_segment called before any handle_samples")]
   OutputTimebaseUnset,
-
-  /// `handle_vad_segment` referenced audio that has not been
-  /// buffered yet — `seg.end_sample()` is past the buffer's
-  /// high-water mark. This typically indicates upstream
-  /// VAD/sample skew (the caller pushed VAD ahead of the
-  /// corresponding audio packets). Without this guard, a later
-  /// `handle_eof` flush or chunk emission would `extract` past
-  /// the buffer's tail and panic.
-  #[error("VAD segment end {vad_end} is past buffered samples {buffered}")]
-  VadAheadOfAudio {
-    /// `seg.end_sample()` value the caller passed in.
-    vad_end: u64,
-    /// `buffer.absolute_sample_offset()` at the time of the push.
-    buffered: u64,
-  },
-
-  /// `handle_samples` was called with a `Timestamp` whose timebase
-  /// does not match the timebase recorded from the first push.
-  #[error("inconsistent output timebase: expected {expected:?}, got {got:?}")]
-  InconsistentTimebase {
-    /// Expected output timebase (recorded on first push).
-    expected: mediatime::Timebase,
-    /// Caller-supplied timebase that did not match.
-    got: mediatime::Timebase,
-  },
-
-  /// Caller passed a `Timestamp` whose timebase has a zero
-  /// numerator. `mediatime::Timebase::new(0, _)` is constructible
-  /// (the type only enforces non-zero denominator), and using it
-  /// as the target of `Timebase::rescale_pts` would panic. The
-  /// public boundary rejects it explicitly so a malformed caller
-  /// timebase surfaces as `Err(_)` instead of an abort.
-  #[error("timebase numerator must be non-zero (got {numerator})")]
-  InvalidTimebase {
-    /// The offending zero (or otherwise rejected) numerator.
-    numerator: u32,
-  },
-
-  /// Caller `inject_*`-ed a chunk_id that does not match an in-flight
-  /// chunk.
+  /// `handle_vad_segment` referenced audio past the buffered tail.
+  #[error("{0}")]
+  VadAheadOfAudio(VadAheadOfAudio),
+  /// `handle_samples` timebase doesn't match the recorded one.
+  #[error("{0}")]
+  InconsistentTimebase(InconsistentTimebase),
+  /// Caller's timebase has a zero numerator.
+  #[error("{0}")]
+  InvalidTimebase(InvalidTimebase),
+  /// Caller `inject_*`-ed a chunk_id that does not match in-flight.
   #[error("unknown or already-resolved chunk_id {0}")]
   UnknownChunk(ChunkId),
-
-  /// Caller called `handle_eof` and then attempted to push or
-  /// `handle_restart`. Once a stream is ended it cannot be re-anchored;
-  /// construct a fresh `Transcriber` instead.
+  /// Caller called `handle_eof` and then attempted to push.
   #[error("operation rejected after handle_eof")]
   AfterEof,
 }
+
+/// PTS regression payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("PTS regression on {kind:?}: advance = {advance}")]
+pub struct PtsRegression {
+  kind: PushKind,
+  advance: i64,
+}
+
+impl PtsRegression {
+  /// Construct from kind + negative-delta advance.
+  #[must_use]
+  pub const fn new(kind: PushKind, advance: i64) -> Self {
+    Self { kind, advance }
+  }
+  /// Which input kind regressed.
+  #[must_use]
+  pub const fn kind(&self) -> PushKind {
+    self.kind
+  }
+  /// Negative delta in output-timebase PTS units.
+  #[must_use]
+  pub const fn advance(&self) -> i64 {
+    self.advance
+  }
+}
+
+/// Forward gap exceeded the configured tolerance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("forward gap {gap_samples} samples exceeds tolerance {tolerance_samples}")]
+pub struct GapExceedsTolerance {
+  gap_samples: u64,
+  tolerance_samples: u64,
+}
+
+impl GapExceedsTolerance {
+  /// Construct from observed gap + configured tolerance.
+  #[must_use]
+  pub const fn new(gap_samples: u64, tolerance_samples: u64) -> Self {
+    Self {
+      gap_samples,
+      tolerance_samples,
+    }
+  }
+  /// Size of the forward gap in 16 kHz samples.
+  #[must_use]
+  pub const fn gap_samples(&self) -> u64 {
+    self.gap_samples
+  }
+  /// Currently configured tolerance.
+  #[must_use]
+  pub const fn tolerance_samples(&self) -> u64 {
+    self.tolerance_samples
+  }
+}
+
+/// Sample buffer would exceed its configured cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("sample buffer at capacity ({buffered}/{cap})")]
+pub struct Backpressure {
+  buffered: usize,
+  cap: usize,
+}
+
+impl Backpressure {
+  /// Construct from buffered count + configured cap.
+  #[must_use]
+  pub const fn new(buffered: usize, cap: usize) -> Self {
+    Self { buffered, cap }
+  }
+  /// Buffered sample count after this push would have committed.
+  #[must_use]
+  pub const fn buffered(&self) -> usize {
+    self.buffered
+  }
+  /// Configured cap.
+  #[must_use]
+  pub const fn cap(&self) -> usize {
+    self.cap
+  }
+}
+
+/// `handle_vad_segment` referenced audio past the buffered tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("VAD segment end {vad_end} is past buffered samples {buffered}")]
+pub struct VadAheadOfAudio {
+  vad_end: u64,
+  buffered: u64,
+}
+
+impl VadAheadOfAudio {
+  /// Construct from VAD end + current buffer high-water.
+  #[must_use]
+  pub const fn new(vad_end: u64, buffered: u64) -> Self {
+    Self { vad_end, buffered }
+  }
+  /// `seg.end_sample()` value the caller passed in.
+  #[must_use]
+  pub const fn vad_end(&self) -> u64 {
+    self.vad_end
+  }
+  /// `buffer.absolute_sample_offset()` at the time of the push.
+  #[must_use]
+  pub const fn buffered(&self) -> u64 {
+    self.buffered
+  }
+}
+
+/// Caller's timebase doesn't match the one recorded on first push.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("inconsistent output timebase: expected {expected:?}, got {got:?}")]
+pub struct InconsistentTimebase {
+  expected: mediatime::Timebase,
+  got: mediatime::Timebase,
+}
+
+impl InconsistentTimebase {
+  /// Construct from expected vs. supplied timebases.
+  #[must_use]
+  pub const fn new(expected: mediatime::Timebase, got: mediatime::Timebase) -> Self {
+    Self { expected, got }
+  }
+  /// Expected output timebase (recorded on first push).
+  #[must_use]
+  pub const fn expected(&self) -> mediatime::Timebase {
+    self.expected
+  }
+  /// Caller-supplied timebase that did not match.
+  #[must_use]
+  pub const fn got(&self) -> mediatime::Timebase {
+    self.got
+  }
+}
+
+/// Caller supplied a malformed timebase (zero numerator).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("timebase numerator must be non-zero (got {numerator})")]
+pub struct InvalidTimebase {
+  numerator: u32,
+}
+
+impl InvalidTimebase {
+  /// Construct from the offending zero numerator.
+  #[must_use]
+  pub const fn new(numerator: u32) -> Self {
+    Self { numerator }
+  }
+  /// The offending zero numerator.
+  #[must_use]
+  pub const fn numerator(&self) -> u32 {
+    self.numerator
+  }
+}
+
+// --- Per-chunk inference failures -----------------------------
 
 /// Per-chunk inference failure surfaced via `Event::Error`.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum WorkFailure {
   /// ASR (whisper) inference failed.
-  #[error("ASR failed: {message}")]
-  AsrFailed {
-    /// Failure category.
-    kind: AsrFailureKind,
-    /// Human-readable detail (typically the backend's error text).
-    message: SmolStr,
-  },
-
+  #[error(transparent)]
+  Asr(AsrError),
   /// Word-level forced alignment failed.
-  #[error("alignment failed for language {language:?}: {message}")]
-  AlignmentFailed {
-    /// Failure category.
-    kind: AlignmentFailureKind,
-    /// Human-readable detail.
-    message: SmolStr,
-    /// Language whose aligner failed.
-    language: Lang,
-  },
-
-  /// No aligner registered for the chunk's language and the
-  /// fallback policy is `Error`.
-  #[error("no aligner registered for language {language:?}")]
-  LanguageUnsupportedForAlignment {
-    /// Detected language without a registered aligner.
-    language: Lang,
-  },
-
+  #[error(transparent)]
+  Alignment(AlignmentError),
+  /// No aligner registered for the chunk's language.
+  #[error("{0}")]
+  LanguageUnsupported(LanguageUnsupportedForAlignment),
   /// Worker exceeded its per-job timeout.
-  #[error("{kind:?} worker hung; elapsed {elapsed:?}")]
-  WorkerHangTimeout {
-    /// Which worker timed out.
-    kind: WorkerKind,
-    /// Time spent on the failed job.
-    elapsed: Duration,
-  },
+  #[error("{0}")]
+  WorkerHang(WorkerHangTimeout),
 }
 
-/// Why an ASR inference failed.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum AsrFailureKind {
-  /// All temperatures in the runner's retry ladder were tried and
-  /// every result violated the log-prob or compression-ratio
-  /// thresholds.
-  AllTemperaturesFailed,
+/// ASR-side per-chunk failures. Variant identifies the cause; the
+/// payload carries the diagnostic message.
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum AsrError {
+  /// All temperatures in the retry ladder were tried and every
+  /// result violated the log-prob or compression-ratio thresholds.
+  #[error("ASR all temperatures failed: {0}")]
+  AllTemperaturesFailed(AsrFailure),
   /// Auto-detected language is not in whisper.cpp's supported set.
-  UnsupportedLanguage,
+  #[error("ASR unsupported language: {0}")]
+  UnsupportedLanguage(AsrFailure),
   /// Backend returned an error during inference.
-  BackendError,
+  #[error("ASR backend error: {0}")]
+  BackendError(AsrFailure),
 }
-// Note: there is no `EmptyOutput` variant. A whisper-rs result with
-// zero segments is normal output — usually a silent chunk — and is
-// represented as a `Transcript` with empty `text` and an elevated
-// `no_speech_prob`. Treating empty output as a failure would convert
-// every silent chunk into Event::Error and contradict the
-// `no_speech_prob` field's semantics.
 
-/// Why a word-level alignment failed.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum AlignmentFailureKind {
+/// Diagnostic payload shared across [`AsrError`] variants.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct AsrFailure {
+  message: SmolStr,
+}
+
+impl AsrFailure {
+  /// Construct from a human-readable diagnostic.
+  #[must_use]
+  pub const fn new(message: SmolStr) -> Self {
+    Self { message }
+  }
+  /// Diagnostic message.
+  #[must_use]
+  pub fn message(&self) -> &SmolStr {
+    &self.message
+  }
+}
+
+/// Alignment-side per-chunk failures. Variant identifies the cause;
+/// the payload carries the diagnostic + the language whose aligner
+/// failed.
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum AlignmentError {
   /// wav2vec2 ONNX inference failed.
-  ModelInferenceFailed,
-  /// Tokenization of the normalised text against the wav2vec2
-  /// vocab failed.
-  TokenizationFailed,
+  #[error("alignment model inference failed: {0}")]
+  ModelInferenceFailed(AlignmentFailure),
+  /// Tokenization of the normalised text failed.
+  #[error("alignment tokenization failed: {0}")]
+  TokenizationFailed(AlignmentFailure),
   /// Text normalisation step failed.
-  NormalizationFailed,
+  #[error("alignment normalization failed: {0}")]
+  NormalizationFailed(AlignmentFailure),
   /// CTC Viterbi found no valid alignment path.
-  NoAlignmentPath,
+  #[error("no alignment path: {0}")]
+  NoAlignmentPath(AlignmentFailure),
   /// Whisper text was empty after normalisation.
-  EmptyText,
-  /// A pronounced symbol the model cannot honestly align (e.g.
-  /// `&` in `AT&T`, `@`, `%`) appeared in the chunk and is not
-  /// covered by the wildcard policy. The chunk's word-level
-  /// alignment is dropped (the dispatch emits `Transcript {
-  /// text, words: [] }`), but the failure is **observable** —
-  /// callers can see this kind in telemetry rather than the
-  /// silent empty-`AlignmentResult` path. Distinct
-  /// from `TokenizationFailed`, which is reserved for genuine
-  /// tokenizer/model mismatches that are not recoverable.
-  /// ([high].)
-  SemanticOutOfVocab,
+  #[error("empty text after normalisation: {0}")]
+  EmptyText(AlignmentFailure),
+  /// A pronounced symbol the model cannot honestly align appeared
+  /// in the chunk and is not covered by the wildcard policy.
+  #[error("alignment semantic-OOV: {0}")]
+  SemanticOutOfVocab(AlignmentFailure),
 }
 
-/// Which input kind triggered a `PtsRegression`.
+/// Diagnostic payload shared across [`AlignmentError`] variants.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("language={language:?} message={message}")]
+pub struct AlignmentFailure {
+  message: SmolStr,
+  language: Lang,
+}
+
+impl AlignmentFailure {
+  /// Construct from a diagnostic + the language whose aligner
+  /// produced it.
+  #[must_use]
+  pub const fn new(message: SmolStr, language: Lang) -> Self {
+    Self { message, language }
+  }
+  /// Diagnostic message.
+  #[must_use]
+  pub fn message(&self) -> &SmolStr {
+    &self.message
+  }
+  /// Language whose aligner failed.
+  #[must_use]
+  pub const fn language(&self) -> &Lang {
+    &self.language
+  }
+}
+
+/// No aligner registered for the chunk's language and the fallback
+/// policy is `Error`.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("no aligner registered for language {language:?}")]
+pub struct LanguageUnsupportedForAlignment {
+  language: Lang,
+}
+
+impl LanguageUnsupportedForAlignment {
+  /// Construct from the detected language without a registered
+  /// aligner.
+  #[must_use]
+  pub const fn new(language: Lang) -> Self {
+    Self { language }
+  }
+  /// Detected language without a registered aligner.
+  #[must_use]
+  pub const fn language(&self) -> &Lang {
+    &self.language
+  }
+}
+
+/// Worker exceeded its per-job timeout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{kind:?} worker hung; elapsed {elapsed:?}")]
+pub struct WorkerHangTimeout {
+  kind: WorkerKind,
+  elapsed: Duration,
+}
+
+impl WorkerHangTimeout {
+  /// Construct from the worker kind + wall-clock elapsed.
+  #[must_use]
+  pub const fn new(kind: WorkerKind, elapsed: Duration) -> Self {
+    Self { kind, elapsed }
+  }
+  /// Which worker timed out.
+  #[must_use]
+  pub const fn kind(&self) -> WorkerKind {
+    self.kind
+  }
+  /// Time spent on the failed job.
+  #[must_use]
+  pub const fn elapsed(&self) -> Duration {
+    self.elapsed
+  }
+}
+
+// --- Tag enums ------------------------------------------------
+
+/// Which input kind triggered a [`PtsRegression`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PushKind {
   /// `handle_samples`.
@@ -215,14 +385,10 @@ pub enum WorkerKind {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::string::ToString;
 
   #[test]
   fn pts_regression_displays_kind() {
-    let e = TranscriberError::PtsRegression {
-      kind: PushKind::Samples,
-      advance: -100,
-    };
+    let e = TranscriberError::PtsRegression(PtsRegression::new(PushKind::Samples, -100));
     let s = e.to_string();
     assert!(s.contains("Samples"));
     assert!(s.contains("-100"));
@@ -230,10 +396,9 @@ mod tests {
 
   #[test]
   fn work_failure_clones() {
-    let f = WorkFailure::AsrFailed {
-      kind: AsrFailureKind::AllTemperaturesFailed,
-      message: "oops".into(),
-    };
+    let f = WorkFailure::Asr(AsrError::AllTemperaturesFailed(AsrFailure::new(
+      "oops".into(),
+    )));
     let _ = f.clone();
   }
 }

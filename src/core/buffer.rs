@@ -14,7 +14,13 @@ use Vec;
 
 use mediatime::{Timebase, Timestamp};
 
-use crate::{time::ANALYSIS_TIMEBASE, types::TranscriberError};
+use crate::{
+  time::ANALYSIS_TIMEBASE,
+  types::{
+    Backpressure, GapExceedsTolerance, InconsistentTimebase, PtsRegression, PushKind,
+    TranscriberError, VadAheadOfAudio,
+  },
+};
 
 /// Live audio buffer.
 pub(crate) struct SampleBuffer {
@@ -91,10 +97,7 @@ impl SampleBuffer {
     let (effective_tb, effective_anchor, would_be_first_push) = match self.output_tb {
       Some(expected_tb) => {
         if starts_at.timebase() != expected_tb {
-          return Err(TranscriberError::InconsistentTimebase {
-            expected: expected_tb,
-            got: starts_at.timebase(),
-          });
+          return Err(TranscriberError::InconsistentTimebase(InconsistentTimebase::new(expected_tb, starts_at.timebase())));
         }
         (expected_tb, self.base_pts_out_anchor, false)
       }
@@ -115,10 +118,7 @@ impl SampleBuffer {
     let delta_pts_out = starts_at.pts() - expected_pts_out;
 
     let delta_samples: u64 = if delta_pts_out < 0 {
-      return Err(TranscriberError::PtsRegression {
-        kind: crate::types::PushKind::Samples,
-        advance: delta_pts_out,
-      });
+      return Err(TranscriberError::PtsRegression(PtsRegression::new(crate::types::PushKind::Samples, delta_pts_out)));
     } else if delta_pts_out == 0 {
       0
     } else {
@@ -126,10 +126,7 @@ impl SampleBuffer {
       // zero-fill width / tolerance check.
       let g = Timebase::rescale_pts(delta_pts_out, effective_tb, ANALYSIS_TIMEBASE);
       if (g as u64) > self.gap_tolerance_samples {
-        return Err(TranscriberError::GapExceedsTolerance {
-          gap_samples: g as u64,
-          tolerance_samples: self.gap_tolerance_samples,
-        });
+        return Err(TranscriberError::GapExceedsTolerance(GapExceedsTolerance::new(g as u64, self.gap_tolerance_samples)));
       }
       g as u64
     };
@@ -160,10 +157,7 @@ impl SampleBuffer {
     let delta_usize = match usize::try_from(delta_samples) {
       Ok(v) => v,
       Err(_) => {
-        return Err(TranscriberError::Backpressure {
-          buffered: usize::MAX,
-          cap: self.cap,
-        });
+        return Err(TranscriberError::Backpressure(Backpressure::new(usize::MAX, self.cap)));
       }
     };
     let total_with_queued = self
@@ -175,17 +169,11 @@ impl SampleBuffer {
     let total_with_queued = match total_with_queued {
       Some(v) => v,
       None => {
-        return Err(TranscriberError::Backpressure {
-          buffered: usize::MAX,
-          cap: self.cap,
-        });
+        return Err(TranscriberError::Backpressure(Backpressure::new(usize::MAX, self.cap)));
       }
     };
     if total_with_queued > self.cap {
-      return Err(TranscriberError::Backpressure {
-        buffered: total_with_queued,
-        cap: self.cap,
-      });
+      return Err(TranscriberError::Backpressure(Backpressure::new(total_with_queued, self.cap)));
     }
 
     // Empty-packet must never mutate stream state. Three cases
@@ -386,10 +374,7 @@ mod tests {
     let result = b.append(ts_at_48k(47_000), &[0.0; 100], 0);
     assert!(matches!(
       result,
-      Err(TranscriberError::PtsRegression {
-        kind: crate::types::PushKind::Samples,
-        ..
-      })
+      Err(TranscriberError::PtsRegression(PtsRegression::new(crate::types::PushKind::Samples, )))
     ));
   }
 
@@ -412,7 +397,7 @@ mod tests {
     let r = b.append(ts_at_48k(1300), &[0.0; 100], 0);
     assert!(matches!(
       r,
-      Err(TranscriberError::GapExceedsTolerance { .. })
+      Err(TranscriberError::GapExceedsTolerance(_))
     ));
   }
 
@@ -421,7 +406,7 @@ mod tests {
     let mut b = SampleBuffer::new(150, 3200);
     let r = b.append(ts_at_48k(0), &[0.0; 200], 0);
     assert!(
-      matches!(r, Err(TranscriberError::Backpressure { buffered, cap }) if buffered == 200 && cap == 150)
+      matches!(r, Err(TranscriberError::Backpressure(_)) if buffered == 200 && cap == 150)
     );
     // Backpressure must NOT mutate state. The buffer should be
     // empty and absolute_sample_offset should still be 0 — the
@@ -449,7 +434,7 @@ mod tests {
     let mut b = SampleBuffer::new(150, 3200);
     // First push at cap is rejected with no state advance.
     let r = b.append(ts_at_48k(0), &[0.0; 200], 0);
-    assert!(matches!(r, Err(TranscriberError::Backpressure { .. })));
+    assert!(matches!(r, Err(TranscriberError::Backpressure(_))));
     assert_eq!(b.buffered_samples(), 0);
     assert_eq!(b.absolute_sample_offset(), 0);
     // Same anchor PTS still works on a smaller packet.
@@ -471,7 +456,7 @@ mod tests {
     let mut b = SampleBuffer::new(150, 3200);
     // First push fails with Backpressure (200 > 150).
     let r = b.append(ts_at_48k(48_000), &[0.0; 200], 0);
-    assert!(matches!(r, Err(TranscriberError::Backpressure { .. })));
+    assert!(matches!(r, Err(TranscriberError::Backpressure(_))));
     // Timebase and anchor must remain uncommitted.
     assert_eq!(
       b.output_timebase(),
@@ -507,7 +492,7 @@ mod tests {
     let r = b.append(Timestamp::new(0, other_tb), &[0.0; 100], 0);
     assert!(matches!(
       r,
-      Err(TranscriberError::InconsistentTimebase { .. })
+      Err(TranscriberError::InconsistentTimebase(_))
     ));
   }
 
@@ -689,7 +674,7 @@ mod tests {
     let huge_pts = 48_000_i64.saturating_mul(6 * 3600);
     let r = b.append(ts_at_48k(huge_pts), &[1.0; 1], 0);
     match r {
-      Err(TranscriberError::Backpressure { .. }) => {}
+      Err(TranscriberError::Backpressure(_)) => {}
       other => panic!("expected Backpressure on overflow; got {other:?}"),
     }
   }

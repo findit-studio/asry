@@ -34,7 +34,7 @@
 //! into an in-band `NoAlignmentPath` failure rather than an OOM.
 //! - **Vocab-id bounds checks** — every real token id and the
 //! blank id must fit in the model's vocab dim; a tokenizer-vs-
-//! model mismatch surfaces as `AlignmentFailureKind::TokenizationFailed`
+//! model mismatch surfaces as `::TokenizationFailed`
 //! / `ModelInferenceFailed` rather than a panicking out-of-bounds
 //! read.
 
@@ -44,7 +44,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
   runner::aligner::algorithm::encode::LogProbsTV,
-  types::{AlignmentFailureKind, Lang, WorkFailure, WorkerKind},
+  types::{AlignmentError, AlignmentFailure, Lang, WorkFailure, WorkerHangTimeout, WorkerKind},
 };
 
 /// Sentinel token id for "wildcard" (any non-blank vocab item)
@@ -202,45 +202,29 @@ pub fn get_trellis(
   let t = log_probs.t();
   let num_tokens = tokens.len();
   if num_tokens == 0 {
-    return Err(WorkFailure::AlignmentFailed {
-      kind: AlignmentFailureKind::NoAlignmentPath,
-      message: SmolStr::from("token sequence is empty"),
-      language: language.clone(),
-    });
+    return Err(WorkFailure::Alignment(AlignmentError::NoAlignmentPath(AlignmentFailure::new(SmolStr::from("token sequence is empty"), language.clone()))));
   }
   let v = log_probs.v();
   if (blank_id as usize) >= v {
-    return Err(WorkFailure::AlignmentFailed {
-      kind: AlignmentFailureKind::ModelInferenceFailed,
-      message: format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!(
         "blank token id {blank_id} >= model output vocab dim {v}; tokenizer/model mismatch?"
-      ),
-      language: language.clone(),
-    });
+      ), language.clone()))));
   }
   for (i, &tok) in tokens.iter().enumerate() {
     if tok == WILDCARD_TOKEN_ID {
       continue;
     }
     if tok < 0 {
-      return Err(WorkFailure::AlignmentFailed {
-        kind: AlignmentFailureKind::TokenizationFailed,
-        message: format_smolstr!(
+      return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
           "token id {tok} at position {i} is negative (only the wildcard \
  sentinel {WILDCARD_TOKEN_ID} is allowed); tokenizer bug?"
-        ),
-        language: language.clone(),
-      });
+        ), language.clone()))));
     }
     if (tok as usize) >= v {
-      return Err(WorkFailure::AlignmentFailed {
-        kind: AlignmentFailureKind::TokenizationFailed,
-        message: format_smolstr!(
+      return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
           "token id {tok} at position {i} >= model output vocab dim {v}; \
  tokenizer/model mismatch?"
-        ),
-        language: language.clone(),
-      });
+        ), language.clone()))));
     }
   }
 
@@ -249,45 +233,30 @@ pub fn get_trellis(
   // a typed error so the runner short-circuits cleanly rather than
   // surface a panic from the DP boundary.
   if t < num_tokens {
-    return Err(WorkFailure::AlignmentFailed {
-      kind: AlignmentFailureKind::NoAlignmentPath,
-      message: format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::NoAlignmentPath(AlignmentFailure::new(format_smolstr!(
         "audio too short: T={} frames < {} chars; trellis is degenerate",
         t,
         num_tokens
-      ),
-      language: language.clone(),
-    });
+      ), language.clone()))));
   }
 
   let cells = match t.checked_mul(num_tokens) {
     Some(v) => v,
     None => {
-      return Err(WorkFailure::AlignmentFailed {
-        kind: AlignmentFailureKind::NoAlignmentPath,
-        message: format_smolstr!("trellis size overflows usize: T={t} * num_tokens={num_tokens}"),
-        language: language.clone(),
-      });
+      return Err(WorkFailure::Alignment(AlignmentError::NoAlignmentPath(AlignmentFailure::new(format_smolstr!("trellis size overflows usize: T={t} * num_tokens={num_tokens}"), language.clone()))));
     }
   };
   if cells > TRELLIS_CELL_BUDGET {
-    return Err(WorkFailure::AlignmentFailed {
-      kind: AlignmentFailureKind::NoAlignmentPath,
-      message: format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::NoAlignmentPath(AlignmentFailure::new(format_smolstr!(
         "trellis exceeds {} cells (T={} × num_tokens={} = {})",
         TRELLIS_CELL_BUDGET,
         t,
         num_tokens,
         cells
-      ),
-      language: language.clone(),
-    });
+      ), language.clone()))));
   }
   if abort_flag.load(Ordering::Relaxed) {
-    return Err(WorkFailure::WorkerHangTimeout {
-      kind: WorkerKind::Alignment,
-      elapsed: core::time::Duration::ZERO,
-    });
+    return Err(WorkFailure::WorkerHang(WorkerHangTimeout::new(WorkerKind::Alignment, core::time::Duration::ZERO)));
   }
 
   // Allocate as a flat `T * num_tokens` row-major buffer so we can
@@ -387,10 +356,7 @@ pub fn get_trellis(
   // ─────────────────────────────────────────────────────────────
   for t_idx in 0..t.saturating_sub(1) {
     if t_idx % 64 == 0 && abort_flag.load(Ordering::Relaxed) {
-      return Err(WorkFailure::WorkerHangTimeout {
-        kind: WorkerKind::Alignment,
-        elapsed: core::time::Duration::ZERO,
-      });
+      return Err(WorkFailure::WorkerHang(WorkerHangTimeout::new(WorkerKind::Alignment, core::time::Duration::ZERO)));
     }
     let blank_emit = log_probs.at(t_idx, blank_id as usize);
     // Pre-compute the wildcard emission for this frame once
@@ -488,18 +454,10 @@ pub fn backtrack_beam(
   let t = log_probs.t();
   let num_tokens = tokens.len();
   if num_tokens == 0 {
-    return Err(WorkFailure::AlignmentFailed {
-      kind: AlignmentFailureKind::NoAlignmentPath,
-      message: SmolStr::from("token sequence is empty"),
-      language: language.clone(),
-    });
+    return Err(WorkFailure::Alignment(AlignmentError::NoAlignmentPath(AlignmentFailure::new(SmolStr::from("token sequence is empty"), language.clone()))));
   }
   if t == 0 {
-    return Err(WorkFailure::AlignmentFailed {
-      kind: AlignmentFailureKind::NoAlignmentPath,
-      message: SmolStr::from("emission has zero frames"),
-      language: language.clone(),
-    });
+    return Err(WorkFailure::Alignment(AlignmentError::NoAlignmentPath(AlignmentFailure::new(SmolStr::from("emission has zero frames"), language.clone()))));
   }
 
   // WhisperX's init: `T = trellis.size(0) - 1`, `J =
@@ -510,16 +468,12 @@ pub fn backtrack_beam(
   let final_j = num_tokens - 1;
   let final_score = trellis[final_t * num_tokens + final_j];
   if !final_score.is_finite() {
-    return Err(WorkFailure::AlignmentFailed {
-      kind: AlignmentFailureKind::NoAlignmentPath,
-      message: format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::NoAlignmentPath(AlignmentFailure::new(format_smolstr!(
         "trellis end cell at (t={}, j={}) is non-finite ({}); no path to backtrack",
         final_t,
         final_j,
         final_score
-      ),
-      language: language.clone(),
-    });
+      ), language.clone()))));
   }
   // All beam nodes ever created live in this arena. Active beams
   // are indices into it. A node's `prev` field links to its
@@ -558,10 +512,7 @@ pub fn backtrack_beam(
   while !active.is_empty() && arena[active[0] as usize].token_index > 0 {
     iters += 1;
     if iters % 64 == 0 && abort_flag.load(Ordering::Relaxed) {
-      return Err(WorkFailure::WorkerHangTimeout {
-        kind: WorkerKind::Alignment,
-        elapsed: core::time::Duration::ZERO,
-      });
+      return Err(WorkFailure::WorkerHang(WorkerHangTimeout::new(WorkerKind::Alignment, core::time::Duration::ZERO)));
     }
     next_active.clear();
     for &beam_idx in &active {
@@ -644,14 +595,10 @@ pub fn backtrack_beam(
       // Stay branch.
       if stay_score.is_finite() {
         if arena.len() >= BEAM_NODE_BUDGET {
-          return Err(WorkFailure::AlignmentFailed {
-            kind: AlignmentFailureKind::NoAlignmentPath,
-            message: format_smolstr!(
+          return Err(WorkFailure::Alignment(AlignmentError::NoAlignmentPath(AlignmentFailure::new(format_smolstr!(
               "beam arena exceeded {BEAM_NODE_BUDGET} nodes; lattice likely degenerate \
  (high T, very few tokens). Aborting backtrack to bound memory."
-            ),
-            language: language.clone(),
-          });
+            ), language.clone()))));
         }
         let new_idx = arena.len() as u32;
         arena.push(BeamNode {
@@ -667,14 +614,10 @@ pub fn backtrack_beam(
       // score is finite).
       if j_curr > 0 && change_score.is_finite() {
         if arena.len() >= BEAM_NODE_BUDGET {
-          return Err(WorkFailure::AlignmentFailed {
-            kind: AlignmentFailureKind::NoAlignmentPath,
-            message: format_smolstr!(
+          return Err(WorkFailure::Alignment(AlignmentError::NoAlignmentPath(AlignmentFailure::new(format_smolstr!(
               "beam arena exceeded {BEAM_NODE_BUDGET} nodes (change branch); lattice \
  likely degenerate. Aborting backtrack to bound memory."
-            ),
-            language: language.clone(),
-          });
+            ), language.clone()))));
         }
         let new_idx = arena.len() as u32;
         arena.push(BeamNode {
@@ -700,11 +643,7 @@ pub fn backtrack_beam(
   }
 
   if active.is_empty() {
-    return Err(WorkFailure::AlignmentFailed {
-      kind: AlignmentFailureKind::NoAlignmentPath,
-      message: SmolStr::from("beam search emptied before reaching token 0"),
-      language: language.clone(),
-    });
+    return Err(WorkFailure::Alignment(AlignmentError::NoAlignmentPath(AlignmentFailure::new(SmolStr::from("beam search emptied before reaching token 0"), language.clone()))));
   }
 
   // Reconstruct the path in ascending-time order. Two parts:
@@ -965,15 +904,11 @@ pub fn align_to_word_segments(
   // Sanity: `word_idx_per_token` must align 1:1 with `tokens`.
   // Caller bug otherwise.
   if tokens.len() != word_idx_per_token.len() {
-    return Err(WorkFailure::AlignmentFailed {
-      kind: AlignmentFailureKind::TokenizationFailed,
-      message: format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
         "tokens.len() = {} != word_idx_per_token.len() = {}; tokenizer bug?",
         tokens.len(),
         word_idx_per_token.len()
-      ),
-      language: language.clone(),
-    });
+      ), language.clone()))));
   }
 
   let trellis = get_trellis(log_probs, tokens, blank_id, abort_flag, language)?;
@@ -1668,10 +1603,7 @@ mod tests {
     let err = get_trellis(&log_probs, &[], 0, never(), &Lang::En).unwrap_err();
     assert!(matches!(
       err,
-      WorkFailure::AlignmentFailed {
-        kind: AlignmentFailureKind::NoAlignmentPath,
-        ..
-      }
+      WorkFailure::Alignment(AlignmentError::NoAlignmentPath(_))
     ));
   }
 
@@ -1682,10 +1614,7 @@ mod tests {
     let err = get_trellis(&log_probs, &[1, 2, 3], 0, never(), &Lang::En).unwrap_err();
     assert!(matches!(
       err,
-      WorkFailure::AlignmentFailed {
-        kind: AlignmentFailureKind::NoAlignmentPath,
-        ..
-      }
+      WorkFailure::Alignment(AlignmentError::NoAlignmentPath(_))
     ));
   }
 
@@ -1695,10 +1624,7 @@ mod tests {
     let err = get_trellis(&log_probs, &[1, 99], 0, never(), &Lang::En).unwrap_err();
     assert!(matches!(
       err,
-      WorkFailure::AlignmentFailed {
-        kind: AlignmentFailureKind::TokenizationFailed,
-        ..
-      }
+      WorkFailure::Alignment(AlignmentError::TokenizationFailed(_))
     ));
   }
 
@@ -1717,10 +1643,7 @@ mod tests {
     let err = get_trellis(&log_probs, &[1, -2], 0, never(), &Lang::En).unwrap_err();
     assert!(matches!(
       err,
-      WorkFailure::AlignmentFailed {
-        kind: AlignmentFailureKind::TokenizationFailed,
-        ..
-      }
+      WorkFailure::Alignment(AlignmentError::TokenizationFailed(_))
     ));
   }
 
@@ -1734,10 +1657,7 @@ mod tests {
     let err = get_trellis(&log_probs, &tokens, 0, &abort, &Lang::En).unwrap_err();
     assert!(matches!(
       err,
-      WorkFailure::WorkerHangTimeout {
-        kind: WorkerKind::Alignment,
-        ..
-      }
+      WorkFailure::WorkerHang(WorkerHangTimeout::new(WorkerKind::Alignment, ))
     ));
   }
 
@@ -1748,10 +1668,10 @@ mod tests {
     let log_probs = LogProbsTV::new(8_000, 8, vec![0.0_f32; 1]);
     let tokens: Vec<i32> = (0..5_000).map(|i| 1 + (i % 4)).collect();
     let err = get_trellis(&log_probs, &tokens, 0, never(), &Lang::En).unwrap_err();
-    let WorkFailure::AlignmentFailed { kind, message, .. } = err else {
+    let WorkFailure::Alignment(AlignmentError::NoAlignmentPath(payload)) = err else {
       panic!("expected AlignmentFailed");
     };
-    assert!(matches!(kind, AlignmentFailureKind::NoAlignmentPath));
+    let message = payload.message();
     assert!(
       message.contains("trellis exceeds"),
       "message must call out the budget; got {message:?}"

@@ -6,7 +6,7 @@ use smol_str::SmolStr;
 
 /// Why text normalisation failed. Used as
 /// `WorkFailure::AlignmentFailed.message` source; the kind is
-/// always `AlignmentFailureKind::NormalizationFailed`.
+/// always `::NormalizationFailed`.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum NormalizationError {
   /// Input was empty after stripping whitespace and punctuation;

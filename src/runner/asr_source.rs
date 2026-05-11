@@ -28,7 +28,7 @@ use std::sync::{Arc, atomic::AtomicBool};
 
 use crate::{
   core::{AsrParams, AsrResult},
-  types::{ChunkId, WorkFailure},
+  types::{AsrError, AsrFailure, ChunkId, WorkFailure},
 };
 
 #[cfg(feature = "runner")]
@@ -178,7 +178,7 @@ impl AsrSource for WhisperAsrSource {
     // The alignment path has the equivalent guard
     // (`Aligner::align_chunk_with_abort`); ASR was the only
     // public ingestion path missing it. Reject as
-    // `AsrFailureKind::BackendError` with the failing index;
+    // `::BackendError` with the failing index;
     // the audio sample value itself is not logged because
     // floats are not user-content but the index is enough to
     // localise the bug.
@@ -189,13 +189,10 @@ impl AsrSource for WhisperAsrSource {
       .enumerate()
       .find(|(_, s)| !s.is_finite())
     {
-      return Err(WorkFailure::AsrFailed {
-        kind: crate::types::AsrFailureKind::BackendError,
-        message: format_smolstr!(
+      return Err(WorkFailure::Asr(AsrError::BackendError(AsrFailure::new(format_smolstr!(
           "non-finite ASR sample at index {idx} (value {val:?}); upstream audio corruption — \
            refuse to encode rather than poison whisper.cpp's float math"
-        ),
-      });
+        )))));
     }
     let job = AsrWorkItem {
       chunk_id: chunk.chunk_id(),

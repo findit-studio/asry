@@ -282,7 +282,7 @@ impl AsrParams {
   /// Panics if `value == 0`. The retry ladder iterates
   /// `for _attempt in 0..max_attempts`, so `0` would skip
   /// `state.full(...)` entirely and return
-  /// [`AsrFailureKind::AllTemperaturesFailed`](crate::types::AsrFailureKind::AllTemperaturesFailed)
+  /// [`::AllTemperaturesFailed`](crate::types::::AllTemperaturesFailed)
   /// for every chunk — total ASR data loss with no model
   /// inference attempted (). Use `1` for
   /// "single attempt, no temperature retries"; the temperature

@@ -36,8 +36,10 @@ pub use align::dispatch;
 pub use mediatime::{TimeRange, Timebase, Timestamp};
 
 pub use types::{
-  AlignmentFailureKind, AsrFailureKind, ChunkId, Lang, PushKind, TranscriberError, Transcript,
-  VadSegment, Word, WorkFailure, WorkerKind,
+  AlignmentError, AlignmentFailure, AsrError, AsrFailure, Backpressure, ChunkId,
+  GapExceedsTolerance, InconsistentTimebase, InvalidTimebase, Lang, LanguageUnsupportedForAlignment,
+  PtsRegression, PushKind, TranscriberError, Transcript, VadAheadOfAudio, VadSegment, Word,
+  WorkFailure, WorkerHangTimeout, WorkerKind,
 };
 
 pub use core::{

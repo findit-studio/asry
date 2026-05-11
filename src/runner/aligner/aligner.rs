@@ -12,7 +12,7 @@ use crate::{
   core::AlignmentResult,
   runner::{RunnerError, aligner::normalizer::DynTextNormalizer},
   time::SAMPLE_RATE_HZ,
-  types::{Lang, WorkFailure},
+  types::{AlignmentError, AlignmentFailure, Lang, WorkFailure, WorkerHangTimeout},
 };
 
 /// Per-language forced-alignment engine. Loads a wav2vec2 ONNX
@@ -196,11 +196,7 @@ impl Aligner {
         return Ok(Vec::new());
       }
       Err(e) => {
-        return Err(crate::types::WorkFailure::AlignmentFailed {
-          kind: crate::types::AlignmentFailureKind::NormalizationFailed,
-          message: format_smolstr!("normalize failed: {e}"),
-          language: self.language.clone(),
-        });
+        return Err(crate::types::WorkFailure::Alignment(AlignmentError::NormalizationFailed(AlignmentFailure::new(format_smolstr!("normalize failed: {e}"), self.language.clone()))));
       }
     };
     let n_words = normalized.normalized().split_whitespace().count();
@@ -342,7 +338,7 @@ impl Aligner {
   /// method's doc-comment for argument semantics.
   ///
   /// Returns [`WorkFailure::AlignmentFailed`] with kind
-  /// [`crate::types::AlignmentFailureKind::ModelInferenceFailed`]
+  /// [`crate::types::::ModelInferenceFailed`]
   /// if [`RunOptions::new`] fails (rare; ORT initialisation
   /// hiccup).
   pub fn align_chunk<F>(
@@ -356,14 +352,9 @@ impl Aligner {
   where
     F: Fn(u64, u64) -> TimeRange,
   {
-    use crate::types::AlignmentFailureKind;
 
     let abort_flag = core::sync::atomic::AtomicBool::new(false);
-    let run_options = RunOptions::new().map_err(|e| WorkFailure::AlignmentFailed {
-      kind: AlignmentFailureKind::ModelInferenceFailed,
-      message: format_smolstr!("RunOptions::new failed: {e:?}"),
-      language: self.language.clone(),
-    })?;
+    let run_options = RunOptions::new().map_err(|e| WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!("RunOptions::new failed: {e:?}"), self.language.clone()))))?;
     // Default OOV policy for the no-abort entrypoint:
     // detect events first, apply the historical default
     // (`alphanumeric → wildcard, pronounced → fail-closed`).
@@ -515,7 +506,6 @@ impl Aligner {
         tokenize::tokenize_with_word_map,
         trellis_beam::align_to_word_segments,
       },
-      types::AlignmentFailureKind,
     };
 
     // Helper: produce a WorkerHangTimeout when the watchdog has
@@ -528,10 +518,7 @@ impl Aligner {
     // next stage boundary instead of compounding the hang by
     // running CTC + Viterbi + compose on probably-bogus data.
     let timed_out = || -> WorkFailure {
-      WorkFailure::WorkerHangTimeout {
-        kind: crate::types::WorkerKind::Alignment,
-        elapsed: core::time::Duration::ZERO,
-      }
+      WorkFailure::WorkerHang(WorkerHangTimeout::new(crate::types::WorkerKind::Alignment, core::time::Duration::ZERO))
     };
 
     if abort_flag.load(Ordering::Relaxed) {
@@ -591,14 +578,10 @@ impl Aligner {
       .enumerate()
       .find(|(_, s)| !s.is_finite())
     {
-      return Err(WorkFailure::AlignmentFailed {
-        kind: AlignmentFailureKind::ModelInferenceFailed,
-        message: format_smolstr!(
+      return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!(
           "non-finite sample at index {idx} (value {val:?}); upstream audio corruption — \
  refuse to encode, masking-as-silence would only hide the bug"
-        ),
-        language: self.language.clone(),
-      });
+        ), self.language.clone()))));
     }
     let speech_mask = build_speech_mask(samples.len(), sub_segments, &self.language)?;
 
@@ -622,11 +605,7 @@ impl Aligner {
         return Ok(AlignmentResult::new(Vec::new()));
       }
       Err(crate::runner::aligner::normalizer::NormalizationError::RuleFailed { detail }) => {
-        return Err(WorkFailure::AlignmentFailed {
-          kind: AlignmentFailureKind::NormalizationFailed,
-          message: detail,
-          language: self.language.clone(),
-        });
+        return Err(WorkFailure::Alignment(AlignmentError::NormalizationFailed(AlignmentFailure::new(detail, self.language.clone()))));
       }
     };
 
@@ -982,18 +961,14 @@ fn validate_direct_decision_languages(
 ) -> Result<(), WorkFailure> {
   for (i, resolved) in oov_decisions.iter().enumerate() {
     if resolved.event().language() != expected_lang {
-      return Err(WorkFailure::AlignmentFailed {
-        kind: crate::types::AlignmentFailureKind::TokenizationFailed,
-        message: format_smolstr!(
+      return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
           "align_chunk_with_abort: oov_decisions[{i}].event.language = {:?} \
  but this aligner's language is {:?}. Direct callers must pass \
  ResolvedOov produced for THIS aligner's language. Recompute via \
  `Self::detect_oov(text)` + a policy helper from `crate::core::oov`.",
           resolved.event().language(),
           expected_lang,
-        ),
-        language: expected_lang.clone(),
-      });
+        ), expected_lang.clone()))));
     }
   }
   Ok(())
@@ -1007,7 +982,7 @@ fn validate_direct_decision_languages(
 /// `RunOptions::terminate()`. ORT then returns
 /// `Session::run_with_options` with an `Err`. If the caller
 /// just `?`-propagates that, the failure surfaces as
-/// `AlignmentFailureKind::ModelInferenceFailed` (looks like a
+/// `::ModelInferenceFailed` (looks like a
 /// broken backend or bad model) instead of
 /// `WorkFailure::WorkerHangTimeout` (the contract the watchdog
 /// publishes — alerts and retry policy hang off this kind).
@@ -1021,10 +996,7 @@ fn classify_encode_abort(
 ) -> WorkFailure {
   use core::sync::atomic::Ordering;
   if abort_flag.load(Ordering::Relaxed) {
-    WorkFailure::WorkerHangTimeout {
-      kind: crate::types::WorkerKind::Alignment,
-      elapsed: core::time::Duration::ZERO,
-    }
+    WorkFailure::WorkerHang(WorkerHangTimeout::new(crate::types::WorkerKind::Alignment, core::time::Duration::ZERO))
   } else {
     err
   }
@@ -1058,23 +1030,18 @@ fn build_speech_mask(
   sub_segments: &[TimeRange],
   language: &Lang,
 ) -> Result<Vec<bool>, WorkFailure> {
-  use crate::types::AlignmentFailureKind;
   let mut mask = vec![false; n_samples];
   let n_samples_i64 = n_samples as i64;
   for &seg in sub_segments {
     if seg.timebase().num() != 1 || seg.timebase().den().get() != SAMPLE_RATE_HZ {
-      return Err(WorkFailure::AlignmentFailed {
-        kind: AlignmentFailureKind::ModelInferenceFailed,
-        message: format_smolstr!(
+      return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!(
           "Aligner::align expects sub_segments in chunk-local 1/{} timebase, \
  got {}/{}; caller passed sub_segments in the wrong timebase \
  (samples will not match audio if we proceed).",
           SAMPLE_RATE_HZ,
           seg.timebase().num(),
           seg.timebase().den().get(),
-        ),
-        language: language.clone(),
-      });
+        ), language.clone()))));
     }
     let start = seg.start_pts().clamp(0, n_samples_i64) as usize;
     let end = seg.end_pts().clamp(0, n_samples_i64) as usize;
@@ -1438,17 +1405,10 @@ mod tests {
   fn classify_encode_abort_promotes_to_timeout_when_aborted() {
     use core::sync::atomic::AtomicBool;
     let aborted = AtomicBool::new(true);
-    let original = WorkFailure::AlignmentFailed {
-      kind: crate::types::AlignmentFailureKind::ModelInferenceFailed,
-      message: "ort terminate".into(),
-      language: Lang::En,
-    };
+    let original = WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new("ort terminate".into(), Lang::En)));
     let classified = classify_encode_abort(&aborted, original);
     match classified {
-      WorkFailure::WorkerHangTimeout {
-        kind: crate::types::WorkerKind::Alignment,
-        ..
-      } => {}
+      WorkFailure::WorkerHang(WorkerHangTimeout::new(crate::types::WorkerKind::Alignment, )) => {}
       other => {
         panic!("aborted-encode error must surface as WorkerHangTimeout(Alignment); got {other:?}",)
       }
@@ -1472,11 +1432,7 @@ mod tests {
     )];
     let result = validate_direct_decision_languages(&stale, &Lang::En);
     match result {
-      Err(WorkFailure::AlignmentFailed {
-        kind: crate::types::AlignmentFailureKind::TokenizationFailed,
-        ref message,
-        ..
-      }) => assert!(
+      Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(_))) => assert!(
         message.contains("oov_decisions[0].event.language")
           && message.contains("Ko")
           && message.contains("En"),
@@ -1512,17 +1468,10 @@ mod tests {
   fn classify_encode_abort_passes_through_when_not_aborted() {
     use core::sync::atomic::AtomicBool;
     let not_aborted = AtomicBool::new(false);
-    let original = WorkFailure::AlignmentFailed {
-      kind: crate::types::AlignmentFailureKind::ModelInferenceFailed,
-      message: "ort genuine error".into(),
-      language: Lang::En,
-    };
+    let original = WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new("ort genuine error".into(), Lang::En)));
     let classified = classify_encode_abort(&not_aborted, original);
     match classified {
-      WorkFailure::AlignmentFailed {
-        kind: crate::types::AlignmentFailureKind::ModelInferenceFailed,
-        ..
-      } => {}
+      WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(_)) => {}
       other => panic!("non-aborted encode error must pass through unchanged; got {other:?}"),
     }
   }
@@ -2001,7 +1950,7 @@ mod tests {
       WorkFailure::AlignmentFailed { kind, message, .. } => {
         assert_eq!(
           kind,
-          crate::types::AlignmentFailureKind::ModelInferenceFailed
+          crate::types::::ModelInferenceFailed
         );
         assert!(
           message.contains("chunk-local 1/16000 timebase"),
@@ -2026,7 +1975,7 @@ mod tests {
     let out_tb = mediatime::Timebase::new(1, core::num::NonZeroU32::new(48_000).unwrap());
     let segs = [TimeRange::new(0, 1000, out_tb)];
     let err = build_speech_mask(16_000, &segs, &Lang::En).expect_err("must error");
-    assert!(matches!(err, WorkFailure::AlignmentFailed { .. }));
+    assert!(matches!(err, WorkFailure::Alignment(_)));
   }
 
   #[test]
