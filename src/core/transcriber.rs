@@ -118,8 +118,8 @@ const fn default_max_in_flight() -> usize {
   6
 }
 
-// Codex round-37 round-25 [medium]: hard caps on the public
-// chunk / buffer / in-flight knobs. Pre-fix the constructor
+// hard caps on the public
+// chunk / buffer / in-flight knobs. The constructor
 // only rejected zero values; a tenant-controlled or
 // accidentally-large value could push the runner into
 // process-scale per-chunk allocations (a 1-hour `chunk_size`
@@ -152,7 +152,7 @@ pub const MAX_IN_FLIGHT: usize = 4_096;
 /// [`crate::core::buffer::SampleBuffer::append`] additionally
 /// rejects any `delta_samples` whose addition would wrap, but
 /// capping the public knob keeps the configuration intent
-/// honest. (Codex round-37 round-26 [high].)
+/// honest. ([high].)
 pub const MAX_GAP_TOLERANCE_SAMPLES: u64 = MAX_BUFFER_CAP_SAMPLES as u64;
 
 impl TranscriberOptions {
@@ -240,8 +240,7 @@ impl TranscriberOptions {
   // --- Mutating setters ----------------------------------------
 
   /// Set [`Self::chunk_size`]. Panics if `value` exceeds
-  /// [`MAX_CHUNK_SIZE`] (Codex round-37 round-25 [medium]:
-  /// per-chunk RAM is unbounded otherwise).
+  /// [`MAX_CHUNK_SIZE`] ( /// per-chunk RAM is unbounded otherwise).
   pub fn set_chunk_size(&mut self, value: Duration) {
     assert!(
       value <= MAX_CHUNK_SIZE,
@@ -303,8 +302,7 @@ impl TranscriberOptions {
   // --- Builder-style (consuming) -------------------------------
 
   /// Builder-style override for [`Self::chunk_size`]. Panics
-  /// if `value` exceeds [`MAX_CHUNK_SIZE`] (Codex round-37
-  /// round-25 [medium]).
+  /// if `value` exceeds [`MAX_CHUNK_SIZE`] .
   pub fn with_chunk_size(mut self, value: Duration) -> Self {
     assert!(
       value <= MAX_CHUNK_SIZE,
@@ -327,7 +325,7 @@ impl TranscriberOptions {
 
   /// Builder-style override for [`Self::gap_tolerance_samples`].
   /// Panics if `value` exceeds [`MAX_GAP_TOLERANCE_SAMPLES`]
-  /// (Codex round-37 round-26 [high]).
+  /// ([high]).
   pub fn with_gap_tolerance_samples(mut self, value: u64) -> Self {
     assert!(
       value <= MAX_GAP_TOLERANCE_SAMPLES,
@@ -345,7 +343,7 @@ impl TranscriberOptions {
 
   /// Builder-style override for [`Self::max_in_flight`].
   /// Panics if `value` exceeds [`MAX_IN_FLIGHT`] (Codex
-  /// round-37 round-25 [medium]).
+  /// [medium]).
   pub fn with_max_in_flight(mut self, value: usize) -> Self {
     assert!(
       value <= MAX_IN_FLIGHT,
@@ -417,12 +415,12 @@ impl Transcriber {
   /// (`AutoLockAfter(0)`).
   ///
   /// - `max_in_flight == 0` — the dispatch loop would route every
-  ///   emitted chunk to `cut_pending` and never issue a `Asr`.
+  /// emitted chunk to `cut_pending` and never issue a `Asr`.
   /// - `LanguagePolicy::AutoLockAfter(0)` — a 0-observation lock
-  ///   has no defined mode and would call the tiebreak helper on
-  ///   an empty list.
+  /// has no defined mode and would call the tiebreak helper on
+  /// an empty list.
   /// - `chunk_size` that rounds to 0 16 kHz samples (e.g.
-  ///   `Duration::ZERO`) — Cut's hard-split path divides by it.
+  /// `Duration::ZERO`) — Cut's hard-split path divides by it.
   pub fn new(config: TranscriberOptions) -> Self {
     assert!(
       config.max_in_flight > 0,
@@ -447,7 +445,7 @@ impl Transcriber {
       "TranscriberOptions::chunk_size must round to at least 1 sample at 16 kHz; got {:?}",
       config.chunk_size
     );
-    // Codex round-37 round-25 [medium]: enforce documented
+    // enforce documented
     // ceilings even on direct `Transcriber::new(config)` calls
     // — `with_*` and `set_*` already guard their inputs, but
     // a serde-deserialised or hand-built `TranscriberOptions`
@@ -544,7 +542,7 @@ impl Transcriber {
   /// not yet been observed by `poll_event` (those are in
   /// `pending_events`).
   ///
-  /// Codex round-35: the runner's `DrainTimeout.in_flight`
+  /// : the runner's `DrainTimeout.in_flight`
   /// previously reported `buffered_samples()` (a sample count)
   /// despite the field being documented as "chunks awaiting
   /// results". A trimmed buffer can read `0` while real chunks
@@ -610,7 +608,7 @@ impl Transcriber {
   /// 16 kHz sample indices before passing them to
   /// [`crate::Aligner::align_chunk`].
   ///
-  /// Codex round-37 round-10 [high]: this was `pub(crate)`
+  /// this was `pub(crate)`
   /// when `ManagedTranscriber` was the only caller; the
   /// Sans-I/O pivot exposes it so external pump-driver code
   /// can construct alignment inputs.
@@ -625,7 +623,7 @@ impl Transcriber {
   /// wrapped into chunk-local `TimeRange`s for the aligner.
   /// Returns `None` if the chunk is not in flight.
   ///
-  /// Codex round-37 round-10 [high]: bumped from `pub(crate)`
+  /// bumped from `pub(crate)`
   /// alongside the rest of the alignment-context helpers.
   #[cfg(feature = "alignment")]
   pub fn chunk_sub_segments_samples(
@@ -640,8 +638,8 @@ impl Transcriber {
   /// configured caps? Counts cut_pending's pre-extracted audio
   /// alongside the live buffer.
   ///
-  /// Codex round-37 round-34 [medium]: arithmetic is overflow-
-  /// safe. Pre-fix the `usize` chain wrapped on adversarial
+  /// arithmetic is overflow-
+  /// safe. The `usize` chain wrapped on adversarial
   /// `samples_len = usize::MAX` inputs (panic in debug, false
   /// "yes" in release once the wrap dropped below the cap).
   /// Now any overflow returns `false` — the request cannot fit
@@ -663,7 +661,7 @@ impl Transcriber {
   ///
   /// Errors:
   /// - `PtsRegression`, `GapExceedsTolerance`, `Backpressure`,
-  ///   `InconsistentTimebase`, `AfterEof` per `SampleBuffer::append`.
+  /// `InconsistentTimebase`, `AfterEof` per `SampleBuffer::append`.
   pub fn handle_samples(
     &mut self,
     starts_at: Timestamp,
@@ -702,17 +700,17 @@ impl Transcriber {
   /// Errors:
   /// - `OutputTimebaseUnset` if no `handle_samples` has been called.
   /// - `PtsRegression { kind: VadSegment }` if `seg.start_sample`
-  ///   overlaps the previous VAD segment — i.e., is strictly
-  ///   *less than* its `end_sample`. Touching segments (where
-  ///   `new.start == prev.end`) are accepted: silero occasionally
-  ///   emits them on silence-edge transitions and rejecting them
-  ///   would force callers to add gap-injection logic for the
-  ///   same data silero already produced cleanly.
+  /// overlaps the previous VAD segment — i.e., is strictly
+  /// *less than* its `end_sample`. Touching segments (where
+  /// `new.start == prev.end`) are accepted: silero occasionally
+  /// emits them on silence-edge transitions and rejecting them
+  /// would force callers to add gap-injection logic for the
+  /// same data silero already produced cleanly.
   /// - `VadAheadOfAudio` if `seg.end_sample()` is past the
-  ///   buffer's current high-water mark. The cut state machine
-  ///   would otherwise accept the segment and emit chunks that
-  ///   later panic in `buffer.extract` once they reach
-  ///   promotion.
+  /// buffer's current high-water mark. The cut state machine
+  /// would otherwise accept the segment and emit chunks that
+  /// later panic in `buffer.extract` once they reach
+  /// promotion.
   /// - `AfterEof` if `handle_eof()` was called.
   pub fn handle_vad_segment(&mut self, seg: VadSegment) -> Result<(), TranscriberError> {
     if self.eof_signaled {
@@ -795,7 +793,7 @@ impl Transcriber {
   /// impossible: anything the precheck approves will also pass
   /// the runtime check.
   ///
-  /// Codex round-35: `process_packet` previously committed
+  /// : `process_packet` previously committed
   /// samples first, then pushed VADs one at a time. A failing
   /// VAD #N left samples + VADs 0..N-1 committed, so the caller
   /// could not safely retry the packet. Pre-flighting fixes the
@@ -848,17 +846,17 @@ impl Transcriber {
   /// to:
   ///
   /// 1. Trim audio that is no longer referenced by any live
-  ///    chunk — without this, a stream with long silences would
-  ///    accumulate audio in the buffer until the configured cap
-  ///    is hit and `handle_samples` returns
-  ///    `TranscriberError::Backpressure` with no recovery path
-  ///    (chunks emit only on VAD or EOF).
+  /// chunk — without this, a stream with long silences would
+  /// accumulate audio in the buffer until the configured cap
+  /// is hit and `handle_samples` returns
+  /// `TranscriberError::Backpressure` with no recovery path
+  /// (chunks emit only on VAD or EOF).
   /// 2. Pre-flush the cut accumulator if a hypothetical future
-  ///    segment starting at `sample_index` would force a flush
-  ///    (`sample_index - current_start > chunk_size_samples`).
-  ///    This handles the speech-followed-by-long-silence case
-  ///    where a trailing partial chunk would otherwise sit in
-  ///    the cut state until EOF.
+  /// segment starting at `sample_index` would force a flush
+  /// (`sample_index - current_start > chunk_size_samples`).
+  /// This handles the speech-followed-by-long-silence case
+  /// where a trailing partial chunk would otherwise sit in
+  /// the cut state until EOF.
   ///
   /// `sample_index` advances the VAD watermark; subsequent
   /// `handle_vad_segment` calls with `start_sample < sample_index`
@@ -869,7 +867,7 @@ impl Transcriber {
   /// - `OutputTimebaseUnset` if no `handle_samples` has been called.
   /// - `AfterEof` if `handle_eof()` was called.
   /// - `PtsRegression { kind: VadSegment }` if `sample_index` is
-  ///   less than the current VAD watermark.
+  /// less than the current VAD watermark.
   pub fn handle_no_speech_through(&mut self, sample_index: u64) -> Result<(), TranscriberError> {
     if self.eof_signaled {
       return Err(TranscriberError::AfterEof);
@@ -958,7 +956,7 @@ impl Transcriber {
   ///
   /// Errors:
   /// - `UnknownChunk(chunk_id)` if `chunk_id` is not in flight or
-  ///   is in flight but not awaiting an ASR result.
+  /// is in flight but not awaiting an ASR result.
   pub fn handle_asr(
     &mut self,
     chunk_id: ChunkId,
@@ -998,7 +996,7 @@ impl Transcriber {
   ///
   /// Errors:
   /// - `UnknownChunk(chunk_id)` if `chunk_id` is not in flight or
-  ///   is in flight but not awaiting any worker result.
+  /// is in flight but not awaiting any worker result.
   pub fn handle_failure(
     &mut self,
     chunk_id: ChunkId,
@@ -1017,15 +1015,15 @@ impl Transcriber {
   ///
   /// Steps:
   /// 1. Flush the cut state machine. Any partial chunk goes through
-  ///    `on_emit`, which pre-extracts its audio and either promotes
-  ///    or queues per the AutoLockAfter gate.
+  /// `on_emit`, which pre-extracts its audio and either promotes
+  /// or queues per the AutoLockAfter gate.
   /// 2. Clear the live buffer; reset `absolute_sample_offset` and
-  ///    `buffer_drop_offset` to 0.
+  /// `buffer_drop_offset` to 0.
   /// 3. Re-anchor `base_pts_out_anchor` to `starts_at.pts()`.
   /// 4. `next_chunk_id` continues monotonically.
   /// 5. Pre-existing `cut_pending` entries already hold their audio
-  ///    in their own `Arc<[f32]>`s — they survive the buffer reset
-  ///    without a special drain pass.
+  /// in their own `Arc<[f32]>`s — they survive the buffer reset
+  /// without a special drain pass.
   ///
   /// Previously this method drained `cut_pending` into `in_flight`
   /// via a `draining_for_restart` bypass that ignored the
@@ -1039,12 +1037,12 @@ impl Transcriber {
   /// Errors:
   /// - `AfterEof` if `handle_eof()` was previously called.
   /// - `InconsistentTimebase` if the buffer already has an established
-  ///   output timebase from a prior `handle_samples` and `starts_at`'s
-  ///   timebase doesn't match. Pre-fix code silently overwrote the
-  ///   timebase, so a 48 kHz stream restarted at a millisecond
-  ///   timebase would produce post-restart chunks in a different
-  ///   unit from pre-restart ones — corrupting ordering and PTS
-  ///   arithmetic with no surfaced error.
+  /// output timebase from a prior `handle_samples` and `starts_at`'s
+  /// timebase doesn't match. Earlier code silently overwrote the
+  /// timebase, so a 48 kHz stream restarted at a millisecond
+  /// timebase would produce post-restart chunks in a different
+  /// unit from pre-restart ones — corrupting ordering and PTS
+  /// arithmetic with no surfaced error.
   pub fn handle_restart(&mut self, starts_at: Timestamp) -> Result<(), TranscriberError> {
     if self.eof_signaled {
       return Err(TranscriberError::AfterEof);
@@ -1171,9 +1169,9 @@ mod tests {
   fn handle_restart_drains_cut_pending_into_in_flight() {
     // max_in_flight = 1 forces queueing.
     let config = TranscriberOptions::default()
-            .with_max_in_flight(1)
-            .with_chunk_size(Duration::from_millis(125)) // 2_000 samples
-            .with_buffer_cap_samples(100_000);
+ .with_max_in_flight(1)
+ .with_chunk_size(Duration::from_millis(125)) // 2_000 samples
+ .with_buffer_cap_samples(100_000);
     let mut t = Transcriber::new(config);
 
     // Push enough audio to cover three chunks.
@@ -1212,9 +1210,9 @@ mod tests {
     use crate::core::command::Command;
 
     let config = TranscriberOptions::default()
-      .with_chunk_size(Duration::from_millis(125)) // 2_000 samples
-      .with_max_in_flight(4)
-      .with_buffer_cap_samples(100_000);
+ .with_chunk_size(Duration::from_millis(125)) // 2_000 samples
+ .with_max_in_flight(4)
+ .with_buffer_cap_samples(100_000);
     let mut t = Transcriber::new(config);
 
     // Pre-restart epoch: anchor at PTS 0 in the 1/48000 timebase.
@@ -1290,9 +1288,9 @@ mod tests {
     use smol_str::SmolStr;
 
     let config = TranscriberOptions::default()
-            .with_chunk_size(Duration::from_secs(2)) // 32_000 samples @ 16k
-            .with_buffer_cap_samples(200_000)
-            .with_max_in_flight(4);
+ .with_chunk_size(Duration::from_secs(2)) // 32_000 samples @ 16k
+ .with_buffer_cap_samples(200_000)
+ .with_max_in_flight(4);
     let mut t = Transcriber::new(config);
 
     // 4 seconds of 16 kHz audio = 64_000 samples.
@@ -1385,7 +1383,7 @@ mod tests {
     let _ = Transcriber::new(config);
   }
 
-  /// Codex round-37 round-25 [medium]: chunk_size beyond
+  /// chunk_size beyond
   /// MAX_CHUNK_SIZE is rejected at the builder boundary so a
   /// caller-supplied or tenant-controlled value can't push the
   /// runner into per-chunk RAM scaling with input.
@@ -1418,7 +1416,7 @@ mod tests {
     let _ = Transcriber::new(config);
   }
 
-  /// Codex round-37 round-34 [medium]: `would_accept` must be
+  /// `would_accept` must be
   /// safe against adversarial `samples_len = usize::MAX`. Pre-
   /// fix the unchecked `usize` add wrapped, returning `true`
   /// for an enormous request. Post-fix the overflow path
@@ -1454,9 +1452,9 @@ mod tests {
     let r = t.handle_restart(Timestamp::new(0, other_tb));
     assert!(
       matches!(r, Err(TranscriberError::InconsistentTimebase {
-                expected,
-                got,
-            }) if expected == tb_48k() && got == other_tb),
+ expected,
+ got,
+ }) if expected == tb_48k() && got == other_tb),
       "expected InconsistentTimebase, got {:?}",
       r
     );
@@ -1497,9 +1495,10 @@ mod tests {
     t.handle_vad_segment(VadSegment::new(0, 4_000)).unwrap();
     // Emit chunk 0 (cap=1 → in_flight) and start a new accumulator.
     t.handle_vad_segment(VadSegment::new(4_000, 8_000)).unwrap();
-    // Emit chunk 1 (gated by cap=1 → cut_pending). Pre-fix: live
-    // stayed at 12 000, cut_pending now adds 4 000 — total 16 000
-    // > cap. Post-fix: trim ran, live dropped, total bounded.
+    // Emit chunk 1 (gated by cap=1 → cut_pending). Trim must
+    // run as cut_pending fills so the live + pending total
+    // stays bounded; without it live(12 000) + pending(4 000)
+    // = 16 000 > cap would block the next push.
     t.handle_vad_segment(VadSegment::new(8_000, 12_000))
       .unwrap();
 
@@ -1509,7 +1508,7 @@ mod tests {
     assert!(
       t.would_accept(0, 0),
       "after VAD-only emission, buffered + cut_pending audio must stay within cap; \
-             live={}, cap=12_000",
+ live={}, cap=12_000",
       t.buffered_samples()
     );
   }
@@ -1547,7 +1546,7 @@ mod tests {
   }
 
   /// handle_no_speech_through must not let trim drop audio past
-  /// the declared `sample_index`. Pre-fix code passed
+  /// the declared `sample_index`. Earlier code passed
   /// `cut.pending_start()` to `after_inject`; when no cut
   /// accumulator existed, after_inject's fallback was
   /// `buffer.absolute_sample_offset()` (drop everything). With
@@ -1596,8 +1595,7 @@ mod tests {
   }
 
   /// cut_pending audio (the pre-extracted ExtractedChunk Arcs)
-  /// must count toward the buffer cap for Backpressure. Pre-fix
-  /// code only counted the live buffer's samples, so a runner
+  /// must count toward the buffer cap for Backpressure.  /// code only counted the live buffer's samples, so a runner
   /// slower than ingest could build up cut_pending arbitrarily —
   /// every trim emptied the live buffer and let the caller push
   /// more, but cut_pending retained the audio. Net effect:
@@ -1609,10 +1607,10 @@ mod tests {
   /// cut_pending (4 000 audio samples in Arc). handle_no_speech_through
   /// trims the live buffer to 4 000 samples (cut accumulator's
   /// start is at 8 000, high-water is 12 000). Then push 6 000
-  /// more samples. Pre-fix: live(4 000) + new(6 000) = 10 000 ≤
-  /// cap(12 000), accepted — even though cut_pending adds another
-  /// 4 000 for a real total of 14 000. Post-fix: 14 000 > 12 000
-  /// → Backpressure.
+  /// more samples. The Backpressure check must include
+  /// cut_pending audio: live(4 000) + new(6 000) + pending(4 000)
+  /// = 14 000 > cap(12 000) → Backpressure, even though
+  /// live + new alone fits.
   #[test]
   fn cut_pending_audio_counts_against_buffer_cap() {
     let config = TranscriberOptions::default()
@@ -1651,14 +1649,14 @@ mod tests {
     let r = t.handle_samples(next, &[0.0; 6_000]);
     assert!(
       matches!(r, Err(TranscriberError::Backpressure { buffered, cap })
-                if buffered == 14_000 && cap == 12_000),
+ if buffered == 14_000 && cap == 12_000),
       "expected Backpressure {{ buffered: 14_000, cap: 12_000 }}, got {:?}",
       r
     );
   }
 
   /// handle_restart must NOT bypass the AutoLockAfter
-  /// observation-window gate. Pre-fix code routed every drained
+  /// observation-window gate. Earlier code routed every drained
   /// chunk through on_emit with `draining_for_restart` flag set,
   /// which forced promotion regardless of the effective-cap-of-n
   /// rule. Net effect: a recovery happening before the lock
@@ -1668,7 +1666,7 @@ mod tests {
   /// Reproduction: AutoLockAfter(1) + max_in_flight = 4. Push
   /// audio + 4 VAD segments. The gate caps in_flight at 1, so
   /// chunks 1, 2, 3 sit in cut_pending. Trigger handle_restart
-  /// without injecting chunk 0's result. Pre-fix would have
+  /// without injecting chunk 0's result. would have
   /// promoted chunks 1, 2, 3 (issuing Asr without lock).
   /// Post-fix: chunks 1, 2, 3 stay in cut_pending; only after the
   /// lock fires (chunk 0 returns) do they promote with the hint.
@@ -1677,10 +1675,10 @@ mod tests {
     use crate::core::command::Command;
 
     let config = TranscriberOptions::default()
-            .with_chunk_size(Duration::from_millis(125)) // 2_000 samples
-            .with_max_in_flight(4)
-            .with_buffer_cap_samples(100_000)
-            .with_language_policy(LanguagePolicy::AutoLockAfter(1));
+ .with_chunk_size(Duration::from_millis(125)) // 2_000 samples
+ .with_max_in_flight(4)
+ .with_buffer_cap_samples(100_000)
+ .with_language_policy(LanguagePolicy::AutoLockAfter(1));
     let mut t = Transcriber::new(config);
 
     // 4 VAD segments emitted; with gate cap = 1, chunk 0 in
@@ -1695,7 +1693,7 @@ mod tests {
     t.handle_restart(ts(50_000_000)).unwrap();
 
     // Drain commands. There must be exactly ONE Asr — chunk 0's
-    // — issued before the restart. Pre-fix would have produced
+    // — issued before the restart. would have produced
     // additional Asr commands (without lock) for the drained
     // chunks 1, 2, 3.
     let mut run_asr_count = 0;
@@ -1865,7 +1863,7 @@ mod tests {
     // Signal silence through sample 30 000 — gap from the
     // segment's end (16 000) is 14 000 samples (~875 ms),
     // greater than the 500 ms (8 000-sample) silence threshold,
-    // but FAR below chunk_size (480 000). Pre-fix code only
+    // but FAR below chunk_size (480 000). Earlier code only
     // pre-flushed on chunk_size; the chunk stayed pending.
     t.handle_no_speech_through(30_000).unwrap();
 
@@ -1999,7 +1997,7 @@ mod tests {
     assert!(t.is_idle());
   }
 
-  /// Codex round-30 regression: a chunk whose accumulation begins
+  /// regression: a chunk whose accumulation begins
   /// in packet A (under override O_A) but whose VAD-driven close
   /// only happens in packet B (under override O_B or none) must
   /// emit Asr with O_A's params, not O_B's. The cut state
@@ -2007,10 +2005,10 @@ mod tests {
   /// the snapshot rides on `MergedChunk.override_at_start` until
   /// the dispatch consumes it.
   ///
-  /// Pre-fix: dispatch.on_emit read `current_override` directly,
-  /// so the override active at the *closing* packet won —
-  /// language hints / prompts / strategy overrides got attached
-  /// to the wrong audio.
+  /// If dispatch reads `current_override` at emit time, the
+  /// override active at the *closing* packet wins — language
+  /// hints / prompts / strategy overrides would attach to the
+  /// wrong audio.
   #[test]
   fn override_binds_to_packet_that_started_chunk_not_packet_that_closed_it() {
     use crate::core::{AsrParamsOverride, command::Command};
@@ -2039,7 +2037,7 @@ mod tests {
       "chunk should not emit during packet A — only half a chunk"
     );
 
-    // Packet B: stamp a *different* override O_B. Pre-fix code
+    // Packet B: stamp a *different* override O_B. Earlier code
     // would let O_B leak onto chunk 0 when EOF closes it.
     let o_b = AsrParamsOverride::new().with_initial_temperature(Some(0.3));
     t.set_runtime_override(Some(o_b));
@@ -2065,7 +2063,7 @@ mod tests {
     let _ = o_a; // captured semantically via initial_temperature
   }
 
-  // --- Codex round-35: precheck_vad_segments ---
+  // --- : precheck_vad_segments ---
 
   #[test]
   fn precheck_vad_segments_passes_for_valid_packet() {

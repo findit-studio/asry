@@ -10,21 +10,21 @@
 //! itself, not via a separate command/response round-trip:
 //!
 //! ```text
-//! AlignmentSet::detect_oov(text, lang)             -> Vec<OovEvent>
-//!  └─ caller pairs each event with a decision via a helper
-//!     from this module (or its own loop) producing a per-
-//!     chunk Vec<ResolvedOov>
+//! AlignmentSet::detect_oov(text, lang) -> Vec<OovEvent>
+//! └─ caller pairs each event with a decision via a helper
+//! from this module (or its own loop) producing a per-
+//! chunk Vec<ResolvedOov>
 //!
 //! AlignWorkItem { runs, oov_decisions: Vec<Vec<ResolvedOov>>, .. }
-//!  └─ alignment pool reads `oov_decisions[run_idx]` for each
-//!     run and threads it into `tokenize_with_word_map`; the
-//!     dispatcher recomputes events for the chunk's text and
-//!     refuses to apply a payload whose events do not match
-//!     by identity (kind / char_index / word_index / language).
-//!     Length, outer-shape, OR per-position identity mismatch
-//!     fails loudly as
-//!     `AlignmentFailureKind::TokenizationFailed` instead of
-//!     silently mis-aligning a stale-but-same-length payload.
+//! └─ alignment pool reads `oov_decisions[run_idx]` for each
+//! run and threads it into `tokenize_with_word_map`; the
+//! dispatcher recomputes events for the chunk's text and
+//! refuses to apply a payload whose events do not match
+//! by identity (kind / char_index / word_index / language).
+//! Length, outer-shape, OR per-position identity mismatch
+//! fails loudly as
+//! `AlignmentFailureKind::TokenizationFailed` instead of
+//! silently mis-aligning a stale-but-same-length payload.
 //! ```
 //!
 //! For whole-chunk alignment use [`AlignmentSet::detect_oov`]
@@ -64,7 +64,7 @@ use crate::types::Lang;
 /// during normalisation) differently from semantic OOV
 /// (chars the model dictionary doesn't have).
 ///
-/// Codex round-37 round-3 (parity loop) [high]: introduced so
+/// introduced so
 /// `fail_closed_all_decisions` truly fails on every wildcard
 /// (pre-fix, boundary + internal-punct wildcards bypassed the
 /// OOV policy entirely — strict callers got wildcard tokens
@@ -141,7 +141,7 @@ impl OovEvent {
   ///
   /// Compares the three positional fields (`kind`,
   /// `char_index`, `word_index`) but **not** `language`.
-  /// Codex round-37 round-10 (parity loop) [high]: the
+  /// the
   /// `language` field is a caller-policy stamp that
   /// `AlignmentSet::detect_oov` overrides under
   /// `AlignerKey::Any` fallback to the caller-requested
@@ -202,12 +202,12 @@ pub enum OovDecision {
 /// if the lengths happen to match — the kind mismatch fails
 /// the per-position identity check.
 ///
-/// Codex round-37 round-9 (parity loop) [high]: prior shape
+/// prior shape
 /// passed bare `Vec<OovDecision>` which carried no event
 /// identity, so a stale same-length decisions vec would
 /// silently bypass policy.
 ///
-/// Codex round-37 round-10 (parity loop) [high]: identity
+/// identity
 /// initially included `language`, which broke
 /// `AlignerKey::Any` fallback (`AlignmentSet::detect_oov`
 /// patches event language to the caller's requested lang,
@@ -225,11 +225,11 @@ pub struct ResolvedOov {
 
 /// Default Sans-I/O policy:
 /// * Semantic OOV: alphanumeric / apostrophe → wildcard;
-///   pronounced symbol → fail-closed.
+/// pronounced symbol → fail-closed.
 /// * Boundary-punct + internal-punct (structural wildcards):
-///   wildcard. They reflect tokenizer mechanics, not caller
-///   text — failing-closed on `U.S.A.`'s internal `.` would
-///   cripple normal English alignment.
+/// wildcard. They reflect tokenizer mechanics, not caller
+/// text — failing-closed on `U.S.A.`'s internal `.` would
+/// cripple normal English alignment.
 ///
 /// Encodes the "WhisperX-style alphanumeric, fail-closed-on-
 /// pronounced" behaviour whispery shipped before the
@@ -393,7 +393,7 @@ mod tests {
     );
   }
 
-  /// Codex round-37 round-3 (parity loop) [high]: structural
+  /// structural
   /// wildcards (boundary + internal-punct) get Wildcard
   /// under the default policy — matches historical behaviour.
   #[test]

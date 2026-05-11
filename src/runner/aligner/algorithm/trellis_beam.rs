@@ -2,21 +2,21 @@
 //!
 //! Ports WhisperX `alignment.py`:
 //! - `get_trellis(emission, tokens, blank_id)` — forward DP that
-//!   builds a `(T, num_tokens)` lattice. Each cell `trellis[t, j]`
-//!   is the best log-prob to consume the first `t` frames while
-//!   sitting at character position `j`.
+//! builds a `(T, num_tokens)` lattice. Each cell `trellis[t, j]`
+//! is the best log-prob to consume the first `t` frames while
+//! sitting at character position `j`.
 //! - `get_wildcard_emission(frame_emission, tokens, blank_id)` —
-//!   for tokens with id `-1` (wildcards), use
-//!   `max(non_blank_logprobs)` at that frame so chars the model
-//!   doesn't have a vocab entry for can still be aligned.
+//! for tokens with id `-1` (wildcards), use
+//! `max(non_blank_logprobs)` at that frame so chars the model
+//! doesn't have a vocab entry for can still be aligned.
 //! - `backtrack_beam(trellis, emission, tokens, blank_id,
-//!   beam_width=2)` — beam search over (t, j) states with the
-//!   "stay" / "change" transitions.
+//! beam_width=2)` — beam search over (t, j) states with the
+//! "stay" / "change" transitions.
 //! - `merge_repeats(path, transcript)` — char-level segments by
-//!   token_index group.
+//! token_index group.
 //! - `merge_words(segments, separator="|")` — group char segments
-//!   by `|`-separator into word segments with duration-weighted
-//!   score.
+//! by `|`-separator into word segments with duration-weighted
+//! score.
 //!
 //! The trellis here is intentionally shaped exactly like WhisperX's
 //! (`(T, num_tokens)`); the `state_per_frame` lattice the legacy
@@ -26,17 +26,17 @@
 //!
 //! Whispery-specific concerns kept here:
 //! - **Watchdog / abort flag** — checked once per frame row in the
-//!   forward DP and once per beam-step iteration so a pathological
-//!   token sequence × T pair can't hold the alignment worker past
-//!   `align_timeout`.
+//! forward DP and once per beam-step iteration so a pathological
+//! token sequence × T pair can't hold the alignment worker past
+//! `align_timeout`.
 //! - **Lattice cell budget** — caps `T × num_tokens` at 32 M cells
-//!   so a hallucinated long token list against a long chunk turns
-//!   into an in-band `NoAlignmentPath` failure rather than an OOM.
+//! so a hallucinated long token list against a long chunk turns
+//! into an in-band `NoAlignmentPath` failure rather than an OOM.
 //! - **Vocab-id bounds checks** — every real token id and the
-//!   blank id must fit in the model's vocab dim; a tokenizer-vs-
-//!   model mismatch surfaces as `AlignmentFailureKind::TokenizationFailed`
-//!   / `ModelInferenceFailed` rather than a panicking out-of-bounds
-//!   read.
+//! blank id must fit in the model's vocab dim; a tokenizer-vs-
+//! model mismatch surfaces as `AlignmentFailureKind::TokenizationFailed`
+//! / `ModelInferenceFailed` rather than a panicking out-of-bounds
+//! read.
 
 use alloc::{string::String, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -77,7 +77,7 @@ const TRELLIS_CELL_BUDGET: usize = 32_000_000;
 
 /// Hard cap on the size of the [`BeamNode`] arena that
 /// `backtrack_beam` builds during the per-frame branch
-/// extension. Codex round-37 round-18 [high]: pre-fix only
+/// extension. only
 /// the trellis allocation was budgeted, so a degenerate
 /// `num_tokens = 1, T = 32 M` lattice — well under the
 /// 32 M-cell trellis cap — could grow the arena to tens of
@@ -144,12 +144,12 @@ pub struct WordSegment {
 ///
 /// The shape and recurrence match `alignment.py:387-404`:
 /// ```text
-/// trellis[1:, 0]                = cumsum(emission[1:, blank_id], 0)
-/// trellis[0, 1:]                = -inf
-/// trellis[-num_tokens + 1:, 0]  = +inf
+/// trellis[1:, 0] = cumsum(emission[1:, blank_id], 0)
+/// trellis[0, 1:] = -inf
+/// trellis[-num_tokens + 1:, 0] = +inf
 /// trellis[t+1, 1:] = max(
-///     trellis[t, 1:] + emission[t, blank_id],
-///     trellis[t, :-1] + wildcard_emission(emission[t], tokens[1:]),
+/// trellis[t, 1:] + emission[t, blank_id],
+/// trellis[t, :-1] + wildcard_emission(emission[t], tokens[1:]),
 /// )
 /// ```
 ///
@@ -189,7 +189,7 @@ pub fn get_trellis(
         kind: AlignmentFailureKind::TokenizationFailed,
         message: alloc::format!(
           "token id {tok} at position {i} is negative (only the wildcard \
-           sentinel {WILDCARD_TOKEN_ID} is allowed); tokenizer bug?"
+ sentinel {WILDCARD_TOKEN_ID} is allowed); tokenizer bug?"
         ),
         language: language.clone(),
       });
@@ -199,7 +199,7 @@ pub fn get_trellis(
         kind: AlignmentFailureKind::TokenizationFailed,
         message: alloc::format!(
           "token id {tok} at position {i} >= model output vocab dim {v}; \
-           tokenizer/model mismatch?"
+ tokenizer/model mismatch?"
         ),
         language: language.clone(),
       });
@@ -298,11 +298,11 @@ pub fn get_trellis(
   // This MIRRORS WhisperX 1:1. WhisperX's `get_trellis`
   // (`whisperx/alignment.py:387-404`) writes:
   //
-  //     trellis[t + 1, 1:] = torch.maximum(
-  //         trellis[t, 1:]   + emission[t, blank_id],
-  //         trellis[t, :-1]  + get_wildcard_emission(
-  //             emission[t], tokens[1:], blank_id),
-  //     )
+  // trellis[t + 1, 1:] = torch.maximum(
+  // trellis[t, 1:] + emission[t, blank_id],
+  // trellis[t, :-1] + get_wildcard_emission(
+  // emission[t], tokens[1:], blank_id),
+  // )
   //
   // The slice `tokens[1:]` (broadcast against `trellis[t, :-1]`
   // and stored at `trellis[t+1, 1:]`) means column `j` reads
@@ -314,31 +314,31 @@ pub fn get_trellis(
   // Why this looks wrong but is what we want anyway:
   //
   // 1. PARITY IS THE PRIMARY SUCCESS METRIC. The whole alignment
-  //    subsystem was built and validated against WhisperX bit-
-  //    exactly (median IoU 0.9955–0.9990 across the dia
-  //    fixtures, 0 below-0.5 outliers in 854 word pairs).
-  //    Diverging from `tokens[1:]` to score `tokens[0]` would
-  //    re-shift every word's start-of-word frame and silently
-  //    invalidate that calibration. No fixture would tell us the
-  //    new path is "right" — only that it differs from WhisperX.
+  // subsystem was built and validated against WhisperX bit-
+  // exactly (median IoU 0.9955–0.9990 across the dia
+  // fixtures, 0 below-0.5 outliers in 854 word pairs).
+  // Diverging from `tokens[1:]` to score `tokens[0]` would
+  // re-shift every word's start-of-word frame and silently
+  // invalidate that calibration. No fixture would tell us the
+  // new path is "right" — only that it differs from WhisperX.
   //
   // 2. THE DIVERGENCE IN PRACTICE IS SMALL. The CTC alignment is
-  //    forced (transcript is given), so `tokens[0]` is implicitly
-  //    pinned to the chunk start by the column-0 → column-1
-  //    transition; only the exact frame at which that transition
-  //    fires is biased. For multi-character tokens the bias is
-  //    drowned out by the surrounding posteriors. For single-
-  //    token transcripts the trellis is degenerate anyway
-  //    (column 0's blank cumsum is the only legal path).
+  // forced (transcript is given), so `tokens[0]` is implicitly
+  // pinned to the chunk start by the column-0 → column-1
+  // transition; only the exact frame at which that transition
+  // fires is biased. For multi-character tokens the bias is
+  // drowned out by the surrounding posteriors. For single-
+  // token transcripts the trellis is degenerate anyway
+  // (column 0's blank cumsum is the only legal path).
   //
   // 3. CHANGING THE INDEXING IS NOT A LOCAL FIX. Both `get_trellis`
-  //    and `backtrack_beam` consume the same convention (the
-  //    backtracker indexes into `tokens` via the column index it
-  //    just descended from). A real correction would need to
-  //    grow the trellis to `(T, num_tokens + 1)` and adjust
-  //    every `state.j` arithmetic in the backtracker — and would
-  //    still need a side-by-side parity rerun to confirm we hadn't
-  //    broken anything else.
+  // and `backtrack_beam` consume the same convention (the
+  // backtracker indexes into `tokens` via the column index it
+  // just descended from). A real correction would need to
+  // grow the trellis to `(T, num_tokens + 1)` and adjust
+  // every `state.j` arithmetic in the backtracker — and would
+  // still need a side-by-side parity rerun to confirm we hadn't
+  // broken anything else.
   //
   // If WhisperX upstream ever fixes this, we can adopt the change
   // and rerun parity. Until then, "match WhisperX" trumps "match
@@ -405,7 +405,7 @@ fn max_non_blank_logprob(log_probs: &LogProbsTV, t_idx: usize, blank_v: usize) -
 ///
 /// Replaces the previous `BeamState { ..., path: Vec<PathPoint> }`
 /// design. The path is reconstructed at the end of `backtrack_beam`
-/// by walking the `prev` chain. Codex round-22 flagged the cloning
+/// by walking the `prev` chain. Flagged the cloning
 /// approach as O(T²) in path-copy cost — each iteration cloned
 /// `path` (up to length `T`) for every stay/change branch
 /// (`beam_width × 2` branches per iteration × `T` iterations × O(T)
@@ -487,7 +487,7 @@ pub fn backtrack_beam(
   // are indices into it. A node's `prev` field links to its
   // predecessor (or None for the seed). Replacing the previous
   // `Vec<PathPoint>`-per-state design avoids the O(T²) path-clone
-  // cost Codex round-22 flagged: each branch now pushes ONE node
+  // cost Flagged: each branch now pushes ONE node
   // + an index, regardless of how long the path has grown.
   //
   // Pre-reserve: NONE. The trellis budget caps `T * num_tokens`
@@ -495,7 +495,7 @@ pub fn backtrack_beam(
   // pass-through can therefore drive `T` up to 32 M frames. A
   // pre-reserve of `1 + beam_width * 2 * T` nodes at that scale
   // would allocate ~3 GB up-front, before the per-iteration
-  // abort check fires (Codex round-26). Push-driven growth is
+  // abort check fires (). Push-driven growth is
   // amortised O(1) and bounded by the same per-iteration abort
   // flag the loop already honours; for typical T ≈ 1500 the
   // doubling churn is ~400 KB total, dwarfed by the trellis
@@ -552,8 +552,8 @@ pub fn backtrack_beam(
       // The beam's branch score is the predecessor cell value
       // ALONE, NOT `predecessor + p_emission`. WhisperX's
       // `alignment.py:540-541` source reads:
-      //   stayed  = trellis[t - 1, j]   + p_stay
-      //   changed = trellis[t - 1, j-1] + p_change
+      // stayed = trellis[t - 1, j] + p_stay
+      // changed = trellis[t - 1, j-1] + p_change
       //
       // Codex has flagged this comparator three times now
       // (rounds 26, 36, 37 round-6) with formal counterexamples
@@ -569,13 +569,11 @@ pub fn backtrack_beam(
       // ffmpeg-next audio loading (so encoder inputs are
       // bit-equivalent with WhisperX) — every literal
       // `+ p_emission` port observed:
-      //   02_pyannote_sample: 0.997 → 0.913
-      //   04_three_speaker:   0.999 → 0.901
-      //   03_dual_speaker:    0.995 → 0.000  (catastrophic)
+      // 02_pyannote_sample: 0.997 → 0.913
+      // 04_three_speaker: 0.999 → 0.901
+      // 03_dual_speaker: 0.995 → 0.000 (catastrophic)
       // The predecessor-only comparator below produces paths
-      // bit-identical to WhisperX's recorded paths
-      // (`0_dialogue` segment-20 trellis-diff confirmed in
-      // round 26 commit `a0a147d`).
+      // bit-identical to WhisperX's recorded paths.
       //
       // The likely mechanism: PyTorch's beam path-tracking
       // re-derives `trellis[t, j]` from the chosen predecessor
@@ -585,7 +583,7 @@ pub fn backtrack_beam(
       // effectively drops the emission term — exactly the
       // behaviour our implementation reproduces.
       //
-      // Codex round-37 round-6 also suggested an alternative:
+      // also suggested an alternative:
       // "store argmax predecessors during trellis construction".
       // That would also fold `p_emission` into the backtracking
       // decision, and would also break parity for the same
@@ -612,7 +610,7 @@ pub fn backtrack_beam(
             kind: AlignmentFailureKind::NoAlignmentPath,
             message: alloc::format!(
               "beam arena exceeded {BEAM_NODE_BUDGET} nodes; lattice likely degenerate \
-               (high T, very few tokens). Aborting backtrack to bound memory."
+ (high T, very few tokens). Aborting backtrack to bound memory."
             ),
             language: language.clone(),
           });
@@ -635,7 +633,7 @@ pub fn backtrack_beam(
             kind: AlignmentFailureKind::NoAlignmentPath,
             message: alloc::format!(
               "beam arena exceeded {BEAM_NODE_BUDGET} nodes (change branch); lattice \
-               likely degenerate. Aborting backtrack to bound memory."
+ likely degenerate. Aborting backtrack to bound memory."
             ),
             language: language.clone(),
           });
@@ -673,20 +671,20 @@ pub fn backtrack_beam(
 
   // Reconstruct the path in ascending-time order. Two parts:
   //
-  //   (a) WhisperX's leading-blank fill: frames [0, winner.t)
-  //       emit blank at token-0 (visualisation only — the
-  //       trailing leading-blanks always land at token 0 with
-  //       blank emissions, so they don't affect any later
-  //       segment-grouping).
+  // (a) WhisperX's leading-blank fill: frames [0, winner.t)
+  // emit blank at token-0 (visualisation only — the
+  // trailing leading-blanks always land at token 0 with
+  // blank emissions, so they don't affect any later
+  // segment-grouping).
   //
-  //   (b) The chain walk from `winner` (smallest time) back to
-  //       the seed (largest time). Walking `prev` from winner
-  //       yields nodes in ASCENDING time order because each
-  //       branch was created with `time_index = parent.time_index
-  //       - 1`, so `parent.time_index = child.time_index + 1`.
+  // (b) The chain walk from `winner` (smallest time) back to
+  // the seed (largest time). Walking `prev` from winner
+  // yields nodes in ASCENDING time order because each
+  // branch was created with `time_index = parent.time_index
+  // - 1`, so `parent.time_index = child.time_index + 1`.
   //
   // Total: O(T) work, O(T) allocation, no per-branch path-vector
-  // cloning. Codex round-22 flagged the previous O(T²) clone cost.
+  // cloning. Flagged the previous O(T²) clone cost.
   let winner_idx = active[0] as usize;
   let winner_t = arena[winner_idx].time_index;
   let winner_token = arena[winner_idx].token_index;
@@ -797,15 +795,15 @@ where
   let mut i2 = 0_usize;
   while i1 < n {
     // A "word boundary" fires when:
-    //   1. We've walked off the end of the segments.
-    //   2. The token at i2 is a separator (`|` for English).
-    //   3. The word index for the char at i2 differs from the
-    //      word index for the char at i1 (CJK case: no
-    //      separator tokens, but each glyph carries its own
-    //      `word_idx`). Only checked once we've consumed at
-    //      least one char (`i2 > i1`); i1 == i2 means we just
-    //      stepped past a separator and have no in-progress
-    //      word to compare against.
+    // 1. We've walked off the end of the segments.
+    // 2. The token at i2 is a separator (`|` for English).
+    // 3. The word index for the char at i2 differs from the
+    // word index for the char at i1 (CJK case: no
+    // separator tokens, but each glyph carries its own
+    // `word_idx`). Only checked once we've consumed at
+    // least one char (`i2 > i1`); i1 == i2 means we just
+    // stepped past a separator and have no in-progress
+    // word to compare against.
     let at_boundary = i2 >= n
       || is_separator(char_segments[i2].token_index)
       || (i2 > i1
@@ -848,10 +846,10 @@ where
       }
       // Advance the cursor:
       // - If we landed on a separator (or fell off the end),
-      //   skip it: i1 = i2 + 1, i2 = i1.
+      // skip it: i1 = i2 + 1, i2 = i1.
       // - If we hit a word-idx change at a non-separator char,
-      //   that char is the START of the next word — keep it:
-      //   i1 = i2 (and don't increment i2 yet).
+      // that char is the START of the next word — keep it:
+      // i1 = i2 (and don't increment i2 yet).
       if i2 < n && !is_separator(char_segments[i2].token_index) {
         // Word-index change at a non-separator char: don't
         // skip, that char belongs to the next word group.
@@ -926,8 +924,8 @@ pub fn align_to_word_segments(
   // word boundary's content):
   // - It's the wav2vec2 `|` delimiter (vocab id == separator_token_id).
   // - `word_idx_per_token[i]` is `None` (the tokenizer flagged
-  //   it as a delimiter / unmapped specifically). This catches
-  //   any future delimiters that aren't `|`.
+  // it as a delimiter / unmapped specifically). This catches
+  // any future delimiters that aren't `|`.
   let is_separator = |tok_idx: usize| -> bool {
     if word_idx_per_token.get(tok_idx).copied().flatten().is_none() {
       return true;
@@ -1086,8 +1084,8 @@ mod tests {
     assert_eq!(
       trellis_a, trellis_b,
       "Changing `tokens[0]`'s emission posterior must NOT change the trellis. \
-       If this fires the WhisperX-parity quirk has been broken — see the long \
-       comment above the forward DP loop in get_trellis."
+ If this fires the WhisperX-parity quirk has been broken — see the long \
+ comment above the forward DP loop in get_trellis."
     );
   }
 
@@ -1101,7 +1099,7 @@ mod tests {
     assert!((m - (-1.0)).abs() < 1e-6);
   }
 
-  /// Codex round-37 round-6 [medium] regression: the beam-search
+  /// regression: the beam-search
   /// backtracking step ranks predecessor branches by
   /// `trellis[t-1, j_pred]` ALONE, not `predecessor + p_emission`.
   /// This intentionally diverges from a naive read of

@@ -347,7 +347,7 @@ impl Dispatch {
   /// snapshot rather than reading `self.current_override` —
   /// otherwise a chunk whose audio was pushed under packet A's
   /// override but whose VAD-driven close happened in packet B
-  /// would silently get B's override (Codex round-30 finding).
+  /// would silently get B's override (finding).
   pub(crate) fn on_emit(&mut self, chunk: MergedChunk, chunk_id: ChunkId, buffer: &SampleBuffer) {
     let override_at_start = chunk.override_at_start.clone();
     let extracted = ExtractedChunk::extract_from(chunk_id, chunk, buffer, override_at_start);
@@ -581,7 +581,7 @@ impl Dispatch {
     // Update LanguagePolicy::AutoLockAfter observations. The
     // cursor advances strictly in ChunkId order so out-of-order
     // ASR completion can't race-determine the locked language —
-    // pre-fix code recorded observations on completion, so
+    // earlier code recorded observations on completion, so
     // chunk 5 finishing before chunk 0 could lock against an
     // unrepresentative early sample of the stream. Empty-text
     // results and ASR failures don't add an observation, but
@@ -912,7 +912,7 @@ mod tests {
   /// but promoted in a later "process_packet" with override O2
   /// set, must still emit Asr with O1's params.
   ///
-  /// Codex round-30 expanded this contract from "override at
+  /// expanded this contract from "override at
   /// emit time" to "override at chunk-accumulation-start time" —
   /// the chunk reaches `on_emit` already carrying its origin
   /// override, and dispatch reads from there rather than its
@@ -1237,7 +1237,7 @@ mod tests {
 
   /// `AutoLockAfter(n)` must lock to the most-frequent observed
   /// language, not the last observation. With n=3 and
-  /// observations [En, En, Zh], the pre-fix code locked to Zh
+  /// observations [En, En, Zh], the earlier code locked to Zh
   /// (last seen); the contract is En (most frequent).
   /// First-occurrence tiebreaking handles equally-frequent
   /// languages deterministically.
@@ -1298,12 +1298,12 @@ mod tests {
 
   /// AutoLockAfter must order observations by ChunkId, not by
   /// ASR completion order. With max_in_flight > 1, chunk 1 can
-  /// finish before chunk 0; pre-fix code recorded observations
+  /// finish before chunk 0; earlier code recorded observations
   /// in completion order, race-determining the lock based on
   /// which worker happened to finish first. Reproduction: chunk
   /// 0 = En, chunk 1 = Zh, ASR for chunk 1 arrives first. With
   /// first-occurrence tiebreaking, chunk_id order [En, Zh] picks
-  /// En; completion order [Zh, En] picks Zh — pre-fix would have
+  /// En; completion order [Zh, En] picks Zh — would have
   /// locked Zh.
   #[test]
   fn auto_lock_after_orders_by_chunk_id_not_completion() {
@@ -1461,7 +1461,7 @@ mod tests {
   /// get Asr with `language_hint = None` and may auto-detect
   /// different languages, defeating the lock contract.
   /// Reproduction: `AutoLockAfter(1)` + `max_in_flight = 4`.
-  /// Emit 3 chunks without injecting. Pre-fix code promoted all
+  /// Emit 3 chunks without injecting. Earlier code promoted all
   /// three with no hint. Post-fix code keeps only 1 in flight;
   /// the rest wait.
   #[test]
@@ -1586,7 +1586,7 @@ mod tests {
     .unwrap();
     d.after_inject(&mut b, Some(0), u64::MAX);
     assert_eq!(d.locked_language, None);
-    // Pre-fix: chunk 3 promoted here (slot freed). Post-fix: still pending.
+    // Chunk 3 must remain pending — observation cursor hasn't advanced.
     assert_eq!(
       d.cut_pending.len(),
       1,

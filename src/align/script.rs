@@ -72,8 +72,9 @@ impl SegmentContext {
 /// handles embedded Latin per-character (matching WhisperX's
 /// `LANGUAGES_WITHOUT_SPACES` contract). Retained for callers
 /// that may want this classification independent of script
-/// dispatch; the dispatcher itself no longer uses it (round 24
-/// reverted the round-9 fold-Latin-into-CJK rule).
+/// dispatch; the dispatcher itself no longer uses it (Latin
+/// chars under CJK `state_lang` route to `Lang::En` to preserve
+/// code-switches).
 #[must_use]
 pub const fn is_no_space_cjk_lang(lang: &Lang) -> bool {
   matches!(lang, Lang::Ja | Lang::Zh | Lang::Yue | Lang::Ko)
@@ -196,7 +197,7 @@ pub fn script_to_lang(ch: char, ctx: SegmentContext, state_lang: Option<&Lang>) 
     }
     Script::Latin => match state_lang {
       Some(l) if is_latin_script_lang(l) => CharClass::Lang(l.clone()),
-      // Codex round-37 round-24 [high]: route Latin chars to
+      // route Latin chars to
       // `Lang::En` even when `state_lang` is a no-space CJK
       // language. Round 9 had this fold Latin INTO the CJK
       // run so embedded loanwords ("USAで", "Python") could
@@ -330,7 +331,7 @@ mod tests {
     );
   }
 
-  /// Codex round-37 round-24 [high]: a Latin char under a
+  /// a Latin char under a
   /// CJK `state_lang` must route to `Lang::En` so genuine
   /// code-switches (e.g. `"hello 你好"` detected as Zh) split
   /// into separate per-language runs instead of collapsing

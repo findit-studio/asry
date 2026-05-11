@@ -97,7 +97,7 @@ const fn default_max_attempts() -> u8 {
 /// already panic on `0`, but a deserialized config bypasses
 /// them. Surface the violation as a typed deserialization
 /// error instead of letting a misconfigured serde value silently
-/// drop every ASR result. Codex round-33.
+/// drop every ASR result. .
 #[cfg(feature = "serde")]
 fn deserialize_nonzero_max_attempts<'de, D>(deserializer: D) -> Result<u8, D::Error>
 where
@@ -138,7 +138,7 @@ const fn default_n_threads() -> i32 {
 }
 /// Validate `n_threads >= 1` at the serde boundary. The setters
 /// already panic on `<= 0`, but a deserialized config bypasses
-/// them. Codex round-34: whisper.cpp's decoder loop allocates
+/// them. : whisper.cpp's decoder loop allocates
 /// `std::vector<std::thread>(n_threads - 1)` when not exactly 1,
 /// so `n_threads = 0` underflows to a huge allocation request and
 /// `n_threads < 0` aborts. Surface the violation as a typed
@@ -284,7 +284,7 @@ impl AsrParams {
   /// `state.full(...)` entirely and return
   /// [`AsrFailureKind::AllTemperaturesFailed`](crate::types::AsrFailureKind::AllTemperaturesFailed)
   /// for every chunk — total ASR data loss with no model
-  /// inference attempted (Codex round-33). Use `1` for
+  /// inference attempted (). Use `1` for
   /// "single attempt, no temperature retries"; the temperature
   /// ladder needs at least one pass.
   pub const fn set_max_attempts(&mut self, value: u8) {
@@ -338,7 +338,7 @@ impl AsrParams {
   /// `std::vector<std::thread>(n_threads - 1)` when `n_threads`
   /// isn't exactly `1`, so `0` underflows to a huge allocation
   /// request and any negative value aborts inside the worker.
-  /// Codex round-34 flagged this as a high-severity FFI footgun.
+  /// Flagged this as a high-severity FFI footgun.
   pub const fn set_n_threads(&mut self, value: i32) {
     assert!(
       value >= 1,
@@ -654,8 +654,7 @@ pub enum Command {
   /// alignment work. Result returns via
   /// [`super::Transcriber::handle_alignment`].
   ///
-  /// **Coordinate-space contract.** Codex round-37 round-18
-  /// [high]: `sub_segments` here is in the caller's **output
+  /// **Coordinate-space contract.** /// [high]: `sub_segments` here is in the caller's **output
   /// timebase** (the timebase of the first `handle_samples`
   /// `Timestamp`). For human readers / downstream consumers
   /// this is the "natural" form. **The aligner does NOT accept
@@ -672,11 +671,11 @@ pub enum Command {
   /// let raw_subs = transcriber.chunk_sub_segments_samples(chunk_id).unwrap();
   /// let tb_16k = mediatime::Timebase::new(1, NonZeroU32::new(16_000).unwrap());
   /// let aligner_subs: Vec<TimeRange> = raw_subs.iter()
-  ///   .map(|(s, e)| TimeRange::new(
-  ///     (*s as i64) - (chunk_first as i64),
-  ///     (*e as i64) - (chunk_first as i64),
-  ///     tb_16k))
-  ///   .collect();
+  /// .map(|(s, e)| TimeRange::new(
+  /// (*s as i64) - (chunk_first as i64),
+  /// (*e as i64) - (chunk_first as i64),
+  /// tb_16k))
+  /// .collect();
   /// ```
   ///
   /// The `sub_segments` field stays in output timebase here so
@@ -719,8 +718,8 @@ pub enum Command {
 /// `Some(Some(_))` sets it, and `None` leaves the field
 /// untouched.
 ///
-/// **Serde wire form for `Option<Option<T>>` fields.** Codex
-/// round-37: the derived `Option<Option<T>>` impl collapses
+/// **Serde wire form for `Option<Option<T>>` fields.**
+/// The derived `Option<Option<T>>` impl collapses
 /// "field absent" and "field present with null" into the same
 /// outer `None` — so `{"language_hint": null}` would be
 /// indistinguishable from omitting the field, defeating the
@@ -766,7 +765,7 @@ pub struct AsrParamsOverride {
 
 /// Double-option deserializer for `language_hint`. See the
 /// type-level doc on [`AsrParamsOverride`] for the absent / null /
-/// value contract that this helper implements. Codex round-37.
+/// value contract that this helper implements. .
 #[cfg(feature = "serde")]
 fn deserialize_double_option_lang<'de, D>(d: D) -> Result<Option<Option<Lang>>, D::Error>
 where
@@ -934,7 +933,7 @@ mod tests {
     assert_eq!(back.max_attempts(), 3);
   }
 
-  /// Codex round-33: `max_attempts = 0` would silently drop
+  /// : `max_attempts = 0` would silently drop
   /// every chunk's ASR (the retry ladder iterates `0..0` and
   /// returns `AllTemperaturesFailed`). The setters panic; the
   /// `with_*` builder panics symmetrically.
@@ -951,7 +950,7 @@ mod tests {
     let _ = AsrParams::default().with_max_attempts(0);
   }
 
-  // Codex round-34: n_threads validation.
+  // : n_threads validation.
 
   #[test]
   #[should_panic(expected = "n_threads must be >= 1")]
@@ -991,7 +990,7 @@ mod tests {
     assert!(res.is_err(), "n_threads=-2 must be rejected");
   }
 
-  /// Codex round-33: deserialized config must fail loudly on
+  /// : deserialized config must fail loudly on
   /// `max_attempts: 0` rather than producing a runner that
   /// silently drops every chunk.
   #[cfg(feature = "serde")]
@@ -1026,7 +1025,7 @@ mod tests {
     assert!(p.initial_prompt().is_none());
   }
 
-  // --- Codex round-37: AsrParamsOverride double-option serde ---
+  // --- : AsrParamsOverride double-option serde ---
 
   /// Field absent → outer `None` (no override on this field).
   #[cfg(feature = "serde")]
@@ -1044,7 +1043,7 @@ mod tests {
   }
 
   /// Field set to JSON `null` → `Some(None)` (clear the override).
-  /// Pre-fix this was indistinguishable from "absent" because
+  /// this was indistinguishable from "absent" because
   /// the derived `Option<Option<T>>` impl collapsed both to
   /// outer `None`.
   #[cfg(feature = "serde")]

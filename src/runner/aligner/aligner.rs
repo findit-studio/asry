@@ -217,7 +217,7 @@ impl Aligner {
   /// Audio sample rate the model expects. Hardcoded to 16 kHz
   /// for wav2vec2; non-16 kHz models are not supported in v1
   /// (the silence mask, frame timebase, and stride checks all
-  /// assume `SAMPLE_RATE_HZ`). Codex round-26 flagged that
+  /// assume `SAMPLE_RATE_HZ`). Flagged that
   /// the previous `set_sample_rate` / `with_sample_rate`
   /// overrides mutated `self.sample_rate` but were never read
   /// downstream — a caller setting a non-16 kHz value got
@@ -280,10 +280,10 @@ impl Aligner {
   /// - values above `1.0` (incl. `+∞`) clamp to `1.0`
   /// - values below `0.0` (incl. `-∞`) clamp to `0.0`
   /// - `NaN` resets to
-  ///   [`DEFAULT_MIN_SPEECH_COVERAGE`](crate::runner::aligner::algorithm::compose::DEFAULT_MIN_SPEECH_COVERAGE)
-  ///   (`0.5`)
+  /// [`DEFAULT_MIN_SPEECH_COVERAGE`](crate::runner::aligner::algorithm::compose::DEFAULT_MIN_SPEECH_COVERAGE)
+  /// (`0.5`)
   ///
-  /// Codex round-29 flagged the prior permissive behaviour
+  /// Flagged the prior permissive behaviour
   /// ("values are stored verbatim — out-of-range values
   /// effectively disable the coverage check") as a footgun: a
   /// config typo of `1.5` instead of `0.5` would silently drop
@@ -392,9 +392,9 @@ impl Aligner {
   /// call `run_options.terminate()` from another thread; ORT
   /// then unwinds `Session::run_with_options`.
   ///
-  /// Codex round-37 round-13 [high]: introduced this so the
+  /// introduced this so the
   /// public Sans-I/O alignment path has a documented
-  /// cancellation surface. Pre-fix [`Self::align_chunk`]
+  /// cancellation surface. [`Self::align_chunk`]
   /// owned both handles internally, leaving callers no way to
   /// recover from a stuck inference.
   ///
@@ -404,9 +404,9 @@ impl Aligner {
   #[allow(
     clippy::too_many_arguments,
     reason = "7 args carry independent semantic inputs (audio, \
-              sub_segments, text, chunk anchor, timebase bridge, \
-              abort flag, run options); each comes from a different \
-              upstream pass"
+ sub_segments, text, chunk anchor, timebase bridge, \
+ abort flag, run options); each comes from a different \
+ upstream pass"
   )]
   pub fn align_chunk_with_abort<F>(
     &mut self,
@@ -426,7 +426,7 @@ impl Aligner {
   where
     F: Fn(u64, u64) -> TimeRange,
   {
-    // Codex round-37 round-12 (parity loop) [high]: dispatcher
+    // dispatcher
     // path validates `oov_decisions[i].event.language` against
     // the run's requested language in `run_one_alignment`'s
     // `validate_oov_decision_languages`. The public direct
@@ -459,32 +459,32 @@ impl Aligner {
   /// Inputs:
   /// - `samples`: the chunk's 16 kHz f32 mono audio.
   /// - `sub_segments`: VAD sub-segments **in chunk-local 1/16000
-  ///   timebase**, so `start_pts()` / `end_pts()` are chunk-local
-  ///   16 kHz sample indices in `[0, samples.len()]`. The silence
-  ///   mask in step 0 (and `build_speech_frames` in step 7) reads
-  ///   the PTS values directly as sample offsets — they are NOT
-  ///   in any output / wall-clock timebase. Out-of-range PTS get
-  ///   clamped to `[0, samples.len()]`. The internal worker dispatch
-  ///   path (`managed_transcriber.rs`) converts output-timebase
-  ///   sub-segments to this form before calling. External callers
-  ///   that drive `align_chunk` (parity / benchmarking tooling)
-  ///   must respect the same contract; a non-1/16000 timebase
-  ///   trips a `debug_assert`.
+  /// timebase**, so `start_pts()` / `end_pts()` are chunk-local
+  /// 16 kHz sample indices in `[0, samples.len()]`. The silence
+  /// mask in step 0 (and `build_speech_frames` in step 7) reads
+  /// the PTS values directly as sample offsets — they are NOT
+  /// in any output / wall-clock timebase. Out-of-range PTS get
+  /// clamped to `[0, samples.len()]`. The internal worker dispatch
+  /// path (`managed_transcriber.rs`) converts output-timebase
+  /// sub-segments to this form before calling. External callers
+  /// that drive `align_chunk` (parity / benchmarking tooling)
+  /// must respect the same contract; a non-1/16000 timebase
+  /// trips a `debug_assert`.
   /// - `text`: Whisper's transcribed text.
   /// - `chunk_first_sample_in_stream`: the chunk's first 16 kHz
-  ///   sample index in stream coordinates (used to convert
-  ///   wav2vec2 frame indices back to stream sample indices).
+  /// sample index in stream coordinates (used to convert
+  /// wav2vec2 frame indices back to stream sample indices).
   /// - `samples_to_output_range`: callback bridging stream sample
-  ///   indices to output-timebase `TimeRange`s. The core's
-  ///   `SampleBuffer::samples_to_output_range` is `pub(crate)`;
-  ///   the worker constructs a closure over it.
+  /// indices to output-timebase `TimeRange`s. The core's
+  /// `SampleBuffer::samples_to_output_range` is `pub(crate)`;
+  /// the worker constructs a closure over it.
   #[allow(
     clippy::too_many_arguments,
     reason = "8 args, each carrying an independent semantic input \
-              (audio buffer, sub-segments, transcript, chunk anchor, \
-              timebase bridge closure, abort flag, run options); \
-              clustering them into a struct adds indirection without \
-              clarity gain since callers already pass them positionally"
+ (audio buffer, sub-segments, transcript, chunk anchor, \
+ timebase bridge closure, abort flag, run options); \
+ clustering them into a struct adds indirection without \
+ clarity gain since callers already pass them positionally"
   )]
   pub(crate) fn align<F>(
     &mut self,
@@ -538,18 +538,18 @@ impl Aligner {
     }
 
     // wav2vec2's first conv layer has a 400-sample receptive
-    // field. Codex round-25 flagged a stride mismatch on short
+    // field. Flagged a stride mismatch on short
     // inputs: the encoder pads internally to 400 and emits `T`
     // frames whose stride is governed by the padded length, but
     // the downstream `samples_per_frame = samples.len() / (T-1)`
     // ratio used the *original* shorter length, projecting
     // padded frames onto the chunk at the wrong stride. The
-    // round-25 mitigation was an early-return that dropped any
+    // Earlier mitigation was an early-return that dropped any
     // <400-sample slice — safe for the single-language path
     // (whisper rarely emits sub-25ms segments) but a silent
     // word-loss path under script-dispatch, where a single-word
     // run carved from a code-switched segment can legitimately
-    // be <400 samples (Codex round-37 round-4 [high]).
+    // be <400 samples ([high]).
     //
     // Round-4 fix: pad explicitly below (the existing branch),
     // then thread the *padded* length through the downstream
@@ -575,7 +575,7 @@ impl Aligner {
     // inside `encode_log_softmax`) had the intermediate zeros
     // mean-shifted by the normaliser, so masked regions became
     // `(0 - mean) / std` ≠ 0 by the time they reached the model.
-    // Codex round-37 round-32 [medium]: scan the RAW samples
+    // scan the RAW samples
     // for finiteness before the speech-mask zeroes everything
     // outside VAD. `encode_log_softmax`'s finite-sample guard
     // only sees the masked buffer, so a NaN/Inf in a
@@ -594,7 +594,7 @@ impl Aligner {
         kind: AlignmentFailureKind::ModelInferenceFailed,
         message: alloc::format!(
           "non-finite sample at index {idx} (value {val:?}); upstream audio corruption — \
-           refuse to encode, masking-as-silence would only hide the bug"
+ refuse to encode, masking-as-silence would only hide the bug"
         ),
         language: self.language.clone(),
       });
@@ -725,7 +725,7 @@ impl Aligner {
     } else {
       alloc::borrow::Cow::Borrowed(&normalized_samples[..])
     };
-    // Codex round-37 round-10 (parity loop) [medium]: see
+    // see
     // `classify_encode_abort` for the rationale — terminate-
     // induced encode errors must surface as
     // `WorkerHangTimeout`, not `ModelInferenceFailed`.
@@ -897,7 +897,7 @@ impl Aligner {
     // `build_speech_frames` (which uses it to map encoder frames
     // back to sample ranges for VAD overlap classification) and
     // `compose_words` (which uses the same mapping to emit word
-    // timestamps). Codex round-21 flagged the previous mismatch
+    // timestamps). Flagged the previous mismatch
     // — `build_speech_frames` used nominal `hop_samples` while
     // `compose_words` used the WhisperX effective ratio
     // `n_samples / (T - 1)`. On a 30 s chunk where wav2vec2
@@ -911,8 +911,7 @@ impl Aligner {
     // (no sub-segment overlaps the zero-padding region), and
     // `min_speech_coverage` filters any word that lands there —
     // so the chunk's *real* audio boundary is enforced via the
-    // silence path, not via the clamp arg. Codex round-37 round-4
-    // fixed this (the previous code passed `samples.len()` here
+    // silence path, not via the clamp arg. // fixed this (the previous code passed `samples.len()` here
     // even when the encoder ran on `padded_samples`, so the
     // `samples_per_frame = samples.len() / (T-1)` stride was
     // wrong — frames computed by ORT against 400 samples were
@@ -924,8 +923,7 @@ impl Aligner {
       self.hop_samples,
     );
     // Real chunk length for word-range clamping AND for the
-    // per-frame speech threshold (Codex round-37 round-28 [high]:
-    // frames whose nominal `[frame_lo, frame_hi)` extends past
+    // per-frame speech threshold ( // frames whose nominal `[frame_lo, frame_hi)` extends past
     // the real audio must compare overlap against the
     // real-window width, not nominal — otherwise a 100-sample
     // all-speech run padded to 400 has frame 0 classified as
@@ -939,7 +937,7 @@ impl Aligner {
       sub_segments,
     );
     // Real chunk length also drives word-range clamping. Codex
-    // round-37 round-6 [high]: pre-fix passed `encoder_n_samples`
+    // passed `encoder_n_samples`
     // for both, so a 200-sample run padded to 400 could emit
     // word ranges out to the padded boundary, overlapping
     // adjacent script-dispatch runs.
@@ -959,7 +957,7 @@ impl Aligner {
   }
 }
 
-/// Codex round-37 round-12 (parity loop) [high]: validate
+/// validate
 /// every supplied `ResolvedOov.event.language` matches
 /// `expected_lang`.
 ///
@@ -988,9 +986,9 @@ fn validate_direct_decision_languages(
         kind: crate::types::AlignmentFailureKind::TokenizationFailed,
         message: alloc::format!(
           "align_chunk_with_abort: oov_decisions[{i}].event.language = {:?} \
-           but this aligner's language is {:?}. Direct callers must pass \
-           ResolvedOov produced for THIS aligner's language. Recompute via \
-           `Self::detect_oov(text)` + a policy helper from `crate::core::oov`.",
+ but this aligner's language is {:?}. Direct callers must pass \
+ ResolvedOov produced for THIS aligner's language. Recompute via \
+ `Self::detect_oov(text)` + a policy helper from `crate::core::oov`.",
           resolved.event.language,
           expected_lang,
         ),
@@ -1003,7 +1001,7 @@ fn validate_direct_decision_languages(
 
 /// Classify an `encode_log_softmax` failure based on whether the
 /// alignment watchdog already flipped `abort_flag` (Codex
-/// round-37 round-10, parity loop, severity medium).
+/// ).
 ///
 /// The watchdog cancels in-flight ORT inference by calling
 /// `RunOptions::terminate()`. ORT then returns
@@ -1040,21 +1038,21 @@ fn classify_encode_abort(
 /// Two contract details worth highlighting:
 ///
 /// 1. A non-1/16000 timebase fails the chunk in BOTH debug and
-///    release with a `WorkFailure::AlignmentFailed`. Previously
-///    the check was a `debug_assert!` only, so release builds
-///    silently misinterpreted (e.g.) a millisecond-timebase PTS
-///    as a sample index, masking the wrong samples and producing
-///    plausible-but-wrong word alignments. Internal callers
-///    always wrap in 1/16000 (`managed_transcriber.rs`); external
-///    callers of `align_chunk` are documented to do the same and
-///    now hit a clear runtime error if they don't.
+/// release with a `WorkFailure::AlignmentFailed`. Previously
+/// the check was a `debug_assert!` only, so release builds
+/// silently misinterpreted (e.g.) a millisecond-timebase PTS
+/// as a sample index, masking the wrong samples and producing
+/// plausible-but-wrong word alignments. Internal callers
+/// always wrap in 1/16000 (`managed_transcriber.rs`); external
+/// callers of `align_chunk` are documented to do the same and
+/// now hit a clear runtime error if they don't.
 /// 2. `i64 → usize` is via `.clamp(0, n_samples_i64) as usize`, NOT
-///    `as u64 as usize`. The old cast wrapped negative `start_pts`
-///    to a huge u64, which then got clamped to `n_samples` and the
-///    `if end > start` guard dropped the sub-segment entirely.
-///    Negative-overlap ranges (sub-segment whose head extends past
-///    the chunk start) now get their head trimmed and their tail
-///    masked, matching `compose::build_speech_frames`'s `.max(0)`.
+/// `as u64 as usize`. The old cast wrapped negative `start_pts`
+/// to a huge u64, which then got clamped to `n_samples` and the
+/// `if end > start` guard dropped the sub-segment entirely.
+/// Negative-overlap ranges (sub-segment whose head extends past
+/// the chunk start) now get their head trimmed and their tail
+/// masked, matching `compose::build_speech_frames`'s `.max(0)`.
 fn build_speech_mask(
   n_samples: usize,
   sub_segments: &[TimeRange],
@@ -1069,8 +1067,8 @@ fn build_speech_mask(
         kind: AlignmentFailureKind::ModelInferenceFailed,
         message: alloc::format!(
           "Aligner::align expects sub_segments in chunk-local 1/{} timebase, \
-           got {}/{}; caller passed sub_segments in the wrong timebase \
-           (samples will not match audio if we proceed).",
+ got {}/{}; caller passed sub_segments in the wrong timebase \
+ (samples will not match audio if we proceed).",
           SAMPLE_RATE_HZ,
           seg.timebase().num(),
           seg.timebase().den().get(),
@@ -1138,9 +1136,9 @@ fn validate_word_delimiter_present(
   Err(RunnerError::AlignerLoad {
     message: String::from(
       "tokenizer is missing the `|` word-delimiter token, but the language's normaliser \
-       declared `use_word_delimiter = true`. wav2vec2 word-segmented vocabularies require \
-       a `|` token between spoken words. Either swap to a tokenizer that exposes `|`, or \
-       supply a normaliser whose `use_word_delimiter` returns false (char-level segmentation).",
+ declared `use_word_delimiter = true`. wav2vec2 word-segmented vocabularies require \
+ a `|` token between spoken words. Either swap to a tokenizer that exposes `|`, or \
+ supply a normaliser whose `use_word_delimiter` returns false (char-level segmentation).",
     ),
   })
 }
@@ -1152,6 +1150,15 @@ fn validate_word_delimiter_present(
 /// function so it can be tested without standing up an ORT
 /// session + tokenizer fixture.
 const fn coerce_speech_coverage(value: f32) -> f32 {
+  // NaN coercion is intentional release behaviour (avoid
+  // panicking in production for a config typo), but dev
+  // builds should surface the bug — silently getting the
+  // default for `f32::NAN` is the kind of mistake that hides
+  // for months.
+  debug_assert!(
+    !value.is_nan(),
+    "min_speech_coverage = NaN — likely a programming error; release builds coerce to default"
+  );
   // Order matters: `value < 0.0` and `value > 1.0` are both
   // false when `value` is NaN, so the NaN branch must come
   // first. `const fn` permits `is_nan()` and the comparison
@@ -1223,7 +1230,7 @@ fn load_tokenizer_with_compat(path: &Path) -> Result<Tokenizer, RunnerError> {
 /// than a full `serde_json::Value` round-trip, because whispery
 /// avoids the `serde_json` runtime dep on the alignment feature
 /// (the bundled vocab is parsed at build time; parity-dump JSON
-/// is hand-formatted). Codex round-29 flagged that the previous
+/// is hand-formatted). Flagged that the previous
 /// implementation used naive substring searches (`s.find(...)`,
 /// `s[..].contains(...)`) without quote-awareness, so a tokenizer
 /// JSON whose string values happened to contain `"model"` or
@@ -1247,7 +1254,7 @@ fn inject_wordlevel_model_type(bytes: &[u8]) -> Option<alloc::vec::Vec<u8>> {
   }
 
   // Inject the discriminator fields right after `{`.
-  let injection = b"\n        \"type\": \"WordLevel\",\n        \"unk_token\": \"<unk>\",";
+  let injection = b"\n \"type\": \"WordLevel\",\n \"unk_token\": \"<unk>\",";
   let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(bytes.len() + injection.len());
   out.extend_from_slice(&bytes[..=model_open]);
   out.extend_from_slice(injection);
@@ -1420,7 +1427,7 @@ fn has_top_level_key(bytes: &[u8], start: usize, end: usize, key: &[u8]) -> bool
 mod tests {
   use super::*;
 
-  /// Codex round-37 round-10 (parity loop) [medium]: when the
+  /// when the
   /// alignment watchdog flips `abort_flag` and ORT returns an
   /// error from terminate(), the encode-failure classifier
   /// must promote it to `WorkerHangTimeout`, not pass it
@@ -1448,10 +1455,10 @@ mod tests {
     }
   }
 
-  /// Codex round-37 round-12 (parity loop) [high]: the public
+  /// the public
   /// direct-aligner path validates that every supplied
   /// `ResolvedOov.event.language` matches the aligner's
-  /// language. Pre-fix a parity test / power-user caller could
+  /// language. a parity test / power-user caller could
   /// pass cross-language decisions whose positional fields
   /// happen to match and silently apply wildcard timings the
   /// caller intended to fail-closed.
@@ -1553,28 +1560,28 @@ mod tests {
     // rejects this raw; the compat shim must inject the
     // missing fields and retry.
     let raw = br#"{
-      "version": "1.0",
-      "truncation": null,
-      "padding": null,
-      "added_tokens": [],
-      "normalizer": null,
-      "pre_tokenizer": {"type": "Split", "pattern": {"Regex": ""}, "behavior": "Isolated", "invert": false},
-      "post_processor": null,
-      "decoder": null,
-      "model": {
-        "vocab": {
-          "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3, "|": 4,
-          "A": 5, "B": 6, "C": 7
-        }
-      }
-    }"#;
+ "version": "1.0",
+ "truncation": null,
+ "padding": null,
+ "added_tokens": [],
+ "normalizer": null,
+ "pre_tokenizer": {"type": "Split", "pattern": {"Regex": ""}, "behavior": "Isolated", "invert": false},
+ "post_processor": null,
+ "decoder": null,
+ "model": {
+ "vocab": {
+ "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3, "|": 4,
+ "A": 5, "B": 6, "C": 7
+ }
+ }
+ }"#;
     // Confirm the raw form really does fail (otherwise the
     // shim is exercising nothing). If `tokenizers` upstream
     // ever relaxes its parser, this assert catches it.
     assert!(
       Tokenizer::from_bytes(raw).is_err(),
       "tokenizers 0.20 unexpectedly accepted raw upstream HF format; \
-       the compat shim is no longer necessary"
+ the compat shim is no longer necessary"
     );
 
     // Shim must accept and patch.
@@ -1591,21 +1598,21 @@ mod tests {
   #[test]
   fn load_tokenizer_with_compat_skips_already_patched_input() {
     let already_typed = br#"{
-      "model": {
-        "type": "WordLevel",
-        "vocab": {"<unk>": 0, "A": 1},
-        "unk_token": "<unk>"
-      }
-    }"#;
+ "model": {
+ "type": "WordLevel",
+ "vocab": {"<unk>": 0, "A": 1},
+ "unk_token": "<unk>"
+ }
+ }"#;
     assert!(inject_wordlevel_model_type(already_typed).is_none());
   }
 
-  /// Codex round-29 finding 2: the patcher used naive substring
-  /// search (`s.find("\"model\"")`) which would match a `"model"`
-  /// substring inside any string value before it reached the
-  /// real top-level `"model"` key. The quote-aware scanner must
-  /// skip `"model"` text appearing inside strings and inject at
-  /// the actual top-level key.
+  /// The patcher must use a quote-aware scanner — a naive
+  /// substring search (`s.find("\"model\"")`) would match a
+  /// `"model"` substring inside any string value before
+  /// reaching the real top-level `"model"` key. Skip `"model"`
+  /// text appearing inside strings and inject at the actual
+  /// top-level key.
   ///
   /// Test strategy: byte-level — we don't go through the
   /// `Tokenizer::from_bytes` schema validator because the
@@ -1621,11 +1628,11 @@ mod tests {
     // `\"model\"`. A naive `s.find("\"model\"")` would land here.
     // The real `"model": {` key sits AFTER the decoy.
     let raw = br#"{
-      "decoy": "this string mentions \"model\" with escape-quoted braces",
-      "model": {
-        "vocab": {"<pad>": 0, "<unk>": 1, "|": 2, "A": 3}
-      }
-    }"#;
+ "decoy": "this string mentions \"model\" with escape-quoted braces",
+ "model": {
+ "vocab": {"<pad>": 0, "<unk>": 1, "|": 2, "A": 3}
+ }
+ }"#;
     let patched = inject_wordlevel_model_type(raw)
       .expect("patcher must locate the real top-level model key, not the decoy substring");
     let s = core::str::from_utf8(&patched).expect("UTF-8");
@@ -1633,21 +1640,21 @@ mod tests {
       .find("\"type\": \"WordLevel\"")
       .expect("patched output must contain injected discriminator");
     let real_model_key = s
-      .find("\n      \"model\": {")
+      .find("\n \"model\": {")
       .expect("real model key must remain in output");
     assert!(
       inj > real_model_key,
       "injection at offset {inj} must come AFTER real model key at offset {real_model_key}; \
-       the decoy substring would have placed it earlier"
+ the decoy substring would have placed it earlier"
     );
   }
 
-  /// Codex round-29 finding 2: brace counting was naive and
-  /// counted braces even inside string values. A description
-  /// like `"value with {curly} braces"` would skew the depth
-  /// tracker and the scanner would lose the model body's
-  /// matching close brace. The quote-aware close-brace finder
-  /// must skip braces inside strings.
+  /// The close-brace finder must skip braces inside strings.
+  /// Naive brace counting would count braces even inside string
+  /// values, so a description like
+  /// `"value with {curly} braces"` would skew the depth tracker
+  /// and the scanner would lose the model body's matching close
+  /// brace.
   ///
   /// Test strategy: verify the injection successfully completes
   /// without a `None` bail, AND the patched output contains the
@@ -1663,11 +1670,11 @@ mod tests {
   #[test]
   fn inject_wordlevel_model_type_ignores_braces_inside_strings() {
     let raw = br#"{
-      "decoy": "value with { braces } and more { } inside",
-      "model": {
-        "vocab": {"<pad>": 0, "<unk>": 1, "|": 2, "B": 3}
-      }
-    }"#;
+ "decoy": "value with { braces } and more { } inside",
+ "model": {
+ "vocab": {"<pad>": 0, "<unk>": 1, "|": 2, "B": 3}
+ }
+ }"#;
     let patched = inject_wordlevel_model_type(raw)
       .expect("patcher must skip braces inside string values when finding model body close");
     let s = core::str::from_utf8(&patched).expect("UTF-8");
@@ -1682,25 +1689,24 @@ mod tests {
     );
   }
 
-  /// Codex round-29 finding 2: the discriminator pre-check was a
-  /// substring search that would treat `"type"` *anywhere* inside
-  /// the model body — including string values like
-  /// `"_note": "the type of ..."` — as evidence that the
-  /// discriminator was already present, and skip patching. The
-  /// quote-aware key check must only match `"type"` when it's a
-  /// JSON key (followed by `:`) at the top level of the model
-  /// object.
+  /// The discriminator pre-check must only match `"type"` when
+  /// it's a JSON key (followed by `:`) at the top level of the
+  /// model object. A naive substring search would treat
+  /// `"type"` anywhere inside the model body — including
+  /// string values like `"_note": "the type of ..."` — as
+  /// evidence that the discriminator was already present, and
+  /// skip patching.
   #[test]
   fn inject_wordlevel_model_type_does_not_treat_quoted_type_as_discriminator() {
     let raw = br#"{
-      "model": {
-        "_note": "the type of model is wav2vec2",
-        "vocab": {"<pad>": 0, "<unk>": 1, "|": 2, "C": 3}
-      }
-    }"#;
+ "model": {
+ "_note": "the type of model is wav2vec2",
+ "vocab": {"<pad>": 0, "<unk>": 1, "|": 2, "C": 3}
+ }
+ }"#;
     let patched = inject_wordlevel_model_type(raw).expect(
       "patcher must NOT short-circuit on a quoted `type` substring inside a string value; \
-       it must inject the real discriminator key",
+ it must inject the real discriminator key",
     );
     let s = core::str::from_utf8(&patched).expect("UTF-8");
     assert!(
@@ -1709,7 +1715,7 @@ mod tests {
     );
   }
 
-  // --- Coverage coercion (Codex round-29 finding 1) ---
+  // --- Coverage coercion (finding 1) ---
   //
   // Per user direction: don't panic on bad inputs — coerce them
   // toward a valid threshold so misconfigured callers still
@@ -1738,16 +1744,24 @@ mod tests {
     assert_eq!(coerce_speech_coverage(f32::NEG_INFINITY), 0.0);
   }
 
+  /// In debug builds the `debug_assert!` fires so a NaN
+  /// config value is loud during development. Release builds
+  /// fall through to the coerce-to-default path so a typo
+  /// doesn't take down production.
   #[test]
-  fn coerce_speech_coverage_treats_nan_as_default() {
-    // NaN compares false to every comparison operator, so a
-    // permissive setter would store it verbatim and silently
-    // drop every word (since `coverage < NaN` is always false).
-    // Reset to the documented sane default instead.
+  #[cfg(not(debug_assertions))]
+  fn coerce_speech_coverage_treats_nan_as_default_in_release() {
     assert_eq!(
       coerce_speech_coverage(f32::NAN),
       crate::runner::aligner::algorithm::compose::DEFAULT_MIN_SPEECH_COVERAGE,
     );
+  }
+
+  #[test]
+  #[cfg(debug_assertions)]
+  #[should_panic(expected = "min_speech_coverage = NaN")]
+  fn coerce_speech_coverage_panics_on_nan_in_debug() {
+    let _ = coerce_speech_coverage(f32::NAN);
   }
 
   // --- Word-delimiter validation ---
@@ -1756,20 +1770,20 @@ mod tests {
   /// cases where the delimiter check should pass.
   fn tokenizer_with_pipe_delimiter() -> Tokenizer {
     let json = r#"{
-      "version": "1.0",
-      "truncation": null,
-      "padding": null,
-      "added_tokens": [],
-      "normalizer": null,
-      "pre_tokenizer": {"type": "Split", "pattern": {"Regex": ""}, "behavior": "Isolated", "invert": false},
-      "post_processor": null,
-      "decoder": null,
-      "model": {
-        "type": "WordLevel",
-        "vocab": {"<unk>": 0, "<pad>": 1, "|": 2, "A": 3, "B": 4},
-        "unk_token": "<unk>"
-      }
-    }"#;
+ "version": "1.0",
+ "truncation": null,
+ "padding": null,
+ "added_tokens": [],
+ "normalizer": null,
+ "pre_tokenizer": {"type": "Split", "pattern": {"Regex": ""}, "behavior": "Isolated", "invert": false},
+ "post_processor": null,
+ "decoder": null,
+ "model": {
+ "type": "WordLevel",
+ "vocab": {"<unk>": 0, "<pad>": 1, "|": 2, "A": 3, "B": 4},
+ "unk_token": "<unk>"
+ }
+ }"#;
     Tokenizer::from_bytes(json.as_bytes()).expect("parse")
   }
 
@@ -1777,20 +1791,20 @@ mod tests {
   /// configuration mistake the delimiter check catches.
   fn tokenizer_without_pipe_delimiter() -> Tokenizer {
     let json = r#"{
-      "version": "1.0",
-      "truncation": null,
-      "padding": null,
-      "added_tokens": [],
-      "normalizer": null,
-      "pre_tokenizer": {"type": "Split", "pattern": {"Regex": ""}, "behavior": "Isolated", "invert": false},
-      "post_processor": null,
-      "decoder": null,
-      "model": {
-        "type": "WordLevel",
-        "vocab": {"<unk>": 0, "<pad>": 1, "A": 2, "B": 3},
-        "unk_token": "<unk>"
-      }
-    }"#;
+ "version": "1.0",
+ "truncation": null,
+ "padding": null,
+ "added_tokens": [],
+ "normalizer": null,
+ "pre_tokenizer": {"type": "Split", "pattern": {"Regex": ""}, "behavior": "Isolated", "invert": false},
+ "post_processor": null,
+ "decoder": null,
+ "model": {
+ "type": "WordLevel",
+ "vocab": {"<unk>": 0, "<pad>": 1, "A": 2, "B": 3},
+ "unk_token": "<unk>"
+ }
+ }"#;
     Tokenizer::from_bytes(json.as_bytes()).expect("parse")
   }
 
@@ -1838,27 +1852,27 @@ mod tests {
   /// is content-addressed, not contiguous-range.
   fn tokenizer_kresnik_shape() -> Tokenizer {
     let json = r#"{
-      "version": "1.0",
-      "truncation": null,
-      "padding": null,
-      "added_tokens": [],
-      "normalizer": null,
-      "pre_tokenizer": {"type": "Split", "pattern": {"Regex": ""}, "behavior": "Isolated", "invert": false},
-      "post_processor": null,
-      "decoder": null,
-      "model": {
-        "type": "WordLevel",
-        "vocab": {"안": 0, "녕": 1, "하": 2, "세": 3, "요": 4, "|": 859, "[UNK]": 1203, "[PAD]": 1204},
-        "unk_token": "[UNK]"
-      }
-    }"#;
+ "version": "1.0",
+ "truncation": null,
+ "padding": null,
+ "added_tokens": [],
+ "normalizer": null,
+ "pre_tokenizer": {"type": "Split", "pattern": {"Regex": ""}, "behavior": "Isolated", "invert": false},
+ "post_processor": null,
+ "decoder": null,
+ "model": {
+ "type": "WordLevel",
+ "vocab": {"안": 0, "녕": 1, "하": 2, "세": 3, "요": 4, "|": 859, "[UNK]": 1203, "[PAD]": 1204},
+ "unk_token": "[UNK]"
+ }
+ }"#;
     Tokenizer::from_bytes(json.as_bytes()).expect("parse")
   }
 
   #[test]
   fn detect_blank_token_id_resolves_bracket_pad_at_high_index() {
     // kresnik places `[PAD]` at id 1204; the helper must return
-    // it. Pre-fix risk: a resolver that hardcoded id 0 (the
+    // it. risk: a resolver that hardcoded id 0 (the
     // jonatasgrosman convention) would silently misalign every
     // CTC frame to the first syllable instead of the blank.
     let tok = tokenizer_kresnik_shape();
@@ -1984,7 +1998,7 @@ mod tests {
   fn build_speech_mask_errors_on_non_analysis_timebase() {
     // Promoted from the previous `debug_assert!`-only check: a
     // non-1/16000 timebase now fails the chunk in BOTH debug and
-    // release. Codex round-20 round-tripped this as a
+    // release. round-tripped this as a
     // medium-severity finding because release builds silently
     // misinterpreted (e.g.) a millisecond-timebase PTS as a
     // 16 kHz sample index, masking the wrong samples and
@@ -2106,7 +2120,7 @@ mod tests {
     );
   }
 
-  /// Codex round-25 regression: a chunk shorter than wav2vec2's
+  /// regression: a chunk shorter than wav2vec2's
   /// 400-sample receptive field must NOT enter the encode path,
   /// because the encoder would pad to 400 and emit `T` frames
   /// whose stride is governed by the padded length, while

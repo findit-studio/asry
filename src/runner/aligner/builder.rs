@@ -21,17 +21,17 @@ use crate::runner::aligner::{
 /// use whispery::{AlignmentFallback, EnglishNormalizer, Lang};
 ///
 /// let aligner = Aligner::from_paths(
-///     Lang::En,
-///     Path::new("path/to/wav2vec2.onnx"),
-///     Path::new("path/to/tokenizer.json"),
-///     Box::new(EnglishNormalizer::new()),
+/// Lang::En,
+/// Path::new("path/to/wav2vec2.onnx"),
+/// Path::new("path/to/tokenizer.json"),
+/// Box::new(EnglishNormalizer::new()),
 /// )
 /// .expect("aligner load");
 ///
 /// let set = AlignmentSetBuilder::new()
-///     .with_fallback(AlignmentFallback::SkipChunk)
-///     .register(AlignerKey::Lang(Lang::En), aligner)
-///     .build();
+/// .with_fallback(AlignmentFallback::SkipChunk)
+/// .register(AlignerKey::Lang(Lang::En), aligner)
+/// .build();
 /// # }
 /// ```
 pub struct AlignmentSetBuilder {
@@ -65,9 +65,9 @@ impl AlignmentSetBuilder {
   ///
   /// Wrapped in a `Mutex<Aligner>`.
   ///
-  /// Codex round-37 round-30 [medium]: panics if `key` is
+  /// panics if `key` is
   /// [`AlignerKey::Lang`]`(L)` and `aligner.language() != L`.
-  /// Pre-fix the registry accepted any aligner under any key,
+  /// The registry accepted any aligner under any key,
   /// so a swapped registration (e.g. `AlignerKey::Lang(Lang::Zh)`
   /// pointing at an English aligner) silently routed CJK
   /// script-dispatch runs through the English normalizer /
@@ -83,9 +83,9 @@ impl AlignmentSetBuilder {
         aligner.language(),
         key_lang,
         "AlignerKey::Lang({key_lang:?}) registration cannot accept an aligner built \
-         for {actual:?}; either register under AlignerKey::Lang({actual:?}), \
-         AlignerKey::Any (explicit multilingual fallback), or rebuild the \
-         aligner for the desired language",
+ for {actual:?}; either register under AlignerKey::Lang({actual:?}), \
+ AlignerKey::Any (explicit multilingual fallback), or rebuild the \
+ aligner for the desired language",
         actual = aligner.language(),
       );
     }

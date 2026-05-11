@@ -80,14 +80,13 @@ pub(crate) fn effective_samples_per_frame(
 /// 480000` instead of nominal `1500`), the drift hits ~40 ms by
 /// the chunk end — enough to drop a valid late-frame word whose
 /// nominal frame looks silent, or keep a word whose emitted
-/// range lands outside the VAD speech span. Codex round-21
-/// flagged this as a medium-severity inconsistency. The fix is
+/// range lands outside the VAD speech span. /// flagged this as a medium-severity inconsistency. The fix is
 /// to feed both functions the same `samples_per_frame` value via
 /// [`effective_samples_per_frame`].
 ///
 /// `n_samples` is the chunk's input audio length in 16 kHz samples.
 /// Sub-segment bounds are clamped to `[0, n_samples]` before any
-/// overlap math — Codex round-24 flagged that without this clamp,
+/// overlap math — Flagged that without this clamp,
 /// a VAD segment overshooting the chunk end could "credit" the
 /// trailing frame's interval (which can extend past the audio for
 /// the WhisperX effective ratio's last frame: `[(T-1)*spf, T*spf)`
@@ -105,14 +104,12 @@ pub(crate) fn build_speech_frames(
   // Total encoder input length (real audio + sub-receptive-field
   // zero padding). Drives frame indexing.
   n_samples: u64,
-  // Real audio length without padding. Codex round-37 round-28
-  // [high]: when `real_n_samples < n_samples` (the short-run
+  // Real audio length without padding. // [high]: when `real_n_samples < n_samples` (the short-run
   // padded path), per-frame threshold and segment clamps must
   // use the REAL extent — otherwise a 100-sample all-speech run
   // padded to 400 sees frame 0's nominal threshold of 160 (half
   // of 320), the overlap is only 100, the frame is classified
-  // as silence, and `compose_words` drops every word. Pre-fix
-  // this argument did not exist; callers passed
+  // as silence, and `compose_words` drops every word.  // this argument did not exist; callers passed
   // `encoder_n_samples` for the single `n_samples` slot.
   real_n_samples: u64,
   sub_segments: &[mediatime::TimeRange],
@@ -122,7 +119,7 @@ pub(crate) fn build_speech_frames(
   }
   // A frame is marked "speech" only if at least half its
   // `samples_per_frame` samples are inside some VAD sub-segment.
-  // Pre-fix any overlap, even 1 sample, promoted the whole frame
+  // any overlap, even 1 sample, promoted the whole frame
   // — a tiny VAD island inside an otherwise-silent frame let the
   // post-pass keep CTC-forced words whose ranges covered mostly
   // zero-masked audio. ≥50 % is the natural threshold — frames
@@ -143,14 +140,14 @@ pub(crate) fn build_speech_frames(
   // the 30 s edge case), well within the half-frame margin.
   let spf_int = samples_per_frame.floor() as i64;
   let min_overlap_samples = ((spf_int + 1) / 2).max(1);
-  // Codex round-37 round-29 [medium] clamped sub-segment
+  // clamped sub-segment
   // endpoints to `real_n_samples` (not `n_samples` /
   // encoder length); the encoder-length sentinel is unused
   // here because of that fix.
   let real_n_samples_i64 = real_n_samples.min(n_samples) as i64;
 
   // Coalesce overlapping/adjacent sub-segments into a non-overlapping
-  // union BEFORE per-frame accumulation. Codex round-27 flagged that
+  // union BEFORE per-frame accumulation. Flagged that
   // the previous implementation summed each sub-segment's per-frame
   // intersection independently, so two overlapping ranges (e.g.
   // [0, 100] and [50, 150] inside frame 0's [0, 320) interval)
@@ -173,14 +170,14 @@ pub(crate) fn build_speech_frames(
   // round-24): a VAD segment whose `end_pts > n_samples` would
   // credit the trailing frame's interval with phantom-sample
   // overlap.
-  // Codex round-37 round-29 [medium]: clamp to REAL audio
+  // clamp to REAL audio
   // length, not encoder length. When `real_n_samples <
   // n_samples` (the short-run padded path), a VAD sub-segment
   // that overshoots the real audio would otherwise contribute
   // overlap from padded zeros — `build_speech_mask` already
   // clamps to `samples.len()` before encoding, so allowing
   // overshoot here lets `compose_words` keep CTC word spans
-  // over silence/padding. Pre-fix this clamped to
+  // over silence/padding. this clamped to
   // `n_samples_i64` (encoder length).
   let mut clamped_segs: alloc::vec::Vec<(i64, i64)> = sub_segments
     .iter()
@@ -229,7 +226,7 @@ pub(crate) fn build_speech_frames(
       }
     }
   }
-  // Codex round-37 round-28 [high]: per-frame threshold scales
+  // per-frame threshold scales
   // with the frame's REAL-audio window. For a 100-sample run
   // padded to 400, frame 0 covers `[0, 320)` but only the first
   // 100 samples are real audio — the threshold must compare
@@ -278,20 +275,20 @@ pub(crate) fn build_speech_frames(
 /// audio (false). Whispery's correctness layer:
 ///
 /// - **Drop words with low speech coverage**
-///   (`min_speech_coverage`).
+/// (`min_speech_coverage`).
 /// - **Drop words with a long contiguous silent gap inside the
-///   span** (`max_intra_silent_run`).
+/// span** (`max_intra_silent_run`).
 ///
 /// These are *post-processing* — applied to spans WhisperX's
 /// algorithm picked, not folded into the lattice.
 #[allow(
   clippy::too_many_arguments,
   reason = "10 args carry the per-chunk composition contract \
-            (raw word segments, original surface forms, speech mask, \
-            chunk anchor, hop, sample count, output bridge closure, \
-            speech-coverage threshold, intra-silence run threshold, \
-            language-aware policy); each is a distinct semantic axis \
-            from upstream passes — bundling them adds indirection"
+ (raw word segments, original surface forms, speech mask, \
+ chunk anchor, hop, sample count, output bridge closure, \
+ speech-coverage threshold, intra-silence run threshold, \
+ language-aware policy); each is a distinct semantic axis \
+ from upstream passes — bundling them adds indirection"
 )]
 pub(crate) fn compose_words<F>(
   word_segments: &[WordSegment],
@@ -309,8 +306,7 @@ pub(crate) fn compose_words<F>(
   // padding). Word ranges are clamped to
   // `[chunk_first_sample, chunk_first_sample + real_n_samples)`
   // so a 200-sample run zero-padded to 400 for the encoder
-  // doesn't emit timestamps in the padded region. Codex round-37
-  // round-6 [high]: previously `n_samples` filled both roles, so
+  // doesn't emit timestamps in the padded region. // previously `n_samples` filled both roles, so
   // padded-input runs leaked padded duration into output timing.
   // For non-padded slices, callers pass the same value for both.
   real_n_samples: u64,
@@ -396,9 +392,9 @@ where
     }
 
     // Frame-to-sample with WhisperX's effective ratio. Codex
-    // round-37 round-26 [medium]: `chunk_first_sample_in_stream`
+    // `chunk_first_sample_in_stream`
     // is supplied by the caller and could land near `u64::MAX`
-    // for very long streams; pre-fix the unchecked add panicked
+    // for very long streams; the unchecked add panicked
     // in debug and wrapped in release, emitting words at
     // tiny-sample-index ranges that violated the chunk window.
     // Use `saturating_add` and skip any word whose start
@@ -448,9 +444,9 @@ mod tests {
     }
   }
 
-  /// Codex round-37 round-26 [medium]: a chunk anchor near
+  /// a chunk anchor near
   /// `u64::MAX` must NOT panic in debug or wrap to a tiny
-  /// sample index in release. Pre-fix the unchecked
+  /// sample index in release. The unchecked
   /// `chunk_first_sample_in_stream + offset` did exactly that;
   /// post-fix `saturating_add` clamps to `u64::MAX` and the
   /// downstream `raw_start >= chunk_end_sample` guard drops
@@ -744,9 +740,9 @@ mod tests {
     assert_eq!(mask, alloc::vec![false; 8]);
   }
 
-  /// Codex round-37 round-28 [high]: a 100-sample all-speech
+  /// a 100-sample all-speech
   /// run padded to 400 samples for the encoder must NOT be
-  /// classified silent. Pre-fix the threshold (~160 = half of
+  /// classified silent. The threshold (~160 = half of
   /// 320) was applied uniformly, so frame 0's overlap of 100
   /// failed the gate and `compose_words` dropped every word.
   /// Post-fix the per-frame threshold scales with the REAL
@@ -771,12 +767,12 @@ mod tests {
     );
   }
 
-  /// Codex round-37 round-29 [medium]: a VAD sub-segment that
+  /// a VAD sub-segment that
   /// overshoots the real audio (because the public
   /// `Aligner::align_chunk` caller passed sub_segments in
   /// terms of the unpadded chunk but the padded-encode path is
   /// active) MUST NOT contribute overlap from padded zeros.
-  /// Pre-fix `clamped_segs` clamped to `n_samples_i64`
+  /// `clamped_segs` clamped to `n_samples_i64`
   /// (encoder length, ≥ real); a 200-sample sub-segment with
   /// real_n_samples=100, n_samples=400 gave frame 0 an
   /// overlap of 200, comfortably above the 50-sample
@@ -827,7 +823,7 @@ mod tests {
       mask,
       alloc::vec![false, false],
       "partial overshoot must not credit padded samples; \
-       real overlap (10) is below real-window threshold (25)",
+ real overlap (10) is below real-window threshold (25)",
     );
   }
 
@@ -908,7 +904,7 @@ mod tests {
 
   #[test]
   fn build_speech_frames_clamps_overshoot_seg_to_chunk_end() {
-    // Codex round-24 regression: when a sub-segment's end_pts
+    // regression: when a sub-segment's end_pts
     // overshoots `n_samples`, `build_speech_frames` previously
     // counted phantom samples past the chunk end as overlap,
     // marking the trailing frame as speech against audio that
@@ -953,7 +949,7 @@ mod tests {
 
   #[test]
   fn build_speech_frames_uses_union_not_sum_for_overlapping_segments() {
-    // Codex round-27 regression: previously
+    // regression: previously
     // `build_speech_frames` summed each sub-segment's per-frame
     // intersection independently, double-counting overlapping
     // ranges. Two overlapping segs whose UNION sat below the
@@ -1041,7 +1037,7 @@ mod tests {
 
   #[test]
   fn build_speech_frames_uses_effective_ratio_not_nominal_hop() {
-    // Codex round-21 regression: `build_speech_frames` and
+    // regression: `build_speech_frames` and
     // `compose_words` MUST use the same frame-to-sample
     // mapping. Previously `build_speech_frames` used nominal
     // `hop_samples` (e.g. 320 for wav2vec2-base) while
@@ -1053,15 +1049,15 @@ mod tests {
     // That asymmetry can:
     //
     // - Misclassify a late-chunk frame as speech (because the
-    //   nominal interval lands inside a VAD segment) while
-    //   `compose_words` emits the word at samples that are
-    //   actually outside the VAD speech span (kept word with
-    //   misaligned timing).
+    // nominal interval lands inside a VAD segment) while
+    // `compose_words` emits the word at samples that are
+    // actually outside the VAD speech span (kept word with
+    // misaligned timing).
     //
     // - Or symmetrically: drop a valid late-frame word
-    //   because the nominal frame interval lands outside a VAD
-    //   segment that the effective-ratio interval would have
-    //   matched.
+    // because the nominal frame interval lands outside a VAD
+    // segment that the effective-ratio interval would have
+    // matched.
     //
     // The fix is to feed both functions the same
     // `samples_per_frame` value. This regression pins that
@@ -1113,8 +1109,8 @@ mod tests {
     assert!(
       any_disagreement,
       "effective vs nominal mappings must disagree on at least one frame in [740, 760] \
-       — that's the asymmetry the unified `samples_per_frame` parameter is meant to eliminate. \
-       eff[740..=760] = {:?}, nom[740..=760] = {:?}",
+ — that's the asymmetry the unified `samples_per_frame` parameter is meant to eliminate. \
+ eff[740..=760] = {:?}, nom[740..=760] = {:?}",
       &mask_eff[740..=760],
       &mask_nom[740..=760]
     );
@@ -1127,11 +1123,10 @@ mod tests {
     );
   }
 
-  /// Codex round-37 round-6 [high]: when the encoder ran on a
+  /// when the encoder ran on a
   /// padded buffer (e.g. 200 real samples zero-padded to 400),
   /// `compose_words` must clamp word ranges to the **real**
-  /// chunk boundary, not the padded encoder boundary. Pre-fix
-  /// the same value drove both stride and clamp, so a 200-sample
+  /// chunk boundary, not the padded encoder boundary.  /// the same value drove both stride and clamp, so a 200-sample
   /// run could emit timestamps out to sample 400 — overlapping
   /// adjacent script-dispatch runs.
   #[test]
@@ -1160,7 +1155,7 @@ mod tests {
     assert!(
       r.end_pts() <= 200,
       "word end {} must not exceed real_n_samples (200); padded \
-       boundary (400) would overlap adjacent runs",
+ boundary (400) would overlap adjacent runs",
       r.end_pts()
     );
   }

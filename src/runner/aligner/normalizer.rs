@@ -45,7 +45,7 @@ pub struct NormalizedText<'a> {
   /// tokens (`*` placeholder + token id `-1`) IN SOURCE ORDER,
   /// so leading punctuation like `"hello` keeps its `*` BEFORE
   /// the encoded chars while trailing punctuation like `hello"`
-  /// keeps its `*` AFTER. Codex round-28 flagged that an earlier
+  /// keeps its `*` AFTER. Flagged that an earlier
   /// design carrying only a TOTAL count caused
   /// `tokenize_with_word_map` to push every wildcard at the end
   /// of the word's encoded chars, making leading and trailing

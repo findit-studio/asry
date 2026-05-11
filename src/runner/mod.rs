@@ -32,7 +32,7 @@
 //!
 //! let abort_flag = Arc::new(AtomicBool::new(false));
 //! // Allocate a FRESH `RunOptions` per alignment chunk
-//! // (Codex round-37 round-27 [high]). ORT termination is
+//! // ([high]). ORT termination is
 //! // sticky — reusing a single handle means the first
 //! // `terminate()` poisons every subsequent
 //! // `Session::run`. Per-chunk allocation keeps each

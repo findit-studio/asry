@@ -115,8 +115,7 @@ impl AlignmentSet {
     };
     let guard = aligner_mu.lock().unwrap_or_else(|p| p.into_inner());
     let mut events = guard.detect_oov(text)?;
-    // Codex round-37 round-2 (parity loop) [medium]:
-    // `Aligner::detect_oov` stamps every event with its OWN
+    // // `Aligner::detect_oov` stamps every event with its OWN
     // construction language. When `lookup` falls back to
     // `AlignerKey::Any` (e.g. an English aligner registered
     // as the multilingual fallback for an unsupported
@@ -149,9 +148,9 @@ impl AlignmentSet {
   /// caller can surface the failure to the chunk before
   /// alignment.
   ///
-  /// Codex round-37 round-1 (parity loop) [high]: introduced
+  /// introduced
   /// to thread caller policy through the per-run path —
-  /// pre-fix the dispatcher silently substituted
+  /// the dispatcher silently substituted
   /// `default_oov_decisions` regardless of caller intent.
   pub fn detect_oov_per_run(
     &self,

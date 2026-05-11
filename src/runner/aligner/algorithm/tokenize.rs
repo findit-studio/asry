@@ -100,7 +100,7 @@ fn is_skippable_internal_punct(c: char) -> bool {
 
 /// Consume the next caller decision for a wildcard-generating
 /// position; surface a typed `TokenizationFailed` if the
-/// caller pre-sized too small. Codex round-37 round-3 (parity
+/// caller pre-sized too small. (parity
 /// loop) [high]: shared by the boundary-prefix /
 /// internal-punct / symbol-OOV / boundary-suffix sites so
 /// they all consult the same indexed slice.
@@ -117,7 +117,7 @@ fn consume_oov_decision(
       kind: AlignmentFailureKind::TokenizationFailed,
       message: alloc::format!(
         "oov_decisions ran out at index {} ({site_label}); call detect_oov_events \
-         first to size the decisions vec correctly",
+ first to size the decisions vec correctly",
         *oov_consumed,
       ),
       language: language.clone(),
@@ -133,7 +133,7 @@ fn boundary_fail_closed(language: &Lang, position: &str) -> WorkFailure {
     kind: AlignmentFailureKind::SemanticOutOfVocab,
     message: alloc::format!(
       "BoundaryPunct ({position}) resolved as FailClosed by caller policy; \
-       chunk word alignment dropped (ASR text preserved)."
+ chunk word alignment dropped (ASR text preserved)."
     ),
     language: language.clone(),
   }
@@ -143,11 +143,11 @@ fn boundary_fail_closed(language: &Lang, position: &str) -> WorkFailure {
 // (the `whisperx-strict-tokenizer` Cargo feature went with it).
 // Policy is now caller-supplied as data — see
 // `crate::core::oov`:
-//   * `default_oov_decisions` — historical default
-//     (alphanumeric/apostrophe → wildcard, pronounced → fail-closed).
-//   * `wildcard_all_decisions` — replaces the removed
-//     `whisperx-strict-tokenizer` feature (WhisperX 1:1).
-//   * `fail_closed_all_decisions` — strictest.
+// * `default_oov_decisions` — historical default
+// (alphanumeric/apostrophe → wildcard, pronounced → fail-closed).
+// * `wildcard_all_decisions` — replaces the removed
+// `whisperx-strict-tokenizer` feature (WhisperX 1:1).
+// * `fail_closed_all_decisions` — strictest.
 //
 // `tokenize_with_word_map` consumes the resulting
 // `&[ResolvedOov]` per OOV position in `detect_oov_events`
@@ -161,9 +161,9 @@ fn boundary_fail_closed(language: &Lang, position: &str) -> WorkFailure {
 #[allow(
   clippy::too_many_arguments,
   reason = "8 args mirror the wav2vec2 tokenisation contract \
-            (tokenizer, text, word_count, delimiter flag, casing \
-            flag, unk id, wildcard map, output buffer); each is a \
-            distinct semantic input from a different upstream pass"
+ (tokenizer, text, word_count, delimiter flag, casing \
+ flag, unk id, wildcard map, output buffer); each is a \
+ distinct semantic input from a different upstream pass"
 )]
 /// Sans-I/O OOV detection — runs the same per-character
 /// iteration as [`tokenize_with_word_map`] but emits an
@@ -182,7 +182,7 @@ fn boundary_fail_closed(language: &Lang, position: &str) -> WorkFailure {
 /// a wildcard token at the same position; that's a tokenizer-
 /// internal detail, not a policy decision.
 ///
-/// Codex round-37 round-22 pinned the contract that pronounced
+/// pinned the contract that pronounced
 /// non-alphanumeric OOV chars (`&`, `@`, `%`, `,`) are
 /// observable rather than silently dropped — this function
 /// makes them observable to the caller as data.
@@ -200,7 +200,7 @@ pub fn detect_oov_events(
   // Per-word boundary-punct counts as supplied to
   // `tokenize_with_word_map`. Must be either empty (=
   // "no boundary wildcards") or `word_count`-long. Codex
-  // round-37 round-3 (parity loop) [high]: boundary-punct
+  // boundary-punct
   // wildcards are surfaced as `OovKind::BoundaryPunct`
   // events so strict callers
   // (`fail_closed_all_decisions`) can refuse them.
@@ -333,13 +333,13 @@ pub fn detect_oov_events(
 ///
 /// Validation surfaces three flavours of `TokenizationFailed`:
 /// * length mismatch — caller pre-sized too few or too many
-///   decisions for this text;
+/// decisions for this text;
 /// * per-position identity mismatch — caller's payload was
-///   produced for different text (different char_index,
-///   word_index, kind, or language) and would silently
-///   misalign if applied;
+/// produced for different text (different char_index,
+/// word_index, kind, or language) and would silently
+/// misalign if applied;
 /// * mid-loop too-short consumption — defense-in-depth if the
-///   preflight is somehow bypassed.
+/// preflight is somehow bypassed.
 ///
 /// `OovDecision::Wildcard` pushes `WILDCARD_TOKEN_ID = -1`;
 /// `OovDecision::FailClosed` returns `SemanticOutOfVocab`.
@@ -386,7 +386,7 @@ pub fn tokenize_with_word_map(
   // check rather than silently misaligning.
   oov_decisions: &[crate::core::ResolvedOov],
 ) -> Result<TokenizedText, WorkFailure> {
-  // Codex round-37 round-7 (parity loop) [medium] + round-9
+  // + round-9
   // [high]: pre-validate length AND per-position event
   // identity BEFORE applying any decisions.
   //
@@ -416,16 +416,16 @@ pub fn tokenize_with_word_map(
       kind: AlignmentFailureKind::TokenizationFailed,
       message: alloc::format!(
         "oov_decisions length {} does not match the {} OOV events detected for this \
-         text; this typically means the caller passed decisions from a different \
-         chunk's text. Re-run `detect_oov_events` for the chunk's normalised text \
-         and re-decide before calling `tokenize_with_word_map`.",
+ text; this typically means the caller passed decisions from a different \
+ chunk's text. Re-run `detect_oov_events` for the chunk's normalised text \
+ and re-decide before calling `tokenize_with_word_map`.",
         oov_decisions.len(),
         pre_events.len(),
       ),
       language: language.clone(),
     });
   }
-  // Codex round-37 round-10 (parity loop) [high]: identity
+  // identity
   // equality must compare POSITIONAL fields only (kind,
   // char_index, word_index) — not `language`. Under
   // `AlignerKey::Any` fallback, `AlignmentSet::detect_oov`
@@ -443,10 +443,10 @@ pub fn tokenize_with_word_map(
         kind: AlignmentFailureKind::TokenizationFailed,
         message: alloc::format!(
           "oov_decisions[{i}] was produced for a different OOV event than the one \
-           this chunk's text actually has at position {i}: supplied={:?} but \
-           detected={:?}. This typically means the caller reused decisions from a \
-           previous chunk whose OOV count happened to match. Re-run \
-           `detect_oov_events` for THIS chunk's normalised text and re-decide.",
+ this chunk's text actually has at position {i}: supplied={:?} but \
+ detected={:?}. This typically means the caller reused decisions from a \
+ previous chunk whose OOV count happened to match. Re-run \
+ `detect_oov_events` for THIS chunk's normalised text and re-decide.",
           resolved.event,
           pre,
         ),
@@ -505,7 +505,7 @@ pub fn tokenize_with_word_map(
     // punctuation like `"hello` aligns its `*` placeholders
     // ahead of `h, e, l, l, o`. The CTC graph then matches the
     // source order, mirroring WhisperX's approach. Codex
-    // round-37 round-3 (parity loop) [high]: each wildcard
+    // each wildcard
     // consults `oov_decisions` so strict callers
     // (`fail_closed_all_decisions`) genuinely fail-close on
     // structural wildcards too.
@@ -525,19 +525,18 @@ pub fn tokenize_with_word_map(
     }
     for ch in word.chars() {
       if is_skippable_internal_punct(ch) {
-        // Codex round-37 round-8 [medium]: emit the wildcard
+        // emit the wildcard
         // token immediately at the source position of the
-        // skipped internal punctuation. Pre-fix this counted
+        // skipped internal punctuation. this counted
         // skipped chars and appended all wildcards at the end
         // of the word, breaking WhisperX token-order parity for
         // dotted acronyms like "U.S.A": WhisperX interleaves
-        // [U, *, S, *, A, *] (one `*` per `.`), the pre-fix
-        // emitted [U, S, A, *, *, *]. The total token count
+        // [U, *, S, *, A, *] (one `*` per `.`), the  // emitted [U, S, A, *, *, *]. The total token count
         // matched but the per-position CTC frame attribution
         // shifted, moving boundaries on the following word.
         // Now we keep the source order — wildcards land at the
         // exact byte position of the punct char. The OOV
-        // decision (round-37 round-3 parity-loop [high])
+        // decision (parity-loop [high])
         // governs whether the wildcard is actually emitted or
         // surfaces as `SemanticOutOfVocab`.
         let decision =
@@ -549,7 +548,7 @@ pub fn tokenize_with_word_map(
               kind: AlignmentFailureKind::SemanticOutOfVocab,
               message: alloc::format!(
                 "InternalPunct {ch:?} resolved as FailClosed by caller policy; \
-                 chunk word alignment dropped (ASR text preserved)."
+ chunk word alignment dropped (ASR text preserved)."
               ),
               language: language.clone(),
             });
@@ -595,23 +594,23 @@ pub fn tokenize_with_word_map(
             // told us to drop. We surface a typed failure so
             // the dispatch recovery preserves the ASR
             // transcript while making the drop observable.
-            // Codex round-37 round-22 [high] introduced this
+            // introduced this
             // kind; the Sans-I/O OOV refactor preserves it.
             return Err(WorkFailure::AlignmentFailed {
               kind: AlignmentFailureKind::SemanticOutOfVocab,
               message: alloc::format!(
                 "OOV {ch:?} resolved as FailClosed by caller policy; \
-                 chunk word alignment dropped (ASR text preserved)."
+ chunk word alignment dropped (ASR text preserved)."
               ),
               language: language.clone(),
             });
           }
         }
       } else {
-        // Codex round-37 round-11 [high]: validate every model
+        // validate every model
         // id fits an `i32` AND is non-negative before storing
         // alongside the `WILDCARD_TOKEN_ID = -1` sentinel.
-        // Pre-fix `id as i32` aliased `u32::MAX` to `-1`, which
+        // `id as i32` aliased `u32::MAX` to `-1`, which
         // the trellis would then treat as a wildcard instead of
         // a real model token — silent misalignment for sparse
         // / malformed tokenizers. `i32::try_from` returns the
@@ -622,7 +621,7 @@ pub fn tokenize_with_word_map(
             kind: AlignmentFailureKind::TokenizationFailed,
             message: alloc::format!(
               "tokenizer returned id {} which exceeds i32::MAX or aliases the wildcard \
-               sentinel; tokenizer / model mismatch?",
+ sentinel; tokenizer / model mismatch?",
               id
             ),
             language: language.clone(),
@@ -632,7 +631,7 @@ pub fn tokenize_with_word_map(
               kind: AlignmentFailureKind::TokenizationFailed,
               message: alloc::format!(
                 "tokenizer returned negative-after-cast id {} (raw {}); refusing to alias \
-                 wildcard sentinel",
+ wildcard sentinel",
                 signed_id,
                 id
               ),
@@ -645,9 +644,8 @@ pub fn tokenize_with_word_map(
     }
     // Append SUFFIX wildcards from the normaliser's trailing-
     // punct strip count. Internal-punct wildcards are emitted
-    // in source order inside the loop above (Codex round-37
-    // round-8 fix), so this branch only handles boundary
-    // wildcards now. Codex round-37 round-3 (parity loop)
+    // in source order inside the loop above ( // round-8 fix), so this branch only handles boundary
+    // wildcards now.
     // [high]: each suffix wildcard consults `oov_decisions`
     // — see the prefix loop above for the rationale.
     for _ in 0..suffix_wildcards {
@@ -687,7 +685,7 @@ pub fn tokenize_with_word_map(
       && let Some(d) = delim_id
     {
       // Same overflow / sentinel-alias guard as the per-char
-      // path above (Codex round-37 round-11 [high]).
+      // path above ([high]).
       let signed_d = i32::try_from(d).map_err(|_| WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::TokenizationFailed,
         message: alloc::format!(
@@ -717,9 +715,9 @@ pub fn tokenize_with_word_map(
     last_emitted_word = Some(word_idx);
   }
 
-  // Codex round-37 round-2 (parity loop) [high]: every
+  // every
   // supplied decision must correspond to an OOV the
-  // tokenizer encountered. Pre-fix the loop only checked
+  // tokenizer encountered. The loop only checked
   // `oov_decisions.get(oov_consumed)` for the too-short
   // case; a stale / superset decision vec from a previous
   // chunk could leak in and silently apply the wrong prefix
@@ -732,9 +730,9 @@ pub fn tokenize_with_word_map(
       kind: AlignmentFailureKind::TokenizationFailed,
       message: alloc::format!(
         "oov_decisions length {} does not match the {} OOV chars actually \
-         encountered; this typically means the caller passed decisions \
-         from a different chunk's text. Re-run `detect_oov_events` for \
-         the chunk's normalised text and re-decide.",
+ encountered; this typically means the caller passed decisions \
+ from a different chunk's text. Re-run `detect_oov_events` for \
+ the chunk's normalised text and re-decide.",
         oov_decisions.len(),
         oov_consumed,
       ),
@@ -763,33 +761,33 @@ mod tests {
   /// shape (uppercase-only ASCII alphabet plus `<unk>`, `<pad>`,
   /// `|`).
   const UPPERCASE_TOKENIZER_JSON: &str = r#"{
-    "version": "1.0",
-    "truncation": null,
-    "padding": null,
-    "added_tokens": [],
-    "normalizer": null,
-    "pre_tokenizer": {
-      "type": "Split",
-      "pattern": {"Regex": ""},
-      "behavior": "Isolated",
-      "invert": false
-    },
-    "post_processor": null,
-    "decoder": null,
-    "model": {
-      "type": "WordLevel",
-      "vocab": {
-        "<unk>": 0,
-        "<pad>": 1,
-        "|": 2,
-        "A": 3, "B": 4, "C": 5, "D": 6, "E": 7, "F": 8, "G": 9,
-        "H": 10, "I": 11, "J": 12, "K": 13, "L": 14, "M": 15,
-        "N": 16, "O": 17, "P": 18, "Q": 19, "R": 20, "S": 21,
-        "T": 22, "U": 23, "V": 24, "W": 25, "X": 26, "Y": 27, "Z": 28
-      },
-      "unk_token": "<unk>"
-    }
-  }"#;
+ "version": "1.0",
+ "truncation": null,
+ "padding": null,
+ "added_tokens": [],
+ "normalizer": null,
+ "pre_tokenizer": {
+ "type": "Split",
+ "pattern": {"Regex": ""},
+ "behavior": "Isolated",
+ "invert": false
+ },
+ "post_processor": null,
+ "decoder": null,
+ "model": {
+ "type": "WordLevel",
+ "vocab": {
+ "<unk>": 0,
+ "<pad>": 1,
+ "|": 2,
+ "A": 3, "B": 4, "C": 5, "D": 6, "E": 7, "F": 8, "G": 9,
+ "H": 10, "I": 11, "J": 12, "K": 13, "L": 14, "M": 15,
+ "N": 16, "O": 17, "P": 18, "Q": 19, "R": 20, "S": 21,
+ "T": 22, "U": 23, "V": 24, "W": 25, "X": 26, "Y": 27, "Z": 28
+ },
+ "unk_token": "<unk>"
+ }
+ }"#;
 
   fn uppercase_tokenizer() -> Tokenizer {
     Tokenizer::from_bytes(UPPERCASE_TOKENIZER_JSON.as_bytes())
@@ -872,9 +870,9 @@ mod tests {
     assert_eq!(events[0].language, Lang::En);
   }
 
-  /// Codex round-37 round-2 (parity loop) [high]: a
+  /// a
   /// decisions slice longer than the actual OOV count must
-  /// reject loudly. Pre-fix the loop only checked the
+  /// reject loudly. The loop only checked the
   /// too-short case via `oov_decisions.get(oov_consumed)`;
   /// extras at the tail were silently ignored. The risk:
   /// stale decisions from a previous chunk leak in (e.g.
@@ -925,12 +923,11 @@ mod tests {
     }
   }
 
-  /// Codex round-37 round-7 (parity loop) [medium]: when a
+  /// when a
   /// stale too-long decisions vec STARTS with `FailClosed`,
   /// the pre-flight length check must reject it as
   /// `TokenizationFailed` BEFORE the loop's `FailClosed`
-  /// early-return surfaces as `SemanticOutOfVocab`. Pre-fix
-  /// the early-return skipped the post-loop length check
+  /// early-return surfaces as `SemanticOutOfVocab`.  /// the early-return skipped the post-loop length check
   /// entirely, so a one-OOV chunk with a 2-decision payload
   /// got `SemanticOutOfVocab` (recoverable, drops words
   /// silently) instead of `TokenizationFailed` (the actual
@@ -975,19 +972,19 @@ mod tests {
         ..
       }) => panic!(
         "stale too-long decisions starting with FailClosed must surface as \
-         TokenizationFailed (the loud diagnostic); SemanticOutOfVocab is the \
-         silent recoverable path that masks the bug"
+ TokenizationFailed (the loud diagnostic); SemanticOutOfVocab is the \
+ silent recoverable path that masks the bug"
       ),
       other => panic!("expected TokenizationFailed mismatch; got {other:?}"),
     }
   }
 
-  /// Codex round-37 round-9 (parity loop) [high]: a stale
+  /// a stale
   /// decisions vec whose length matches the chunk's OOV count
   /// but whose embedded events were produced for DIFFERENT
   /// text must be rejected as `TokenizationFailed`.
   ///
-  /// Pre-fix the preflight only checked length; a `[Wildcard]`
+  /// The preflight only checked length; a `[Wildcard]`
   /// decision originally produced for the digit OOV in `"4"`
   /// could be reused against `&` in `"AT&T"` and the dispatcher
   /// would happily wildcard the `&` even though the default
@@ -1034,7 +1031,7 @@ mod tests {
     }
   }
 
-  /// Codex round-37 round-10 (parity loop) [high]: under
+  /// under
   /// `AlignerKey::Any` fallback, `AlignmentSet::detect_oov`
   /// stamps events with the CALLER-requested language so
   /// caller policy can switch on it; the inner Aligner
@@ -1077,7 +1074,7 @@ mod tests {
     assert!(
       result.is_ok(),
       "Any-fallback identity check must compare positional fields \
-       only (kind/char_index/word_index), not language. Got: {result:?}",
+ only (kind/char_index/word_index), not language. Got: {result:?}",
     );
   }
 
@@ -1103,7 +1100,7 @@ mod tests {
     let tok = uppercase_tokenizer();
     let unk = tok.token_to_id("<unk>");
     let events = detect_oov_events(&tok, "U.S.A", 1, true, unk, &Lang::En, &[]).expect("ok");
-    // Codex round-37 round-3 (parity loop) [high]: internal-
+    // internal-
     // punct wildcards are now surfaced as `OovKind::InternalPunct`
     // events so strict policies (`fail_closed_all_decisions`)
     // can refuse them. `U.S.A` has two `.` chars.
@@ -1195,7 +1192,7 @@ mod tests {
   }
 
   /// Internal periods strip to wildcard tokens in **source
-  /// order** (Codex round-37 round-8 [medium]: pre-fix the
+  /// order** (the
   /// implementation appended internal-punct wildcards at the
   /// end of the word, breaking WhisperX token-order parity for
   /// dotted acronyms; the post-fix layout is [U, *, S, *, A] —
@@ -1290,7 +1287,7 @@ mod tests {
   /// aligning to whichever vocab item wins the frame produces
   /// a wrong range.
   ///
-  /// Codex round-37 round-22 [high]: pre-fix this returned
+  /// this returned
   /// `Ok(empty TokenizedText)`, which `Aligner::align` treated
   /// as a successful empty alignment — silent loss with no
   /// observable failure. Post-fix the chunk-drop is surfaced
@@ -1459,7 +1456,7 @@ mod tests {
     assert_eq!(result.word_idx_per_token, alloc::vec![Some(0); 6]);
   }
 
-  /// Codex round-28 regression: leading punctuation like `"hello`
+  /// regression: leading punctuation like `"hello`
   /// must place its wildcard BEFORE the encoded letters, not
   /// after them. Without this distinction, `"hello` (prefix=1)
   /// and `hello"` (suffix=1) would produce identical token

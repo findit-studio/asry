@@ -3,11 +3,11 @@
 //! Two distinct error channels:
 //!
 //! - [`TranscriberError`] is for state-machine push/inject failures
-//!   returned synchronously from `Transcriber::push_*` /
-//!   `inject_*` / `handle_restart`.
+//! returned synchronously from `Transcriber::push_*` /
+//! `inject_*` / `handle_restart`.
 //! - [`WorkFailure`] is for per-chunk inference failures surfaced
-//!   asynchronously via `Event::Error { chunk_id, error: WorkFailure }`
-//!   (drained by `poll_event`).
+//! asynchronously via `Event::Error { chunk_id, error: WorkFailure }`
+//! (drained by `poll_event`).
 
 use core::time::Duration;
 
@@ -185,10 +185,10 @@ pub enum AlignmentFailureKind {
   /// alignment is dropped (the dispatch emits `Transcript {
   /// text, words: [] }`), but the failure is **observable** —
   /// callers can see this kind in telemetry rather than the
-  /// pre-fix silent empty-`AlignmentResult` path. Distinct
+  /// silent empty-`AlignmentResult` path. Distinct
   /// from `TokenizationFailed`, which is reserved for genuine
   /// tokenizer/model mismatches that are not recoverable.
-  /// (Codex round-37 round-22 [high].)
+  /// ([high].)
   SemanticOutOfVocab,
 }
 

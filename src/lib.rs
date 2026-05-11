@@ -8,6 +8,10 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
 #![deny(missing_docs)]
+// `doc_lazy_continuation` is a markdown-rendering style lint; we
+// don't gate substantive docs on indentation conventions for
+// continuation lines after list items.
+#![allow(clippy::doc_lazy_continuation)]
 // Crate default: no unsafe. Modules that need `core::arch` SIMD
 // intrinsics opt in locally via `#![allow(unsafe_code)]`. This is
 // `deny` rather than `forbid` so an explicit per-module override is

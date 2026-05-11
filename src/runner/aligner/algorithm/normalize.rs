@@ -24,18 +24,18 @@
 //! backends:
 //!
 //! - `neon` — aarch64 base ISA (4-lane f32). Always selected on
-//!   aarch64 — no runtime detection because NEON is mandatory.
+//! aarch64 — no runtime detection because NEON is mandatory.
 //! - `x86_sse41` — x86_64 with SSE4.1 (4-lane f32). The minimal
-//!   SIMD floor for x86_64 since 2008. We use SSE4.1 (not 4.2)
-//!   because 4.2 only adds CRC32 / string-search ops that don't
-//!   matter here.
+//! SIMD floor for x86_64 since 2008. We use SSE4.1 (not 4.2)
+//! because 4.2 only adds CRC32 / string-search ops that don't
+//! matter here.
 //! - `x86_avx2` — x86_64 with AVX2 (8-lane f32). Mainstream from
-//!   Haswell (2013) onwards.
+//! Haswell (2013) onwards.
 //! - `x86_avx512` — x86_64 with AVX-512F (16-lane f32). Premium
-//!   server CPUs (Skylake-X+, Ice Lake-SP, AMD Zen 4). Some chips
-//!   downclock under sustained AVX-512 use, so the dispatcher
-//!   only takes this path when the feature is detected — never
-//!   speculatively.
+//! server CPUs (Skylake-X+, Ice Lake-SP, AMD Zen 4). Some chips
+//! downclock under sustained AVX-512 use, so the dispatcher
+//! only takes this path when the feature is detected — never
+//! speculatively.
 //!
 //! `wasm32` simd128 is intentionally absent: the `alignment`
 //! feature requires `whisper-rs` and `ort`, neither of which
@@ -194,14 +194,14 @@ pub fn zero_mean_unit_var_normalize(samples: &[f32]) -> Vec<f32> {
     return scalar::zero_mean_unit_var_normalize(samples);
   }
   cfg_select! {
-    target_arch = "aarch64" => {
-      // SAFETY: NEON is part of the aarch64 base ISA; the kernel's
-      // `#[target_feature(enable = "neon")]` makes the compiler emit
-      // intrinsics in an explicitly-enabled context.
-      unsafe { neon::zero_mean_unit_var_normalize(samples) }
-    }
-    target_arch = "x86_64" => x86_dispatch(samples),
-    _ => scalar::zero_mean_unit_var_normalize(samples),
+  target_arch = "aarch64" => {
+  // SAFETY: NEON is part of the aarch64 base ISA; the kernel's
+  // `#[target_feature(enable = "neon")]` makes the compiler emit
+  // intrinsics in an explicitly-enabled context.
+  unsafe { neon::zero_mean_unit_var_normalize(samples) }
+  }
+  target_arch = "x86_64" => x86_dispatch(samples),
+  _ => scalar::zero_mean_unit_var_normalize(samples),
   }
 }
 
@@ -232,16 +232,16 @@ fn x86_dispatch(samples: &[f32]) -> Vec<f32> {
   // No-std compile-time fallback. Matches the runtime fallback
   // order: AVX-512F first, then AVX2, then SSE4.1, else scalar.
   cfg_select! {
-    all(not(feature = "std"), target_feature = "avx512f") => {
-      unsafe { x86_avx512::zero_mean_unit_var_normalize(samples) }
-    }
-    all(not(feature = "std"), target_feature = "avx2") => {
-      unsafe { x86_avx2::zero_mean_unit_var_normalize(samples) }
-    }
-    all(not(feature = "std"), target_feature = "sse4.1") => {
-      unsafe { x86_sse41::zero_mean_unit_var_normalize(samples) }
-    }
-    _ => scalar::zero_mean_unit_var_normalize(samples),
+  all(not(feature = "std"), target_feature = "avx512f") => {
+  unsafe { x86_avx512::zero_mean_unit_var_normalize(samples) }
+  }
+  all(not(feature = "std"), target_feature = "avx2") => {
+  unsafe { x86_avx2::zero_mean_unit_var_normalize(samples) }
+  }
+  all(not(feature = "std"), target_feature = "sse4.1") => {
+  unsafe { x86_sse41::zero_mean_unit_var_normalize(samples) }
+  }
+  _ => scalar::zero_mean_unit_var_normalize(samples),
   }
 }
 
@@ -991,7 +991,7 @@ mod tests {
   /// The dispatched normalise must produce scalar-equivalent
   /// output even for finite high-magnitude input. Verified by
   /// matching against the scalar reference call directly —
-  /// pre-fix the SIMD path took over and silently drifted.
+  /// the SIMD path took over and silently drifted.
   #[test]
   fn dispatched_finite_high_magnitude_matches_scalar() {
     let xs = finite_high_magnitude_input();
@@ -1018,11 +1018,11 @@ mod tests {
   // ---- Silence-aware normalisation ------
 
   /// Speech with non-zero mean must NOT shift masked-silence
-  /// positions away from zero in the output. Pre-fix, the
-  /// non-mask-aware normaliser computed a global mean over the
-  /// already-masked buffer, so masked positions ended up at
-  /// `(0 - mean) / std` ≠ 0 — wav2vec2 then saw "silence" with
-  /// a residue, and word boundaries leaked into masked gaps.
+  /// positions away from zero in the output. A non-mask-aware
+  /// normaliser that computes a global mean over the
+  /// already-masked buffer leaves masked positions at
+  /// `(0 - mean) / std` ≠ 0 — wav2vec2 then sees "silence" with
+  /// a residue, and word boundaries leak into masked gaps.
   #[test]
   fn silence_mask_normalize_keeps_masked_positions_at_zero() {
     // 16 samples: [speech with DC offset]+[silence]+[speech with DC offset].

@@ -81,7 +81,7 @@ impl SampleBuffer {
     extra_queued_samples: usize,
   ) -> Result<(), TranscriberError> {
     // Do NOT commit `output_tb` / `base_pts_out_anchor` until
-    // every error path has been cleared. Pre-fix code wrote the
+    // every error path has been cleared. Earlier code wrote the
     // anchor on first push *before* the capacity check, so a
     // first-push Backpressure left a "ghost" timebase that later
     // retries (with a corrected timebase or smaller packet) would
@@ -144,19 +144,19 @@ impl SampleBuffer {
     // caller can retry the same packet later.
     //
     // Include `extra_queued_samples` (audio already held in
-    // cut_pending Arcs from the pre-extraction design). Without
-    // this term, a slow runner could let cut_pending grow
-    // unboundedly because trim emptied the live buffer.
-    // Codex round-37 round-26 [high]: overflow-safe capacity
-    // arithmetic. Pre-fix `samples.len() + delta_samples as
-    // usize + packet.len() + extra_queued_samples` was unchecked
-    // — a public `gap_tolerance_samples` near `u64::MAX` plus a
-    // large `delta_samples` could wrap to a small `usize` and
-    // bypass the `> self.cap` guard, letting the subsequent
-    // zero-fill `extend` attempt a multi-GB allocation. Cast +
-    // sum via `usize::try_from` and `checked_add`; treat any
-    // overflow as backpressure (the input would not fit by any
-    // measure).
+    // cut_pending Arcs). Without this term, a slow runner could
+    // let cut_pending grow unboundedly because trim emptied the
+    // live buffer.
+    //
+    // Overflow-safe capacity arithmetic: unchecked
+    // `samples.len() + delta_samples as usize + packet.len() +
+    // extra_queued_samples` would let a public
+    // `gap_tolerance_samples` near `u64::MAX` plus a large
+    // `delta_samples` wrap to a small `usize` and bypass the
+    // `> self.cap` guard, letting the subsequent zero-fill
+    // `extend` attempt a multi-GB allocation. Cast + sum via
+    // `usize::try_from` and `checked_add`; treat any overflow
+    // as backpressure (the input would not fit by any measure).
     let delta_usize = match usize::try_from(delta_samples) {
       Ok(v) => v,
       Err(_) => {
@@ -188,20 +188,19 @@ impl SampleBuffer {
       });
     }
 
-    // Codex round-37 + round-38: empty-packet must never mutate
-    // stream state. Three cases cover all empty-packet inputs:
+    // Empty-packet must never mutate stream state. Three cases
+    // cover all empty-packet inputs:
     //
     // 1. Empty packet at `delta_pts_out > 0` (a "heartbeat" at a
-    //    slightly future PTS): used to commit the anchor (if
-    //    first push), zero-fill, and advance
-    //    `absolute_sample_offset`. The next real packet at the
-    //    originally-expected PTS then trips `PtsRegression`. Now
-    //    a true no-op.
-    // 2. Empty FIRST push (round-38 finding 4): used to commit
-    //    the anchor at the heartbeat's PTS. Real first-audio at
-    //    a different PTS would then trip `PtsRegression` /
-    //    `InconsistentTimebase`. Now a true no-op — the anchor
-    //    is reserved for the first non-empty push.
+    //    slightly future PTS): true no-op. Committing the anchor
+    //    or advancing `absolute_sample_offset` here would trip
+    //    `PtsRegression` for the next real packet at the
+    //    originally-expected PTS.
+    // 2. Empty FIRST push: true no-op. The anchor is reserved for
+    //    the first non-empty push so a heartbeat-then-real-audio
+    //    sequence doesn't lock the anchor at the heartbeat's PTS
+    //    and then trip `PtsRegression` / `InconsistentTimebase`
+    //    on the real first-audio at a different PTS.
     // 3. Empty subsequent push at `delta == 0`: already a no-op
     //    (delta_samples = 0, packet.len() = 0, no first-push
     //    commit). Preserved for callers using empty packets as
@@ -486,8 +485,7 @@ mod tests {
   }
 
   /// After a first-push Backpressure, the buffer must accept a
-  /// *different* timebase as its actual first push. (Pre-fix
-  /// behavior committed the rejected timebase, so this would
+  /// *different* timebase as its actual first push. ( /// behavior committed the rejected timebase, so this would
   /// have tripped InconsistentTimebase.)
   #[test]
   fn first_push_backpressure_allows_different_timebase_on_retry() {
@@ -564,14 +562,13 @@ mod tests {
     b.append(ts_at_48k(50_000_000), &[2.0; 1000], 0).unwrap();
   }
 
-  // --- Codex round-37: empty packet must not advance the stream ---
+  // --- Empty packet must not advance the stream ---
 
-  /// An empty packet at a forward PTS within gap-tolerance MUST
-  /// NOT zero-fill or advance `absolute_sample_offset`. Pre-fix,
-  /// such a "heartbeat" call would commit phantom audio and
-  /// reject the next real packet at the originally-expected PTS
-  /// as `PtsRegression`. Post-fix, the next real packet is
-  /// accepted.
+  /// An empty packet at a forward PTS within gap-tolerance must
+  /// NOT zero-fill or advance `absolute_sample_offset`.
+  /// Advancing here would commit phantom audio and reject the
+  /// next real packet at the originally-expected PTS as
+  /// `PtsRegression`.
   #[test]
   fn empty_packet_at_forward_delta_does_not_advance_stream() {
     let mut b = SampleBuffer::new(1_000_000, 16_000);
@@ -600,7 +597,7 @@ mod tests {
     );
 
     // The next real packet at the originally-expected PTS must
-    // succeed (pre-fix this was rejected as PtsRegression).
+    // succeed (this was rejected as PtsRegression).
     let r2 = b.append(next_expected, &[2.0; 500], 0);
     assert!(
       r2.is_ok(),
@@ -614,16 +611,14 @@ mod tests {
   /// push, since there is no expected next yet). A subsequent
   /// empty-at-forward-delta call is then a no-op, and a real
   /// packet at the originally-expected PTS still succeeds.
-  /// This documents that "heartbeat then real audio" sequences
-  /// don't trip PtsRegression after the round-37 fix.
-  /// Codex round-38 finding 4: the FIRST empty packet must NOT
-  /// commit the anchor. A heartbeat-then-real-audio sequence
-  /// (empty packet at heartbeat PTS, then real audio at the
-  /// actual stream-zero PTS) now succeeds — the anchor is
-  /// reserved for the first non-empty push. Pre-fix, the empty
-  /// heartbeat claimed the anchor at its own PTS and the real
-  /// audio at PTS 0 failed with `PtsRegression` /
-  /// `InconsistentTimebase`.
+  ///
+  /// The FIRST empty packet must NOT commit the anchor — a
+  /// heartbeat-then-real-audio sequence (empty packet at
+  /// heartbeat PTS, then real audio at the actual stream-zero
+  /// PTS) must succeed. The anchor is reserved for the first
+  /// non-empty push; otherwise the empty heartbeat would claim
+  /// the anchor at its own PTS and real audio at PTS 0 would
+  /// fail with `PtsRegression` / `InconsistentTimebase`.
   #[test]
   fn empty_first_packet_does_not_commit_anchor() {
     let mut b = SampleBuffer::new(1_000_000, 16_000);
@@ -651,7 +646,7 @@ mod tests {
     assert!(b.output_timebase().is_some());
 
     // Subsequent empty heartbeat at a forward PTS does not
-    // advance state (round-37 fix).
+    // advance state.
     let offset_before = b.absolute_sample_offset();
     let r = b.append(ts_at_48k(next_expected.pts() + 100), &[], 0);
     assert!(r.is_ok());
@@ -672,10 +667,9 @@ mod tests {
     assert_eq!(b.absolute_sample_offset(), offset_before);
   }
 
-  /// Codex round-37 round-26 [high]: gigantic forward gaps must
+  /// gigantic forward gaps must
   /// surface as `Backpressure`, not panic on `usize` overflow
-  /// in the capacity-pre-check arithmetic. The pre-fix
-  /// `samples.len() + delta_samples as usize + packet.len() +
+  /// in the capacity-pre-check arithmetic. The  /// `samples.len() + delta_samples as usize + packet.len() +
   /// extra_queued` expression could wrap on 64-bit when
   /// `gap_tolerance_samples` was set near `u64::MAX` and the
   /// caller advanced PTS by that much. Post-fix the
