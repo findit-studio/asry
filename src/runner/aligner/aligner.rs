@@ -758,7 +758,7 @@ impl Aligner {
         let n = SEG_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir_path = std::path::PathBuf::from(dir);
         let _ = std::fs::create_dir_all(&dir_path);
-        let em_path = dir_path.join(format_smolstr!("wy_seg{n}.emission.bin"));
+        let em_path = dir_path.join(format!("wy_seg{n}.emission.bin"));
         if let Ok(mut f) = std::fs::File::create(&em_path) {
           use std::io::Write;
           let _ = f.write_all(&(log_probs.t() as u32).to_le_bytes());
@@ -772,18 +772,18 @@ impl Aligner {
           }
           let _ = f.write_all(&buf);
         }
-        let tok_path = dir_path.join(format_smolstr!("wy_seg{n}.tokens.json"));
+        let tok_path = dir_path.join(format!("wy_seg{n}.tokens.json"));
         if let Ok(mut f) = std::fs::File::create(&tok_path) {
           use std::io::Write;
           // Hand-format JSON to avoid the serde_json prod dep.
-          let mut payload = format_smolstr!("{{\"blank_id\":{},\"tokens\":[", self.blank_token_id);
+          let mut payload = format!("{{\"blank_id\":{},\"tokens\":[", self.blank_token_id);
           for (i, t) in tokenized.token_ids().iter().enumerate() {
             if i > 0 {
               payload.push(',');
             }
-            payload.push_str(&format_smolstr!("{}", t));
+            payload.push_str(&format!("{t}"));
           }
-          payload.push_str(&format_smolstr!(
+          payload.push_str(&format!(
             "],\"n_samples\":{},\"T\":{},\"V\":{}}}",
             padded_samples.len(),
             log_probs.t(),
@@ -866,7 +866,7 @@ impl Aligner {
           &self.language,
         );
         if let Ok(trellis) = trellis {
-          let path = dir_path.join(format_smolstr!("wy_seg{n}.trellis.bin"));
+          let path = dir_path.join(format!("wy_seg{n}.trellis.bin"));
           if let Ok(mut f) = std::fs::File::create(&path) {
             use std::io::Write;
             let _ = f.write_all(&(log_probs.t() as u32).to_le_bytes());
