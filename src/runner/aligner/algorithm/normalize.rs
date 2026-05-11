@@ -56,8 +56,6 @@
 //! SIMD paths come out measurably faster on real chunks (480 k
 //! samples for 30 s @ 16 kHz). All backends keep the f64 accumulator.
 
-use Vec;
-
 /// f32 horizontal-sum overflow recovery shared across all SIMD
 /// backends. Real audio in `[-1, 1]` never trips the check;
 /// high-dynamic-range or pathological f32 inputs (`[1e38, ...]`)
@@ -229,7 +227,6 @@ fn x86_dispatch(samples: &[f32]) -> Vec<f32> {
 /// by non-aarch64 targets and by the bench's `scalar` variant for
 /// the head-to-head comparison.
 pub mod scalar {
-  use super::Vec;
 
   /// Always-on f64-accumulator reference. See module docs.
   pub fn zero_mean_unit_var_normalize(samples: &[f32]) -> Vec<f32> {
@@ -369,7 +366,6 @@ pub(crate) fn normalize_with_silence_mask(samples: &[f32], speech_mask: &[bool])
 #[cfg(target_arch = "aarch64")]
 #[doc(hidden)]
 pub mod neon {
-  use super::Vec;
   use core::arch::aarch64::*;
 
   /// NEON-vectorised zero-mean unit-variance normalisation.
@@ -471,7 +467,6 @@ pub mod neon {
 #[cfg(target_arch = "x86_64")]
 #[doc(hidden)]
 pub mod x86_sse41 {
-  use super::Vec;
   use core::arch::x86_64::*;
 
   /// Reduce a 4-lane `__m128` to its f32 horizontal sum.
@@ -576,7 +571,6 @@ pub mod x86_sse41 {
 #[cfg(target_arch = "x86_64")]
 #[doc(hidden)]
 pub mod x86_avx2 {
-  use super::Vec;
   use core::arch::x86_64::*;
 
   /// Reduce a 256-bit `__m256` to its f32 horizontal sum: collapse
@@ -686,7 +680,6 @@ pub mod x86_avx2 {
 #[cfg(target_arch = "x86_64")]
 #[doc(hidden)]
 pub mod x86_avx512 {
-  use super::Vec;
   use core::arch::x86_64::*;
 
   /// # Safety

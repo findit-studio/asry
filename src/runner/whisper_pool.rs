@@ -546,11 +546,13 @@ pub(super) fn compression_ratio_for_text(text: &str) -> f32 {
 /// - `avg_logprob >= params.log_prob_threshold` (default −1.0)
 /// - `compression_ratio <= params.compression_ratio_threshold` (default 2.4)
 ///
-/// Failure: `WorkFailure::AsrFailed { kind: AllTemperaturesFailed, .. }`
-/// after all `max_attempts` failed; `WorkFailure::AsrFailed { kind:
-/// BackendError, .. }` if `state.full()` itself returned an error;
-/// `WorkFailure::WorkerHang(WorkerHangTimeout::new(Asr, ))` if the abort
-/// flag was flipped (the watchdog detected timeout).
+/// Failure:
+/// - `WorkFailure::Asr(AsrError::AllTemperaturesExhausted(_))`
+///   after all `max_attempts` failed.
+/// - `WorkFailure::Asr(AsrError::Backend(_))` if `state.full()`
+///   itself returned an error.
+/// - `WorkFailure::WorkerHang(_)` (kind `WorkerKind::Asr`) if the
+///   abort flag was flipped.
 pub(in crate::runner) fn run_with_temperature_ladder(
   state: &mut WhisperState,
   job: &AsrWorkItem,

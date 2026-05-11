@@ -1,8 +1,6 @@
 //! Silence-mask construction stage of the alignment algorithm.
 
 #[cfg(test)]
-use Vec;
-
 #[cfg(test)]
 use mediatime::TimeRange;
 

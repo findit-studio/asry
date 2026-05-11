@@ -342,8 +342,10 @@ impl Aligner {
   /// `abort_flag` / `run_options` infrastructure. See that
   /// method's doc-comment for argument semantics.
   ///
-  /// Returns [`WorkFailure::AlignmentFailed`] with kind
-  /// [`crate::types::::ModelInferenceFailed`]
+  /// Returns
+  /// [`WorkFailure::Alignment`](crate::types::WorkFailure::Alignment)
+  /// with variant
+  /// [`AlignmentError::ModelInference`](crate::types::AlignmentError::ModelInference)
   /// if [`RunOptions::new`] fails (rare; ORT initialisation
   /// hiccup).
   pub fn align_chunk<F>(

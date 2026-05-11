@@ -207,7 +207,7 @@ impl OovEvent {
 /// The caller produces one decision per event in the same
 /// order. Length / shape mismatches against the chunk's
 /// detected events surface as
-/// [`::TokenizationFailed`](crate::types::::TokenizationFailed)
+/// [`AlignmentError::Tokenization`](crate::types::AlignmentError::Tokenization)
 /// — the alignment dispatcher refuses to apply stale or
 /// out-of-shape decisions silently.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -223,7 +223,7 @@ pub enum OovDecision {
   /// transcript still ships in the resulting
   /// [`Transcript`](crate::types::Transcript) but
   /// `Transcript::words()` is empty for this chunk. Surfaces
-  /// as [`::SemanticOutOfVocab`](crate::types::::SemanticOutOfVocab)
+  /// as [`AlignmentError::SemanticOutOfVocab`](crate::types::AlignmentError::SemanticOutOfVocab)
   /// in the chunk's failure record. Honest at the cost of
   /// dropped timing.
   FailClosed,

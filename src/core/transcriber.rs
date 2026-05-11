@@ -399,7 +399,9 @@ pub struct Transcriber {
   /// `end_sample` of a pushed `VadSegment`, or as the explicit
   /// watermark in `handle_no_speech_through`. Future VAD pushes
   /// and no-speech signals must advance this; regressions
-  /// surface as `TranscriberError::PtsRegression(PtsRegression::new(VadSegment, ))`.
+  /// surface as
+  /// `TranscriberError::PtsRegression(_)` (with the payload's
+  /// `kind()` returning [`PushKind::VadSegment`]).
   /// Independent from `Cut::last_pushed_end()` because the cut
   /// state machine only tracks pushed segments, while the
   /// watermark also incorporates explicit silence declarations.

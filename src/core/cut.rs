@@ -4,7 +4,6 @@
 //! (`SampleRange`); conversion to the output timebase happens at
 //! emission time.
 
-use Vec;
 use core::time::Duration;
 
 use crate::{core::AsrParamsOverride, types::VadSegment};

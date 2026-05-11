@@ -16,8 +16,6 @@
 //! `runner`-feature [`dispatch`] entry point wraps real whispercpp
 //! segments through the trait; tests build mock segments directly.
 
-use Vec;
-
 use smol_str::SmolStr;
 
 use crate::{
@@ -871,8 +869,6 @@ fn compute_bounds(
 #[cfg(feature = "runner")]
 mod runner_glue {
   //! Bridge `whispercpp::Segment<'_>` onto [`super::SegmentLike`].
-
-  use Vec;
 
   use super::{SegmentLike, TokenInfo};
 
