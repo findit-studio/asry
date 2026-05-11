@@ -18,12 +18,14 @@ on:
       - '**.md'
       - '**.txt'
   workflow_dispatch:
-  schedule: [cron: "0 1 */7 * *"]
+  schedule: 
+    - cron: "0 1 1 * *"
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
   RUST_BACKTRACE: 1
+  WHISPERY_FETCH_FIXTURES: '1'
 
 jobs:
   # Check formatting (platform-independent, one OS is enough)
@@ -61,12 +63,12 @@ jobs:
       # Explicit feature combos — see build job for rationale.
       run: |
         set -e
-        cargo clippy
-        cargo clippy --features alignment
-        cargo clippy --features alignment,serde
-        cargo clippy --features alignment,bench-internals
+        cargo clippy -- -D warnings
+        cargo clippy --features alignment -- -D warnings
+        cargo clippy --features alignment,serde -- -D warnings
+        cargo clippy --features alignment,bench-internals -- -D warnings
         if [ "$RUNNER_OS" = "macOS" ]; then
-          cargo clippy --features alignment,metal,coreml
+          cargo clippy --features alignment,metal,coreml -- -D warnings
         fi
       shell: bash
 
@@ -176,36 +178,7 @@ jobs:
         cargo test --features alignment
         cargo test --features alignment,serde
         cargo test --features alignment,bench-internals
-      shell: bash
-
-  # valgrind:
-  #   name: valgrind
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v6
-  #     - name: Cache cargo build and registry
-  #       uses: actions/cache@v5
-  #       with:
-  #         path: |
-  #           ~/.cargo/registry
-  #           ~/.cargo/git
-  #           target
-  #         key: ubuntu-latest-valgrind-${{ hashFiles('**/Cargo.lock') }}
-  #         restore-keys: |
-  #           ubuntu-latest-valgrind-
-  #     - name: Install Rust
-  #       run: rustup update stable && rustup default stable
-  #     - name: Install Valgrind
-  #       run: |
-  #         sudo apt-get update -y
-  #         sudo apt-get install -y valgrind
-  #     # Uncomment and customize when you have binaries to test:
-  #     # - name: cargo build foo
-  #     #   run: cargo build --bin foo
-  #     #   working-directory: integration
-  #     # - name: Run valgrind foo
-  #     #   run: valgrind --error-exitcode=1 --leak-check=full --show-leak-kinds=all ./target/debug/foo
-  #     #   working-directory: integration
+      shell: bash 
 
   coverage:
     name: coverage

@@ -1661,8 +1661,8 @@ mod tests {
     assert_eq!(path.len(), t);
     // The path should include both token 0 and token 1.
     let tokens: Vec<usize> = path.iter().map(|p| p.token_index).collect();
-    assert!(tokens.iter().any(|&j| j == 0));
-    assert!(tokens.iter().any(|&j| j == 1));
+    assert!(tokens.contains(&0));
+    assert!(tokens.contains(&1));
   }
 
   #[test]
