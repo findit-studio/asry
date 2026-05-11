@@ -1105,8 +1105,8 @@ mod tests {
     let err = validate_for_whisper_ffi(&p).unwrap_err();
     match err {
       WorkFailure::Asr(AsrError::Backend(payload)) => {
-        let message = err.to_string();
-        assert!(err.to_string().contains("best_of"), "got {message}", message = err.to_string());
+        
+        assert!(payload.message().contains("best_of"), "got {message}", message = err.to_string());
       }
       other => panic!("expected AsrError::Backend, got {other:?}"),
     }

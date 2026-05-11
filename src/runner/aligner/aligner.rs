@@ -1984,9 +1984,9 @@ mod tests {
     let err = build_speech_mask(16_000, &segs, &Lang::En).expect_err("must error");
     match err {
       WorkFailure::Alignment(AlignmentError::ModelInference(payload)) => {
-        let message = err.to_string();
+        
         assert!(
-          err.to_string().contains("chunk-local 1/16000 timebase"),
+          payload.message().contains("chunk-local 1/16000 timebase"),
           "error message must cite the contract; got: {message}"
         );
         assert!(

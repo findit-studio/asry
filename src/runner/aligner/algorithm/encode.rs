@@ -583,9 +583,9 @@ mod tests {
     let err = reject_non_finite_input(&samples, &Lang::En).unwrap_err();
     match err {
       WorkFailure::Alignment(AlignmentError::ModelInference(payload)) => {
-        let message = err.to_string();
+        
         assert!(
-          err.to_string().contains("index 2"),
+          payload.message().contains("index 2"),
           "message must name index; got {message}", message = err.to_string()
         );
       }
@@ -641,9 +641,9 @@ mod tests {
     let err = log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).unwrap_err();
     match err {
       WorkFailure::Alignment(AlignmentError::ModelInference(payload)) => {
-        let message = err.to_string();
+        
         assert!(
-          err.to_string().contains("non-finite logit"),
+          payload.message().contains("non-finite logit"),
           "message must call out the non-finite logit; got {message}", message = err.to_string()
         );
         assert!(err.to_string().contains("frame 0"));
