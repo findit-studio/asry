@@ -1,8 +1,9 @@
 //! Throughput bench: dispatch state machine with mocked inference.
 
 use core::time::Duration;
+use std::hint::black_box;
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use whispery::{AsrResult, Command, Lang, Transcriber, TranscriberOptions, VadSegment};
 
 fn bench_dispatch(c: &mut Criterion) {
@@ -31,7 +32,7 @@ fn bench_dispatch(c: &mut Criterion) {
           .unwrap();
         }
       }
-      while let Some(_) = black_box(t.poll_event()) {}
+      while black_box(t.poll_event()).is_some() {}
     });
   });
 }

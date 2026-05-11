@@ -2,8 +2,9 @@
 //! Transcriber surface.
 
 use core::{num::NonZeroU32, time::Duration};
+use std::hint::black_box;
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use mediatime::{Timebase, Timestamp};
 use whispery::{Transcriber, TranscriberOptions, VadSegment};
 

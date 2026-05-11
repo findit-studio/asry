@@ -17,7 +17,8 @@
 //! cargo bench --features bench-internals --bench aligner_simd_baseline
 //! ```
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 
 #[cfg(target_arch = "aarch64")]
 use whispery::__bench::neon;
@@ -135,7 +136,7 @@ fn synth_log_probs(t: usize, v: usize) -> LogProbsTV {
     let target = ti % v;
     data[ti * v + target] = -0.1;
   }
-  LogProbsTV { t, v, data }
+  LogProbsTV::new(t, v, data)
 }
 
 fn bench_ctc_viterbi(c: &mut Criterion) {

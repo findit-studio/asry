@@ -860,7 +860,7 @@ mod tests {
 
     let segs_at = alloc::vec![TimeRange::new(0, 2, tb_16k)];
     let mask_at = build_speech_frames(4, 3.0, 12, 12, &segs_at);
-    assert_eq!(mask_at[0], true);
+    assert!(mask_at[0]);
   }
 
   #[test]
@@ -936,8 +936,8 @@ mod tests {
     // [320, 480) and might trip the threshold.
     let partial = alloc::vec![TimeRange::new(200, 480, tb_16k)];
     let mask_partial = build_speech_frames(2, 320.0, 320, 320, &partial);
-    assert_eq!(
-      mask_partial[1], false,
+    assert!(
+      !mask_partial[1],
       "frame 1 must not be speech (no real audio)"
     );
   }

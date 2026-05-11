@@ -768,8 +768,8 @@ impl Aligner {
           // diagnostic-only; the per-cell `to_le_bytes` is acceptable
           // overhead for the few-K-cells * once-per-segment frequency.
           let mut buf: alloc::vec::Vec<u8> =
-            alloc::vec::Vec::with_capacity(log_probs.data.len() * 4);
-          for v in &log_probs.data {
+            alloc::vec::Vec::with_capacity(log_probs.data().len() * 4);
+          for v in log_probs.data() {
             buf.extend_from_slice(&v.to_le_bytes());
           }
           let _ = f.write_all(&buf);
@@ -862,7 +862,7 @@ impl Aligner {
         let dir_path = std::path::PathBuf::from(dir);
         let trellis = crate::runner::aligner::algorithm::trellis_beam::get_trellis(
           &log_probs,
-          &tokenized.token_ids(),
+          tokenized.token_ids(),
           self.blank_token_id,
           abort_flag,
           &self.language,

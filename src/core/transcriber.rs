@@ -1411,8 +1411,8 @@ mod tests {
   #[test]
   #[should_panic(expected = "MAX_CHUNK_SIZE")]
   fn config_with_chunk_size_above_cap_panics_in_new() {
-    let mut config = TranscriberOptions::default();
-    config.chunk_size = MAX_CHUNK_SIZE + Duration::from_secs(1);
+    let config =
+      TranscriberOptions::default().with_chunk_size(MAX_CHUNK_SIZE + Duration::from_secs(1));
     let _ = Transcriber::new(config);
   }
 
@@ -1948,7 +1948,7 @@ mod tests {
     // Subsequent VAD inside the rejected interval (which we
     // didn't actually push) succeeds — i.e., watermark wasn't
     // poisoned.
-    t.handle_samples(ts(0).clone(), &[]).ok(); // no-op
+    t.handle_samples(ts(0), &[]).ok(); // no-op
     // Push more audio so VAD in the original interval is buffered.
     let next = t.next_expected_starts_at().unwrap();
     t.handle_samples(next, &[0.0; 5_000]).unwrap();

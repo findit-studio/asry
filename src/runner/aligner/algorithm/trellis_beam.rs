@@ -1044,7 +1044,7 @@ mod tests {
     let trellis = get_trellis(&log_probs, &[1], 0, never(), &Lang::En).expect("trellis");
     // trellis[0,0] = 0 (init), trellis[1,0] = emission[1, blank]
     // = -0.5, trellis[2,0] = -1.0, trellis[3,0] = -1.5.
-    assert_eq!(trellis.len(), t * 1);
+    assert_eq!(trellis.len(), t);
     assert_eq!(trellis[0], 0.0);
     assert_eq!(trellis[1], -0.5);
     assert_eq!(trellis[2], -1.0);
@@ -1059,8 +1059,8 @@ mod tests {
     let t = 3;
     let log_probs = lp(t, v, alloc::vec![-1.0_f32; t * v]);
     let trellis = get_trellis(&log_probs, &[1, 2], 0, never(), &Lang::En).expect("trellis");
-    assert!(trellis[0 * 2 + 1].is_infinite());
-    assert!(trellis[0 * 2 + 1] < 0.0);
+    assert!(trellis[1].is_infinite());
+    assert!(trellis[1] < 0.0);
   }
 
   #[test]
@@ -1071,8 +1071,8 @@ mod tests {
     let t = 5;
     let log_probs = lp(t, v, alloc::vec![-1.0_f32; t * v]);
     let trellis = get_trellis(&log_probs, &[1, 2, 1], 0, never(), &Lang::En).expect("trellis");
-    assert!(trellis[3 * 3 + 0].is_infinite() && trellis[3 * 3 + 0] > 0.0);
-    assert!(trellis[4 * 3 + 0].is_infinite() && trellis[4 * 3 + 0] > 0.0);
+    assert!(trellis[3 * 3].is_infinite() && trellis[3 * 3] > 0.0);
+    assert!(trellis[4 * 3].is_infinite() && trellis[4 * 3] > 0.0);
   }
 
   #[test]
@@ -1086,7 +1086,7 @@ mod tests {
     // costs more; the recurrence chooses max(stay, change).
     let mut data = alloc::vec![-100.0_f32; t * v];
     for ti in 0..t {
-      data[ti * v + 0] = -1.0; // blank
+      data[ti * v] = -1.0; // blank
       data[ti * v + 1] = -2.0; // token id 1
       data[ti * v + 2] = -2.0; // token id 2
     }
@@ -1197,13 +1197,13 @@ mod tests {
     let v = 3;
     let t = 3;
     let mut data = alloc::vec![-100.0_f32; t * v];
-    data[0 * v + 0] = -0.5; // frame 0 blank
-    data[0 * v + 1] = -0.4; // frame 0 token 1
-    data[1 * v + 0] = -0.5; // frame 1 blank
-    data[1 * v + 1] = -0.3; // frame 1 token 1 (preferred)
-    data[1 * v + 2] = -0.4; // frame 1 token 2
-    data[2 * v + 0] = -0.5; // frame 2 blank
-    data[2 * v + 2] = -0.2; // frame 2 token 2 (preferred)
+    data[0] = -0.5; // frame 0 blank
+    data[1] = -0.4; // frame 0 token 1
+    data[3] = -0.5; // frame 1 blank
+    data[4] = -0.3; // frame 1 token 1 (preferred)
+    data[5] = -0.4; // frame 1 token 2
+    data[6] = -0.5; // frame 2 blank
+    data[7] = -0.2; // frame 2 token 2 (preferred)
     let log_probs = lp(t, v, data);
     let trellis = get_trellis(&log_probs, &[1, 2], 0, never(), &Lang::En).expect("trellis");
     let path = backtrack_beam(
@@ -1242,15 +1242,15 @@ mod tests {
     let v = 3;
     let t = 3;
     let mut data = alloc::vec![-100.0_f32; t * v];
-    data[0 * v + 1] = -0.1; // frame 0: token 1
-    data[1 * v + 0] = -0.1; // frame 1: blank
-    data[2 * v + 2] = -0.1; // frame 2: token 2
+    data[1] = -0.1; // frame 0: token 1
+    data[3] = -0.1; // frame 1: blank
+    data[8] = -0.1; // frame 2: token 2
     // Make blank cheap everywhere too, so trellis values stay
     // finite.
-    data[0 * v + 0] = -0.5;
-    data[1 * v + 1] = -1.0;
-    data[1 * v + 2] = -1.0;
-    data[2 * v + 0] = -0.5;
+    data[0] = -0.5;
+    data[1] = -1.0;
+    data[2] = -1.0;
+    data[6] = -0.5;
     let log_probs = lp(t, v, data);
     let trellis = get_trellis(&log_probs, &[1, 2], 0, never(), &Lang::En).expect("trellis");
     let path = backtrack_beam(
@@ -1537,19 +1537,19 @@ mod tests {
     // Default to a strong blank, weak everything else.
     let mut data = alloc::vec![-100.0_f32; t * v];
     // Frame 0: token 1 wins (path: at j=0, change to j=1).
-    data[0 * v + 0] = -10.0; // blank
-    data[0 * v + 1] = -0.1; // token 1
+    data[0] = -10.0; // blank
+    data[1] = -0.1; // token 1
     // Frame 1: token 2 strong, blank weak — encourages change
     // to j=2 (path: j=1 → j=2 via emission of token 2).
-    data[1 * v + 0] = -10.0; // blank
-    data[1 * v + 2] = -0.1; // token 2
+    data[4] = -10.0; // blank
+    data[6] = -0.1; // token 2
     // Frame 2: blank strong; staying at j=2 gives high score.
-    data[2 * v + 0] = -0.1; // blank
-    data[2 * v + 2] = -2.0; // token 2 (mediocre)
-    data[2 * v + 3] = -2.0; // token 3 (mediocre)
+    data[8] = -0.1; // blank
+    data[10] = -2.0; // token 2 (mediocre)
+    data[11] = -2.0; // token 3 (mediocre)
     // Frame 3: token 3 strong (path: j=2 → j=3 via emission).
-    data[3 * v + 0] = -10.0; // blank
-    data[3 * v + 3] = -0.1;
+    data[12] = -10.0; // blank
+    data[15] = -0.1;
 
     let log_probs = lp(t, v, data);
     let tokens = alloc::vec![1_i32, 2_i32, 3_i32];
@@ -1599,10 +1599,10 @@ mod tests {
     let v = 3;
     let t = 4;
     let mut data = alloc::vec![-100.0_f32; t * v];
-    data[0 * v + 1] = -0.1;
-    data[1 * v + 0] = -0.1;
-    data[2 * v + 2] = -0.1;
-    data[3 * v + 0] = -0.1;
+    data[1] = -0.1;
+    data[3] = -0.1;
+    data[8] = -0.1;
+    data[9] = -0.1;
     let log_probs = lp(t, v, data);
     let words = align_to_word_segments(
       &log_probs,
@@ -1635,21 +1635,21 @@ mod tests {
     let t = 4;
     let mut data = alloc::vec![-1.0_f32; t * v];
     // Frame 0: blank cheap.
-    data[0 * v + 0] = -0.1;
-    data[0 * v + 1] = -1.0;
-    data[0 * v + 2] = -1.0;
+    data[0] = -0.1;
+    data[1] = -1.0;
+    data[2] = -1.0;
     // Frame 1: token 1 cheap.
-    data[1 * v + 0] = -1.0;
-    data[1 * v + 1] = -0.1;
-    data[1 * v + 2] = -1.0;
+    data[3] = -1.0;
+    data[4] = -0.1;
+    data[5] = -1.0;
     // Frame 2: token 2 cheap.
-    data[2 * v + 0] = -1.0;
-    data[2 * v + 1] = -1.0;
-    data[2 * v + 2] = -0.1;
+    data[6] = -1.0;
+    data[7] = -1.0;
+    data[8] = -0.1;
     // Frame 3: blank cheap.
-    data[3 * v + 0] = -0.1;
-    data[3 * v + 1] = -1.0;
-    data[3 * v + 2] = -1.0;
+    data[9] = -0.1;
+    data[10] = -1.0;
+    data[11] = -1.0;
     let log_probs = lp(t, v, data);
     let trellis = get_trellis(&log_probs, &[1, 2], 0, never(), &Lang::En).expect("trellis");
     let path =
@@ -1745,7 +1745,7 @@ mod tests {
     // T=8000 × num_tokens=5000 = 40M cells > 32M budget.
     // intentionally undersized
     let log_probs = LogProbsTV::new(8_000, 8, alloc::vec![0.0_f32; 1]);
-    let tokens: Vec<i32> = (0..5_000).map(|i| 1 + ((i as i32) % 4)).collect();
+    let tokens: Vec<i32> = (0..5_000).map(|i| 1 + (i % 4)).collect();
     let err = get_trellis(&log_probs, &tokens, 0, never(), &Lang::En).unwrap_err();
     let WorkFailure::AlignmentFailed { kind, message, .. } = err else {
       panic!("expected AlignmentFailed");

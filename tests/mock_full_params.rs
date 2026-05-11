@@ -44,7 +44,7 @@ fn ladder_steps_construct_without_panic() {
     // path instead. Here we assert temperature progression
     // analytically.
     assert!(
-      t >= 0.0 && t <= 1.0 + 1e-6,
+      (0.0..=1.0 + 1e-6).contains(&t),
       "ladder step {} out of range",
       t
     );
