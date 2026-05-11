@@ -10,8 +10,6 @@
 //! in-flight chunks already hold their audio in their own
 //! `Arc<[f32]>` (decoupled from the live buffer).
 
-use Vec;
-
 use mediatime::{Timebase, Timestamp};
 
 use crate::{

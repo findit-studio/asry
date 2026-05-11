@@ -583,10 +583,10 @@ mod tests {
     let err = reject_non_finite_input(&samples, &Lang::En).unwrap_err();
     match err {
       WorkFailure::Alignment(AlignmentError::ModelInference(payload)) => {
-        let message = payload.message();
+        let message = err.to_string();
         assert!(
-          message.contains("index 2"),
-          "message must name index; got {message:?}"
+          err.to_string().contains("index 2"),
+          "message must name index; got {message}", message = err.to_string()
         );
       }
       other => panic!("expected AlignmentFailed; got {other:?}"),
@@ -641,13 +641,13 @@ mod tests {
     let err = log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).unwrap_err();
     match err {
       WorkFailure::Alignment(AlignmentError::ModelInference(payload)) => {
-        let message = payload.message();
+        let message = err.to_string();
         assert!(
-          message.contains("non-finite logit"),
-          "message must call out the non-finite logit; got {message:?}"
+          err.to_string().contains("non-finite logit"),
+          "message must call out the non-finite logit; got {message}", message = err.to_string()
         );
-        assert!(message.contains("frame 0"));
-        assert!(message.contains("vocab 1"));
+        assert!(err.to_string().contains("frame 0"));
+        assert!(err.to_string().contains("vocab 1"));
       }
       other => panic!("expected AlignmentFailed; got {other:?}"),
     }
@@ -698,10 +698,10 @@ mod tests {
     let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
       panic!("expected AlignmentFailed");
     };
-    let message = payload.message();
+    let message = err.to_string();
     assert!(
-      message.contains("log-softmax output non-finite"),
-      "diagnostic must call out the per-element finite check; got {message:?}"
+      err.to_string().contains("log-softmax output non-finite"),
+      "diagnostic must call out the per-element finite check; got {message}", message = err.to_string()
     );
   }
 
@@ -762,8 +762,8 @@ mod tests {
     let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
       panic!("expected AlignmentFailed");
     };
-    let message = payload.message();
-    assert!(message.contains("negative time dim"));
+    let message = err.to_string();
+    assert!(err.to_string().contains("negative time dim"));
   }
 
   #[test]
@@ -788,10 +788,10 @@ mod tests {
     let WorkFailure::Alignment(AlignmentError::NoAlignmentPath(payload)) = &err else {
       panic!("expected NoAlignmentPath; got {err:?}");
     };
-    let message = payload.message();
+    let message = err.to_string();
     assert!(
-      message.contains("zero encoder frames"),
-      "diagnostic must explain the short-chunk cause; got {message:?}"
+      err.to_string().contains("zero encoder frames"),
+      "diagnostic must explain the short-chunk cause; got {message}", message = err.to_string()
     );
   }
 
@@ -805,10 +805,10 @@ mod tests {
     let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = &err else {
       panic!("T=0 with non-empty buffer must stay fatal; got {err:?}");
     };
-    let message = payload.message();
+    let message = err.to_string();
     assert!(
-      message.contains("shape/data mismatch") || message.contains("buffer has"),
-      "diagnostic must call out the shape/data inconsistency; got {message:?}"
+      err.to_string().contains("shape/data mismatch") || err.to_string().contains("buffer has"),
+      "diagnostic must call out the shape/data inconsistency; got {message}", message = err.to_string()
     );
   }
 
@@ -840,10 +840,10 @@ mod tests {
     let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
       panic!("expected AlignmentFailed");
     };
-    let message = payload.message();
+    let message = err.to_string();
     assert!(
-      message.contains("smaller stride"),
-      "diagnostic must call out the smaller-stride case; got {message:?}"
+      err.to_string().contains("smaller stride"),
+      "diagnostic must call out the smaller-stride case; got {message}", message = err.to_string()
     );
   }
 
@@ -863,10 +863,10 @@ mod tests {
     let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
       panic!("expected AlignmentFailed");
     };
-    let message = payload.message();
+    let message = err.to_string();
     assert!(
-      message.contains("larger stride"),
-      "diagnostic must call out the larger-stride case; got {message:?}"
+      err.to_string().contains("larger stride"),
+      "diagnostic must call out the larger-stride case; got {message}", message = err.to_string()
     );
   }
 
@@ -901,10 +901,10 @@ mod tests {
     let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
       panic!("expected AlignmentFailed");
     };
-    let message = payload.message();
+    let message = err.to_string();
     assert!(
-      message.contains("doesn't match tokenizer vocab"),
-      "diagnostic must call out the vocab mismatch; got {message:?}"
+      err.to_string().contains("doesn't match tokenizer vocab"),
+      "diagnostic must call out the vocab mismatch; got {message}", message = err.to_string()
     );
   }
 
@@ -931,8 +931,8 @@ mod tests {
     };
     let message = err.to_string();
     assert!(
-      message.contains("doesn't match"),
-      "must call out length mismatch; got {message:?}"
+      err.to_string().contains("doesn't match"),
+      "must call out length mismatch; got {message}", message = err.to_string()
     );
   }
 
@@ -956,8 +956,8 @@ mod tests {
     };
     let message = err.to_string();
     assert!(
-      message.contains("overflow") || message.contains("doesn't fit"),
-      "must call out overflow; got {message:?}"
+      err.to_string().contains("overflow") || err.to_string().contains("doesn't fit"),
+      "must call out overflow; got {message}", message = err.to_string()
     );
   }
 
@@ -983,8 +983,8 @@ mod tests {
     };
     let message = err.to_string();
     assert!(
-      message.contains("frame 2"),
-      "must locate the bad frame; got {message:?}"
+      err.to_string().contains("frame 2"),
+      "must locate the bad frame; got {message}", message = err.to_string()
     );
   }
 

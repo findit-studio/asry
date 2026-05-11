@@ -1739,10 +1739,10 @@ mod tests {
     let WorkFailure::Alignment(AlignmentError::NoAlignmentPath(payload)) = err else {
       panic!("expected AlignmentFailed");
     };
-    let message = payload.message();
+    let message = err.to_string();
     assert!(
-      message.contains("trellis exceeds"),
-      "message must call out the budget; got {message:?}"
+      err.to_string().contains("trellis exceeds"),
+      "message must call out the budget; got {message}", message = err.to_string()
     );
   }
 }

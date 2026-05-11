@@ -20,12 +20,9 @@
 //! or any `#![allow(unsafe_code)]` exemption. The `unsafe`
 //! surface lives entirely inside the `whisper-cpp` crate.
 
-use std::{
-  sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-  },
-  vec::Vec,
+use std::sync::{
+  Arc,
+  atomic::{AtomicBool, Ordering},
 };
 
 use whispercpp::{
@@ -908,10 +905,10 @@ mod tests {
     let flag = Arc::new(AtomicBool::new(false));
     let res = full_params_from(&p, 0.0, flag);
     match res {
-      Err(WorkFailure::Asr(AsrError::Backend(AsrFailure::new()))) => {
+      Err(WorkFailure::Asr(AsrError::Backend(payload))) => {
         assert!(
-          message.contains("set_language") && message.contains("zzzz"),
-          "expected set_language diagnostic mentioning the offending code; got {message:?}"
+          err.to_string().contains("set_language") && err.to_string().contains("zzzz"),
+          "expected set_language diagnostic mentioning the offending code; got {message}", message = err.to_string()
         );
       }
       other => panic!("expected AsrFailed/BackendError for unknown language; got {other:?}"),
@@ -935,10 +932,10 @@ mod tests {
     let flag = Arc::new(AtomicBool::new(false));
     let res = full_params_from(&p, 0.0, flag);
     match res {
-      Err(WorkFailure::Asr(AsrError::Backend(AsrFailure::new()))) => {
+      Err(WorkFailure::Asr(AsrError::Backend(payload))) => {
         assert!(
-          message.contains("language hint") && message.contains("lowercase ASCII"),
-          "expected charset-violation diagnostic; got {message:?}"
+          err.to_string().contains("language hint") && err.to_string().contains("lowercase ASCII"),
+          "expected charset-violation diagnostic; got {message}", message = err.to_string()
         );
       }
       other => panic!("expected AsrFailed/BackendError; got {other:?}"),
@@ -1011,7 +1008,7 @@ mod tests {
     let flag = Arc::new(AtomicBool::new(false));
     let res = full_params_from(&p, 0.0, flag);
     match res {
-      Err(WorkFailure::Asr(AsrError::Backend(AsrFailure::new()))) => {}
+      Err(WorkFailure::Asr(AsrError::Backend(payload))) => {}
       other => panic!("expected AsrFailed/BackendError; got {other:?}"),
     }
   }
@@ -1028,10 +1025,10 @@ mod tests {
     let flag = Arc::new(AtomicBool::new(false));
     let res = full_params_from(&p, 0.0, flag);
     match res {
-      Err(WorkFailure::Asr(AsrError::Backend(AsrFailure::new()))) => {
+      Err(WorkFailure::Asr(AsrError::Backend(payload))) => {
         assert!(
-          message.contains("initial_prompt") && message.contains("NUL"),
-          "expected NUL diagnostic; got {message:?}"
+          err.to_string().contains("initial_prompt") && err.to_string().contains("NUL"),
+          "expected NUL diagnostic; got {message}", message = err.to_string()
         );
       }
       other => panic!("expected AsrFailed/BackendError; got {other:?}"),
@@ -1108,8 +1105,8 @@ mod tests {
     let err = validate_for_whisper_ffi(&p).unwrap_err();
     match err {
       WorkFailure::Asr(AsrError::Backend(payload)) => {
-        let message = payload.message();
-        assert!(message.contains("best_of"), "got {message}");
+        let message = err.to_string();
+        assert!(err.to_string().contains("best_of"), "got {message}", message = err.to_string());
       }
       other => panic!("expected AsrError::Backend, got {other:?}"),
     }
@@ -1124,7 +1121,7 @@ mod tests {
     let err = validate_for_whisper_ffi(&p).unwrap_err();
     match err {
       WorkFailure::Asr(err) => {
-        assert!(message.contains("beam_size"), "got {message}");
+        assert!(err.to_string().contains("beam_size"), "got {message}", message = err.to_string());
       }
       other => panic!("expected AsrFailed, got {other:?}"),
     }

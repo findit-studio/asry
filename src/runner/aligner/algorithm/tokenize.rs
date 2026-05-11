@@ -947,8 +947,8 @@ mod tests {
     match result {
       Err(WorkFailure::Alignment(AlignmentError::Tokenization(_))) => {
         assert!(
-          message.contains("oov_decisions length 2") && message.contains("1 OOV events detected"),
-          "diagnostic should cite the length mismatch; got {message:?}",
+          err.to_string().contains("oov_decisions length 2") && err.to_string().contains("1 OOV events detected"),
+          "diagnostic should cite the length mismatch; got {message}", message = err.to_string(),
         );
       }
       other => panic!("expected TokenizationFailed mismatch; got {other:?}"),
@@ -1035,8 +1035,8 @@ mod tests {
     match result {
       Err(WorkFailure::Alignment(AlignmentError::Tokenization(_))) => {
         assert!(
-          message.contains("different OOV event"),
-          "diagnostic should cite the per-position identity mismatch; got {message:?}",
+          err.to_string().contains("different OOV event"),
+          "diagnostic should cite the per-position identity mismatch; got {message}", message = err.to_string(),
         );
       }
       other => panic!("expected TokenizationFailed identity mismatch; got {other:?}"),
@@ -1322,8 +1322,8 @@ mod tests {
       Err(crate::types::WorkFailure::Alignment(AlignmentError::SemanticOutOfVocab(_))) => {
         assert_eq!(language, &Lang::En);
         assert!(
-          message.contains("'&'") || message.contains("\"&\""),
-          "diagnostic should cite the offending char; got {message:?}",
+          err.to_string().contains("'&'") || err.to_string().contains("\"&\""),
+          "diagnostic should cite the offending char; got {message}", message = err.to_string(),
         );
       }
       other => panic!("expected SemanticOutOfVocab AlignmentFailed; got {other:?}"),

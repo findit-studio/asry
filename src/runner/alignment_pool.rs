@@ -1210,39 +1210,43 @@ mod tests {
   /// `Event::Error` so the caller can detect a broken setup.
   #[test]
   fn data_dependent_failures_are_recoverable() {
-    let recoverable = [::NoAlignmentPath, ::EmptyText];
-    for kind in recoverable {
-      let f = WorkFailure::AlignmentFailed {
-        kind,
-        message: SmolStr::new(""),
-        language: crate::types::Lang::En,
-      };
+    let make = |variant: fn(AlignmentFailure) -> AlignmentError| {
+      WorkFailure::Alignment(variant(AlignmentFailure::new(
+        SmolStr::new(""),
+        crate::types::Lang::En,
+      )))
+    };
+    let recoverable: [(&str, fn(AlignmentFailure) -> AlignmentError); 2] = [
+      ("NoAlignmentPath", AlignmentError::NoAlignmentPath),
+      ("EmptyText", AlignmentError::EmptyText),
+    ];
+    for (name, ctor) in recoverable {
+      let f = make(ctor);
       assert!(
         alignment_failure_is_recoverable(&f),
-        "{kind:?} must preserve ASR text",
+        "{name} must preserve ASR text",
       );
     }
   }
 
-  /// Backend / configuration alignment failures must stay
-  /// fatal. these were being silently swallowed into
-  /// `Ok(empty)`, masking broken backends.
+  /// Backend / configuration alignment failures must stay fatal —
+  /// otherwise they get silently swallowed into `Ok(empty)`, masking
+  /// broken backends.
   #[test]
   fn backend_alignment_failures_stay_fatal() {
-    let fatal = [
-      ::ModelInferenceFailed,
-      ::TokenizationFailed,
-      ::NormalizationFailed,
+    let make = |variant: fn(AlignmentFailure) -> AlignmentError| {
+      WorkFailure::Alignment(variant(AlignmentFailure::new(SmolStr::new(""), Lang::En)))
+    };
+    let fatal: [(&str, fn(AlignmentFailure) -> AlignmentError); 3] = [
+      ("ModelInference", AlignmentError::ModelInference),
+      ("Tokenization", AlignmentError::Tokenization),
+      ("Normalization", AlignmentError::Normalization),
     ];
-    for kind in fatal {
-      let f = WorkFailure::AlignmentFailed {
-        kind,
-        message: SmolStr::new(""),
-        language: Lang::En,
-      };
+    for (name, ctor) in fatal {
+      let f = make(ctor);
       assert!(
         !alignment_failure_is_recoverable(&f),
-        "{kind:?} signals a backend/config bug; must propagate",
+        "{name} signals a backend/config bug; must propagate",
       );
     }
   }
@@ -1702,8 +1706,8 @@ mod tests {
     let result = validate_oov_decision_languages(&[], &Lang::Ko, &resolved);
     match result {
       Err(WorkFailure::Alignment(AlignmentError::Tokenization(_))) => assert!(
-        message.contains("oov_decisions[0][0].event.language") && message.contains("job.language"),
-        "diagnostic should cite the whole-chunk mismatch; got {message:?}",
+        err.to_string().contains("oov_decisions[0][0].event.language") && err.to_string().contains("job.language"),
+        "diagnostic should cite the whole-chunk mismatch; got {message}", message = err.to_string(),
       ),
       other => panic!("expected TokenizationFailed; got {other:?}"),
     }
@@ -1749,8 +1753,8 @@ mod tests {
     let result = validate_oov_decision_languages(&runs, &Lang::En, &resolved);
     match result {
       Err(WorkFailure::Alignment(AlignmentError::Tokenization(_))) => assert!(
-        message.contains("oov_decisions[1][0]") && message.contains("runs[1].language()"),
-        "diagnostic should cite the run index of the mismatch; got {message:?}",
+        err.to_string().contains("oov_decisions[1][0]") && err.to_string().contains("runs[1].language()"),
+        "diagnostic should cite the run index of the mismatch; got {message}", message = err.to_string(),
       ),
       other => panic!("expected TokenizationFailed; got {other:?}"),
     }
@@ -1775,10 +1779,10 @@ mod tests {
     let result = clip_sub_segments(&subs, 1_600, 4_800, &Lang::En);
     match result {
       Err(WorkFailure::Alignment(AlignmentError::ModelInference(payload))) => {
-        let message = payload.message();
+        let message = err.to_string();
         assert!(
-          message.contains("1/16000") && message.contains("48000"),
-          "expected diagnostic citing both timebases; got {message:?}",
+          err.to_string().contains("1/16000") && err.to_string().contains("48000"),
+          "expected diagnostic citing both timebases; got {message}", message = err.to_string(),
         );
       }
       other => panic!("expected ModelInferenceFailed, got {other:?}"),

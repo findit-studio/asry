@@ -1466,10 +1466,10 @@ mod tests {
     let result = validate_direct_decision_languages(&stale, &Lang::En);
     match result {
       Err(WorkFailure::Alignment(AlignmentError::Tokenization(_))) => assert!(
-        message.contains("oov_decisions[0].event.language")
-          && message.contains("Ko")
-          && message.contains("En"),
-        "diagnostic should cite the offending index + the languages; got {message:?}",
+        err.to_string().contains("oov_decisions[0].event.language")
+          && err.to_string().contains("Ko")
+          && err.to_string().contains("En"),
+        "diagnostic should cite the offending index + the languages; got {message}", message = err.to_string(),
       ),
       other => panic!("expected TokenizationFailed cross-language; got {other:?}"),
     }
@@ -1798,8 +1798,8 @@ mod tests {
       panic!("expected AlignerLoad");
     };
     assert!(
-      message.contains("`|` word-delimiter"),
-      "must call out the missing delimiter; got {message:?}"
+      err.to_string().contains("`|` word-delimiter"),
+      "must call out the missing delimiter; got {message}", message = err.to_string()
     );
   }
 
@@ -1983,21 +1983,18 @@ mod tests {
     let segs = [TimeRange::new(0, 100, ms_tb)];
     let err = build_speech_mask(16_000, &segs, &Lang::En).expect_err("must error");
     match err {
-      WorkFailure::AlignmentFailed { kind, message, .. } => {
-        assert_eq!(
-          kind,
-          crate::types::::ModelInferenceFailed
-        );
+      WorkFailure::Alignment(AlignmentError::ModelInference(payload)) => {
+        let message = err.to_string();
         assert!(
-          message.contains("chunk-local 1/16000 timebase"),
+          err.to_string().contains("chunk-local 1/16000 timebase"),
           "error message must cite the contract; got: {message}"
         );
         assert!(
-          message.contains("1/1000"),
+          err.to_string().contains("1/1000"),
           "error message must cite the offending timebase; got: {message}"
         );
       }
-      other => panic!("expected AlignmentFailed, got {other:?}"),
+      other => panic!("expected ModelInference, got {other:?}"),
     }
   }
 
