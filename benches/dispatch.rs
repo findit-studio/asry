@@ -3,8 +3,8 @@
 use core::time::Duration;
 use std::hint::black_box;
 
-use criterion::{Criterion, criterion_group, criterion_main};
 use asry::{AsrResult, Command, Lang, Transcriber, TranscriberOptions, VadSegment};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 fn bench_dispatch(c: &mut Criterion) {
   c.bench_function("e2e_300_chunks_mocked", |b| {

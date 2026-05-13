@@ -308,10 +308,7 @@ fn fetch_jfk_wav(fixture_dir: &std::path::Path) {
     }
     let _ = fs::remove_file(&wav_path);
   }
-  eprintln!(
-    "[asry build.rs] downloading {} ({})",
-    WAV_FILENAME, WAV_URL
-  );
+  eprintln!("[asry build.rs] downloading {} ({})", WAV_FILENAME, WAV_URL);
   if download(WAV_URL, &wav_path).is_err() {
     let _ = fs::remove_file(&wav_path);
     return;
@@ -343,10 +340,7 @@ fn fetch_wav2vec2_fixtures(models_dir: &std::path::Path) {
   if !fetch_with_sha(MODEL_W2V_URL, &model_path, MODEL_W2V_SHA256) {
     return;
   }
-  println!(
-    "cargo:rustc-env=ASRY_W2V_MODEL={}",
-    model_path.display()
-  );
+  println!("cargo:rustc-env=ASRY_W2V_MODEL={}", model_path.display());
 
   let tokenizer_path = models_dir.join(TOKENIZER_W2V_FILENAME);
   // Previously this path patched the downloaded tokenizer.json

@@ -8,8 +8,8 @@
 
 use core::{num::NonZeroU32, time::Duration};
 
-use mediatime::{Timebase, Timestamp};
 use asry::{AsrResult, Command, Event, Lang, Transcriber, TranscriberOptions, VadSegment};
+use mediatime::{Timebase, Timestamp};
 
 fn main() {
   // Output timebase: original media at 48 kHz.
