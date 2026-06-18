@@ -101,6 +101,7 @@
 
 mod asr_source;
 mod errors;
+mod lang_compat;
 pub(crate) mod whisper_pool;
 
 // `pub(crate)` (rather than `mod`) so the crate-root

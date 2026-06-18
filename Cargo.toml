@@ -12,7 +12,7 @@ categories  = ["multimedia::audio", "science"]
 
 [features]
 default  = ["runner"]
-serde    = ["runner", "dep:serde", "dep:humantime-serde", "smol_str/serde", "mediatime/serde", "whispercpp?/serde"]
+serde    = ["dep:serde", "dep:humantime-serde", "smol_str/serde", "mediatime/serde"]
 runner   = ["dep:whispercpp", "dep:miniz_oxide"]
 alignment = ["runner", "dep:ort", "dep:tokenizers", "dep:ndarray"]
 # Apple-only GPU acceleration for whisper.cpp. `metal` runs the
