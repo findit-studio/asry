@@ -114,9 +114,11 @@
 // gated on `alignment` (the ort aligner loader), not `runner`.
 mod asr_source;
 mod errors;
-// Needs `whispercpp` unconditionally (no internal cfg-splitting),
-// so it stays behind `runner` specifically even though the parent
+// Both need `whispercpp` unconditionally (no internal cfg-splitting),
+// so they stay behind `runner` specifically even though the parent
 // module is reachable under `emissions` too.
+#[cfg(feature = "runner")]
+mod lang_compat;
 #[cfg(feature = "runner")]
 pub(crate) mod whisper_pool;
 
