@@ -751,11 +751,12 @@ fn build_asr_result(
     0.0
   };
 
-  // `detected_lang` returns the typed `Lang` directly. Falls
-  // back to the configured language hint (or `Lang::Other("")`
-  // if none) when whisper.cpp didn't detect or assert a language
-  // for this chunk.
-  let language = state.detected_lang().unwrap_or_else(|| {
+  // `detected_lang` returns a typed `whispercpp::Lang`; convert it
+  // to asry's native `Lang` at the FFI boundary (see
+  // `runner::lang_compat`). Falls back to the configured language
+  // hint (or `Lang::Other("")` if none) when whisper.cpp didn't
+  // detect or assert a language for this chunk.
+  let language = state.detected_lang().map(Lang::from).unwrap_or_else(|| {
     params
       .language_hint()
       .cloned()
