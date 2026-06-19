@@ -295,7 +295,16 @@ fn build_template(params: &AsrParams) -> Result<FullParams, WorkFailure> {
       ))))
     })?;
   } else {
-    p.set_detect_language(true);
+    // No hint → auto-detect the language AND transcribe. whisper.cpp's
+    // `detect_language` flag DETECTS ONLY: it runs language ID then returns an
+    // EMPTY transcript. The `"auto"` language sentinel (accepted by
+    // `set_language`) detects then decodes, which is what an unhinted chunk
+    // wants.
+    p.set_language("auto").map_err(|e| {
+      WorkFailure::Asr(AsrError::Backend(AsrFailure::new(format_smolstr!(
+        "set_language(auto) rejected by whisper.cpp: {e}"
+      ))))
+    })?;
   }
   if let Some(prompt) = params.initial_prompt() {
     // Prompt content is user-supplied so we are more cautious —
