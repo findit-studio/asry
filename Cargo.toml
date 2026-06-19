@@ -15,13 +15,15 @@ default  = ["runner"]
 serde    = ["dep:serde", "dep:humantime-serde", "smol_str/serde", "mediatime/serde"]
 runner   = ["dep:whispercpp", "dep:miniz_oxide"]
 alignment = ["runner", "dep:ort", "dep:tokenizers", "dep:ndarray"]
-# Apple-only GPU acceleration for whisper.cpp. `metal` runs the
-# encoder on the unified-memory Metal backend (works on every
-# Apple Silicon Mac); `coreml` additionally dispatches the encoder
-# to ANE if the caller has produced a CoreML companion `.mlmodelc`.
-# Both default OFF — the crate compiles BLAS-only on every
-# platform without these features. Enable both on Apple Silicon
-# for production.
+# Apple GPU acceleration for whisper.cpp. `metal` runs the encoder
+# on the unified-memory Metal backend (works on every Apple Silicon
+# Mac); `coreml` additionally dispatches the encoder to ANE if the
+# caller has produced a CoreML companion `.mlmodelc`. `metal` is
+# AUTO-enabled on Apple targets whenever `runner` is active (see the
+# `[target.'cfg(target_vendor = "apple")'.dependencies]` block below)
+# — a strict win there. This explicit feature stays for manual /
+# cross-platform control; `coreml` remains opt-in. Non-Apple `runner`
+# builds compile BLAS-only.
 metal  = ["runner", "whispercpp/metal"]
 coreml = ["runner", "whispercpp/coreml"]
 # Re-exports `pub(crate)` alignment internals (scalar/NEON normaliser
@@ -117,6 +119,14 @@ serde           = { version = "1", optional = true, default-features = false, fe
 humantime-serde = { version = "1", optional = true, default-features = false }
 arbitrary       = { version = "1", optional = true, features = ["derive"] }
 quickcheck      = { version = "1", optional = true, default-features = false }
+
+# Auto-enable whisper.cpp's Metal GPU encoder on Apple targets whenever the
+# `runner` is active. This only ADDS the `metal` feature to the already-optional
+# `whispercpp` dep — it does not activate it, so a `runner`-off build still pulls
+# no whispercpp, and a non-Apple `runner` build stays CPU/BLAS. Metal is
+# Apple-only and a strict win on every Apple Silicon Mac.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+whispercpp = { version = "0.2", optional = true, default-features = false, features = ["metal"] }
 
 [dev-dependencies]
 criterion  = { version = "0.8", default-features = false, features = ["html_reports"] }
