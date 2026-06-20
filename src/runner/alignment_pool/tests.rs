@@ -601,3 +601,66 @@ fn clip_sub_segments_rejects_non_16000_timebase() {
     other => panic!("expected ModelInferenceFailed, got {other:?}"),
   }
 }
+
+/// `AlignWorkItem::from_parts` builds a work item from
+/// already-snapshotted transcriber metadata (no `&Transcriber`
+/// in hand), so a downstream alignment service on a different
+/// thread can construct one. Construction test only: the
+/// desktop's `tests/align.rs` is the true forced-alignment e2e
+/// gate.
+#[test]
+fn from_parts_builds_item_from_synthetic_values() {
+  use core::num::NonZeroU32;
+
+  let samples: Arc<[f32]> = Arc::from(vec![0.0_f32, 0.1, 0.2, 0.3].into_boxed_slice());
+  // chunk-first = 0 so stream-coordinate sub-segment pairs are
+  // already chunk-local; the flip subtracts 0 and re-wraps in
+  // 1/16000.
+  let chunk_first_sample: u64 = 0;
+  let sub_pairs: Vec<(u64, u64)> = vec![(160, 320)];
+  let bridge: Arc<dyn Fn(u64, u64) -> TimeRange + Send + Sync> = Arc::new(|s, e| {
+    TimeRange::new(
+      s as i64,
+      e as i64,
+      mediatime::Timebase::new(1, NonZeroU32::new(16_000).unwrap()),
+    )
+  });
+
+  let item = AlignWorkItem::from_parts(
+    ChunkId::from_raw(7),
+    Arc::clone(&samples),
+    SmolStr::new("hello"),
+    Lang::En,
+    Vec::new(),
+    Arc::new(AtomicBool::new(false)),
+    Vec::new(),
+    chunk_first_sample,
+    sub_pairs,
+    Arc::clone(&bridge),
+  )
+  .expect("from_parts returns Some for resolved parts");
+
+  assert_eq!(item.chunk_id(), ChunkId::from_raw(7));
+  assert_eq!(item.text().as_str(), "hello");
+  assert_eq!(item.language(), &Lang::En);
+  assert!(item.runs().is_empty());
+  assert!(item.oov_decisions().is_empty());
+  assert_eq!(item.chunk_first_sample_in_stream(), 0);
+  assert_eq!(item.samples().len(), 4);
+  assert!(!item.abort_flag().load(Ordering::Relaxed));
+
+  // Coordinate-space flip: stream `(160, 320)` minus
+  // chunk_first 0 → chunk-local 1/16000 `TimeRange` with
+  // `start_pts() == sample index`.
+  let subs = item.sub_segments();
+  assert_eq!(subs.len(), 1);
+  assert_eq!(subs[0].start_pts(), 160);
+  assert_eq!(subs[0].end_pts(), 320);
+  assert_eq!(subs[0].timebase().num(), 1);
+  assert_eq!(subs[0].timebase().den().get(), 16_000);
+
+  // The bridge passed in is the one wired onto the item.
+  let mapped = (item.samples_to_output_range())(1_000, 2_000);
+  assert_eq!(mapped.start_pts(), 1_000);
+  assert_eq!(mapped.end_pts(), 2_000);
+}

@@ -187,17 +187,93 @@ impl AlignWorkItem {
     // `TokenizationFailed`).
     oov_decisions: Vec<Vec<ResolvedOov>>,
   ) -> Option<Self> {
-    use core::num::NonZeroU32;
     let chunk_first = transcriber.chunk_first_sample(chunk_id)?;
     let raw_subs = transcriber.chunk_sub_segments_samples(chunk_id)?;
     let bridge = transcriber.chunk_samples_to_output_range_fn(chunk_id)?;
+    Self::from_parts(
+      chunk_id,
+      samples,
+      text,
+      language,
+      runs,
+      abort_flag,
+      oov_decisions,
+      chunk_first,
+      raw_subs,
+      bridge,
+    )
+  }
+
+  /// Construct an `AlignWorkItem` from a
+  /// [`crate::core::Command::Alignment`] payload + the three
+  /// per-chunk metadata values **already snapshotted off the
+  /// [`crate::core::Transcriber`]**, instead of borrowing the
+  /// transcriber directly.
+  ///
+  /// This is the thread-portable sibling of
+  /// [`Self::from_run_alignment`]. A downstream alignment
+  /// service running on a *different* thread cannot hold a
+  /// `&Transcriber`, so the owner thread snapshots the three
+  /// chunk-metadata values while it still holds the borrow —
+  /// [`crate::core::Transcriber::chunk_first_sample`],
+  /// [`crate::core::Transcriber::chunk_sub_segments_samples`],
+  /// and
+  /// [`crate::core::Transcriber::chunk_samples_to_output_range_fn`]
+  /// — and ships them across the thread boundary (all three are
+  /// `Send`: two plain values plus an `Arc<dyn Fn + Send +
+  /// Sync>`). The align service then rebuilds the work item with
+  /// no transcriber in hand.
+  ///
+  /// Behaviour is otherwise identical to
+  /// [`Self::from_run_alignment`]; that constructor delegates
+  /// here after pulling the three values, so the
+  /// coordinate-space flip (output-timebase → chunk-local
+  /// 1/16000) stays in lockstep between the two paths.
+  ///
+  /// Returns `Some` unconditionally — unlike
+  /// [`Self::from_run_alignment`], there is no "chunk no longer
+  /// in flight" failure mode here because the caller has already
+  /// resolved the three values; the `Option` return is kept so
+  /// the two constructors share a signature shape.
+  ///
+  /// `chunk_first_sample` is the chunk's first 16 kHz sample
+  /// index in stream coordinates (was
+  /// `transcriber.chunk_first_sample(chunk_id)`).
+  /// `chunk_sub_segments_samples` is the chunk's sub-VAD
+  /// segments as stream-coordinate `(start, end)` 16 kHz sample
+  /// pairs (was
+  /// `transcriber.chunk_sub_segments_samples(chunk_id)`); they
+  /// are offset by `chunk_first_sample` and re-wrapped into
+  /// chunk-local 1/16000 `TimeRange`s here.
+  /// `samples_to_output_range` bridges stream sample indices to
+  /// output-timebase `TimeRange`s (was
+  /// `transcriber.chunk_samples_to_output_range_fn(chunk_id)`).
+  #[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors `Command::Alignment` fields + caller-owned abort_flag \
+ + the three transcriber chunk-metadata snapshots; \
+ destructured-pattern callers line them up positionally"
+  )]
+  pub fn from_parts(
+    chunk_id: ChunkId,
+    samples: Arc<[f32]>,
+    text: SmolStr,
+    language: Lang,
+    runs: Vec<Run>,
+    abort_flag: Arc<AtomicBool>,
+    oov_decisions: Vec<Vec<ResolvedOov>>,
+    chunk_first_sample: u64,
+    chunk_sub_segments_samples: Vec<(u64, u64)>,
+    samples_to_output_range: Arc<dyn Fn(u64, u64) -> TimeRange + Send + Sync>,
+  ) -> Option<Self> {
+    use core::num::NonZeroU32;
     let tb_16k = mediatime::Timebase::new(1, NonZeroU32::new(16_000).unwrap());
-    let aligner_subs: Vec<TimeRange> = raw_subs
+    let aligner_subs: Vec<TimeRange> = chunk_sub_segments_samples
       .iter()
       .map(|(s, e)| {
         TimeRange::new(
-          (*s as i64) - (chunk_first as i64),
-          (*e as i64) - (chunk_first as i64),
+          (*s as i64) - (chunk_first_sample as i64),
+          (*e as i64) - (chunk_first_sample as i64),
           tb_16k,
         )
       })
@@ -210,8 +286,8 @@ impl AlignWorkItem {
       language,
       runs,
       abort_flag,
-      chunk_first_sample_in_stream: chunk_first,
-      samples_to_output_range: bridge,
+      chunk_first_sample_in_stream: chunk_first_sample,
+      samples_to_output_range,
       oov_decisions,
     })
   }
