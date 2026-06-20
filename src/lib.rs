@@ -42,6 +42,16 @@ pub use align::dispatch;
 // `mediatime` dependency is pinned to a single major in Cargo.toml.
 pub use mediatime::{TimeRange, Timebase, Timestamp};
 
+// Re-export `smol_str::SmolStr` — it appears on asry's public API as the text
+// field of `Command::Alignment`, `Run::new`, and `AlignWorkItem::from_parts`.
+// Same rationale as the mediatime re-export above: a consumer that ships those
+// alignment inputs across a thread/service boundary must name the type, and
+// re-exporting spares it a separate `smol_str` dependency just to do so.
+//
+// SemVer note: this ties asry's public API to smol_str's, matching the existing
+// `Cargo.toml` pin (`smol_str = "0.3"`).
+pub use smol_str::SmolStr;
+
 pub use types::{
   AlignmentError, AlignmentFailure, AsrError, AsrFailure, Backpressure, ChunkId,
   GapExceedsTolerance, InconsistentTimebase, InvalidTimebase, Lang,
