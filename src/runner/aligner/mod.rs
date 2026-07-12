@@ -3,14 +3,17 @@
 //!
 //! This whole module is reachable under `feature = "alignment"` OR
 //! `feature = "emissions"` (see the `#[cfg]` on `pub(crate) mod
-//! aligner;` in `runner/mod.rs`). Two of its seven submodules need
-//! ort specifically and stay gated on `alignment` right here:
-//! `aligner` (the `Aligner` struct owns an `ort::Session`) and
-//! `builder` / `set` (the `AlignmentSet` registry stores
-//! `Mutex<Aligner>`). `algorithm`, `normalizer`, and `normalizers`
-//! have no ort dependency and compile under `emissions` alone;
-//! `key` (plain enums, no ort) is gated on `alignment` too since
-//! its only consumers (`builder`/`set`) are.
+//! aligner;` in `runner/mod.rs`). Four of its seven submodules stay
+//! gated on `alignment` right here, for three distinct reasons:
+//! `aligner` uses ort directly (the `Aligner` struct owns an
+//! `ort::Session`); `builder` and `set` need it transitively — they
+//! orchestrate `Aligner` (the `AlignmentSet` registry stores
+//! `Mutex<Aligner>`) rather than call any ort API of their own; and
+//! `key` (plain enums, no ort at all) is gated only because its sole
+//! consumers `builder`/`set` are — reachability, not an ort
+//! dependency. The remaining three — `algorithm`, `normalizer`, and
+//! `normalizers` — have no ort dependency and compile under
+//! `emissions` alone.
 //!
 //! `pub(crate)` (rather than `pub`) on `algorithm` so the
 //! `bench-internals` re-export and the `emissions` module can reach

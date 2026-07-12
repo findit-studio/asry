@@ -146,7 +146,10 @@ pub mod emissions {
           DEFAULT_MAX_INTRA_SILENT_RUN, DEFAULT_MIN_SPEECH_COVERAGE, build_speech_frames,
           compose_words, effective_samples_per_frame,
         },
-        encode::{LogProbsShapeError, LogProbsTV, log_softmax_with_finite_guard},
+        encode::{
+          LogProbsError, LogProbsShapeError, LogProbsTV, LogProbsValueError, NonFiniteClass,
+          log_softmax_with_finite_guard,
+        },
         tokenize::{TokenizedText, detect_oov_events, tokenize_with_word_map},
         trellis_beam::{
           ALIGN_BEAM_WIDTH, AlignEmissionsConfig, WILDCARD_TOKEN_ID, WordSegment, align_emissions,
