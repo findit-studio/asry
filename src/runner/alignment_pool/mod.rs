@@ -477,7 +477,8 @@ pub fn run_one_alignment(
           | AlignmentError::Normalization(p)
           | AlignmentError::NoAlignmentPath(p)
           | AlignmentError::EmptyText(p)
-          | AlignmentError::SemanticOutOfVocab(p) => p.language(),
+          | AlignmentError::SemanticOutOfVocab(p)
+          | AlignmentError::Aborted(p) => p.language(),
         };
         eprintln!(
           "asry alignment recovered chunk={:?} kind={err:?} language={language:?}",
@@ -950,7 +951,8 @@ fn dispatch_runs(
               | AlignmentError::Normalization(p)
               | AlignmentError::NoAlignmentPath(p)
               | AlignmentError::EmptyText(p)
-              | AlignmentError::SemanticOutOfVocab(p) => p.language(),
+              | AlignmentError::SemanticOutOfVocab(p)
+              | AlignmentError::Aborted(p) => p.language(),
             };
             let run_chars = run.text().chars().count();
             eprintln!(

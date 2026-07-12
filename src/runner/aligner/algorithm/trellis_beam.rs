@@ -42,7 +42,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
-  runner::aligner::algorithm::encode::LogProbsTV,
+  runner::aligner::algorithm::{encode::LogProbsTV, tokenize::TokenizedText},
   types::{AlignmentError, AlignmentFailure, Lang, WorkFailure, WorkerHangTimeout, WorkerKind},
 };
 
@@ -1015,6 +1015,132 @@ pub fn align_to_word_segments(
   Ok(merge_words(&char_segments, is_separator, word_idx))
 }
 
+/// Per-call configuration for [`align_emissions`]: the two values
+/// `Aligner::align` normally reads off `self`
+/// (`blank_token_id`, `language`) before invoking this pipeline.
+/// `align_emissions` has no `Aligner` to read them from — it
+/// operates on a caller-supplied [`LogProbsTV`] alone — so they
+/// travel as an explicit config value instead. Both fields are
+/// required (no sensible crate-wide default for either), so there
+/// is no `Default` impl; construct with [`Self::new`].
+#[derive(Debug, Clone)]
+pub struct AlignEmissionsConfig {
+  /// CTC blank-token id. Must be `< log_probs.v()`; validated
+  /// inside [`get_trellis`], which surfaces a mismatch as
+  /// [`AlignmentError::ModelInference`].
+  blank_token_id: u32,
+  /// Language tag attached to any [`AlignmentError`] this call
+  /// produces. Purely diagnostic — it does not affect the
+  /// alignment result.
+  language: Lang,
+}
+
+impl AlignEmissionsConfig {
+  /// Construct from the CTC blank-token id + the language to tag
+  /// errors with.
+  #[must_use]
+  pub const fn new(blank_token_id: u32, language: Lang) -> Self {
+    Self {
+      blank_token_id,
+      language,
+    }
+  }
+
+  /// CTC blank-token id.
+  #[must_use]
+  pub const fn blank_token_id(&self) -> u32 {
+    self.blank_token_id
+  }
+
+  /// Language tag attached to any [`AlignmentError`] this call
+  /// produces.
+  #[must_use]
+  pub const fn language(&self) -> &Lang {
+    &self.language
+  }
+}
+
+/// Ort-free entry point for the post-encoder alignment pipeline:
+/// trellis → beam → merge_repeats → merge_words. Reachable under
+/// the `emissions` feature without pulling in `ort` or
+/// `whispercpp` — a caller with its own acoustic encoder (e.g. a
+/// CoreML wav2vec2 port) constructs a [`LogProbsTV`] from its own
+/// model output and a [`TokenizedText`] via
+/// [`tokenize_with_word_map`](crate::runner::aligner::algorithm::tokenize::tokenize_with_word_map),
+/// then calls this directly.
+///
+/// This is a thin wrapper around [`align_to_word_segments`] — the
+/// same function `Aligner::align` (the `alignment`-feature ort
+/// orchestrator) calls internally. Same algorithm, same
+/// WhisperX-parity behaviour, no edits: `align_emissions` only
+/// changes the error type at the boundary. `align_to_word_segments`
+/// returns [`WorkFailure`] (a pool/worker-oriented type whose
+/// `WorkerHang` variant carries a `WorkerKind` liveness framing
+/// that has no meaning for a bare function call with no pool or
+/// worker behind it); `align_emissions` unwraps
+/// `WorkFailure::Alignment` down to the inner `AlignmentError`, and
+/// re-expresses a would-be `WorkFailure::WorkerHang` (the
+/// `abort_flag` cancellation path) as [`AlignmentError::Aborted`].
+///
+/// # Errors
+///
+/// Returns [`AlignmentError::NoAlignmentPath`] when the CTC lattice
+/// admits no finite path (audio shorter than the token count, a
+/// non-finite trellis boundary cell, or the trellis/beam
+/// cell-or-node budget is exceeded); [`AlignmentError::Tokenization`]
+/// when `tokenized` carries a token id that doesn't fit
+/// `log_probs`'s vocab dimension or a non-wildcard negative id;
+/// [`AlignmentError::ModelInference`] when `config.blank_token_id()`
+/// doesn't fit `log_probs`'s vocab dimension; [`AlignmentError::Aborted`]
+/// when `abort_flag` is observed set before the pipeline completes.
+pub fn align_emissions(
+  log_probs: &LogProbsTV,
+  tokenized: &TokenizedText,
+  abort_flag: &AtomicBool,
+  config: &AlignEmissionsConfig,
+) -> Result<Vec<WordSegment>, AlignmentError> {
+  align_to_word_segments(
+    log_probs,
+    tokenized.token_ids(),
+    tokenized.word_idx_per_token(),
+    tokenized.separator_token_id(),
+    config.blank_token_id(),
+    abort_flag,
+    config.language(),
+  )
+  .map_err(|err| into_alignment_error(err, config.language()))
+}
+
+/// Translate the internal call chain's pool-oriented [`WorkFailure`]
+/// into the plain [`AlignmentError`] [`align_emissions`] promises.
+/// `align_to_word_segments` only ever produces
+/// `WorkFailure::Alignment` (unwrapped directly here) or
+/// `WorkFailure::WorkerHang` (the `abort_flag` cancellation path,
+/// re-expressed as [`AlignmentError::Aborted`]); the other two
+/// `WorkFailure` variants (`Asr`, `LanguageUnsupported`) belong to
+/// ASR/registry code this call chain never touches. Handled with a
+/// typed fallback rather than `unreachable!()` so a future change
+/// to the wrapped function's error surface fails safe instead of
+/// aborting the process.
+fn into_alignment_error(err: WorkFailure, language: &Lang) -> AlignmentError {
+  match err {
+    WorkFailure::Alignment(e) => e,
+    WorkFailure::WorkerHang(timeout) => AlignmentError::Aborted(AlignmentFailure::new(
+      format_smolstr!("align_emissions aborted via abort_flag before completing: {timeout}"),
+      language.clone(),
+    )),
+    other @ (WorkFailure::Asr(_) | WorkFailure::LanguageUnsupported(_)) => {
+      AlignmentError::ModelInference(AlignmentFailure::new(
+        format_smolstr!(
+          "align_emissions: internal call chain produced an unexpected WorkFailure \
+variant ({other:?}); this indicates a bug in the relocation, not the algorithm"
+        ),
+        language.clone(),
+      ))
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1022,7 +1148,10 @@ mod tests {
 
   fn lp(t: usize, v: usize, vals: Vec<f32>) -> LogProbsTV {
     assert_eq!(vals.len(), t * v);
-    LogProbsTV::new(t, v, vals)
+    // The length is already checked above, so `LogProbsTV::new`
+    // (validating as of the `emissions` extraction) can only
+    // succeed here.
+    LogProbsTV::new(t, v, vals).expect("t * v == vals.len(), checked above")
   }
 
   fn never() -> &'static AtomicBool {
@@ -1622,6 +1751,102 @@ mod tests {
     assert_eq!(words[0].word_index, 0);
   }
 
+  // -------- align_emissions (the `emissions` seam) --------
+
+  /// Golden-fixture test for the `emissions` feature's public entry
+  /// point: same emission matrix and expected word as
+  /// `align_to_word_segments_simple_smoke` above, driven through
+  /// [`align_emissions`] + a caller-built [`TokenizedText`] instead
+  /// of the raw tokens / word-index-map / separator triple, and
+  /// through [`AlignEmissionsConfig`] instead of loose blank-id /
+  /// language arguments.
+  ///
+  /// Also asserts equivalence with a direct
+  /// [`align_to_word_segments`] call on the same inputs — pinning
+  /// that `align_emissions` is a pure relocation wrapper (same
+  /// algorithm, same output) and not a reimplementation.
+  #[test]
+  fn align_emissions_known_words_from_golden_emission() {
+    let v = 3;
+    let t = 4;
+    let mut data = vec![-100.0_f32; t * v];
+    data[1] = -0.1;
+    data[3] = -0.1;
+    data[8] = -0.1;
+    data[9] = -0.1;
+    let log_probs = lp(t, v, data);
+    let tokenized = TokenizedText::new(vec![1, 2], vec![Some(0), Some(0)], None);
+    let config = AlignEmissionsConfig::new(0, Lang::En);
+    assert_eq!(config.blank_token_id(), 0);
+    assert_eq!(config.language(), &Lang::En);
+
+    let words = align_emissions(&log_probs, &tokenized, never(), &config).expect("words");
+    assert_eq!(words.len(), 1);
+    assert_eq!(words[0].word_index(), 0);
+
+    let direct = align_to_word_segments(
+      &log_probs,
+      tokenized.token_ids(),
+      tokenized.word_idx_per_token(),
+      tokenized.separator_token_id(),
+      config.blank_token_id(),
+      never(),
+      config.language(),
+    )
+    .expect("words via the internal call chain align_emissions wraps");
+    assert_eq!(words.len(), direct.len());
+    for (via_emissions, via_internal) in words.iter().zip(direct.iter()) {
+      assert_eq!(via_emissions.word_index(), via_internal.word_index());
+      assert_eq!(via_emissions.start_frame(), via_internal.start_frame());
+      assert_eq!(via_emissions.end_frame(), via_internal.end_frame());
+      assert_eq!(via_emissions.score(), via_internal.score());
+    }
+  }
+
+  /// `align_emissions` has no pool/worker to attach a
+  /// `WorkerHangTimeout` to, so the `abort_flag` cancellation path
+  /// (internally `WorkFailure::WorkerHang`) must surface as
+  /// [`AlignmentError::Aborted`] — a variant native to the plain
+  /// `AlignmentError` this function returns — not leak the
+  /// pool-oriented `WorkFailure` type or silently become some
+  /// unrelated variant like `NoAlignmentPath`.
+  #[test]
+  fn align_emissions_reports_abort_flag_as_aborted() {
+    let v = 3;
+    let t = 4;
+    let log_probs = lp(t, v, vec![-1.0_f32; t * v]);
+    let tokenized = TokenizedText::new(vec![1, 2], vec![Some(0), Some(0)], None);
+    let config = AlignEmissionsConfig::new(0, Lang::En);
+    let abort = AtomicBool::new(true);
+
+    let err = align_emissions(&log_probs, &tokenized, &abort, &config).unwrap_err();
+    assert!(
+      matches!(err, AlignmentError::Aborted(_)),
+      "expected AlignmentError::Aborted; got {err:?}"
+    );
+  }
+
+  /// A token id past `log_probs.v()` is a `Tokenization` failure
+  /// under the raw `align_to_word_segments` call chain; confirm
+  /// `align_emissions` unwraps `WorkFailure::Alignment` down to
+  /// that same `AlignmentError::Tokenization` rather than wrapping
+  /// it in something else.
+  #[test]
+  fn align_emissions_surfaces_tokenization_errors_unwrapped() {
+    let v = 3;
+    let t = 4;
+    let log_probs = lp(t, v, vec![-1.0_f32; t * v]);
+    // Token id 99 is out of the V=3 vocab range.
+    let tokenized = TokenizedText::new(vec![1, 99], vec![Some(0), Some(0)], None);
+    let config = AlignEmissionsConfig::new(0, Lang::En);
+
+    let err = align_emissions(&log_probs, &tokenized, never(), &config).unwrap_err();
+    assert!(
+      matches!(err, AlignmentError::Tokenization(_)),
+      "expected AlignmentError::Tokenization; got {err:?}"
+    );
+  }
+
   /// A beam search backtrack that disagrees with greedy Viterbi
   /// on a tied lattice: with a single ambiguous token sequence,
   /// width-2 beam search keeps both prefixes and picks the
@@ -1731,9 +1956,17 @@ mod tests {
 
   #[test]
   fn budget_exceeded_returns_no_alignment_path() {
-    // T=8000 × num_tokens=5000 = 40M cells > 32M budget.
-    // intentionally undersized
-    let log_probs = LogProbsTV::new(8_000, 8, vec![0.0_f32; 1]);
+    // T=8000 × num_tokens=5000 = 40M cells > 32M budget. The
+    // budget check in `get_trellis` fires from `t` and
+    // `tokens.len()` alone, before it ever reads `log_probs.data()`
+    // — so a correctly-shaped-but-trivial (all-zero) 64 000-entry
+    // buffer exercises the same rejection path a real emission
+    // matrix would, without needing one. `LogProbsTV::new` (now
+    // validating, as of the `emissions` extraction) requires the
+    // buffer to actually match `t * v`; a 1-element stand-in like
+    // the previous version of this test used no longer constructs.
+    let log_probs =
+      LogProbsTV::new(8_000, 8, vec![0.0_f32; 8_000 * 8]).expect("t * v == vals.len()");
     let tokens: Vec<i32> = (0..5_000).map(|i| 1 + (i % 4)).collect();
     let err = get_trellis(&log_probs, &tokens, 0, never(), &Lang::En).unwrap_err();
     let WorkFailure::Alignment(AlignmentError::NoAlignmentPath(payload)) = err else {
