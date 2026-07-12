@@ -272,8 +272,7 @@ pub fn build_speech_frames(
 /// [`WordSegment`]s + original-word surface forms.
 ///
 /// `word_segments` come from `merge_words` (crate-internal;
-/// reached publicly through
-/// [`align_to_word_segments`](crate::runner::aligner::algorithm::trellis_beam::align_to_word_segments)
+/// reached publicly through `align_to_word_segments`
 /// or
 /// [`align_emissions`](crate::runner::aligner::algorithm::trellis_beam::align_emissions)),
 /// which drops `|`-delimiter segments and emits one

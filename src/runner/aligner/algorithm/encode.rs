@@ -560,7 +560,7 @@ pub(crate) fn validate_vocab_dim(
 ///
 /// Also validates `v != 0` and `t.checked_mul(v) ==
 /// Some(raw.len())` up front, before any indexing into `raw` —
-/// overflow-safe, the same discipline [`validate_output_dims`]
+/// overflow-safe, the same discipline `validate_output_dims`
 /// applies to the ORT-sourced shape. Internal callers already get
 /// `t`/`v` pre-validated against the ORT output there (redundant,
 /// O(1), here); external `emissions`-feature callers construct

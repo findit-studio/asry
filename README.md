@@ -198,9 +198,8 @@ cargo test --features alignment,bench-internals --test whisperx_unit_parity
 These tests port WhisperX's
 `tests/test_word_timestamp_interpolation.py` 1:1 onto asry's
 CTC pipeline. The alignment-pipeline lib tests (everything under
-`src/runner/aligner/` + `src/runner/alignment_pool/`; 279 as of
-the `emissions` feature, up from a stale "193" this doc used to
-cite) pin the same algorithmic invariants stage-by-stage; median IoU 0.9955–0.9990
+`src/runner/aligner/` + `src/runner/alignment_pool/`) pin the
+same algorithmic invariants stage-by-stage; median IoU 0.9955–0.9990
 across 854 word pairs vs. WhisperX's recorded outputs (measured
 during initial calibration; see `trellis_beam.rs:305-330`).
 
