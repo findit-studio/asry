@@ -267,9 +267,11 @@ impl AsrFailure {
 ///
 /// `#[non_exhaustive]`: this error surface is expected to keep
 /// growing (`Aborted`, below, was the addition that prompted
-/// marking it so), so new variants stay non-breaking for
-/// downstream exhaustive `match`es instead of forcing a SemVer-major
-/// bump each time one lands.
+/// marking it so). Downstream `match`es over a `#[non_exhaustive]`
+/// enum must include a wildcard arm to compile at all — that
+/// requirement is exactly what makes new variants non-breaking for
+/// them, instead of forcing a SemVer-major bump each time one
+/// lands.
 #[derive(Clone, Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AlignmentError {

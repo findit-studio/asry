@@ -34,16 +34,41 @@ use crate::types::{AlignmentError, AlignmentFailure, Lang, WorkFailure};
 // keeps the (1, T) reshape semantically identical without forcing a
 // cross-version `ndarray` bridge or an unused direct dependency.
 
-/// `t * v != data.len()` on [`LogProbsTV::new`]: the flat buffer's
-/// length doesn't match the declared `(T, V)` shape.
+/// [`LogProbsTV::new`] rejected its arguments: either `t * v !=
+/// data.len()` (the flat buffer's length doesn't match the
+/// declared `(T, V)` shape), or `v == 0` (a CTC vocabulary must
+/// contain at least the blank token, so a zero-length vocab axis
+/// is never valid, regardless of `t`). Message text is chosen by
+/// [`Display`](core::fmt::Display) rather than `thiserror`'s
+/// `#[error(...)]` shorthand because the two failures need
+/// different wording — reusing the shape-mismatch wording for the
+/// zero-vocab case would claim `t * v != data.len()` when it does
+/// not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error(
-  "LogProbsTV shape mismatch: t={t}, v={v}, data.len()={data_len} (expected data.len() == t * v)"
-)]
 pub struct LogProbsShapeError {
   t: usize,
   v: usize,
   data_len: usize,
+}
+
+impl core::fmt::Display for LogProbsShapeError {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    if self.v == 0 {
+      write!(
+        f,
+        "LogProbsTV has a zero-length vocab dim: t={}, v=0, data.len()={} \
+ (a CTC vocabulary must contain at least the blank token)",
+        self.t, self.data_len
+      )
+    } else {
+      write!(
+        f,
+        "LogProbsTV shape mismatch: t={}, v={}, data.len()={} (expected \
+ data.len() == t * v)",
+        self.t, self.v, self.data_len
+      )
+    }
+  }
 }
 
 impl LogProbsShapeError {
@@ -117,10 +142,16 @@ impl LogProbsTV {
   ///
   /// # Errors
   ///
-  /// Returns [`LogProbsShapeError`] when `t.checked_mul(v) !=
+  /// Returns [`LogProbsShapeError`] when `v == 0` (checked first,
+  /// for every `t` including `t == 0`: a CTC vocabulary must
+  /// contain at least the blank token, so a zero-length vocab
+  /// axis is never valid) or when `t.checked_mul(v) !=
   /// Some(data.len())`. Does not report non-finite `data` as an
   /// error — see the finiteness contract above.
   pub fn new(t: usize, v: usize, data: Vec<f32>) -> Result<Self, LogProbsShapeError> {
+    if v == 0 {
+      return Err(LogProbsShapeError::new(t, v, data.len()));
+    }
     if t.checked_mul(v) == Some(data.len()) {
       Ok(Self { t, v, data })
     } else {
@@ -527,25 +558,47 @@ pub(crate) fn validate_vocab_dim(
 /// uses. `pub` for exactly that reason — reachable at
 /// `asry::emissions::log_softmax_with_finite_guard`.
 ///
-/// Also validates `t.checked_mul(v) == Some(raw.len())` up front,
-/// before any indexing into `raw` — overflow-safe, the same
-/// discipline [`validate_output_dims`] applies to the ORT-sourced
-/// shape. Internal callers already get `t`/`v` pre-validated
-/// against the ORT output there (redundant, O(1), here); external
-/// `emissions`-feature callers construct `t`/`v`/`raw` themselves
-/// and are not.
+/// Also validates `v != 0` and `t.checked_mul(v) ==
+/// Some(raw.len())` up front, before any indexing into `raw` —
+/// overflow-safe, the same discipline [`validate_output_dims`]
+/// applies to the ORT-sourced shape. Internal callers already get
+/// `t`/`v` pre-validated against the ORT output there (redundant,
+/// O(1), here); external `emissions`-feature callers construct
+/// `t`/`v`/`raw` themselves and are not.
 ///
 /// # Errors
 ///
-/// Returns `ModelInferenceFailed` when `t.checked_mul(v) !=
-/// Some(raw.len())`, or when any logit or output log-probability
-/// is non-finite.
+/// Returns [`WorkFailure::Alignment`](crate::types::WorkFailure::Alignment)
+/// wrapping
+/// [`AlignmentError::ModelInference`](crate::types::AlignmentError::ModelInference)
+/// when `v == 0` (checked first, for every `t` including `t ==
+/// 0`: a CTC vocabulary must contain at least the blank token, so
+/// a zero-length vocab axis is never valid), when
+/// `t.checked_mul(v) != Some(raw.len())`, or when any logit or
+/// output log-probability is non-finite.
 pub fn log_softmax_with_finite_guard(
   raw: &[f32],
   t: usize,
   v: usize,
   language: &Lang,
 ) -> Result<Vec<f32>, WorkFailure> {
+  // V == 0 means the caller declared no vocabulary axis — never
+  // legitimate, for any T (including T == 0, which would
+  // otherwise skip the frame loop below entirely and return
+  // `Ok(vec![])` without ever looking at V). Checked first, the
+  // same discipline `validate_output_dims` applies to the
+  // ORT-sourced shape.
+  if v == 0 {
+    return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
+      AlignmentFailure::new(
+        format_smolstr!(
+          "log-softmax has a zero-length vocab dim: T={t}, V=0 (a CTC \
+ vocabulary must contain at least the blank token)"
+        ),
+        language.clone(),
+      ),
+    )));
+  }
   let total = match t.checked_mul(v) {
     Some(product) => product,
     None => {
@@ -815,6 +868,62 @@ mod tests {
     assert_eq!(err.data_len(), 0);
   }
 
+  /// `t.checked_mul(v) == Some(data.len())` holds trivially for
+  /// `t=0, v=0, data=[]` (`0 * 0 == 0`), so the shape check alone
+  /// used to let a zero-length vocab axis through — a `LogProbsTV`
+  /// with no vocabulary at all, not even a blank token, is
+  /// meaningless for CTC. Must reject regardless of `t`; `t=0` is
+  /// the degenerate case that used to slip past the shape check
+  /// entirely (see `validate_output_dims`'s identical `V == 0`
+  /// rule for the ORT-sourced counterpart of this seam).
+  #[test]
+  fn new_rejects_zero_vocab_with_zero_t() {
+    let Err(err) = LogProbsTV::new(0, 0, Vec::new()) else {
+      panic!("t=0, v=0 must be rejected: a CTC vocabulary needs at least the blank token");
+    };
+    assert_eq!(err.t(), 0);
+    assert_eq!(err.v(), 0);
+    assert_eq!(err.data_len(), 0);
+    let message = err.to_string();
+    assert!(
+      message.contains("zero-length vocab"),
+      "message must call out the zero-length vocab dim, not a shape \
+ mismatch (t * v == data.len() actually holds here); got {message}"
+    );
+    assert!(
+      !message.contains("expected data.len()"),
+      "must not reuse the shape-mismatch wording, which would falsely \
+ claim t * v != data.len(); got {message}"
+    );
+  }
+
+  /// Same defect, `t=1`: `1 * 0 == 0 == data.len()`, so the shape
+  /// check alone accepts it too. Distinct from `t=0` because `at()`
+  /// would be reachable (frames exist) with no vocab columns to
+  /// index — confirms the rejection isn't a `T == 0` special case.
+  #[test]
+  fn new_rejects_zero_vocab_with_positive_t() {
+    let Err(err) = LogProbsTV::new(1, 0, Vec::new()) else {
+      panic!("t=1, v=0 must be rejected: a CTC vocabulary needs at least the blank token");
+    };
+    assert_eq!(err.t(), 1);
+    assert_eq!(err.v(), 0);
+    assert_eq!(err.data_len(), 0);
+    assert!(err.to_string().contains("zero-length vocab"));
+  }
+
+  /// `t=0` with a *positive* vocab dim is the legitimate degenerate
+  /// case (a chunk too short to produce any encoder frame) and must
+  /// stay `Ok` — the zero-vocab rejection above must not overreach
+  /// into rejecting `T == 0` itself.
+  #[test]
+  fn new_accepts_zero_t_with_positive_vocab() {
+    let lp = LogProbsTV::new(0, 5, Vec::new()).expect("t=0 with v=5 and an empty buffer is valid");
+    assert_eq!(lp.t(), 0);
+    assert_eq!(lp.v(), 5);
+    assert!(lp.data().is_empty());
+  }
+
   #[test]
   fn at_indexes_correctly() {
     let lp = LogProbsTV {
@@ -1037,6 +1146,55 @@ mod tests {
     use crate::types::Lang;
     let out = log_softmax_with_finite_guard(&[], 0, 5, &Lang::En).expect("ok");
     assert!(out.is_empty());
+  }
+
+  /// `T = 0, V = 0` passes the entry-length check trivially (`0 *
+  /// 0 == 0 == raw.len()`) and the frame loop `0..0` never runs,
+  /// so — before the explicit `V == 0` guard — this silently
+  /// returned `Ok(vec![])` instead of rejecting a vocabulary with
+  /// no vocab axis at all (not even a blank token). The zero-`T`
+  /// case is exactly what let this slip past both the shape check
+  /// and the per-row loop.
+  #[test]
+  fn log_softmax_rejects_zero_vocab_with_zero_t() {
+    use crate::types::Lang;
+    let err = log_softmax_with_finite_guard(&[], 0, 0, &Lang::En).unwrap_err();
+    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
+      panic!("expected AlignmentFailed");
+    };
+    let message = payload.message();
+    assert!(
+      message.contains("zero-length vocab"),
+      "diagnostic must call out the zero-length vocab dim; got {message}",
+      message = message
+    );
+  }
+
+  /// `T = 1, V = 0` also passes the entry-length check (`1 * 0 ==
+  /// 0 == raw.len()`), then the frame loop's single empty row
+  /// (`v == 0` makes every row slice `raw[0..0]`) already fell
+  /// through to the shifted-normaliser-non-finite branch
+  /// (`sum.ln()` of an empty row's zero-sum is `-inf`) — a typed
+  /// `Err`, but a misleading one that names "non-finite
+  /// normaliser" instead of the true cause. The explicit `V == 0`
+  /// guard now catches this case earlier, with an accurate
+  /// message, the same way it closes the silent-`Ok` hole at
+  /// `T == 0`.
+  #[test]
+  fn log_softmax_rejects_zero_vocab_with_positive_t() {
+    use crate::types::Lang;
+    let err = log_softmax_with_finite_guard(&[], 1, 0, &Lang::En).unwrap_err();
+    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
+      panic!("expected AlignmentFailed");
+    };
+    let message = payload.message();
+    assert!(
+      message.contains("zero-length vocab"),
+      "diagnostic must call out the zero-length vocab dim, not the \
+ unrelated shifted-normaliser-non-finite path it used to fall \
+ through to; got {message}",
+      message = message
+    );
   }
 
   /// `T * V` overflowing `usize` previously reached
