@@ -264,7 +264,14 @@ impl AsrFailure {
 /// Alignment-side per-chunk failures. Variant identifies the cause;
 /// the payload carries the diagnostic + the language whose aligner
 /// failed.
+///
+/// `#[non_exhaustive]`: this error surface is expected to keep
+/// growing (`Aborted`, below, was the addition that prompted
+/// marking it so), so new variants stay non-breaking for
+/// downstream exhaustive `match`es instead of forcing a SemVer-major
+/// bump each time one lands.
 #[derive(Clone, Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AlignmentError {
   /// wav2vec2 ONNX inference failed.
   #[error("alignment model inference failed: {0}")]

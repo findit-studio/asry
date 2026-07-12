@@ -38,6 +38,7 @@ Inventory of asry allocations and the verdict for each:
 | Emission / log_probs | T × V = ~192 KB for default | yes | f32 ✓ | Too small to bother. |
 | `SampleBuffer.samples` | bounded by `chunk_size_samples` + push burst (trims continuously) | no — push-grows + front-trim ring | f32 ✓ | Bounded in practice; deferred. See "zuffer" section. |
 | `pending_transcripts` `VecDeque<Transcript>` | unbounded if caller doesn't poll | no | `Transcript` not `Pod` | Backpressure already covers this. |
+| `encode_log_softmax` input (`src/runner/aligner/algorithm/encode.rs`) | up to ~1.9 MB per chunk (30 s @ 16 kHz f32) | yes (per call) | f32 ✓ | Not a spill candidate — a redundant copy, not a growth risk. `samples_for_aligner.to_vec()` re-copies a buffer the caller (`Aligner::align`) already owns as a `Vec<f32>` before downgrading it to `&[f32]` to cross this boundary; fix is to take `Vec<f32>` by value and move it into `Tensor::from_array` instead of copying. Deferred, not fixed, by the `emissions`-seam PR that found it: `encode_log_softmax` has zero unit-test coverage of its own and needs the (currently unpopulated) live-ORT fixtures under `tests/parity/fixtures/` to verify byte-identical encoder input before/after — follow-up PR once fixtures are available. |
 
 ### Concrete migration target: `ExtractedChunk.samples`
 
