@@ -41,8 +41,9 @@ use crate::types::{AlignmentError, AlignmentFailure, Lang, WorkFailure};
 /// `(T, V)` shape, including the overflow case where `t * v` doesn't
 /// fit `usize`), or `v == 0` (a CTC vocabulary must contain at least
 /// the blank token, so a zero-length vocab axis is never valid,
-/// regardless of `t`). The value-domain arm — a non-finite
-/// log-probability — is [`LogProbsValueError`]. Message text is
+/// regardless of `t`). The value-domain arm — a value outside the
+/// log-probability domain (finite ∧ `≤ 0`) — is
+/// [`LogProbsValueError`]. Message text is
 /// chosen by [`Display`](core::fmt::Display) rather than
 /// `thiserror`'s `#[error(...)]` shorthand because the two shape
 /// failures need different wording — reusing the shape-mismatch
@@ -100,50 +101,59 @@ impl LogProbsShapeError {
   }
 }
 
-/// Which class of non-finite value the value-domain scan in
-/// [`LogProbsTV::new`] rejected. Reported by [`LogProbsValueError`]
-/// in place of the raw `f32` because a raw `f32` is not `Eq`
-/// (`NaN != NaN`) — a class keeps the error `Copy + Eq`, matching
-/// its [`LogProbsShapeError`] sibling.
+/// How a value fell outside the log-probability domain (finite ∧
+/// `≤ 0`) that the value-domain scan in [`LogProbsTV::new`]
+/// enforces. Reported by [`LogProbsValueError`] in place of the raw
+/// `f32` because a raw `f32` is not `Eq` (`NaN != NaN`) — a class
+/// keeps the error `Copy + Eq`, matching its [`LogProbsShapeError`]
+/// sibling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NonFiniteClass {
+pub enum LogProbsValueClass {
   /// `f32::NAN`.
   Nan,
   /// `f32::INFINITY` (`+∞`).
   PosInf,
   /// `f32::NEG_INFINITY` (`−∞`).
   NegInf,
+  /// A finite value strictly greater than `0.0`. Log-probabilities
+  /// are `≤ 0` (`log(p)` for `p ∈ (0, 1]`), so a positive value is
+  /// not a log-probability: exponentiated by the DP it leaves
+  /// `[0, 1]` (`f32::MAX.exp() = +∞`, `(1e-7).exp() ≈ 1.0000001`).
+  Positive,
 }
 
-impl core::fmt::Display for NonFiniteClass {
+impl core::fmt::Display for LogProbsValueClass {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.write_str(match self {
       Self::Nan => "NaN",
       Self::PosInf => "+Inf",
       Self::NegInf => "-Inf",
+      Self::Positive => "positive",
     })
   }
 }
 
 /// The value-domain arm of [`LogProbsError`] — the
 /// [`LogProbsError::Value`] payload [`LogProbsTV::new`] returns when
-/// `data` holds a non-finite log-probability. Locates the first
-/// offending element by `frame` (row) and `vocab_index` (column)
-/// and records its [`NonFiniteClass`] rather than the raw `f32`, so
-/// the error stays `Copy + Eq` like its [`LogProbsShapeError`]
-/// sibling. See [`LogProbsTV::new`] for the full value-domain rule
-/// (why `±∞` is rejected alongside `NaN`, and why positivity is
-/// deliberately not checked).
+/// `data` holds a value outside the log-probability domain (finite ∧
+/// `≤ 0`). Locates the first offending element by `frame` (row) and
+/// `vocab_index` (column) and records its [`LogProbsValueClass`]
+/// rather than the raw `f32`, so the error stays `Copy + Eq` like
+/// its [`LogProbsShapeError`] sibling. See [`LogProbsTV::new`] for
+/// the full value-domain rule (why `NaN`, `±∞`, and a finite
+/// positive value are all rejected).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("non-finite log-probability at frame {frame}, vocab {vocab_index}: {class}")]
+#[error(
+  "log-probability out of domain (finite and ≤ 0) at frame {frame}, vocab {vocab_index}: {class}"
+)]
 pub struct LogProbsValueError {
   frame: usize,
   vocab_index: usize,
-  class: NonFiniteClass,
+  class: LogProbsValueClass,
 }
 
 impl LogProbsValueError {
-  const fn new(frame: usize, vocab_index: usize, class: NonFiniteClass) -> Self {
+  const fn new(frame: usize, vocab_index: usize, class: LogProbsValueClass) -> Self {
     Self {
       frame,
       vocab_index,
@@ -163,9 +173,9 @@ impl LogProbsValueError {
     self.vocab_index
   }
 
-  /// Which non-finite class the offending element fell into.
+  /// Which value-domain class the offending element fell into.
   #[must_use]
-  pub const fn class(&self) -> NonFiniteClass {
+  pub const fn class(&self) -> LogProbsValueClass {
     self.class
   }
 }
@@ -174,9 +184,10 @@ impl LogProbsValueError {
 /// constructor's full input contract is enumerable at a glance.
 /// [`Shape`](Self::Shape) carries the dimension/indexing rules
 /// (product mismatch, `t * v` overflow, zero-length vocab axis);
-/// [`Value`](Self::Value) carries the value-domain rule (a
-/// non-finite log-probability). Both arms forward their `Display`
-/// to the wrapped error via `#[error(transparent)]`.
+/// [`Value`](Self::Value) carries the value-domain rule (a value
+/// outside the log-probability domain: non-finite, or finite but
+/// `> 0`). Both arms forward their `Display` to the wrapped error
+/// via `#[error(transparent)]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LogProbsError {
   /// The `(t, v, data.len())` triple is inconsistent: `t * v !=
@@ -184,8 +195,8 @@ pub enum LogProbsError {
   /// [`LogProbsShapeError`].
   #[error(transparent)]
   Shape(LogProbsShapeError),
-  /// `data` contained a non-finite log-probability. See
-  /// [`LogProbsValueError`].
+  /// `data` contained a value outside the log-probability domain
+  /// (non-finite, or finite but `> 0`). See [`LogProbsValueError`].
   #[error(transparent)]
   Value(LogProbsValueError),
 }
@@ -225,34 +236,46 @@ impl LogProbsTV {
   ///    whose product overflows `usize` rather than letting it wrap
   ///    to a small product that spuriously matches a small
   ///    `data.len()`.
-  /// 3. **Value domain** — every element of `data` is finite
-  ///    (`f32::is_finite`); `NaN`, `+∞`, and `−∞` are all rejected.
-  ///    This O(T×V) scan is what keeps the seam's numeric domain
-  ///    identical to the one the DP was tested against: the internal
-  ///    ort path feeds the trellis/beam only the output of
-  ///    [`log_softmax_with_finite_guard`], which rejects non-finite
-  ///    logits *and* non-finite outputs, so its emissions are always
-  ///    finite. A `NaN` reaching the DP otherwise seeds a `NaN` word
-  ///    confidence — `f32::max`-based trellis comparisons silently
-  ///    drop it, the end-cell finiteness guard checks a *different*
-  ///    cell from the emission the backtrack reads, and the `NaN`
-  ///    survives `compose_words`' clamp into a public
-  ///    [`Word`](crate::types::Word), violating its `[0, 1]`
-  ///    NaN-free score contract. `−∞` is a plausible caller value
-  ///    for `log(0)` hard-masking, but the internal path never
-  ///    produces it and the DP was never exercised against it, so it
-  ///    is rejected too — the seam's domain is kept exactly equal to
-  ///    the tested (all-finite) domain rather than widened to an
-  ///    untested one.
+  /// 3. **Value domain** — every element of `data` is a valid
+  ///    log-probability: finite (`f32::is_finite`) **and** `≤ 0.0`.
+  ///    `NaN`, `+∞`, `−∞`, and any finite value `> 0.0` are all
+  ///    rejected. This is exactly the mathematical domain of a
+  ///    log-probability (`log(p)` for `p ∈ (0, 1]` is finite and
+  ///    `≤ 0`), and exactly the domain the internal ort path
+  ///    produces: [`log_softmax_with_finite_guard`] emits
+  ///    `lp = (x − max) − ln Σ exp(x − max)`; the `max` element
+  ///    contributes `exp(0) = 1` to the sum, so `Σ ≥ 1` and
+  ///    `ln Σ ≥ 0` fp-wise, hence every output is `(≤ 0) − (≥ 0) ≤
+  ///    0.0` exactly. Enforcing the same `≤ 0` bound at this
+  ///    external seam keeps its numeric domain identical to the one
+  ///    the DP was built and tested against — no wider.
   ///
-  ///    Positivity is deliberately **not** validated. Log-probs are
-  ///    `≤ 0` in exact arithmetic, but a positive value is harmless
-  ///    (it clamps to a valid `[0, 1]` confidence downstream, never
-  ///    breaking a contract), and a caller computing log-softmax in
-  ///    `f32` can legitimately round a true `0.0` to a tiny
-  ///    positive; rejecting `> 0.0` would refuse correct-enough
-  ///    output while buying no safety. The finiteness rule alone is
-  ///    exactly what the internal path guarantees.
+  ///    Why each rejection matters. The DP reads an emission as
+  ///    `exp(lp)`. A `NaN` seeds a `NaN` word confidence
+  ///    (`f32::max`-based trellis comparisons silently drop it, the
+  ///    end-cell finiteness guard checks a *different* cell than the
+  ///    backtrack seed reads, and the `NaN` survives `compose_words`'
+  ///    clamp into a public [`Word`](crate::types::Word), violating
+  ///    its `[0, 1]` NaN-free score contract). A finite `> 0` value
+  ///    exponentiates *out of* `[0, 1]` (`f32::MAX.exp() = +∞`,
+  ///    `(1e-7).exp() ≈ 1.0000001`) and reaches a public
+  ///    `WordSegment` score — which `align_emissions` returns
+  ///    *before* `compose_words`' clamp can defend it — so it must be
+  ///    rejected here at the seam, not downstream. `−∞` is a
+  ///    plausible caller value for `log(0)` hard-masking, but the
+  ///    internal path never produces it and the DP was never
+  ///    exercised against it, so it is rejected too.
+  ///
+  ///    A caller whose own `f32` log-softmax rounds a true `0.0` to a
+  ///    tiny positive must clamp (`.min(0.0)`) before constructing.
+  ///    `0.0` and `−0.0` are accepted (`log(1) = 0` is a legal
+  ///    log-probability); only strictly positive values are not.
+  ///
+  ///    With `lp ≤ 0` enforced, `exp(lp) ∈ [0, 1]`, and every mean of
+  ///    such per-frame values — the per-char mean in `merge_repeats`,
+  ///    then the duration-weighted per-word mean in `merge_words` —
+  ///    stays in `[0, 1]`. So every `WordSegment` score this pipeline
+  ///    produces is finite and in range **by construction**.
   ///
   /// Not `const fn`, unlike most constructors in this crate: the
   /// rejecting paths drop the caller-supplied `data` without moving
@@ -267,8 +290,9 @@ impl LogProbsTV {
   /// Returns [`LogProbsError::Shape`] when `v == 0` or when
   /// `t.checked_mul(v) != Some(data.len())` (product mismatch or
   /// overflow), and [`LogProbsError::Value`] when any element of
-  /// `data` is non-finite — reporting the first offending frame,
-  /// vocab index, and [`NonFiniteClass`].
+  /// `data` is outside the log-probability domain (non-finite, or
+  /// finite but `> 0.0`) — reporting the first offending frame,
+  /// vocab index, and [`LogProbsValueClass`].
   pub fn new(t: usize, v: usize, data: Vec<f32>) -> Result<Self, LogProbsError> {
     if v == 0 {
       return Err(LogProbsError::Shape(LogProbsShapeError::new(
@@ -284,20 +308,31 @@ impl LogProbsTV {
         data.len(),
       )));
     }
-    // Value-domain scan: every log-probability must be finite. One
-    // short-circuiting O(T×V) pass. It runs only on this external
-    // `emissions` seam — the internal ort path builds `LogProbsTV`
-    // via a struct literal after `log_softmax_with_finite_guard` has
-    // already guaranteed finiteness, so it never pays this scan.
-    // `v > 0` and `data.len() == t * v` hold here, so `idx / v` and
-    // `idx % v` recover the (frame, vocab) coordinates.
-    if let Some(idx) = data.iter().position(|x| !x.is_finite()) {
-      let class = if data[idx].is_nan() {
-        NonFiniteClass::Nan
-      } else if data[idx] > 0.0 {
-        NonFiniteClass::PosInf
+    // Value-domain scan: every log-probability must be finite AND
+    // `≤ 0.0` — exactly the mathematical domain of `log(p)` for
+    // `p ∈ (0, 1]`. One short-circuiting O(T×V) pass. It runs only
+    // on this external `emissions` seam — the internal ort path
+    // builds `LogProbsTV` via a struct literal after
+    // `log_softmax_with_finite_guard`, whose output is finite and
+    // `≤ 0` by construction (see `new`'s doc), so it never pays this
+    // scan. `v > 0` and `data.len() == t * v` hold here, so `idx / v`
+    // and `idx % v` recover the (frame, vocab) coordinates. The
+    // accept predicate `x.is_finite() && x <= 0.0` rejects `NaN` (all
+    // comparisons are false), `±∞` (not finite), and any strictly
+    // positive finite; `0.0` and `−0.0` pass (`−0.0 <= 0.0`).
+    if let Some(idx) = data.iter().position(|&x| !(x.is_finite() && x <= 0.0)) {
+      let bad = data[idx];
+      let class = if bad.is_nan() {
+        LogProbsValueClass::Nan
+      } else if bad.is_infinite() {
+        if bad > 0.0 {
+          LogProbsValueClass::PosInf
+        } else {
+          LogProbsValueClass::NegInf
+        }
       } else {
-        NonFiniteClass::NegInf
+        // Finite but failed `x <= 0.0`: strictly positive.
+        LogProbsValueClass::Positive
       };
       return Err(LogProbsError::Value(LogProbsValueError::new(
         idx / v,
@@ -1077,7 +1112,7 @@ mod tests {
     };
     assert_eq!(err.frame(), 0);
     assert_eq!(err.vocab_index(), 0);
-    assert_eq!(err.class(), NonFiniteClass::Nan);
+    assert_eq!(err.class(), LogProbsValueClass::Nan);
   }
 
   /// `+∞` swept into the token column (vocab 1) of a multi-frame
@@ -1093,7 +1128,7 @@ mod tests {
     };
     assert_eq!(err.frame(), 1);
     assert_eq!(err.vocab_index(), 1);
-    assert_eq!(err.class(), NonFiniteClass::PosInf);
+    assert_eq!(err.class(), LogProbsValueClass::PosInf);
   }
 
   /// `−∞` — a plausible `log(0)` hard-mask value a caller might
@@ -1111,7 +1146,7 @@ mod tests {
     };
     assert_eq!(err.frame(), 1);
     assert_eq!(err.vocab_index(), 0);
-    assert_eq!(err.class(), NonFiniteClass::NegInf);
+    assert_eq!(err.class(), LogProbsValueClass::NegInf);
   }
 
   /// A `NaN` specifically in the FINAL frame's blank column — the
@@ -1128,18 +1163,58 @@ mod tests {
     };
     assert_eq!(err.frame(), 2);
     assert_eq!(err.vocab_index(), 0);
-    assert_eq!(err.class(), NonFiniteClass::Nan);
+    assert_eq!(err.class(), LogProbsValueClass::Nan);
   }
 
-  /// Positivity is deliberately unvalidated: log-probs are `≤ 0` in
-  /// exact arithmetic, but a caller's `f32` log-softmax can round a
-  /// true `0.0` to a tiny positive, so a finite positive value must
-  /// stay `Ok` rather than be rejected as "not a log-prob".
+  /// Round-5 domain tightening (was round 4's "positivity
+  /// unvalidated" accept-test, now inverted — that carve-out was
+  /// wrong). A finite positive value is not a log-probability
+  /// (`log(p) ≤ 0` for `p ∈ (0, 1]`) and is rejected. A tiny
+  /// positive `1e-7` — the exact shape a caller's `f32` log-softmax
+  /// rounding a true `0.0` upward produces — exponentiates to
+  /// `≈ 1.0000001`, out of `[0, 1]`, and reaches a public
+  /// `WordSegment` score before any clamp can defend it; the caller
+  /// must clamp with `.min(0.0)` before constructing.
   #[test]
-  fn new_accepts_finite_positive_value_positivity_unvalidated() {
-    let lp = LogProbsTV::new(1, 2, vec![1.0e-7_f32, -0.5]).expect("finite values are accepted");
+  fn new_rejects_tiny_positive_value() {
+    let Err(LogProbsError::Value(err)) = LogProbsTV::new(1, 2, vec![1.0e-7_f32, -0.5]) else {
+      panic!("a finite positive value must be rejected as out-of-domain");
+    };
+    assert_eq!(err.frame(), 0);
+    assert_eq!(err.vocab_index(), 0);
+    assert_eq!(err.class(), LogProbsValueClass::Positive);
+  }
+
+  /// Regression (codex round 5): the exact failing history —
+  /// `LogProbsTV::new(1, 2, vec![f32::MAX, -1.0])`, `blank_id = 0` —
+  /// passed round 4's finite-only scan (`f32::MAX` is finite) and
+  /// reached the DP, where the final-frame blank seed
+  /// `at(final_t, blank).exp() = f32::MAX.exp() = +∞` propagated into
+  /// a public `WordSegment` score (empirically verified `+∞` before
+  /// this fix). `f32::MAX` is finite but `> 0`, so `new` now rejects
+  /// it as an out-of-domain value at the first offending cell.
+  #[test]
+  fn new_rejects_f32_max_from_codex_failing_history() {
+    let Err(LogProbsError::Value(err)) = LogProbsTV::new(1, 2, vec![f32::MAX, -1.0]) else {
+      panic!("f32::MAX (finite but > 0) must be rejected as out-of-domain");
+    };
+    assert_eq!(err.frame(), 0);
+    assert_eq!(err.vocab_index(), 0);
+    assert_eq!(err.class(), LogProbsValueClass::Positive);
+  }
+
+  /// The `≤ 0` bound is inclusive: `0.0` (`log(1)`, the maximal
+  /// log-probability) and `−0.0` are legal and must be accepted
+  /// (`−0.0 <= 0.0` holds). Only strictly positive finite values are
+  /// rejected.
+  #[test]
+  fn new_accepts_zero_and_negative_zero() {
+    let lp =
+      LogProbsTV::new(1, 3, vec![0.0_f32, -0.0, -1.0]).expect("0.0 and -0.0 are ≤ 0, so accepted");
     assert_eq!(lp.t(), 1);
-    assert_eq!(lp.v(), 2);
+    assert_eq!(lp.v(), 3);
+    assert_eq!(lp.at(0, 0), 0.0);
+    assert_eq!(lp.at(0, 1), -0.0);
   }
 
   /// `LogProbsError`'s `Display` is transparent — each arm forwards
@@ -1162,7 +1237,7 @@ mod tests {
       panic!("expected the Value arm");
     };
     assert_eq!(LogProbsError::Value(inner).to_string(), inner.to_string());
-    assert!(inner.to_string().contains("non-finite"));
+    assert!(inner.to_string().contains("out of domain"));
   }
 
   /// `t=0` with a *positive* vocab dim is the legitimate degenerate
