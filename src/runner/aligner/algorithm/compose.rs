@@ -55,8 +55,11 @@ pub const DEFAULT_MAX_INTRA_SILENT_RUN: Duration = Duration::from_millis(80);
 /// `asry::emissions::effective_samples_per_frame` — a caller
 /// driving [`compose_words`] directly (the `emissions` feature,
 /// no `Aligner`) needs this to compute the `samples_per_frame`
-/// argument [`build_speech_frames`] and `compose_words` both take,
-/// exactly as `Aligner::align` does internally.
+/// argument [`build_speech_frames`] takes. `compose_words` does
+/// *not* take `samples_per_frame`; it derives the same value
+/// internally from its `(encoder_n_samples, total_frames,
+/// hop_samples)` arguments via this function, so both views share
+/// one ratio — exactly as `Aligner::align` does internally.
 pub fn effective_samples_per_frame(n_samples: u64, total_frames: usize, hop_samples: u32) -> f64 {
   if total_frames >= 2 {
     (n_samples as f64) / ((total_frames - 1) as f64)

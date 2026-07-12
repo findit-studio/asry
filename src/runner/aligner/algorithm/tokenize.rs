@@ -11,9 +11,10 @@ use crate::{
 
 /// Result of tokenising the normalised text.
 ///
-/// `pub` for the `feature = "bench-internals"` re-export at the
-/// crate root — out-of-tree code only sees this type through the
-/// doc-hidden `asry::__bench` namespace.
+/// `pub` so both `asry::emissions` (a caller tokenises its own text
+/// and feeds the result to `align_emissions`) and the doc-hidden
+/// `feature = "bench-internals"` `asry::__bench` re-export can reach
+/// it.
 #[derive(Debug)]
 pub struct TokenizedText {
   /// Vocab indices in tokenisation order (Y in spec terms),
@@ -187,10 +188,9 @@ fn boundary_fail_closed(language: &Lang, position: &str) -> WorkFailure {
 // order, validating each `ResolvedOov.event` against the
 // freshly-detected event at the same position.
 
-/// `pub` for the `feature = "bench-internals"` re-export at the
-/// crate root. Out-of-tree code only reaches this through
-/// `asry::__bench`, which is doc-hidden and gated on the
-/// `bench-internals` feature.
+/// `pub` so both `asry::emissions` (Sans-I/O OOV detection for a
+/// caller driving tokenisation itself) and the doc-hidden `feature =
+/// "bench-internals"` `asry::__bench` re-export can reach it.
 #[allow(
   clippy::too_many_arguments,
   reason = "8 args mirror the wav2vec2 tokenisation contract \
@@ -379,10 +379,9 @@ pub fn detect_oov_events(
 /// `OovDecision::Wildcard` pushes `WILDCARD_TOKEN_ID = -1`;
 /// `OovDecision::FailClosed` returns `SemanticOutOfVocab`.
 ///
-/// `pub` for the `feature = "bench-internals"` re-export at
-/// the crate root. Out-of-tree code only reaches this through
-/// `asry::__bench`, which is doc-hidden and gated on
-/// `bench-internals`.
+/// `pub` so both `asry::emissions` (the ort-free tokenisation entry
+/// point) and the doc-hidden `feature = "bench-internals"`
+/// `asry::__bench` re-export can reach it.
 pub fn tokenize_with_word_map(
   tokenizer: &Tokenizer,
   normalized: &str,

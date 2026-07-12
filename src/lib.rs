@@ -147,7 +147,7 @@ pub mod emissions {
           compose_words, effective_samples_per_frame,
         },
         encode::{
-          LogProbsError, LogProbsShapeError, LogProbsTV, LogProbsValueError, NonFiniteClass,
+          LogProbsError, LogProbsShapeError, LogProbsTV, LogProbsValueClass, LogProbsValueError,
           log_softmax_with_finite_guard,
         },
         tokenize::{TokenizedText, detect_oov_events, tokenize_with_word_map},

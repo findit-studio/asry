@@ -53,7 +53,9 @@ use crate::{
 /// text_clean]`. Stored as `i32` because the vocab id space is
 /// `u32` but `-1` carries the wildcard signal.
 ///
-/// `pub` for the `feature = "bench-internals"` re-export.
+/// `pub` so both `asry::emissions` (callers building wildcard tokens
+/// into a `TokenizedText`) and the `feature = "bench-internals"`
+/// re-export can reach it.
 pub const WILDCARD_TOKEN_ID: i32 = -1;
 
 /// Beam width WhisperX's `align()` invokes
@@ -62,7 +64,8 @@ pub const WILDCARD_TOKEN_ID: i32 = -1;
 /// according to the reference implementation; we mirror the
 /// upstream choice.
 ///
-/// `pub` for the `feature = "bench-internals"` re-export.
+/// `pub` so both `asry::emissions` and the `feature =
+/// "bench-internals"` re-export can reach it.
 pub const ALIGN_BEAM_WIDTH: usize = 2;
 
 /// Cap on `T * num_tokens` cells in the forward trellis. Same
@@ -119,8 +122,9 @@ impl CharSegment {
 
 /// One word-level segment, the output of `merge_words`.
 ///
-/// `pub` for the `feature = "bench-internals"` re-export — out-of-
-/// tree code only sees this through doc-hidden `asry::__bench`.
+/// `pub` so both `asry::emissions` (the ort-free alignment seam's
+/// return type) and the doc-hidden `feature = "bench-internals"`
+/// `asry::__bench` re-export can reach it.
 #[derive(Debug, Clone)]
 pub struct WordSegment {
   /// Word index in `original_words` / `word_idx_per_token`.
@@ -138,8 +142,12 @@ pub struct WordSegment {
 impl WordSegment {
   /// Construct from word index + frame range + mean score.
   ///
-  /// `score` should be a finite confidence (`exp(mean log-prob)`,
-  /// naturally in `[0, 1]`). It is stored verbatim — this `const fn`
+  /// `score` should be a finite confidence in `[0, 1]`: the mean of
+  /// the word's per-frame linear probabilities `exp(log-prob)` —
+  /// i.e. `mean(exp(...))`, **not** `exp(mean(...))`. `merge_repeats`
+  /// exponentiates each frame's log-prob and averages those per char;
+  /// `merge_words` then takes the duration-weighted mean across the
+  /// word's chars. It is stored verbatim — this `const fn`
   /// does not sanitise it — so a non-finite `score` passed here
   /// would, untreated, propagate into a public
   /// [`Word`](crate::types::Word) and violate its `[0, 1]` NaN-free
@@ -1451,6 +1459,39 @@ mod tests {
     assert_eq!(segs[1].end_frame, 4);
     assert_eq!(segs[2].start_frame, 4);
     assert_eq!(segs[2].end_frame, 5);
+
+    // Score semantics (pins `WordSegment::new`'s doc): the per-char
+    // score is the mean of per-frame LINEAR probabilities
+    // `mean(exp(logprob))`, NOT `exp(mean(logprob))`. For a token
+    // spanning two frames with log-probs {0, -2}, the path points
+    // carry the already-exponentiated emissions exp(0)=1.0 and
+    // exp(-2); `merge_repeats` averages those.
+    let two_frame = vec![
+      PathPointPublic {
+        token_index: 7,
+        time_index: 10,
+        score: (0.0_f32).exp(),
+      },
+      PathPointPublic {
+        token_index: 7,
+        time_index: 11,
+        score: (-2.0_f32).exp(),
+      },
+    ];
+    let two_seg = merge_repeats(&two_frame);
+    assert_eq!(two_seg.len(), 1);
+    let mean_of_exp = ((0.0_f32).exp() + (-2.0_f32).exp()) / 2.0; // ≈ 0.5677
+    let exp_of_mean = (-1.0_f32).exp(); // ≈ 0.3679 — the WRONG formula
+    assert!(
+      (two_seg[0].score - mean_of_exp).abs() < 1e-6,
+      "score must be mean(exp(...)) ≈ 0.5677; got {}",
+      two_seg[0].score
+    );
+    assert!(
+      (two_seg[0].score - exp_of_mean).abs() > 0.1,
+      "score must NOT be exp(mean(...)) ≈ 0.3679; got {}",
+      two_seg[0].score
+    );
   }
 
   #[test]
@@ -1870,6 +1911,91 @@ to a bare align_emissions call; got {message:?}"
       matches!(err, AlignmentError::Tokenization(_)),
       "expected AlignmentError::Tokenization; got {err:?}"
     );
+  }
+
+  /// Round-5 closure property (HIGH): with `LogProbsTV::new`'s domain
+  /// tightened to finite ∧ `≤ 0`, every emission is `exp(lp) ∈
+  /// [0, 1]`, so every `WordSegment` score `align_emissions` returns
+  /// is finite and in `[0, 1]` by construction. Sweep valid lattices
+  /// exercising the final-blank seed (including a legal `0.0`
+  /// = `log(1)` in the final-frame blank column — the exact cell the
+  /// codex `f32::MAX` history drove to `+∞`; here it is `exp(0) = 1.0`,
+  /// the `[0, 1]` upper edge), the leading-blank fill, real-token
+  /// stays, a wildcard column, and a separator splitting two words.
+  #[test]
+  fn align_emissions_valid_lattices_produce_in_range_scores() {
+    let config = AlignEmissionsConfig::new(0, Lang::En);
+
+    let assert_in_range = |label: &str, words: &[WordSegment]| {
+      assert!(!words.is_empty(), "{label}: expected at least one word");
+      for w in words {
+        let s = w.score();
+        assert!(
+          s.is_finite() && (0.0..=1.0).contains(&s),
+          "{label}: score {s} must be finite and in [0, 1]"
+        );
+      }
+    };
+
+    // Case A — real tokens, no wildcard. Mirrors the smoke lattice
+    // but puts a legal `0.0` (`log(1)`) peak at the token-1 frame AND
+    // at the final-frame blank column (the seed the `f32::MAX` bug
+    // hit): `exp(0) = 1.0`, the `[0, 1]` upper edge. Exercises the
+    // leading-blank fill, real-token stays, and the final-blank seed.
+    {
+      let v = 3;
+      let t = 4;
+      let mut data = vec![-100.0_f32; t * v];
+      data[1] = 0.0; // frame 0, token 1 (log(1))
+      data[3] = -0.1; // frame 1, blank
+      data[8] = -0.1; // frame 2, token 2
+      data[9] = 0.0; // frame 3 (final), blank (log(1)) — the seed cell
+      let log_probs = lp(t, v, data);
+      let tokenized = TokenizedText::new(vec![1, 2], vec![Some(0), Some(0)], None);
+      let words = align_emissions(&log_probs, &tokenized, never(), &config).expect("case A aligns");
+      assert_in_range("A/real-token+final-blank=log(1)", &words);
+    }
+
+    // Case B — a wildcard column (token -1). The wildcard's emission
+    // is the per-frame max non-blank log-prob (still ≤ 0), so it
+    // exponentiates into `[0, 1]` like any other emission.
+    {
+      let v = 4;
+      let t = 4;
+      let mut data = vec![-100.0_f32; t * v];
+      data[1] = -0.1; // frame 0, token 1
+      data[4] = -0.1; // frame 1, blank
+      data[2 * v + 2] = -0.1; // frame 2, vocab 2 — wildcard donor (max non-blank)
+      data[3 * v] = -0.1; // frame 3, blank
+      let log_probs = lp(t, v, data);
+      let tokenized = TokenizedText::new(vec![1, WILDCARD_TOKEN_ID], vec![Some(0), Some(0)], None);
+      let words = align_emissions(&log_probs, &tokenized, never(), &config).expect("case B aligns");
+      assert_in_range("B/wildcard", &words);
+    }
+
+    // Case C — a separator token splitting two words. The separator
+    // (word_idx `None`) drops out at `merge_words`, leaving two words.
+    {
+      let v = 4;
+      let t = 6;
+      let sep = 3_u32;
+      let mut data = vec![-100.0_f32; t * v];
+      data[1] = -0.1; // frame 0, token 1 (word 0)
+      data[4] = -0.1; // frame 1, blank
+      data[2 * v + sep as usize] = -0.1; // frame 2, separator
+      data[3 * v] = -0.1; // frame 3, blank
+      data[4 * v + 2] = -0.1; // frame 4, token 2 (word 1)
+      data[5 * v] = -0.1; // frame 5, blank
+      let log_probs = lp(t, v, data);
+      let tokenized = TokenizedText::new(
+        vec![1, sep as i32, 2],
+        vec![Some(0), None, Some(1)],
+        Some(sep),
+      );
+      let words = align_emissions(&log_probs, &tokenized, never(), &config).expect("case C aligns");
+      assert_in_range("C/separator-two-words", &words);
+      assert_eq!(words.len(), 2, "case C must split into two words");
+    }
   }
 
   /// A beam search backtrack that disagrees with greedy Viterbi

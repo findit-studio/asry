@@ -171,7 +171,15 @@ fn build_synthetic_emission(num_frames: usize, tokens: &[i32]) -> LogProbsTV {
       continue;
     }
     for t in start..end {
-      data[t * VOCAB_SIZE + target_v] = 2.0;
+      // Peak = 0.0 = log(1), the maximal valid log-probability. A
+      // real log-softmax never emits a value > 0, and
+      // `LogProbsTV::new` now enforces the `≤ 0` domain — a positive
+      // "logit" like the former 2.0 is rejected. 0.0 is still the
+      // per-frame argmax over the -3.0 blank and -5.0 baseline, so
+      // the winning alignment path (and every structural parity
+      // assertion below) is unchanged; scores now land in `[0, 1]`
+      // exactly as a real emission's would.
+      data[t * VOCAB_SIZE + target_v] = 0.0;
       data[t * VOCAB_SIZE + BLANK_ID as usize] = -3.0;
     }
   }

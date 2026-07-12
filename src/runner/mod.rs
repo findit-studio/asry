@@ -99,12 +99,16 @@
 //! from `spawn_blocking` and wire shutdown via their own
 //! cancellation tokens flipping the supplied `abort_flag`.
 
-// `asr_source` and `errors` compile with zero features: whisper.cpp-
-// specific items inside each are individually `#[cfg(feature =
-// "runner")]` (`WhisperAsrSource`, `RunnerError::AlignerLoad`'s
-// sibling variants), so these two modules stay ungated even though
-// `runner` (below) is now reachable without the `runner` feature —
-// see the `pub mod runner;` doc comment in `lib.rs`.
+// `asr_source` and `errors` compile with zero features, so their
+// `mod` statements stay ungated even though `runner` (below) is now
+// reachable without the `runner` feature — see the `pub mod runner;`
+// doc comment in `lib.rs`. In `asr_source`, the whisper.cpp-specific
+// items (`WhisperAsrSource` and its impls) are individually
+// `#[cfg(feature = "runner")]`. In `errors`, `RunnerError`'s variants
+// are plain data (message strings, `Duration`, `io::Error`,
+// `TranscriberError`) that never name a whisper.cpp type, so the enum
+// builds featureless; its only cfg-gated variant, `AlignerLoad`, is
+// gated on `alignment` (the ort aligner loader), not `runner`.
 mod asr_source;
 mod errors;
 // Needs `whispercpp` unconditionally (no internal cfg-splitting),
