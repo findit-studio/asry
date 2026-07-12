@@ -136,7 +136,7 @@ fn synth_log_probs(t: usize, v: usize) -> LogProbsTV {
     let target = ti % v;
     data[ti * v + target] = -0.1;
   }
-  LogProbsTV::new(t, v, data)
+  LogProbsTV::new(t, v, data).expect("t * v == data.len() by construction above")
 }
 
 fn bench_ctc_viterbi(c: &mut Criterion) {

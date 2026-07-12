@@ -138,7 +138,8 @@ fn build_synthetic_emission(num_frames: usize, tokens: &[i32]) -> LogProbsTV {
     data[ti * VOCAB_SIZE + BLANK_ID as usize] = -1.0;
   }
   if tokens.is_empty() {
-    return LogProbsTV::new(num_frames, VOCAB_SIZE, data);
+    return LogProbsTV::new(num_frames, VOCAB_SIZE, data)
+      .expect("num_frames * VOCAB_SIZE == data.len() by construction above");
   }
   // We distribute over `tokens.len() + 1` slots so the first peak
   // doesn't sit at frame 0 (matches WhisperX's `+ 1` denominator).
@@ -147,7 +148,8 @@ fn build_synthetic_emission(num_frames: usize, tokens: &[i32]) -> LogProbsTV {
     // Pathological — fewer frames than tokens. The trellis would
     // reject it as `audio too short`. Leave blank-only and let the
     // caller see the error.
-    return LogProbsTV::new(num_frames, VOCAB_SIZE, data);
+    return LogProbsTV::new(num_frames, VOCAB_SIZE, data)
+      .expect("num_frames * VOCAB_SIZE == data.len() by construction above");
   }
   // Donor vocab id used for wildcard peaks. Wildcard's emission is
   // max(non_blank logprobs); peaking this id at the wildcard's
@@ -174,6 +176,7 @@ fn build_synthetic_emission(num_frames: usize, tokens: &[i32]) -> LogProbsTV {
     }
   }
   LogProbsTV::new(num_frames, VOCAB_SIZE, data)
+    .expect("num_frames * VOCAB_SIZE == data.len() by construction above")
 }
 
 /// Run align() end-to-end on `text` with `num_frames` frames over

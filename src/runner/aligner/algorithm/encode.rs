@@ -1,5 +1,15 @@
 //! ONNX encode + log-softmax stage of the alignment algorithm.
+//!
+//! Only [`encode_log_softmax`] itself needs `ort` (the ONNX
+//! session call) and is gated on `feature = "alignment"`. Its
+//! output type [`LogProbsTV`] and the log-softmax / validation
+//! helpers below it are ort-free and reachable under the
+//! `emissions` feature too — callers with their own acoustic
+//! encoder (e.g. a CoreML wav2vec2 port) construct a `LogProbsTV`
+//! from their own model output via [`LogProbsTV::new`] and feed it
+//! straight into `asry::emissions::align_emissions`.
 
+#[cfg(feature = "alignment")]
 use ort::{
   session::{RunOptions, Session},
   value::{Shape, Tensor},
@@ -8,22 +18,63 @@ use smol_str::{SmolStr, format_smolstr};
 
 use crate::types::{AlignmentError, AlignmentFailure, Lang, WorkFailure};
 
-// NOTE on the (1, T) reshape: the plan's literal pseudocode uses
-// `ndarray::Array2::from_shape_vec((1, T), …)`, but asry declares
-// `ndarray = "0.16"` while `ort 2.0.0-rc.12` re-exports `ndarray
-// 0.17` internally — `Tensor::from_array(Array<T, D>)` only resolves
-// for ort's own ndarray version, so the two `ndarray` crates collide
-// at the trait-bound layer. We therefore use ort's
-// version-agnostic `OwnedTensorArrayData for (D, Vec<T>)` impl
-// (`Tensor::from_array((shape, v))`), which is exactly the
+// NOTE on the (1, T) reshape `encode_log_softmax` uses below: the
+// plan's literal pseudocode uses `ndarray::Array2::from_shape_vec((1,
+// T), …)`, but wiring a direct `ndarray` dependency alongside ort's
+// OWN internal `ndarray` re-export (`ort`'s `features = ["ndarray"]`
+// flag) would pull in two independent copies of the crate —
+// `Tensor::from_array(Array<T, D>)` only resolves for ort's own
+// `ndarray` version, so a caller-side `ndarray::Array2` doesn't
+// satisfy the trait bound. asry carried a direct `ndarray`
+// dependency for exactly this reshape at one point; it turned out
+// unused (this file never called into it) and was dropped. We use
+// ort's version-agnostic `OwnedTensorArrayData for (D, Vec<T>)` impl
+// instead (`Tensor::from_array((shape, v))`), which is exactly the
 // constructor the ort docs use in their session-input examples. This
 // keeps the (1, T) reshape semantically identical without forcing a
-// cross-version ndarray bridge.
+// cross-version `ndarray` bridge or an unused direct dependency.
 
-/// Output of `encode_log_softmax`. `pub` for the
-/// `feature = "bench-internals"` re-export at the crate root —
-/// the only way external code can reach this type. Out-of-tree
-/// consumers do not see it.
+/// `t * v != data.len()` on [`LogProbsTV::new`]: the flat buffer's
+/// length doesn't match the declared `(T, V)` shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "LogProbsTV shape mismatch: t={t}, v={v}, data.len()={data_len} (expected data.len() == t * v)"
+)]
+pub struct LogProbsShapeError {
+  t: usize,
+  v: usize,
+  data_len: usize,
+}
+
+impl LogProbsShapeError {
+  const fn new(t: usize, v: usize, data_len: usize) -> Self {
+    Self { t, v, data_len }
+  }
+
+  /// Time dimension the caller supplied to [`LogProbsTV::new`].
+  #[must_use]
+  pub const fn t(&self) -> usize {
+    self.t
+  }
+
+  /// Vocab dimension the caller supplied to [`LogProbsTV::new`].
+  #[must_use]
+  pub const fn v(&self) -> usize {
+    self.v
+  }
+
+  /// Actual length of the flat buffer the caller supplied to
+  /// [`LogProbsTV::new`].
+  #[must_use]
+  pub const fn data_len(&self) -> usize {
+    self.data_len
+  }
+}
+
+/// Output of `encode_log_softmax` — or, under the `emissions`
+/// feature, of the caller's own acoustic encoder. `pub` so both
+/// the `feature = "bench-internals"` re-export and
+/// `asry::emissions` can reach it.
 pub struct LogProbsTV {
   /// Time dimension (number of wav2vec2 output frames).
   t: usize,
@@ -35,14 +86,29 @@ pub struct LogProbsTV {
 }
 
 impl LogProbsTV {
-  /// Construct from explicit dimensions + flat row-major buffer.
+  /// Construct from explicit dimensions + flat row-major buffer,
+  /// validating `data.len() == t * v` (via `checked_mul`, so a
+  /// `t`/`v` pair whose product overflows `usize` is rejected too
+  /// rather than silently wrapping).
   ///
-  /// `data.len()` must equal `t * v`. The constructor itself
-  /// doesn't validate; callers (the encoder and the bench
-  /// harness) construct from already-validated shapes.
-  #[must_use]
-  pub const fn new(t: usize, v: usize, data: Vec<f32>) -> Self {
-    Self { t, v, data }
+  /// Not `const fn`, unlike most constructors in this crate: the
+  /// rejecting path drops the caller-supplied `data` without
+  /// moving it into `Self`, and `Vec<f32>` deallocation isn't
+  /// const-evaluable on stable Rust — an infallible `const fn`
+  /// can't reject its input, so matching the crate's usual `pub
+  /// const fn new` shape here would mean giving up validation
+  /// instead.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`LogProbsShapeError`] when `t.checked_mul(v) !=
+  /// Some(data.len())`.
+  pub fn new(t: usize, v: usize, data: Vec<f32>) -> Result<Self, LogProbsShapeError> {
+    if t.checked_mul(v) == Some(data.len()) {
+      Ok(Self { t, v, data })
+    } else {
+      Err(LogProbsShapeError::new(t, v, data.len()))
+    }
   }
 
   /// Time dimension (number of wav2vec2 output frames).
@@ -98,6 +164,14 @@ impl LogProbsTV {
 /// ModelInferenceFailed, .. }` on any ort error (including a
 /// terminate-induced one — the watchdog's
 /// `WorkerHangTimeout` is surfaced by the alignment pool wrapper).
+///
+/// Gated on `feature = "alignment"`: this is the only function in
+/// the file that touches `ort`. Everything above and below it
+/// (`LogProbsTV`, `log_softmax_with_finite_guard`,
+/// `validate_output_dims`, `validate_stride_extent`,
+/// `validate_vocab_dim`, `reject_non_finite_input`) is reachable
+/// under the ort-free `emissions` feature too.
+#[cfg(feature = "alignment")]
 pub(crate) fn encode_log_softmax(
   session: &mut Session,
   samples_for_aligner: &[f32],
@@ -428,9 +502,14 @@ pub(crate) fn validate_vocab_dim(
 /// `Event::Error` and the operator learns about the broken
 /// backend.
 ///
-/// Pulled out of the public `encode_log_softmax` body so unit
-/// tests can exercise the rejection paths without a `Session`.
-pub(crate) fn log_softmax_with_finite_guard(
+/// Pulled out of `encode_log_softmax`'s body so unit tests can
+/// exercise the rejection paths without a `Session`, and so
+/// callers under the ort-free `emissions` feature (their own
+/// encoder's raw logits, no ort session at all) can run the same
+/// finiteness-guarded log-softmax asry's own `alignment` path
+/// uses. `pub` for exactly that reason — reachable at
+/// `asry::emissions::log_softmax_with_finite_guard`.
+pub fn log_softmax_with_finite_guard(
   raw: &[f32],
   t: usize,
   v: usize,
@@ -615,6 +694,72 @@ mod tests {
     // is the SIMD-precision-guard's job, not this guard's.
     let samples = vec![-1.0_f32, 0.0, 1.0, 1e10, -1e10];
     assert!(reject_non_finite_input(&samples, &Lang::En).is_ok());
+  }
+
+  // -------- LogProbsTV::new validation (the `emissions` seam) --------
+
+  /// `LogProbsTV::new` is the public, validating constructor a
+  /// caller with its own encoder (no ort session, `emissions`
+  /// feature) uses to hand its output to the alignment pipeline.
+  /// A correctly-shaped buffer must construct successfully and
+  /// preserve the dimensions + data verbatim.
+  #[test]
+  fn new_accepts_matching_shape() {
+    let lp = LogProbsTV::new(2, 3, vec![-1.0, -2.0, -3.0, -4.0, -5.0, -6.0]).expect("2 * 3 == 6");
+    assert_eq!(lp.t(), 2);
+    assert_eq!(lp.v(), 3);
+    assert_eq!(lp.data(), &[-1.0, -2.0, -3.0, -4.0, -5.0, -6.0]);
+  }
+
+  /// A buffer shorter than `t * v` must be rejected rather than
+  /// silently accepted (which would let `at()` panic on an
+  /// out-of-bounds index later, deep inside the trellis loop,
+  /// instead of at the construction boundary).
+  ///
+  /// `let Err(err) = ... else { panic!() }` rather than
+  /// `.unwrap_err()`: `LogProbsTV` (the `Ok` side) intentionally
+  /// carries no `Debug` impl — its `data: Vec<f32>` can be a
+  /// wav2vec2-scale emission matrix, not something worth printing
+  /// wholesale on a mismatched test expectation — and
+  /// `Result::unwrap_err` requires `T: Debug`.
+  #[test]
+  fn new_rejects_undersized_buffer() {
+    let Err(err) = LogProbsTV::new(2, 3, vec![0.0_f32; 5]) else {
+      panic!("t=2, v=3, data.len()=5 must be rejected as a shape mismatch");
+    };
+    assert_eq!(err.t(), 2);
+    assert_eq!(err.v(), 3);
+    assert_eq!(err.data_len(), 5);
+    assert!(err.to_string().contains("t=2"));
+    assert!(err.to_string().contains("v=3"));
+    assert!(err.to_string().contains("data.len()=5"));
+  }
+
+  /// A buffer longer than `t * v` is equally a shape mismatch —
+  /// `data.len()` must equal the product exactly, not merely be
+  /// large enough.
+  #[test]
+  fn new_rejects_oversized_buffer() {
+    let Err(err) = LogProbsTV::new(2, 3, vec![0.0_f32; 7]) else {
+      panic!("t=2, v=3, data.len()=7 must be rejected as a shape mismatch");
+    };
+    assert_eq!(err.data_len(), 7);
+  }
+
+  /// `t * v` overflowing `usize` must reject via `checked_mul`
+  /// rather than silently wrap to a small product that happens to
+  /// equal a small `data.len()` — the same overflow discipline
+  /// `validate_output_dims` already applies to the ORT-sourced
+  /// shape.
+  #[test]
+  fn new_rejects_t_v_overflow() {
+    let big = usize::MAX / 2 + 1;
+    let Err(err) = LogProbsTV::new(big, big, Vec::new()) else {
+      panic!("t * v overflowing usize must be rejected, not silently wrapped");
+    };
+    assert_eq!(err.t(), big);
+    assert_eq!(err.v(), big);
+    assert_eq!(err.data_len(), 0);
   }
 
   #[test]
