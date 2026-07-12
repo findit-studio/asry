@@ -91,6 +91,22 @@ impl LogProbsTV {
   /// `t`/`v` pair whose product overflows `usize` is rejected too
   /// rather than silently wrapping).
   ///
+  /// This validates shape/indexing only — it does **not** check
+  /// finiteness. `NaN`/`Inf` values in `data` pass through
+  /// unrejected; finiteness is a caller-owned contract, not
+  /// something this constructor enforces (an O(T×V) scan here would
+  /// duplicate work the DP and the encoder-side guard already do).
+  /// In practice a non-finite buffer usually still fails loudly
+  /// downstream — the trellis/beam DP's `is_finite` guards surface
+  /// [`AlignmentError::NoAlignmentPath`](crate::types::AlignmentError::NoAlignmentPath)
+  /// — but a `NaN` can lose silently to an `f32::max`-based
+  /// comparison (`f32::max` picks the non-`NaN` operand) and distort
+  /// beam scoring instead of erroring. Callers building `data` from
+  /// raw encoder logits, rather than already-computed
+  /// log-probabilities, should route them through
+  /// [`log_softmax_with_finite_guard`] first — it validates
+  /// finiteness per-row before this constructor ever sees the data.
+  ///
   /// Not `const fn`, unlike most constructors in this crate: the
   /// rejecting path drops the caller-supplied `data` without
   /// moving it into `Self`, and `Vec<f32>` deallocation isn't
@@ -102,7 +118,8 @@ impl LogProbsTV {
   /// # Errors
   ///
   /// Returns [`LogProbsShapeError`] when `t.checked_mul(v) !=
-  /// Some(data.len())`.
+  /// Some(data.len())`. Does not report non-finite `data` as an
+  /// error — see the finiteness contract above.
   pub fn new(t: usize, v: usize, data: Vec<f32>) -> Result<Self, LogProbsShapeError> {
     if t.checked_mul(v) == Some(data.len()) {
       Ok(Self { t, v, data })
