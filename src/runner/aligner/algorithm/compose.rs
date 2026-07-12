@@ -430,7 +430,21 @@ where
       continue;
     }
     let range = samples_to_output_range(raw_start, clamped_end);
-    let score = seg.score().clamp(0.0, 1.0);
+    // `f32::clamp` returns `NaN` unchanged (`NaN` is neither `< min`
+    // nor `> max`), so a non-finite segment score would slip through
+    // and violate `Word`'s `[0, 1]` NaN-free score contract. Map
+    // `NaN` to `0.0` (lowest confidence) before clamping; `±∞` clamp
+    // correctly on their own (`+∞ → 1.0`, `−∞ → 0.0`). The ort path
+    // cannot reach this — the emissions finite-guard rejects
+    // non-finite upstream — so this only hardens the public
+    // `compose_words` / `WordSegment::new` seam against a
+    // directly-constructed non-finite score.
+    let raw_score = seg.score();
+    let score = if raw_score.is_nan() {
+      0.0
+    } else {
+      raw_score.clamp(0.0, 1.0)
+    };
     words.push(Word::new(SmolStr::new(surface.as_ref()), range, score));
   }
 
@@ -541,6 +555,48 @@ mod tests {
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert_eq!(result.words()[0].text(), "Hello!");
+  }
+
+  /// Defensive-output regression (codex round 4): a `WordSegment`
+  /// with a `NaN` score — reachable only by a direct
+  /// `WordSegment::new` on the public `compose_words` seam, never
+  /// via the ort path — must not compose into a `Word` whose score
+  /// is `NaN`. `f32::clamp` passes `NaN` through unchanged, so
+  /// `compose_words` maps it to `0.0` before its `[0, 1]` clamp; the
+  /// composed `Word` must satisfy `Word`'s `[0, 1]` NaN-free
+  /// contract.
+  #[test]
+  fn compose_words_sanitizes_nan_segment_score() {
+    let original = vec![Cow::Borrowed("hi")];
+    let speech_frames = vec![true; 3];
+    let result = compose_words(
+      &[one_word(0, 3, f32::NAN, 0)],
+      &original,
+      &speech_frames,
+      0,
+      320,
+      3 * 320,
+      3 * 320,
+      3,
+      fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
+    );
+    assert_eq!(
+      result.words().len(),
+      1,
+      "the word should survive composition"
+    );
+    let score = result.words()[0].score();
+    assert!(
+      !score.is_nan(),
+      "a NaN segment score must be sanitized, got {score}"
+    );
+    assert!(
+      (0.0..=1.0).contains(&score),
+      "score must be in [0, 1], got {score}"
+    );
+    assert_eq!(score, 0.0, "a NaN score maps to 0.0 (lowest confidence)");
   }
 
   #[test]

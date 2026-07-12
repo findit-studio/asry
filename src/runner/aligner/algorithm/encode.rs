@@ -34,16 +34,20 @@ use crate::types::{AlignmentError, AlignmentFailure, Lang, WorkFailure};
 // keeps the (1, T) reshape semantically identical without forcing a
 // cross-version `ndarray` bridge or an unused direct dependency.
 
-/// [`LogProbsTV::new`] rejected its arguments: either `t * v !=
-/// data.len()` (the flat buffer's length doesn't match the
-/// declared `(T, V)` shape), or `v == 0` (a CTC vocabulary must
-/// contain at least the blank token, so a zero-length vocab axis
-/// is never valid, regardless of `t`). Message text is chosen by
-/// [`Display`](core::fmt::Display) rather than `thiserror`'s
-/// `#[error(...)]` shorthand because the two failures need
-/// different wording — reusing the shape-mismatch wording for the
-/// zero-vocab case would claim `t * v != data.len()` when it does
-/// not.
+/// The shape/indexing arm of [`LogProbsError`] — the
+/// [`LogProbsError::Shape`] payload [`LogProbsTV::new`] returns when
+/// it rejects the `(t, v, data.len())` triple: either `t * v !=
+/// data.len()` (the flat buffer's length doesn't match the declared
+/// `(T, V)` shape, including the overflow case where `t * v` doesn't
+/// fit `usize`), or `v == 0` (a CTC vocabulary must contain at least
+/// the blank token, so a zero-length vocab axis is never valid,
+/// regardless of `t`). The value-domain arm — a non-finite
+/// log-probability — is [`LogProbsValueError`]. Message text is
+/// chosen by [`Display`](core::fmt::Display) rather than
+/// `thiserror`'s `#[error(...)]` shorthand because the two shape
+/// failures need different wording — reusing the shape-mismatch
+/// wording for the zero-vocab case would claim `t * v != data.len()`
+/// when it does not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub struct LogProbsShapeError {
   t: usize,
@@ -96,6 +100,96 @@ impl LogProbsShapeError {
   }
 }
 
+/// Which class of non-finite value the value-domain scan in
+/// [`LogProbsTV::new`] rejected. Reported by [`LogProbsValueError`]
+/// in place of the raw `f32` because a raw `f32` is not `Eq`
+/// (`NaN != NaN`) — a class keeps the error `Copy + Eq`, matching
+/// its [`LogProbsShapeError`] sibling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NonFiniteClass {
+  /// `f32::NAN`.
+  Nan,
+  /// `f32::INFINITY` (`+∞`).
+  PosInf,
+  /// `f32::NEG_INFINITY` (`−∞`).
+  NegInf,
+}
+
+impl core::fmt::Display for NonFiniteClass {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(match self {
+      Self::Nan => "NaN",
+      Self::PosInf => "+Inf",
+      Self::NegInf => "-Inf",
+    })
+  }
+}
+
+/// The value-domain arm of [`LogProbsError`] — the
+/// [`LogProbsError::Value`] payload [`LogProbsTV::new`] returns when
+/// `data` holds a non-finite log-probability. Locates the first
+/// offending element by `frame` (row) and `vocab_index` (column)
+/// and records its [`NonFiniteClass`] rather than the raw `f32`, so
+/// the error stays `Copy + Eq` like its [`LogProbsShapeError`]
+/// sibling. See [`LogProbsTV::new`] for the full value-domain rule
+/// (why `±∞` is rejected alongside `NaN`, and why positivity is
+/// deliberately not checked).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("non-finite log-probability at frame {frame}, vocab {vocab_index}: {class}")]
+pub struct LogProbsValueError {
+  frame: usize,
+  vocab_index: usize,
+  class: NonFiniteClass,
+}
+
+impl LogProbsValueError {
+  const fn new(frame: usize, vocab_index: usize, class: NonFiniteClass) -> Self {
+    Self {
+      frame,
+      vocab_index,
+      class,
+    }
+  }
+
+  /// Frame (row) index of the first non-finite element.
+  #[must_use]
+  pub const fn frame(&self) -> usize {
+    self.frame
+  }
+
+  /// Vocab (column) index of the first non-finite element.
+  #[must_use]
+  pub const fn vocab_index(&self) -> usize {
+    self.vocab_index
+  }
+
+  /// Which non-finite class the offending element fell into.
+  #[must_use]
+  pub const fn class(&self) -> NonFiniteClass {
+    self.class
+  }
+}
+
+/// Everything [`LogProbsTV::new`] can reject, in one type so the
+/// constructor's full input contract is enumerable at a glance.
+/// [`Shape`](Self::Shape) carries the dimension/indexing rules
+/// (product mismatch, `t * v` overflow, zero-length vocab axis);
+/// [`Value`](Self::Value) carries the value-domain rule (a
+/// non-finite log-probability). Both arms forward their `Display`
+/// to the wrapped error via `#[error(transparent)]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum LogProbsError {
+  /// The `(t, v, data.len())` triple is inconsistent: `t * v !=
+  /// data.len()`, `t * v` overflows `usize`, or `v == 0`. See
+  /// [`LogProbsShapeError`].
+  #[error(transparent)]
+  Shape(LogProbsShapeError),
+  /// `data` contained a non-finite log-probability. See
+  /// [`LogProbsValueError`].
+  #[error(transparent)]
+  Value(LogProbsValueError),
+}
+
 /// Output of `encode_log_softmax` — or, under the `emissions`
 /// feature, of the caller's own acoustic encoder. `pub` so both
 /// the `feature = "bench-internals"` re-export and
@@ -111,52 +205,107 @@ pub struct LogProbsTV {
 }
 
 impl LogProbsTV {
-  /// Construct from explicit dimensions + flat row-major buffer,
-  /// validating `data.len() == t * v` (via `checked_mul`, so a
-  /// `t`/`v` pair whose product overflows `usize` is rejected too
-  /// rather than silently wrapping).
+  /// Construct from explicit dimensions + a flat row-major `(T, V)`
+  /// buffer, validating the **complete** input contract below. This
+  /// is the public, validating entry point an `emissions`-feature
+  /// caller (its own acoustic encoder, no ort session) uses to hand
+  /// its output to the alignment pipeline. The internal ort path
+  /// builds a `LogProbsTV` by a different route — a struct literal
+  /// after [`log_softmax_with_finite_guard`] — and never runs this
+  /// constructor or its scan.
   ///
-  /// This validates shape/indexing only — it does **not** check
-  /// finiteness. `NaN`/`Inf` values in `data` pass through
-  /// unrejected; finiteness is a caller-owned contract, not
-  /// something this constructor enforces (an O(T×V) scan here would
-  /// duplicate work the DP and the encoder-side guard already do).
-  /// In practice a non-finite buffer usually still fails loudly
-  /// downstream — the trellis/beam DP's `is_finite` guards surface
-  /// [`AlignmentError::NoAlignmentPath`](crate::types::AlignmentError::NoAlignmentPath)
-  /// — but a `NaN` can lose silently to an `f32::max`-based
-  /// comparison (`f32::max` picks the non-`NaN` operand) and distort
-  /// beam scoring instead of erroring. Callers building `data` from
-  /// raw encoder logits, rather than already-computed
-  /// log-probabilities, should route them through
-  /// [`log_softmax_with_finite_guard`] first — it validates
-  /// finiteness per-row before this constructor ever sees the data.
+  /// The validated contract, checked in order:
+  ///
+  /// 1. **Vocab axis non-empty** — `v != 0` (checked first, for
+  ///    every `t` including `t == 0`: a CTC vocabulary must contain
+  ///    at least the blank token, so a zero-length vocab axis is
+  ///    never valid).
+  /// 2. **Shape / product / overflow** — `t.checked_mul(v) ==
+  ///    Some(data.len())`. `checked_mul` rejects a `t`/`v` pair
+  ///    whose product overflows `usize` rather than letting it wrap
+  ///    to a small product that spuriously matches a small
+  ///    `data.len()`.
+  /// 3. **Value domain** — every element of `data` is finite
+  ///    (`f32::is_finite`); `NaN`, `+∞`, and `−∞` are all rejected.
+  ///    This O(T×V) scan is what keeps the seam's numeric domain
+  ///    identical to the one the DP was tested against: the internal
+  ///    ort path feeds the trellis/beam only the output of
+  ///    [`log_softmax_with_finite_guard`], which rejects non-finite
+  ///    logits *and* non-finite outputs, so its emissions are always
+  ///    finite. A `NaN` reaching the DP otherwise seeds a `NaN` word
+  ///    confidence — `f32::max`-based trellis comparisons silently
+  ///    drop it, the end-cell finiteness guard checks a *different*
+  ///    cell from the emission the backtrack reads, and the `NaN`
+  ///    survives `compose_words`' clamp into a public
+  ///    [`Word`](crate::types::Word), violating its `[0, 1]`
+  ///    NaN-free score contract. `−∞` is a plausible caller value
+  ///    for `log(0)` hard-masking, but the internal path never
+  ///    produces it and the DP was never exercised against it, so it
+  ///    is rejected too — the seam's domain is kept exactly equal to
+  ///    the tested (all-finite) domain rather than widened to an
+  ///    untested one.
+  ///
+  ///    Positivity is deliberately **not** validated. Log-probs are
+  ///    `≤ 0` in exact arithmetic, but a positive value is harmless
+  ///    (it clamps to a valid `[0, 1]` confidence downstream, never
+  ///    breaking a contract), and a caller computing log-softmax in
+  ///    `f32` can legitimately round a true `0.0` to a tiny
+  ///    positive; rejecting `> 0.0` would refuse correct-enough
+  ///    output while buying no safety. The finiteness rule alone is
+  ///    exactly what the internal path guarantees.
   ///
   /// Not `const fn`, unlike most constructors in this crate: the
-  /// rejecting path drops the caller-supplied `data` without
-  /// moving it into `Self`, and `Vec<f32>` deallocation isn't
-  /// const-evaluable on stable Rust — an infallible `const fn`
-  /// can't reject its input, so matching the crate's usual `pub
-  /// const fn new` shape here would mean giving up validation
-  /// instead.
+  /// rejecting paths drop the caller-supplied `data` without moving
+  /// it into `Self` (and `Vec<f32>` deallocation isn't
+  /// const-evaluable on stable Rust), and the value-domain scan is
+  /// not const-evaluable either — an infallible `const fn` could not
+  /// reject its input, so matching the crate's usual `pub const fn
+  /// new` shape here would mean giving up validation instead.
   ///
   /// # Errors
   ///
-  /// Returns [`LogProbsShapeError`] when `v == 0` (checked first,
-  /// for every `t` including `t == 0`: a CTC vocabulary must
-  /// contain at least the blank token, so a zero-length vocab
-  /// axis is never valid) or when `t.checked_mul(v) !=
-  /// Some(data.len())`. Does not report non-finite `data` as an
-  /// error — see the finiteness contract above.
-  pub fn new(t: usize, v: usize, data: Vec<f32>) -> Result<Self, LogProbsShapeError> {
+  /// Returns [`LogProbsError::Shape`] when `v == 0` or when
+  /// `t.checked_mul(v) != Some(data.len())` (product mismatch or
+  /// overflow), and [`LogProbsError::Value`] when any element of
+  /// `data` is non-finite — reporting the first offending frame,
+  /// vocab index, and [`NonFiniteClass`].
+  pub fn new(t: usize, v: usize, data: Vec<f32>) -> Result<Self, LogProbsError> {
     if v == 0 {
-      return Err(LogProbsShapeError::new(t, v, data.len()));
+      return Err(LogProbsError::Shape(LogProbsShapeError::new(
+        t,
+        v,
+        data.len(),
+      )));
     }
-    if t.checked_mul(v) == Some(data.len()) {
-      Ok(Self { t, v, data })
-    } else {
-      Err(LogProbsShapeError::new(t, v, data.len()))
+    if t.checked_mul(v) != Some(data.len()) {
+      return Err(LogProbsError::Shape(LogProbsShapeError::new(
+        t,
+        v,
+        data.len(),
+      )));
     }
+    // Value-domain scan: every log-probability must be finite. One
+    // short-circuiting O(T×V) pass. It runs only on this external
+    // `emissions` seam — the internal ort path builds `LogProbsTV`
+    // via a struct literal after `log_softmax_with_finite_guard` has
+    // already guaranteed finiteness, so it never pays this scan.
+    // `v > 0` and `data.len() == t * v` hold here, so `idx / v` and
+    // `idx % v` recover the (frame, vocab) coordinates.
+    if let Some(idx) = data.iter().position(|x| !x.is_finite()) {
+      let class = if data[idx].is_nan() {
+        NonFiniteClass::Nan
+      } else if data[idx] > 0.0 {
+        NonFiniteClass::PosInf
+      } else {
+        NonFiniteClass::NegInf
+      };
+      return Err(LogProbsError::Value(LogProbsValueError::new(
+        idx / v,
+        idx % v,
+        class,
+      )));
+    }
+    Ok(Self { t, v, data })
   }
 
   /// Time dimension (number of wav2vec2 output frames).
@@ -830,7 +979,7 @@ mod tests {
   /// `Result::unwrap_err` requires `T: Debug`.
   #[test]
   fn new_rejects_undersized_buffer() {
-    let Err(err) = LogProbsTV::new(2, 3, vec![0.0_f32; 5]) else {
+    let Err(LogProbsError::Shape(err)) = LogProbsTV::new(2, 3, vec![0.0_f32; 5]) else {
       panic!("t=2, v=3, data.len()=5 must be rejected as a shape mismatch");
     };
     assert_eq!(err.t(), 2);
@@ -846,7 +995,7 @@ mod tests {
   /// large enough.
   #[test]
   fn new_rejects_oversized_buffer() {
-    let Err(err) = LogProbsTV::new(2, 3, vec![0.0_f32; 7]) else {
+    let Err(LogProbsError::Shape(err)) = LogProbsTV::new(2, 3, vec![0.0_f32; 7]) else {
       panic!("t=2, v=3, data.len()=7 must be rejected as a shape mismatch");
     };
     assert_eq!(err.data_len(), 7);
@@ -860,7 +1009,7 @@ mod tests {
   #[test]
   fn new_rejects_t_v_overflow() {
     let big = usize::MAX / 2 + 1;
-    let Err(err) = LogProbsTV::new(big, big, Vec::new()) else {
+    let Err(LogProbsError::Shape(err)) = LogProbsTV::new(big, big, Vec::new()) else {
       panic!("t * v overflowing usize must be rejected, not silently wrapped");
     };
     assert_eq!(err.t(), big);
@@ -878,7 +1027,7 @@ mod tests {
   /// rule for the ORT-sourced counterpart of this seam).
   #[test]
   fn new_rejects_zero_vocab_with_zero_t() {
-    let Err(err) = LogProbsTV::new(0, 0, Vec::new()) else {
+    let Err(LogProbsError::Shape(err)) = LogProbsTV::new(0, 0, Vec::new()) else {
       panic!("t=0, v=0 must be rejected: a CTC vocabulary needs at least the blank token");
     };
     assert_eq!(err.t(), 0);
@@ -903,13 +1052,117 @@ mod tests {
   /// index — confirms the rejection isn't a `T == 0` special case.
   #[test]
   fn new_rejects_zero_vocab_with_positive_t() {
-    let Err(err) = LogProbsTV::new(1, 0, Vec::new()) else {
+    let Err(LogProbsError::Shape(err)) = LogProbsTV::new(1, 0, Vec::new()) else {
       panic!("t=1, v=0 must be rejected: a CTC vocabulary needs at least the blank token");
     };
     assert_eq!(err.t(), 1);
     assert_eq!(err.v(), 0);
     assert_eq!(err.data_len(), 0);
     assert!(err.to_string().contains("zero-length vocab"));
+  }
+
+  /// Regression (codex round 4): the exact failing history —
+  /// `LogProbsTV::new(1, 2, vec![f32::NAN, 0.0])`, `blank_id = 0` —
+  /// reached the DP with a `NaN` emission in the blank column. The
+  /// one-cell trellis end-cell (a *different* cell) stayed finite
+  /// and passed the backtrack guard, so the seed confidence
+  /// `at(final_t, blank).exp()` = `NaN.exp()` = `NaN` propagated
+  /// into a public `Word`, violating its `[0, 1]` NaN-free score
+  /// contract. `new` now rejects the non-finite emission up front:
+  /// a typed `Err`, never `Ok`.
+  #[test]
+  fn new_rejects_nan_from_codex_failing_history() {
+    let Err(LogProbsError::Value(err)) = LogProbsTV::new(1, 2, vec![f32::NAN, 0.0]) else {
+      panic!("a NaN emission must be rejected as a value-domain error, never accepted");
+    };
+    assert_eq!(err.frame(), 0);
+    assert_eq!(err.vocab_index(), 0);
+    assert_eq!(err.class(), NonFiniteClass::Nan);
+  }
+
+  /// `+∞` swept into the token column (vocab 1) of a multi-frame
+  /// lattice is rejected as a value-domain error locating the exact
+  /// cell and class.
+  #[test]
+  fn new_rejects_positive_infinity_in_token_column() {
+    // 2 frames × 2 vocab; +inf at frame 1, vocab 1.
+    let mut data = vec![-1.0_f32, -2.0, -3.0, -4.0];
+    data[3] = f32::INFINITY;
+    let Err(LogProbsError::Value(err)) = LogProbsTV::new(2, 2, data) else {
+      panic!("a +inf emission must be rejected");
+    };
+    assert_eq!(err.frame(), 1);
+    assert_eq!(err.vocab_index(), 1);
+    assert_eq!(err.class(), NonFiniteClass::PosInf);
+  }
+
+  /// `−∞` — a plausible `log(0)` hard-mask value a caller might
+  /// pass — is rejected too: the internal path never produces it
+  /// and the DP was never exercised against it, so the seam keeps
+  /// its domain equal to the tested (all-finite) one. Placed in the
+  /// blank column of the final frame.
+  #[test]
+  fn new_rejects_negative_infinity_hard_mask_value() {
+    // 2 frames × 2 vocab; -inf at frame 1, vocab 0 (blank column).
+    let mut data = vec![-1.0_f32, -2.0, -3.0, -4.0];
+    data[2] = f32::NEG_INFINITY;
+    let Err(LogProbsError::Value(err)) = LogProbsTV::new(2, 2, data) else {
+      panic!("a -inf emission must be rejected");
+    };
+    assert_eq!(err.frame(), 1);
+    assert_eq!(err.vocab_index(), 0);
+    assert_eq!(err.class(), NonFiniteClass::NegInf);
+  }
+
+  /// A `NaN` specifically in the FINAL frame's blank column — the
+  /// cell the backtrack seed reads (`at(final_t, blank).exp()`), the
+  /// exact bypass the shape and end-cell guards missed — is
+  /// rejected with precise coordinates.
+  #[test]
+  fn new_rejects_nan_in_final_frame_blank_column() {
+    // 3 frames × 2 vocab; NaN at final frame (2), blank (0).
+    let mut data = vec![-1.0_f32; 6];
+    data[4] = f32::NAN;
+    let Err(LogProbsError::Value(err)) = LogProbsTV::new(3, 2, data) else {
+      panic!("a NaN in the final-frame blank column must be rejected");
+    };
+    assert_eq!(err.frame(), 2);
+    assert_eq!(err.vocab_index(), 0);
+    assert_eq!(err.class(), NonFiniteClass::Nan);
+  }
+
+  /// Positivity is deliberately unvalidated: log-probs are `≤ 0` in
+  /// exact arithmetic, but a caller's `f32` log-softmax can round a
+  /// true `0.0` to a tiny positive, so a finite positive value must
+  /// stay `Ok` rather than be rejected as "not a log-prob".
+  #[test]
+  fn new_accepts_finite_positive_value_positivity_unvalidated() {
+    let lp = LogProbsTV::new(1, 2, vec![1.0e-7_f32, -0.5]).expect("finite values are accepted");
+    assert_eq!(lp.t(), 1);
+    assert_eq!(lp.v(), 2);
+  }
+
+  /// `LogProbsError`'s `Display` is transparent — each arm forwards
+  /// verbatim to the wrapped shape / value error
+  /// (`#[error(transparent)]`).
+  #[test]
+  fn log_probs_error_display_is_transparent() {
+    let Err(shape) = LogProbsTV::new(2, 3, vec![0.0_f32; 5]) else {
+      panic!("shape mismatch expected");
+    };
+    let LogProbsError::Shape(inner) = shape else {
+      panic!("expected the Shape arm");
+    };
+    assert_eq!(LogProbsError::Shape(inner).to_string(), inner.to_string());
+
+    let Err(value) = LogProbsTV::new(1, 1, vec![f32::NAN]) else {
+      panic!("value error expected");
+    };
+    let LogProbsError::Value(inner) = value else {
+      panic!("expected the Value arm");
+    };
+    assert_eq!(LogProbsError::Value(inner).to_string(), inner.to_string());
+    assert!(inner.to_string().contains("non-finite"));
   }
 
   /// `t=0` with a *positive* vocab dim is the legitimate degenerate

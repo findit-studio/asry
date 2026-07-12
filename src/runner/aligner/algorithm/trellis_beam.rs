@@ -137,6 +137,16 @@ pub struct WordSegment {
 
 impl WordSegment {
   /// Construct from word index + frame range + mean score.
+  ///
+  /// `score` should be a finite confidence (`exp(mean log-prob)`,
+  /// naturally in `[0, 1]`). It is stored verbatim — this `const fn`
+  /// does not sanitise it — so a non-finite `score` passed here
+  /// would, untreated, propagate into a public
+  /// [`Word`](crate::types::Word) and violate its `[0, 1]` NaN-free
+  /// score contract. The in-crate consumer `compose_words` defends
+  /// the boundary (it maps a `NaN` score to `0.0` before its `[0,
+  /// 1]` clamp), but callers composing segments themselves should
+  /// pass a finite score.
   #[must_use]
   pub const fn new(word_index: usize, start_frame: usize, end_frame: usize, score: f32) -> Self {
     Self {
