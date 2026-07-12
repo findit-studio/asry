@@ -1069,7 +1069,7 @@ impl AlignEmissionsConfig {
 /// [`tokenize_with_word_map`](crate::runner::aligner::algorithm::tokenize::tokenize_with_word_map),
 /// then calls this directly.
 ///
-/// This is a thin wrapper around [`align_to_word_segments`] — the
+/// This is a thin wrapper around `align_to_word_segments` — the
 /// same function `Aligner::align` (the `alignment`-feature ort
 /// orchestrator) calls internally. Same algorithm, same
 /// WhisperX-parity behaviour, no edits: `align_emissions` only
@@ -1125,8 +1125,8 @@ pub fn align_emissions(
 fn into_alignment_error(err: WorkFailure, language: &Lang) -> AlignmentError {
   match err {
     WorkFailure::Alignment(e) => e,
-    WorkFailure::WorkerHang(timeout) => AlignmentError::Aborted(AlignmentFailure::new(
-      format_smolstr!("align_emissions aborted via abort_flag before completing: {timeout}"),
+    WorkFailure::WorkerHang(_timeout) => AlignmentError::Aborted(AlignmentFailure::new(
+      format_smolstr!("align_emissions aborted via abort_flag before completing"),
       language.clone(),
     )),
     other @ (WorkFailure::Asr(_) | WorkFailure::LanguageUnsupported(_)) => {
@@ -1809,7 +1809,11 @@ mod tests {
   /// [`AlignmentError::Aborted`] — a variant native to the plain
   /// `AlignmentError` this function returns — not leak the
   /// pool-oriented `WorkFailure` type or silently become some
-  /// unrelated variant like `NoAlignmentPath`.
+  /// unrelated variant like `NoAlignmentPath`. The payload text
+  /// must match: `align_emissions` has no worker and no timeout,
+  /// so it must not borrow `WorkerHangTimeout`'s `Display` (which
+  /// would falsely claim a hung worker with a bogus elapsed time)
+  /// — it must name the actual cause, `abort_flag` cancellation.
   #[test]
   fn align_emissions_reports_abort_flag_as_aborted() {
     let v = 3;
@@ -1820,10 +1824,21 @@ mod tests {
     let abort = AtomicBool::new(true);
 
     let err = align_emissions(&log_probs, &tokenized, &abort, &config).unwrap_err();
+    let AlignmentError::Aborted(payload) = &err else {
+      panic!("expected AlignmentError::Aborted; got {err:?}");
+    };
+    let message = payload.message().to_ascii_lowercase();
     assert!(
-      matches!(err, AlignmentError::Aborted(_)),
-      "expected AlignmentError::Aborted; got {err:?}"
+      message.contains("abort") || message.contains("cancel"),
+      "Aborted payload should name the abort/cancellation path; got {message:?}"
     );
+    for banned in ["worker", "hung", "elapsed"] {
+      assert!(
+        !message.contains(banned),
+        "Aborted payload leaked pool/worker vocabulary ({banned:?}) that doesn't apply \
+to a bare align_emissions call; got {message:?}"
+      );
+    }
   }
 
   /// A token id past `log_probs.v()` is a `Tokenization` failure
