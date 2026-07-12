@@ -1,18 +1,36 @@
-//! Aligner subsystem — wav2vec2 forced alignment via ort.
-
-// `pub(crate)` so the bench-internals re-export at the crate
-// root can reach the SIMD/scalar normalise variants and the
-// raw `ctc_viterbi` kernel through
-// `crate::runner::aligner::algorithm::*`.
+//! Aligner subsystem — wav2vec2 forced alignment via ort, built on
+//! an ort-free algorithm core.
+//!
+//! This whole module is reachable under `feature = "alignment"` OR
+//! `feature = "emissions"` (see the `#[cfg]` on `pub(crate) mod
+//! aligner;` in `runner/mod.rs`). Two of its seven submodules need
+//! ort specifically and stay gated on `alignment` right here:
+//! `aligner` (the `Aligner` struct owns an `ort::Session`) and
+//! `builder` / `set` (the `AlignmentSet` registry stores
+//! `Mutex<Aligner>`). `algorithm`, `normalizer`, and `normalizers`
+//! have no ort dependency and compile under `emissions` alone;
+//! `key` (plain enums, no ort) is gated on `alignment` too since
+//! its only consumers (`builder`/`set`) are.
+//!
+//! `pub(crate)` (rather than `pub`) on `algorithm` so the
+//! `bench-internals` re-export and the `emissions` module can reach
+//! the SIMD/scalar normalise variants and the trellis/beam/tokenize/
+//! compose items through `crate::runner::aligner::algorithm::*`.
 pub(crate) mod algorithm;
+#[cfg(feature = "alignment")]
 mod aligner;
+#[cfg(feature = "alignment")]
 mod builder;
+#[cfg(feature = "alignment")]
 mod key;
 mod normalizer;
 mod normalizers;
+#[cfg(feature = "alignment")]
 mod set;
 
+#[cfg(feature = "alignment")]
 pub use algorithm::compose::{DEFAULT_MAX_INTRA_SILENT_RUN, DEFAULT_MIN_SPEECH_COVERAGE};
+#[cfg(feature = "alignment")]
 pub use aligner::Aligner;
 
 /// Bundled assets, decoded at build time.
@@ -93,11 +111,16 @@ pub mod bundled {
     }
   }
 }
+#[cfg(feature = "alignment")]
 pub use builder::AlignmentSetBuilder;
+#[cfg(feature = "alignment")]
 pub use key::{AlignerKey, AlignmentFallback};
-pub use normalizer::{DynTextNormalizer, NormalizationError, NormalizedText, TextNormalizer};
+pub use normalizer::{
+  DynTextNormalizer, NormalizationError, NormalizedText, TextNormalizer, WildcardBoundary,
+};
 pub use normalizers::{
   ChineseNormalizer, EnglishNormalizer, JapaneseNormalizer, KoreanNormalizer, LatinNormalizer,
   default_normalizer_for,
 };
+#[cfg(feature = "alignment")]
 pub use set::{AlignmentLookup, AlignmentSet};

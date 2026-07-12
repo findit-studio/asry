@@ -99,16 +99,32 @@
 //! from `spawn_blocking` and wire shutdown via their own
 //! cancellation tokens flipping the supplied `abort_flag`.
 
+// `asr_source` and `errors` compile with zero features: whisper.cpp-
+// specific items inside each are individually `#[cfg(feature =
+// "runner")]` (`WhisperAsrSource`, `RunnerError::AlignerLoad`'s
+// sibling variants), so these two modules stay ungated even though
+// `runner` (below) is now reachable without the `runner` feature —
+// see the `pub mod runner;` doc comment in `lib.rs`.
 mod asr_source;
 mod errors;
+// Needs `whispercpp` unconditionally (no internal cfg-splitting),
+// so it stays behind `runner` specifically even though the parent
+// module is reachable under `emissions` too.
+#[cfg(feature = "runner")]
 pub(crate) mod whisper_pool;
 
 // `pub(crate)` (rather than `mod`) so the crate-root
-// `#[cfg(feature = "bench-internals")] pub mod __bench` can
-// re-export this module's `pub(crate)` SIMD/scalar kernels.
-// Outside the bench gate the module's items are only visible
-// through the curated `pub use` re-exports below.
-#[cfg(feature = "alignment")]
+// `#[cfg(feature = "bench-internals")] pub mod __bench` (and the
+// `#[cfg(feature = "emissions")] pub mod emissions`) re-export this
+// module's `pub(crate)`-then-`pub` algorithm items. Reachable under
+// `emissions` OR `alignment`: `algorithm`, `normalizer`, and
+// `normalizers` (the ort-free trellis/beam/tokenize/normalize/
+// compose pipeline) need only `emissions`; `aligner`, `builder`,
+// `key`, and `set` (the `Aligner`/`AlignmentSet` ort orchestration)
+// stay behind `alignment` specifically via their own `#[cfg]` inside
+// `runner/aligner/mod.rs`. Outside these gates the module's items
+// are only visible through the curated `pub use` re-exports below.
+#[cfg(any(feature = "alignment", feature = "emissions"))]
 pub(crate) mod aligner;
 #[cfg(feature = "alignment")]
 mod alignment_pool;
