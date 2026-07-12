@@ -14,7 +14,21 @@ categories  = ["multimedia::audio", "science"]
 default  = ["runner"]
 serde    = ["runner", "dep:serde", "dep:humantime-serde", "smol_str/serde", "mediatime/serde", "whispercpp?/serde"]
 runner   = ["dep:whispercpp", "dep:miniz_oxide"]
-alignment = ["runner", "dep:ort", "dep:tokenizers", "dep:ndarray"]
+# Ort-free forced-alignment algorithm: the post-encoder pipeline
+# (trellis → beam → merge_repeats → merge_words, reached through
+# `align_emissions`), tokenisation (`tokenize_with_word_map`), the
+# per-language normalizers (`default_normalizer_for`), the Sans-I/O
+# OOV surface, and silence-aware composition (`compose_words`) —
+# everything downstream of a caller-supplied `LogProbsTV`. No ONNX
+# Runtime, no whisper.cpp: a consumer with its own acoustic encoder
+# (e.g. a CoreML wav2vec2 port) depends on `asry` with
+# `default-features = false, features = ["emissions"]` to reach
+# this surface at `asry::emissions::*` without linking either.
+# `alignment` (below) depends on this feature and layers the ORT
+# encoder plus the `Aligner` / `AlignmentSet` orchestration on top
+# — one algorithm implementation, not a fork.
+emissions = ["dep:tokenizers"]
+alignment = ["runner", "emissions", "dep:ort"]
 # Apple-only GPU acceleration for whisper.cpp. `metal` runs the
 # encoder on the unified-memory Metal backend (works on every
 # Apple Silicon Mac); `coreml` additionally dispatches the encoder
@@ -95,7 +109,11 @@ whispercpp = { version = "0.2", optional = true, default-features = false }
 # C dep, ~30 KB.
 miniz_oxide = { version = "0.9", optional = true, default-features = false, features = ["with-alloc"] }
 
-# Alignment feature deps. All optional — Plan A/B compile without them.
+# Alignment feature deps. `ort` is `alignment`-only (the ONNX
+# encoder); `tokenizers` is pulled in by `emissions` (the ort-free
+# algorithm — trellis/beam/tokenize/normalize/compose) and so is
+# also present whenever `alignment` is, since `alignment` depends
+# on `emissions`. All optional — Plan A/B compile without either.
 # ort: ONNX runtime bindings. Pinned to =2.0.0-rc.12 because rc.13+
 # changed Session API in incompatible ways and rc.x versions don't
 # follow semver across rc bumps.
@@ -104,8 +122,6 @@ ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, fea
 # read wav2vec2's tokenizer.json. ^0.20 ships pure-Rust without
 # pulling onig.
 tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
-# ndarray: tensor reshaping for the wav2vec2 input/output shapes.
-ndarray = { version = "0.17", optional = true, default-features = false, features = ["std"] }
 
 # Optional features (Plan A scope only).
 serde           = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }

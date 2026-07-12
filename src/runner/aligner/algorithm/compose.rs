@@ -50,11 +50,14 @@ pub const DEFAULT_MAX_INTRA_SILENT_RUN: Duration = Duration::from_millis(80);
 /// Falls back to nominal `hop_samples` when `total_frames < 2`
 /// (single-frame / empty chunks have no defined ratio). Empty
 /// chunks short-circuit upstream; this is just a safety net.
-pub(crate) fn effective_samples_per_frame(
-  n_samples: u64,
-  total_frames: usize,
-  hop_samples: u32,
-) -> f64 {
+///
+/// `pub` (not `pub(crate)`): reachable at
+/// `asry::emissions::effective_samples_per_frame` — a caller
+/// driving [`compose_words`] directly (the `emissions` feature,
+/// no `Aligner`) needs this to compute the `samples_per_frame`
+/// argument [`build_speech_frames`] and `compose_words` both take,
+/// exactly as `Aligner::align` does internally.
+pub fn effective_samples_per_frame(n_samples: u64, total_frames: usize, hop_samples: u32) -> f64 {
   if total_frames >= 2 {
     (n_samples as f64) / ((total_frames - 1) as f64)
   } else {
@@ -98,7 +101,14 @@ pub(crate) fn effective_samples_per_frame(
 /// `sub_segments` must be in chunk-local sample-index space — the
 /// caller (alignment worker) wraps the segment range PTS in a
 /// 1/16000 timebase so `start_pts` == `start_sample`.
-pub(crate) fn build_speech_frames(
+///
+/// `pub` (not `pub(crate)`): reachable at
+/// `asry::emissions::build_speech_frames` — this is asry's own
+/// silence-aware speech mask, the piece [`compose_words`] needs
+/// for its `speech_frames` argument. A caller driving
+/// `compose_words` directly under the `emissions` feature builds
+/// its mask the same way `Aligner::align` does.
+pub fn build_speech_frames(
   n_frames: usize,
   samples_per_frame: f64,
   // Total encoder input length (real audio + sub-receptive-field
@@ -261,8 +271,11 @@ pub(crate) fn build_speech_frames(
 /// Compose the final `AlignmentResult` from
 /// [`WordSegment`]s + original-word surface forms.
 ///
-/// `word_segments` come from
-/// [`merge_words`](crate::runner::aligner::algorithm::trellis_beam::merge_words),
+/// `word_segments` come from `merge_words` (crate-internal;
+/// reached publicly through
+/// [`align_to_word_segments`](crate::runner::aligner::algorithm::trellis_beam::align_to_word_segments)
+/// or
+/// [`align_emissions`](crate::runner::aligner::algorithm::trellis_beam::align_emissions)),
 /// which drops `|`-delimiter segments and emits one
 /// `WordSegment` per real word with WhisperX-bit-exact
 /// `[start_frame, end_frame)` spans. They are NOT in
@@ -280,6 +293,12 @@ pub(crate) fn build_speech_frames(
 ///
 /// These are *post-processing* — applied to spans WhisperX's
 /// algorithm picked, not folded into the lattice.
+///
+/// `pub` (not `pub(crate)`): named directly in the `emissions`
+/// feature's contract — reachable at
+/// `asry::emissions::compose_words`, the final stage after
+/// [`crate::runner::aligner::algorithm::trellis_beam::align_emissions`]
+/// for a caller with its own acoustic encoder.
 #[allow(
   clippy::too_many_arguments,
   reason = "10 args carry the per-chunk composition contract \
@@ -289,7 +308,7 @@ pub(crate) fn build_speech_frames(
  language-aware policy); each is a distinct semantic axis \
  from upstream passes — bundling them adds indirection"
 )]
-pub(crate) fn compose_words<F>(
+pub fn compose_words<F>(
   word_segments: &[WordSegment],
   original_words: &[Cow<'_, str>],
   speech_frames: &[bool],
