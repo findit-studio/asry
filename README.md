@@ -176,7 +176,8 @@ between coarse stages too.
 |---------|---------|-----------------|
 | `std` | yes | `std`-backed implementations of crate types. Chains `std` to `mediatime`, `smol_str`, and serde when present. |
 | `runner` | yes | `WhisperAsrSource` + the in-house `whispercpp` 0.2.x bindings + the temperature retry ladder + the real-zlib compression-ratio gate (via `miniz_oxide`). Implies `std`. |
-| `alignment` | no | wav2vec2 forced alignment via `ort` (load-dynamic) + tokenizers + ndarray. Lights up `Aligner`, `AlignmentSet`, `run_one_alignment`. Implies `runner`. |
+| `emissions` | no | Ort-free forced-alignment algorithm — trellis/beam/merge word segments (`align_emissions`), tokenisation (`tokenize_with_word_map`) via `tokenizers`, per-language normalizers (`default_normalizer_for`), the Sans-I/O OOV surface, and silence-aware composition (`compose_words`). No `ort`, no whisper.cpp. Reachable at `asry::emissions::*`; `default-features = false, features = ["emissions"]` for a consumer bringing its own acoustic encoder. |
+| `alignment` | no | wav2vec2 forced alignment via `ort` (load-dynamic) layered on `emissions`. Lights up `Aligner`, `AlignmentSet`, `run_one_alignment`. Implies `runner` + `emissions`. |
 | `serde` | no | Derive `serde::{Serialize, Deserialize}` on public state-machine types (`Transcript`, `Word`, `AsrParams`, …). Implies `runner`. |
 | `metal` | no | Apple-only: enables `whispercpp/metal` so the encoder runs on the unified-memory Metal backend. Implies `runner`. |
 | `coreml` | no | Apple-only: enables `whispercpp/coreml` so the encoder additionally dispatches to ANE if the caller has produced a CoreML companion `.mlmodelc`. Implies `runner`. |
@@ -196,8 +197,10 @@ cargo test --features alignment,bench-internals --test whisperx_unit_parity
 
 These tests port WhisperX's
 `tests/test_word_timestamp_interpolation.py` 1:1 onto asry's
-CTC pipeline. The 193 alignment-pipeline lib tests pin the same
-algorithmic invariants stage-by-stage; median IoU 0.9955–0.9990
+CTC pipeline. The alignment-pipeline lib tests (everything under
+`src/runner/aligner/` + `src/runner/alignment_pool/`; 279 as of
+the `emissions` feature, up from a stale "193" this doc used to
+cite) pin the same algorithmic invariants stage-by-stage; median IoU 0.9955–0.9990
 across 854 word pairs vs. WhisperX's recorded outputs (measured
 during initial calibration; see `trellis_beam.rs:305-330`).
 
