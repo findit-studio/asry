@@ -526,13 +526,49 @@ pub(crate) fn validate_vocab_dim(
 /// finiteness-guarded log-softmax asry's own `alignment` path
 /// uses. `pub` for exactly that reason — reachable at
 /// `asry::emissions::log_softmax_with_finite_guard`.
+///
+/// Also validates `t.checked_mul(v) == Some(raw.len())` up front,
+/// before any indexing into `raw` — overflow-safe, the same
+/// discipline [`validate_output_dims`] applies to the ORT-sourced
+/// shape. Internal callers already get `t`/`v` pre-validated
+/// against the ORT output there (redundant, O(1), here); external
+/// `emissions`-feature callers construct `t`/`v`/`raw` themselves
+/// and are not.
+///
+/// # Errors
+///
+/// Returns `ModelInferenceFailed` when `t.checked_mul(v) !=
+/// Some(raw.len())`, or when any logit or output log-probability
+/// is non-finite.
 pub fn log_softmax_with_finite_guard(
   raw: &[f32],
   t: usize,
   v: usize,
   language: &Lang,
 ) -> Result<Vec<f32>, WorkFailure> {
-  let mut data = Vec::with_capacity(t * v);
+  let total = match t.checked_mul(v) {
+    Some(product) => product,
+    None => {
+      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
+        AlignmentFailure::new(
+          format_smolstr!("log-softmax dimensions overflow: T={t} × V={v} doesn't fit in usize"),
+          language.clone(),
+        ),
+      )));
+    }
+  };
+  let raw_len = raw.len();
+  if total != raw_len {
+    return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
+      AlignmentFailure::new(
+        format_smolstr!(
+          "log-softmax input buffer length {raw_len} doesn't match declared T={t} × V={v} = {total}"
+        ),
+        language.clone(),
+      ),
+    )));
+  }
+  let mut data = Vec::with_capacity(total);
   for t_idx in 0..t {
     let row = &raw[t_idx * v..(t_idx + 1) * v];
     if let Some(bad_v) = row.iter().position(|x| !x.is_finite()) {
@@ -915,6 +951,118 @@ mod tests {
       );
     }
   }
+
+  // --- log_softmax_with_finite_guard dimension validation ---
+  //
+  // `encode_log_softmax`'s internal call is already preceded by
+  // `validate_output_dims`, so these paths are unreachable from
+  // that caller. They matter for the `emissions`-feature entry
+  // point, which lets an external caller supply `t`/`v`/`raw`
+  // directly with no ORT-side pre-validation at all.
+
+  /// `raw` shorter than the declared `T × V` used to index straight
+  /// past the end of the last row's slice — an unchecked-slicing
+  /// panic instead of a typed error.
+  #[test]
+  fn log_softmax_rejects_undersized_buffer() {
+    use crate::types::Lang;
+    let err = log_softmax_with_finite_guard(&[0.0f32, 0.0], 2, 2, &Lang::En).unwrap_err();
+    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
+      panic!("expected AlignmentFailed");
+    };
+    let message = payload.message();
+    assert!(
+      message.contains("doesn't match"),
+      "diagnostic must call out the length mismatch; got {message}",
+      message = message
+    );
+  }
+
+  /// An empty buffer against non-zero declared dims is the same
+  /// unchecked-slicing panic as the general undersized case, called
+  /// out on its own since an empty `raw` is the most likely
+  /// caller-side mistake (e.g. forgetting to fill the encoder
+  /// output before calling in).
+  #[test]
+  fn log_softmax_rejects_empty_buffer_with_nonzero_dims() {
+    use crate::types::Lang;
+    let err = log_softmax_with_finite_guard(&[], 1, 1, &Lang::En).unwrap_err();
+    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
+      panic!("expected AlignmentFailed");
+    };
+    assert!(payload.message().contains("doesn't match"));
+  }
+
+  /// `raw` longer than the declared `T × V` never panics — the
+  /// loop only ever reads the first `T × V` elements — so it
+  /// previously returned `Ok` built from a truncated prefix,
+  /// silently discarding the trailing elements instead of
+  /// signalling the shape mismatch.
+  #[test]
+  fn log_softmax_rejects_oversized_buffer_instead_of_silently_truncating() {
+    use crate::types::Lang;
+    let err = log_softmax_with_finite_guard(&[0.0f32, 99.0], 1, 1, &Lang::En).unwrap_err();
+    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
+      panic!("expected AlignmentFailed");
+    };
+    let message = payload.message();
+    assert!(
+      message.contains("doesn't match"),
+      "diagnostic must call out the length mismatch; got {message}",
+      message = message
+    );
+  }
+
+  /// `T = 0` makes the frame loop `0..0`, which never runs
+  /// regardless of what `raw` holds — so a non-empty `raw` was
+  /// previously discarded whole and `Ok(vec![])` returned,
+  /// silently swallowing every element instead of signalling the
+  /// shape mismatch.
+  #[test]
+  fn log_softmax_rejects_zero_t_with_nonempty_buffer_instead_of_silently_discarding() {
+    use crate::types::Lang;
+    let err = log_softmax_with_finite_guard(&[1.0f32, 2.0, 3.0], 0, 5, &Lang::En).unwrap_err();
+    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
+      panic!("expected AlignmentFailed");
+    };
+    assert!(payload.message().contains("doesn't match"));
+  }
+
+  /// `T = 0` with a correctly-empty `raw` (`0 * V == 0 ==
+  /// raw.len()`) is legitimate degenerate input — zero frames in,
+  /// zero log-probabilities out — and must stay `Ok`, not be
+  /// swept up by the new shape guard.
+  #[test]
+  fn log_softmax_accepts_zero_t_with_empty_buffer() {
+    use crate::types::Lang;
+    let out = log_softmax_with_finite_guard(&[], 0, 5, &Lang::En).expect("ok");
+    assert!(out.is_empty());
+  }
+
+  /// `T * V` overflowing `usize` previously reached
+  /// `Vec::with_capacity(t * v)` and `usize::MAX * 2` panicked via
+  /// the debug-mode overflow check (release profile would instead
+  /// wrap to a small-but-wrong capacity and abort on the resulting
+  /// allocation request) — the same overflow discipline
+  /// `validate_output_dims` already applies to the ORT-sourced
+  /// shape, applied here via `checked_mul` before any arithmetic
+  /// on `t`/`v` runs.
+  #[test]
+  fn log_softmax_rejects_t_v_product_overflow() {
+    use crate::types::Lang;
+    let err = log_softmax_with_finite_guard(&[], usize::MAX, 2, &Lang::En).unwrap_err();
+    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
+      panic!("expected AlignmentFailed");
+    };
+    let message = payload.message();
+    assert!(
+      message.contains("overflow"),
+      "diagnostic must call out the overflow; got {message}",
+      message = message
+    );
+  }
+
+  // --- end log_softmax_with_finite_guard dimension validation ---
 
   // --- ORT output dims validation ---
 
