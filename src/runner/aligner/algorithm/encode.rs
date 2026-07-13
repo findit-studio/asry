@@ -387,9 +387,65 @@ impl LogProbsTV {
     &self.data
   }
 
+  /// Read the log-probability of vocab index `v_idx` at frame
+  /// `t_idx`, or `None` when `(t_idx, v_idx)` is outside the `(T, V)`
+  /// grid.
+  ///
+  /// The total counterpart of [`at`](Self::at) — the whole `(usize,
+  /// usize)` argument space maps to a defined answer, so an
+  /// `emissions` caller indexing emissions it did not itself bound can
+  /// stay panic-free.
+  ///
+  /// Bounds-checks `v_idx` against `V` **explicitly**. Checking only
+  /// the flat index is not enough: this buffer is row-major, so a
+  /// `v_idx >= V` aliases into the *next frame's* row whenever the
+  /// flat index still lands inside `data` — `at(0, 3)` on a `(T=2,
+  /// V=3)` tensor computes `0 * 3 + 3 = 3`, which is in bounds, and
+  /// hands back frame 1's vocab 0.
+  #[must_use]
+  pub fn get(&self, t_idx: usize, v_idx: usize) -> Option<f32> {
+    if v_idx >= self.v {
+      return None;
+    }
+    let idx = t_idx.checked_mul(self.v)?.checked_add(v_idx)?;
+    self.data.get(idx).copied()
+  }
+
   /// Read the log-probability of vocab index `v_idx` at frame `t_idx`.
+  ///
+  /// The pinned DP (`get_trellis` / `backtrack_beam`) indexes through
+  /// here on its hot path, always with a `t_idx < T` and a `v_idx < V`
+  /// it has already validated (`get_trellis` rejects a `blank_id >= V`
+  /// and any token id `>= V` before the first read), so this is
+  /// infallible on the `alignment` path and its values are unchanged.
+  ///
+  /// # Panics
+  ///
+  /// Panics when `(t_idx, v_idx)` is outside the `(T, V)` grid —
+  /// deterministically, with the coordinates in the message, and
+  /// **identically in debug and release**. Use [`get`](Self::get) for
+  /// the non-panicking form.
+  ///
+  /// The naked `self.data[t_idx * self.v + v_idx]` this replaces was
+  /// neither: on a `(T=2, V=3)` tensor `at(0, 3)` returned frame 1's
+  /// vocab 0 — a *silently wrong log-probability*, in both profiles,
+  /// because the row-major flat index stayed in bounds — and a large
+  /// `t_idx` overflowed the multiply, panicking under debug overflow
+  /// checks but wrapping to an in-bounds row in release. Routing
+  /// through the checked [`get`](Self::get) closes both: an
+  /// out-of-domain coordinate is now always a panic, never a wrong
+  /// number. Regressions:
+  /// `at_rejects_vocab_index_aliasing_into_the_next_frame`,
+  /// `at_rejects_frame_index_that_overflows_the_flat_index`.
+  #[must_use]
   pub fn at(&self, t_idx: usize, v_idx: usize) -> f32 {
-    self.data[t_idx * self.v + v_idx]
+    match self.get(t_idx, v_idx) {
+      Some(lp) => lp,
+      None => panic!(
+        "LogProbsTV index out of bounds: (t={t_idx}, v={v_idx}) is outside the (T={}, V={}) grid",
+        self.t, self.v
+      ),
+    }
   }
 }
 
@@ -1271,6 +1327,87 @@ mod tests {
     assert_eq!(lp.at(0, 2), -3.0);
     assert_eq!(lp.at(1, 0), -4.0);
     assert_eq!(lp.at(1, 2), -6.0);
+  }
+
+  /// Helper for the `at` / `get` domain tests: the same well-formed
+  /// `(T=2, V=3)` tensor `at_indexes_correctly` pins, built through the
+  /// validating public constructor so the tests speak to the seam an
+  /// `emissions` caller actually reaches.
+  fn two_by_three() -> LogProbsTV {
+    LogProbsTV::new(2, 3, vec![-1.0, -2.0, -3.0, -4.0, -5.0, -6.0])
+      .expect("2 * 3 == 6 and every value is a valid log-probability")
+  }
+
+  /// `get` is the total form of `at`: every `(usize, usize)` maps to a
+  /// defined answer, `Some` inside the grid and `None` outside it —
+  /// including the two coordinates that used to alias or overflow.
+  #[test]
+  fn get_is_total_over_its_argument_space() {
+    let lp = two_by_three();
+    assert_eq!(lp.get(0, 0), Some(-1.0));
+    assert_eq!(lp.get(1, 2), Some(-6.0));
+    // v_idx == V: out of the grid even though the flat index is in
+    // bounds (this is the aliasing case).
+    assert_eq!(lp.get(0, 3), None);
+    // t_idx == T: past the last row.
+    assert_eq!(lp.get(2, 0), None);
+    // Flat index overflows `usize`.
+    assert_eq!(lp.get(usize::MAX, 0), None);
+    assert_eq!(lp.get(usize::MAX, usize::MAX), None);
+  }
+
+  ///  class regression (the `build_speech_frames` sibling).
+  /// `LogProbsTV::at` is `pub` on the `emissions` surface, so a caller
+  /// can hand it any `(usize, usize)`. The naked
+  /// `self.data[t_idx * self.v + v_idx]` did not close that domain.
+  ///
+  /// The buffer is ROW-MAJOR, so a `v_idx >= V` walks into the *next
+  /// frame's* row whenever the flat index still lands inside `data`.
+  /// On this `(T=2, V=3)` tensor, `at(0, 3)` computed `0 * 3 + 3 = 3`
+  /// — in bounds — and returned `-4.0`, which is frame 1's vocab 0.
+  /// Not a panic: a **silently wrong log-probability, in debug and
+  /// release alike**, fed straight into a CTC emission.
+  ///
+  /// It must now be a panic, not a wrong number.
+  #[test]
+  #[should_panic(expected = "(t=0, v=3) is outside the (T=2, V=3) grid")]
+  fn at_rejects_vocab_index_aliasing_into_the_next_frame() {
+    let lp = two_by_three();
+    // Pre-fix: returns -4.0 (frame 1, vocab 0). Post-fix: panics.
+    let _ = lp.at(0, 3);
+  }
+
+  /// The overflow half of the same hole: a large `t_idx` wraps
+  /// `t_idx * self.v`. Under debug overflow checks that panicked with
+  /// the opaque "attempt to multiply with overflow"; in release it
+  /// wrapped to a small in-bounds flat index and returned an unrelated
+  /// element. `checked_mul` in `get` makes both profiles agree on a
+  /// deterministic, coordinate-naming panic.
+  #[test]
+  #[should_panic(expected = "is outside the (T=2, V=3) grid")]
+  fn at_rejects_frame_index_that_overflows_the_flat_index() {
+    let lp = two_by_three();
+    // (usize::MAX / 3) + 1 multiplied by V=3 wraps to 1 mod 2^64, so
+    // pre-fix release handed back `data[1]`.
+    let _ = lp.at((usize::MAX / 3) + 1, 0);
+  }
+
+  /// `at` stays infallible on every coordinate the pinned DP produces:
+  /// `get_trellis` validates `blank_id < V` and every token id `< V`
+  /// before its first read, and only ever reads rows `< T`. Sweep the
+  /// whole grid to pin that the hardened `at` agrees with `get` and
+  /// with the flat row-major layout — i.e. the `alignment` path's
+  /// values are unchanged.
+  #[test]
+  fn at_agrees_with_get_across_the_whole_grid() {
+    let lp = two_by_three();
+    for t_idx in 0..lp.t() {
+      for v_idx in 0..lp.v() {
+        let expected = lp.data()[t_idx * lp.v() + v_idx];
+        assert_eq!(lp.at(t_idx, v_idx), expected);
+        assert_eq!(lp.get(t_idx, v_idx), Some(expected));
+      }
+    }
   }
 
   /// NaN logits from a broken backend must surface as a fatal

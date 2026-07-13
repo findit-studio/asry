@@ -130,10 +130,22 @@ impl<'a> NormalizedText<'a> {
     }
   }
 
-  /// Construct with explicit per-word [`WildcardBoundary`]
-  /// counts. Length must match `original_words`. Panics on
-  /// length mismatch because the count is structurally tied
-  /// to word indexing.
+  /// Construct with explicit per-word [`WildcardBoundary`] counts.
+  ///
+  /// # Panics
+  ///
+  /// Panics when `wildcard_boundary_per_word.len() !=
+  /// original_words.len()`. The two are structurally one vector split
+  /// in half — `wildcard_boundary_per_word[i]` describes
+  /// `original_words[i]` — and every downstream consumer indexes them
+  /// in lock-step, so a length disagreement is an implementor bug in
+  /// the [`TextNormalizer`], not a runtime input condition a caller
+  /// could recover from. Deliberately an assert rather than a
+  /// `Result`: this is a constructor for a value the normaliser
+  /// *produces*, not a seam that ingests untrusted caller data (unlike
+  /// [`LogProbsTV::new`](crate::runner::aligner::algorithm::encode::LogProbsTV::new),
+  /// which validates the analogous shape agreement into a typed error
+  /// precisely because its input DOES come from outside).
   pub fn with_wildcards(
     normalized: String,
     original_words: Vec<Cow<'a, str>>,

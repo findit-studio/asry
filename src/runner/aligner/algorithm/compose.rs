@@ -71,6 +71,42 @@ pub fn effective_samples_per_frame(n_samples: u64, total_frames: usize, hop_samp
   }
 }
 
+/// `ceil(x / 2)` for `x >= 0`, without the `(x + 1) / 2` overflow.
+///
+/// [`build_speech_frames`] needs a *ceil*-half twice — once for the
+/// nominal per-frame majority threshold and once for the real-audio
+/// window's — so that odd strides still demand a strict majority
+/// (`spf = 3` needs 2 samples, not 1). Both operands can legitimately
+/// reach `i64::MAX` on the public seam (`samples_per_frame.floor() as
+/// i64` saturates there for any ratio above `i64::MAX`, and the
+/// real-audio window can span the whole saturated extent), where the
+/// literal `(x + 1) / 2` panics under debug overflow checks and wraps
+/// to a negative in release. `x / 2 + x % 2` is the same value for
+/// every `x >= 0` and cannot overflow: both terms are `<= x`.
+const fn ceil_half(x: i64) -> i64 {
+  x / 2 + x % 2
+}
+
+/// Fold a `u64` sample extent into the `i64` space the overlap
+/// arithmetic works in, *saturating* rather than truncating.
+///
+/// `u64 as i64` is a bit-reinterpreting cast, not a saturating one:
+/// `u64::MAX as i64 == -1`. That negative then became the upper bound
+/// of `frame_lo_i.clamp(0, real_n_samples_i64)`, and `Ord::clamp`
+/// panics when `min > max` — in release as well as debug.  //  found it. Saturating at `i64::MAX` keeps the
+/// bound non-negative for every `u64`, so the clamp can never invert.
+///
+/// Identical to the old cast for every extent `<= i64::MAX`, i.e. for
+/// every value the ORT path can produce (`i64::MAX` 16 kHz samples is
+/// ~18 million years of audio).
+const fn saturating_extent_i64(extent: u64) -> i64 {
+  if extent > i64::MAX as u64 {
+    i64::MAX
+  } else {
+    extent as i64
+  }
+}
+
 /// Build a per-frame speech mask of length `n_frames`, marking
 /// `true` exactly for frames whose audio sample range overlaps any
 /// of the supplied chunk-local sub-segments. Used by
@@ -114,6 +150,30 @@ pub fn effective_samples_per_frame(n_samples: u64, total_frames: usize, hop_samp
 /// for its `speech_frames` argument. A caller driving
 /// `compose_words` directly under the `emissions` feature builds
 /// its mask the same way `Aligner::align` does.
+///
+/// **Total over its argument types.** Every `u64` sample extent and
+/// every `f64` ratio is accepted; none can panic. The sample extents
+/// are folded into `i64` with a *saturating* conversion
+/// ([`saturating_extent_i64`]) and every half-frame threshold is a
+/// [`ceil_half`] rather than a `(x + 1) / 2`, so neither the
+/// `spf + 1` add nor the `real_width + 1` add can overflow, and the
+/// `clamp(0, real_n_samples_i64)` bound can never invert
+/// (`Ord::clamp` panics when `min > max`, in release too).  //  ran this exact history: `n =
+/// u64::MAX; spf = effective_samples_per_frame(n, 2, 320);
+/// build_speech_frames(2, spf, n, n, &[])`. Pre-fix it panicked with
+/// `attempt to add with overflow` under debug overflow checks
+/// (`spf.floor() as i64` saturates to `i64::MAX`, then `+ 1` wraps)
+/// and with `min > max. min = 0, max = -1` in release (`u64::MAX as
+/// i64` is a *truncating* cast to `-1`, so the clamp bound inverted).
+/// Post-fix it yields an all-`false` mask — a defined value, in both
+/// profiles. Regression:
+/// `build_speech_frames_saturates_u64_max_sample_extents`.
+///
+/// Nothing the ORT path can produce reaches those extremes (the
+/// encoder stride check bounds `n_samples` to the chunk's real audio
+/// length), and for every extent `<= i64::MAX` the saturating
+/// conversion and the ceil-halves are *bit-identical* to the previous
+/// arithmetic — so the `alignment` path's behaviour is unchanged.
 pub fn build_speech_frames(
   n_frames: usize,
   samples_per_frame: f64,
@@ -154,13 +214,28 @@ pub fn build_speech_frames(
   // ratio is typically within ~1 sample of `hop_samples` on real
   // wav2vec2-base chunks (320.0 nominal vs 320.43 effective on
   // the 30 s edge case), well within the half-frame margin.
+  //
+  // `f64 as i64` saturates (Rust 1.45+), and `samples_per_frame > 0`
+  // is guaranteed by the guard above, so `spf_int` lands in
+  // `[0, i64::MAX]`. `ceil_half` (not `(spf_int + 1) / 2`) keeps the
+  // ceil-half total there: at `spf_int == i64::MAX` the literal `+ 1`
+  // overflowed —  history, `attempt to add with
+  // overflow` under debug overflow checks, wrap-to-`i64::MIN` in
+  // release. Same value for every reachable stride.
   let spf_int = samples_per_frame.floor() as i64;
-  let min_overlap_samples = ((spf_int + 1) / 2).max(1);
+  let min_overlap_samples = ceil_half(spf_int).max(1);
   // clamped sub-segment
   // endpoints to `real_n_samples` (not `n_samples` /
   // encoder length); the encoder-length sentinel is unused
   // here because of that fix.
-  let real_n_samples_i64 = real_n_samples.min(n_samples) as i64;
+  //
+  //  saturate rather than truncate. `u64 as i64` is a
+  // bit-reinterpreting cast (`u64::MAX as i64 == -1`), and a negative
+  // bound made the `clamp(0, real_n_samples_i64)` calls below panic
+  // outright (`min > max`) — in release too. See
+  // [`saturating_extent_i64`]. Non-negative by construction now, so
+  // every clamp bound below is well-ordered.
+  let real_n_samples_i64 = saturating_extent_i64(real_n_samples.min(n_samples));
 
   // Coalesce overlapping/adjacent sub-segments into a non-overlapping
   // union BEFORE per-frame accumulation. Flagged that
@@ -256,18 +331,25 @@ pub fn build_speech_frames(
     .map(|(f, o)| {
       let frame_lo_i = ((f as f64) * samples_per_frame).round() as i64;
       let frame_hi_i = (((f + 1) as f64) * samples_per_frame).round() as i64;
+      // `real_n_samples_i64 >= 0` (saturating, not truncating), so
+      // both clamp bounds are well-ordered — `Ord::clamp` panics on
+      // `min > max` in every profile, which is exactly how the
+      //  history blew up in release.
       let real_lo = frame_lo_i.clamp(0, real_n_samples_i64);
       let real_hi = frame_hi_i.clamp(0, real_n_samples_i64);
       let real_width = (real_hi - real_lo).max(0);
       // Half-real-width threshold (ceil-half mirroring the
       // nominal computation), capped by the nominal threshold.
+      // `ceil_half` for the same overflow reason as
+      // `min_overlap_samples`: `real_width` reaches `i64::MAX` when
+      // the extents saturate, and `(real_width + 1)` overflowed there.
       let frame_thr = if real_width == 0 {
         // Padded-only frame: it cannot satisfy a real-audio
         // overlap, so any positive nominal threshold works to
         // keep it silent. `min_overlap_samples` is already that.
         min_overlap_samples
       } else {
-        ((real_width + 1) / 2).max(1).min(min_overlap_samples)
+        ceil_half(real_width).max(1).min(min_overlap_samples)
       };
       o >= frame_thr
     })
@@ -304,6 +386,33 @@ pub fn build_speech_frames(
 /// `asry::emissions::compose_words`, the final stage after
 /// [`crate::runner::aligner::algorithm::trellis_beam::align_emissions`]
 /// for a caller with its own acoustic encoder.
+///
+/// # The `samples_to_output_range` contract
+///
+/// `samples_to_output_range` is invoked once per surviving word with
+/// `(raw_start, clamped_end)` — stream-absolute 16 kHz sample indices,
+/// always `raw_start < clamped_end`, and always inside
+/// `[chunk_first_sample_in_stream, chunk_first_sample_in_stream +
+/// real_n_samples)` (saturating).
+///
+/// **It must be total over the whole `u64` range, not just over
+/// `[0, i64::MAX]`.** `chunk_first_sample_in_stream` is a `u64` the
+/// caller chooses, so with a high enough anchor `compose_words` will
+/// legitimately hand this closure sample indices *above* `i64::MAX`.
+/// A bridge that reaches `i64` with a bare `as i64` cast truncates
+/// there (`u64::MAX as i64 == -1`), which can invert an ordered
+/// `(start, end)` pair — and `mediatime::TimeRange::new` asserts
+/// `start <= end`, so the caller's own closure panics. Saturate
+/// (`i64::try_from(x).unwrap_or(i64::MAX)`) or otherwise handle the
+/// high half of the range.
+///
+/// `compose_words`'s own arithmetic is total over every argument:
+/// frame->sample products go through `f64 as u64` (saturating), the
+/// anchor adds are `saturating_add`, speech-mask reads are clamped to
+/// `speech_frames.len()`, and a zero `hop_samples` yields a
+/// zero-numerator [`Timebase`] whose `duration_to_pts` is defined
+/// (`0`). Pinned by
+/// `compose_words_is_total_over_its_degenerate_argument_corners`.
 #[allow(
   clippy::too_many_arguments,
   reason = "10 args carry the per-chunk composition contract \
@@ -467,8 +576,21 @@ mod tests {
     Timebase::new(1, NonZeroU32::new(1000).unwrap())
   }
 
+  /// Stand-in for the caller's sample->PTS bridge.
+  ///
+  /// Saturates rather than `as i64`-casting.  //  `compose_words` is documented to call this with any
+  /// `raw_start < clamped_end` in `[0, u64::MAX]`, and a `u64 as i64`
+  /// cast is *truncating*: `u64::MAX as i64 == -1`. A high anchor
+  /// therefore mapped an ordered `(raw_start, clamped_end)` pair onto
+  /// an INVERTED `(i64, i64)` pair, and `TimeRange::new` asserts
+  /// `start <= end` — so the naive helper panicked inside `mediatime`
+  /// on inputs `compose_words` is entitled to produce. That was a bug
+  /// in this helper, not in `compose_words` (whose own arithmetic
+  /// saturates), but it is exactly the trap the closure contract now
+  /// spells out, so the helper models a CORRECT caller bridge.
   fn fake_samples_to_output_range(start: u64, end: u64) -> TimeRange {
-    TimeRange::new(start as i64, end as i64, tb_ms())
+    let clamp = |x: u64| i64::try_from(x).unwrap_or(i64::MAX);
+    TimeRange::new(clamp(start), clamp(end), tb_ms())
   }
 
   /// Helper: build a single-word `WordSegment`.
@@ -520,6 +642,116 @@ mod tests {
         "unexpected surface form on overflow recovery: {:?}",
         w.text(),
       );
+    }
+  }
+
+  /// Companion to the `build_speech_frames` saturation regressions:
+  /// `compose_words` is the OTHER public arithmetic helper on the
+  /// `emissions` surface, so the same "can any valid-typed input panic
+  /// or silently misbehave?" question has to be answered for it too.
+  ///
+  /// This sweeps the degenerate corners of every argument — a zero
+  /// hop (which makes `Timebase`'s numerator zero), zero/one
+  /// `total_frames` (the `effective_samples_per_frame` fallback), a
+  /// `u64::MAX` chunk anchor and `u64::MAX` sample extents, an empty
+  /// speech mask against a segment that claims frames, a
+  /// `usize::MAX` frame span, `usize::MAX` word index, and non-finite
+  /// scores — and asserts only what must hold for ALL of them: no
+  /// panic, and every emitted `Word` still satisfies `Word`'s
+  /// `[0, 1]` NaN-free score contract and the chunk window.
+  ///
+  /// It found no hole (`compose_words` was already closed: the
+  /// frame->sample conversions are `f64 as u64`, which saturates;
+  /// the anchor adds are `saturating_add`; the speech-mask reads are
+  /// `.min(speech_frames.len())`-clamped; `Timebase::duration_to_pts`
+  /// returns 0 for a zero numerator and saturates at `i64::MAX`).
+  /// It stays as the executable evidence of that.
+  #[test]
+  fn compose_words_is_total_over_its_degenerate_argument_corners() {
+    let anchors = [0_u64, 1, u64::MAX / 2, u64::MAX - 1, u64::MAX];
+    let hops = [0_u32, 1, 320, u32::MAX];
+    let extents = [0_u64, 1, 480_000, u64::MAX];
+    let frame_counts = [0_usize, 1, 2, usize::MAX];
+    let spans = [(0_usize, 0_usize), (0, 1), (0, usize::MAX), (usize::MAX, 0)];
+    let scores = [
+      0.0_f32,
+      1.0,
+      -1.0,
+      2.0,
+      f32::NAN,
+      f32::INFINITY,
+      f32::NEG_INFINITY,
+    ];
+
+    let original = vec![Cow::Borrowed("w")];
+    // Deliberately SHORTER than the spans below, and sometimes empty.
+    for speech_frames in [vec![], vec![true], vec![true, false, true]] {
+      for &anchor in &anchors {
+        for &hop in &hops {
+          for &encoder_n in &extents {
+            for &real_n in &extents {
+              for &total_frames in &frame_counts {
+                for &(start, end) in &spans {
+                  for &score in &scores {
+                    // `usize::MAX` word index exercises the
+                    // `original_words.get()` miss; index 0 hits.
+                    for word_index in [0_usize, usize::MAX] {
+                      let seg = one_word(start, end, score, word_index);
+                      let chunk_end = anchor.saturating_add(real_n);
+                      // Record the (u64, u64) pairs `compose_words`
+                      // hands the bridge. THOSE are what it promises
+                      // things about; what a lossy bridge then makes
+                      // of them is the bridge's business (a saturating
+                      // one can legitimately collapse two distinct
+                      // u64s onto one i64 up at the top of the range).
+                      let seen = core::cell::RefCell::new(Vec::new());
+                      let result = compose_words(
+                        &[seg],
+                        &original,
+                        &speech_frames,
+                        anchor,
+                        hop,
+                        encoder_n,
+                        real_n,
+                        total_frames,
+                        |s, e| {
+                          seen.borrow_mut().push((s, e));
+                          fake_samples_to_output_range(s, e)
+                        },
+                        DEFAULT_MIN_SPEECH_COVERAGE,
+                        DEFAULT_MAX_INTRA_SILENT_RUN,
+                      );
+                      let ctx = format!(
+                        "anchor={anchor}, hop={hop}, encoder_n={encoder_n}, \
+ real_n={real_n}, total_frames={total_frames}, span={start}..{end}, \
+ raw_score={score}, word_index={word_index}"
+                      );
+                      // The documented bridge contract, on the values
+                      // `compose_words` actually supplies.
+                      for &(s, e) in seen.borrow().iter() {
+                        assert!(s < e, "bridge got an inverted range {s}..{e} ({ctx})");
+                        assert!(s >= anchor, "bridge got {s} before the anchor ({ctx})");
+                        assert!(
+                          e <= chunk_end,
+                          "bridge got {e} past the chunk end {chunk_end} ({ctx})"
+                        );
+                      }
+                      // `Word`'s public score contract: finite, [0, 1].
+                      for w in result.words() {
+                        let s = w.score();
+                        assert!(
+                          !s.is_nan() && (0.0..=1.0).contains(&s),
+                          "score contract violated: {s} ({ctx})"
+                        );
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
   }
 
@@ -806,6 +1038,83 @@ mod tests {
   fn build_speech_frames_handles_no_segments() {
     let mask = build_speech_frames(4, 320.0, 1280, 1280, &[]);
     assert_eq!(mask, vec![false; 4]);
+  }
+
+  ///  regression — the exact failing history. Both
+  /// `n_samples` and `real_n_samples` are `u64::MAX`, which is a legal
+  /// value of the advertised argument type and which a bare
+  /// `emissions` caller can supply (the ORT path cannot: the encoder
+  /// stride check bounds `n_samples` to the chunk's audio length).
+  ///
+  /// Pre-fix this panicked in BOTH profiles, at different sites:
+  ///
+  /// - debug (`overflow-checks = on`): `spf.floor() as i64` saturates
+  ///   to `i64::MAX`, then `(spf_int + 1)` → "attempt to add with
+  ///   overflow";
+  /// - release: that add wraps instead, but `u64::MAX as i64` is a
+  ///   *truncating* cast to `-1`, so `frame_lo_i.clamp(0, -1)` →
+  ///   "min > max. min = 0, max = -1". `Ord::clamp` asserts
+  ///   `min <= max` unconditionally, so release is no safer here.
+  ///
+  /// Post-fix the extents saturate into `i64` and the ceil-halves are
+  /// overflow-free, so the call returns a defined all-`false` mask:
+  /// no VAD segment was supplied, therefore no frame is speech.
+  #[test]
+  fn build_speech_frames_saturates_u64_max_sample_extents() {
+    let n = u64::MAX;
+    let spf = effective_samples_per_frame(n, 2, 320);
+    let mask = build_speech_frames(2, spf, n, n, &[]);
+    assert_eq!(
+      mask,
+      vec![false, false],
+      "a u64::MAX sample extent must yield a defined all-false mask, never a panic",
+    );
+  }
+
+  /// Same saturation, with a NON-EMPTY `sub_segments` list — this
+  /// reaches the *other* `clamp(0, real_n_samples_i64)` pair, the one
+  /// inside the `clamped_segs` fold, which the empty-slice history
+  /// above skipped entirely. Pre-fix that clamp took the same inverted
+  /// `(0, -1)` bound and panicked identically.
+  #[test]
+  fn build_speech_frames_saturates_u64_max_extents_with_segments() {
+    use core::num::NonZeroU32;
+    use mediatime::{TimeRange, Timebase};
+
+    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    let n = u64::MAX;
+    let spf = effective_samples_per_frame(n, 2, 320);
+    let segs = vec![TimeRange::new(0, 16_000, tb_16k)];
+    let mask = build_speech_frames(2, spf, n, n, &segs);
+    // Frame 0 spans `[0, i64::MAX)` of "real" audio, so its majority
+    // threshold is ~2^62 samples; a 16 000-sample segment is nowhere
+    // near it. The contract under test is that we get an answer at
+    // all rather than a panicking clamp.
+    assert_eq!(mask.len(), 2);
+    assert_eq!(mask, vec![false, false]);
+  }
+
+  /// The saturating `u64 -> i64` fold and the `ceil_half` rewrite must
+  /// be value-identical to the old `as` cast / `(x + 1) / 2` for every
+  /// extent the ORT path can actually produce. Pin the helpers
+  /// directly against the arithmetic they replaced, across the
+  /// realistic range plus the boundary where the two diverge.
+  #[test]
+  fn saturating_extent_and_ceil_half_match_the_naive_arithmetic_below_the_boundary() {
+    for x in [0_i64, 1, 2, 3, 4, 5, 159, 160, 319, 320, 321, 480_000] {
+      assert_eq!(ceil_half(x), (x + 1) / 2, "ceil_half diverged at {x}");
+    }
+    // Saturating fold is the identity cast for every extent that fits
+    // `i64` — i.e. every extent the encoder stride check permits.
+    for x in [0_u64, 1, 320, 480_000, i64::MAX as u64] {
+      assert_eq!(saturating_extent_i64(x), x as i64, "fold diverged at {x}");
+    }
+    // Above the boundary the old cast went NEGATIVE (that was the
+    // bug); the fold saturates instead.
+    assert_eq!(saturating_extent_i64(u64::MAX), i64::MAX);
+    assert_eq!(saturating_extent_i64(i64::MAX as u64 + 1), i64::MAX);
+    // And ceil_half stays total exactly where `(x + 1) / 2` overflows.
+    assert_eq!(ceil_half(i64::MAX), 4_611_686_018_427_387_904);
   }
 
   #[test]
