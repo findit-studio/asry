@@ -26,12 +26,18 @@ mod aligner;
 mod builder;
 /// Feature-neutral construction guards (tokenizer load + compat shim,
 /// blank/unk id resolution, uppercase probe, vocab-size capture,
-/// delimiter validation, coverage coercion). Ungated: the enclosing
-/// `aligner` module is already `cfg(any(alignment, emissions))`, and
-/// every guard here is ort-free — which is the point. `Aligner` and
-/// the emissions front end share ONE set of guards rather than the
-/// seam getting a second, weaker set.
+/// delimiter validation, coverage coercion) plus `AlignerCore` — the
+/// sealed middle of the sandwich that both `Aligner` and
+/// `EmissionsAligner` contain. Ungated: the enclosing `aligner` module
+/// is already `cfg(any(alignment, emissions))`, and everything here is
+/// ort-free, which is the point. Both front ends share ONE set of
+/// guards rather than the seam getting a second, weaker set.
 mod core;
+/// The validated seam types (`Emissions`, `SpeechSpans`, `SampleSpan`,
+/// `SpeechCoverage`, `OutputClock`, `SpanError`) — the only vocabulary
+/// an external-encoder caller speaks. Each one deletes a domain that a
+/// raw scalar used to leave open.
+pub(crate) mod emissions_api;
 #[cfg(feature = "alignment")]
 mod key;
 mod normalizer;
