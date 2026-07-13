@@ -383,9 +383,11 @@ pub fn detect_oov_events(
 /// two would reject every legitimate `Any`-fallback payload. (This
 /// doc used to list `language` as part of the check; the fallback
 /// test `tokenize_with_word_map_accepts_mismatched_language_under_any_fallback`
-/// requires the opposite.) The direct `Aligner` path — which has no
-/// `Any` fallback — closes that gap at its own boundary with
-/// `validate_direct_decision_languages`;
+/// requires the opposite.) That gap is closed one layer up, in
+/// `AlignerCore::prepare` via `validate_decision_languages`, against
+/// the caller-named policy key — so BOTH front ends (the ORT `Aligner`
+/// and the `EmissionsAligner` seam) get the check from one
+/// implementation, not just whichever one remembered to add it;
 /// * mid-loop too-short consumption — defense-in-depth if the
 /// preflight is somehow bypassed.
 ///

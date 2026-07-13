@@ -285,6 +285,76 @@ fn finish_rejects_a_frame_count_that_cannot_match_the_audio() {
   );
 }
 
+// ———————— The guard that lived in `Aligner` and not in the seam ————————
+
+/// **The seam validates OOV decision languages — it did not before.**
+///
+/// The ORT `Aligner` has always rejected a cross-language `ResolvedOov`
+/// payload on its direct path. `EmissionsAligner::prepare` forwarded the
+/// decisions straight through, so an English aligner handed a Korean
+/// decision *at a matching position* applied the KOREAN policy to English
+/// text, silently.
+///
+/// It slips through everything else on purpose:
+/// `OovEvent::matches_position` compares kind + char_index + word_index and
+/// deliberately IGNORES language, because `AlignerKey::Any` fallback needs
+/// it to. So nothing else was looking.
+///
+/// The guard now lives in `AlignerCore::prepare` — one implementation, both
+/// front ends.
+#[test]
+fn prepare_rejects_oov_decisions_resolved_for_another_language() {
+  use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
+
+  let a = aligner(); // Lang::En
+  let samples = vec![0.2_f32; 16_000];
+
+  // A decision made for Korean, whose POSITIONAL fields (kind, char_index,
+  // word_index) are exactly what an English detection would produce — so
+  // positional matching accepts it and only the language separates them.
+  let foreign = vec![ResolvedOov::new(
+    OovEvent::new(OovKind::Symbol('&'), 0, 0, Lang::Ko),
+    OovDecision::Wildcard,
+  )];
+
+  let Err(err) = a.prepare(&samples, &SpeechSpans::all_speech(), "&", &foreign) else {
+    panic!("a Korean decision must not drive an English aligner's OOV policy");
+  };
+  let EmissionsError::Tokenization(f) = err else {
+    panic!("expected a Tokenization error; got {err:?}");
+  };
+  assert!(
+    f.message().contains("oov_decisions[0].event.language")
+      && f.message().contains("Ko")
+      && f.message().contains("En"),
+    "diagnostic must cite the offending index and both languages; got {}",
+    f.message()
+  );
+}
+
+/// The dual: same-language decisions still flow through untouched.
+///
+/// Same `&` OOV at the same position as the rejection test above — the ONLY
+/// difference is that these decisions were detected from THIS aligner, so
+/// they carry `En`. `wildcard_all_decisions` rather than the default policy
+/// because `&` is a *pronounced* symbol, which the default fail-closes for
+/// unrelated (and correct) reasons.
+#[test]
+fn prepare_accepts_oov_decisions_resolved_for_its_own_language() {
+  use crate::core::oov::wildcard_all_decisions;
+
+  let a = aligner();
+  let samples = vec![0.2_f32; 16_000];
+  let decisions = wildcard_all_decisions(&a.detect_oov("hello & world").expect("detect_oov"));
+  a.prepare(
+    &samples,
+    &SpeechSpans::all_speech(),
+    "hello & world",
+    &decisions,
+  )
+  .expect("decisions detected from THIS aligner carry its language");
+}
+
 // —————————————— The check no DIMENSION check can make ——————————————
 
 /// **Cross-aligner mispairing is rejected, not silently mis-aligned.**
