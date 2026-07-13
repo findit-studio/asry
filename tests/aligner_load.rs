@@ -10,7 +10,7 @@
 //! SHA-256-verifies it. This test is the regression that keeps the
 //! compat shim honest against the real upstream artifact.
 //!
-//! # Why `#[ignore]` and not a silent skip
+//! # Why it is `#[ignore]`d without its fixture, and not silently skipped
 //!
 //! This test used to open with `let (Some(m), Some(t)) = (..) else {
 //! return; };`. build.rs only emits those env vars under
@@ -20,12 +20,19 @@
 //! reports success without executing is worse than no gate: it
 //! occupies the slot a real one would fill.
 //!
-//! `#[ignore]` reports the unrun case honestly (as *ignored*, never as
-//! *passed*), and the `expect` below makes the opted-in run fail loudly
-//! when the fixture is missing. Run it with:
+//! Now the fixture's presence decides. build.rs emits `asry_w2v_en`
+//! only when the English model and tokenizer are both on disk and both
+//! match their SHA-256 pins, so:
+//!
+//! * fixture present ⇒ an ordinary test, which **runs**;
+//! * fixture absent ⇒ `#[ignore]`d, reported as *ignored*;
+//! * forced (`-- --ignored`) without a fixture ⇒ the `expect` below
+//!   fails loudly.
+//!
+//! No path reports `passed` without having executed. Run it with:
 //!
 //! ```sh
-//! ASRY_FETCH_W2V=1 cargo test --features alignment -- --ignored
+//! ASRY_FETCH_W2V=en cargo test --features alignment
 //! ```
 
 #![cfg(feature = "alignment")]
@@ -40,10 +47,13 @@ use asry::{Aligner, EnglishNormalizer, Lang};
 const W2V_MODEL: Option<&str> = option_env!("ASRY_W2V_MODEL");
 const W2V_TOKENIZER: Option<&str> = option_env!("ASRY_W2V_TOKENIZER");
 
-const FIXTURE_OPT_IN: &str = "ASRY_FETCH_W2V=1 cargo test --features alignment -- --ignored";
+const FIXTURE_OPT_IN: &str = "ASRY_FETCH_W2V=en cargo test --features alignment";
 
 #[test]
-#[ignore = "requires the English wav2vec2 fixture (ASRY_FETCH_W2V=1)"]
+#[cfg_attr(
+  not(asry_w2v_en),
+  ignore = "needs the English wav2vec2 fixture: ASRY_FETCH_W2V=en cargo test --features alignment"
+)]
 fn from_paths_loads_bundled_wav2vec2_fixtures() {
   let model_path = W2V_MODEL.unwrap_or_else(|| {
     panic!(

@@ -47,6 +47,13 @@ mod normalizer;
 mod normalizers;
 #[cfg(feature = "alignment")]
 mod set;
+/// Shared access to the `build.rs`-fetched wav2vec2 fixtures, for the
+/// tests that need a real `Aligner` — the `Aligner`'s own, and
+/// `alignment_pool`'s, which proves the pool recovers what the aligner
+/// reports. One helper, so both layers resolve a fixture (and fail on
+/// its absence) identically.
+#[cfg(all(test, feature = "alignment"))]
+pub(crate) mod test_fixtures;
 
 #[cfg(feature = "alignment")]
 pub use algorithm::compose::{DEFAULT_MAX_INTRA_SILENT_RUN, DEFAULT_MIN_SPEECH_COVERAGE};

@@ -72,22 +72,49 @@ mv "$TMP" models/wav2vec2-base-960h.onnx
 
 (Asry's `build.rs` can fetch these for you. The two opt-ins are
 independent: `ASRY_FETCH_MODEL=1` fetches the whisper checkpoint,
-`ASRY_FETCH_W2V=1` fetches the wav2vec2 alignment encoders — you do
+`ASRY_FETCH_W2V` fetches the wav2vec2 alignment encoders — you do
 not need the 1.6 GB whisper checkpoint just to align. The script
 enforces the same SHA-256 pins. Plain `cargo build` makes no network
 requests.)
 
-The forced-alignment tests are `#[ignore]`d, because they cannot run
-without the wav2vec2 fixture above — and a test that quietly returns
-`ok` when its model is missing is not a test. Run them explicitly:
+### Running the forced-alignment tests
+
+`ASRY_FETCH_W2V` selects **per language**, so you only download what
+you intend to run:
+
+| Value | Fetches |
+|---|---|
+| `en` | English only — **378 MB**. What you want. |
+| `en,ja` | a comma-separated subset |
+| `1` | every language — **~10 GB**. `all` is a synonym. |
+| *(unset)* / `0` | nothing |
+
+Valid codes: `en`, `ja`, `zh`, `ko`, `es`, `fr`, `de`, `it`, `pt`. A
+typo is a hard build error, not a silent no-op.
+
+Fetch a language's fixture and its alignment tests simply **run** — no
+`--ignored`, no second step:
 
 ```sh
-ASRY_FETCH_W2V=1 cargo test --features alignment -- --ignored
+export ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib  # ort is load-dynamic
+ASRY_FETCH_W2V=en cargo test --features alignment
 ```
 
-`ort` is built `load-dynamic`, so point it at an ONNX Runtime shared
-library first (e.g. `export
-ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib`).
+Skip the fetch and those same tests are reported as **`ignored`**, with
+the exact command that would enable each one. They are never reported
+as *passed*: `build.rs` emits `asry_w2v_<code>` only once that
+language's model **and** tokenizer are on disk and match their SHA-256
+pins, and a test is `#[ignore]`d unless its own language's cfg is set.
+Force one to run without its fixture (`-- --ignored`) and it fails
+loudly rather than finding some way to report green.
+
+That matters more than it sounds. These tests spent the project's
+entire history behind an `option_env!` guard that returned early when
+the fixture was absent — which was every CI run and every default
+`cargo test`. Eleven tests, each claiming to load a 378 MB ONNX
+encoder, reported `ok` in 0.00s without opening a file. A test that
+reports success without executing is worse than no test: it occupies
+the slot a real gate would fill.
 
 ### Run an end-to-end alignment
 
