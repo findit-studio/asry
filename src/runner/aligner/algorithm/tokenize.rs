@@ -216,9 +216,13 @@ fn boundary_fail_closed(position: &str) -> EmissionsError {
 /// surfaced"; `U.S.A` emits two `InternalPunct` events, as
 /// `detect_oov_events_surfaces_internal_punct` pins.)
 ///
-/// Pronounced non-alphanumeric OOV chars (`&`, `@`, `%`, `,`) are
-/// surfaced as [`OovKind::Symbol`](crate::core::OovKind::Symbol)
-/// rather than silently dropped.
+/// Every char the tokenizer maps to `<unk>` — or to nothing at all —
+/// is surfaced as [`OovKind::Symbol`](crate::core::OovKind::Symbol)
+/// rather than silently dropped. That includes **alphanumerics**, not
+/// just pronounced symbols like `&` / `@` / `%` / `,`: a digit against
+/// the English wav2vec2 vocab, which has none, is a `Symbol` event too
+/// (`tokenize_with_word_map_rejects_stale_same_length_decisions` leans
+/// on `"4"` producing exactly one).
 ///
 /// # Errors
 ///
