@@ -8,7 +8,7 @@
 //!
 //! # Backward compatibility
 //!
-//! [`crate::EnglishNormalizer`] is now a thin wrapper that
+//! `EnglishNormalizer` is now a thin wrapper that
 //! constructs a `LatinNormalizer::new(Lang::En)` — every existing
 //! consumer keeps compiling. The old `english.rs` test contract
 //! (lowercase + boundary-punct strip + apostrophes-survive-inside,
@@ -118,7 +118,7 @@ impl LatinNormalizer {
   /// Construct a Latin normaliser using `Lang::En` rules. Kept as
   /// a `const fn` shorthand for the common case + back-compat
   /// with consumers that don't carry a `Lang` value (e.g.
-  /// [`crate::EnglishNormalizer`]).
+  /// `EnglishNormalizer`).
   pub const fn english() -> Self {
     Self {
       rules: LatinRules {

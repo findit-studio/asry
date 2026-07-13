@@ -8,9 +8,11 @@
 //! API): threading and lifecycle become the caller's
 //! responsibility. The new public primitives are:
 //!
-//! - [`AsrSource`] / [`WhisperAsrSource`] — sync ASR
-//!   compute, no internal threads, caller-driven cancellation
-//!   via a shared `Arc<AtomicBool>`.
+//! - [`AsrSource`] / `WhisperAsrSource` (the latter needs
+//!   `feature = "runner"`; not linked here because it doesn't
+//!   exist under a bare `emissions` build) — sync ASR compute,
+//!   no internal threads, caller-driven cancellation via a
+//!   shared `Arc<AtomicBool>`.
 //! - [`crate::core::Transcriber`] — the existing Sans-I/O
 //!   state machine; pull commands via `poll_command()`,
 //!   dispatch them inline, push results back via
@@ -19,8 +21,9 @@
 //!
 //! Sync users (CLI tools, batch indexers) drive the pump on
 //! one thread. The full ASR + alignment loop, using
-//! [`run_one_alignment`] so per-language script-dispatch
-//! `runs` are honoured:
+//! `run_one_alignment` (needs `feature = "alignment"`; not
+//! linked here because it doesn't exist under a bare `emissions`
+//! build) so per-language script-dispatch `runs` are honoured:
 //!
 //! ```ignore
 //! use core::num::NonZeroU32;

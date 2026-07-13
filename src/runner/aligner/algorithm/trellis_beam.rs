@@ -27,8 +27,9 @@
 //! Asry-specific concerns kept here:
 //! - **Watchdog / abort flag** — checked once per frame row in the
 //! forward DP and once per beam-step iteration so a pathological
-//! token sequence × T pair can't hold the alignment worker past
-//! `align_timeout`.
+//! token sequence × T pair can't hold the caller past its
+//! timeout — the `alignment`-feature pool's `align_timeout`, or an
+//! `emissions`-only caller's own `abort_flag` deadline.
 //! - **Lattice cell budget** — caps `T × num_tokens` at 32 M cells
 //! so a hallucinated long token list against a long chunk turns
 //! into an in-band `NoAlignmentPath` failure rather than an OOM.
