@@ -1,7 +1,54 @@
-//! Build script: fetch the production whisper checkpoint
-//! (ggml-large-v3-turbo.bin, ~1.6 GB) into the in-tree
-//! `models/` directory once, with SHA-256 verification, and
-//! re-run when the env vars below change.
+//! Build script: fetch the SHA-256-pinned model fixtures into the
+//! in-tree `models/` directory once, and re-run when the env vars
+//! below change.
+//!
+//! # The two opt-ins
+//!
+//! Nothing is downloaded unless you ask. The two fixture families are
+//! independent — the alignment path never loads the whisper
+//! checkpoint, so you do not need the 1.6 GB checkpoint to align:
+//!
+//! | Env var | Fetches |
+//! |---|---|
+//! | `ASRY_FETCH_MODEL=1` | `ggml-large-v3-turbo.bin` (~1.6 GB) + `jfk.wav`. Needs the `runner` feature. |
+//! | `ASRY_FETCH_W2V=<sel>` | wav2vec2 forced-alignment encoders. Needs the `alignment` feature. |
+//!
+//! # `ASRY_FETCH_W2V` selects **per language**
+//!
+//! Fetching all nine languages costs ~10 GB, which is not a price
+//! anyone pays casually — and an opt-in nobody takes is how the
+//! alignment tests ended up never running at all (they reported `ok`
+//! in 0.00s without loading a model; see
+//! `runner::aligner::test_fixtures`). So the selector is granular:
+//!
+//! ```sh
+//! ASRY_FETCH_W2V=en          # English only — 378 MB. The common case.
+//! ASRY_FETCH_W2V=en,ja       # a comma-separated subset
+//! ASRY_FETCH_W2V=1           # every language (~10 GB). `all` is a synonym.
+//! ```
+//!
+//! Valid codes are the `code` column of [`W2V_FIXTURES`]: `en`, `ja`,
+//! `zh`, `ko`, `es`, `fr`, `de`, `it`, `pt`. An unrecognised token is a
+//! **hard build error**, never a silent no-op — a typo that quietly
+//! fetches nothing would put you right back in the "the gate never
+//! ran" hole.
+//!
+//! # What a successful fetch emits
+//!
+//! For each language whose model **and** tokenizer downloaded and
+//! matched their SHA-256 pins, this script emits:
+//!
+//! - `cargo:rustc-env=<PREFIX>_MODEL` / `_TOKENIZER` — the on-disk
+//!   paths, read by `option_env!` in the tests;
+//! - `cargo:rustc-cfg=asry_w2v_<code>` — the presence flag the tests
+//!   gate their `#[ignore]` on.
+//!
+//! Both are emitted together or not at all, so `asry_w2v_<code>` means
+//! exactly "a provenance-verified fixture for `<code>` is on disk".
+//! A fixture-gated test compiles to a normal test when its cfg is set
+//! and to an `#[ignore]`d one when it isn't — so it either really runs,
+//! or is honestly reported as *ignored*. It can never report `passed`
+//! without having executed.
 
 use std::{
   fs,
@@ -93,12 +140,13 @@ const TOKENIZER_W2V_KO_SHA256: &str =
 // SHA-verified after upload via `curl -L <url> | sha256sum`.
 //
 // A fetch that 404s or fails its SHA check does NOT fail the build:
-// `fetch_extra_align_fixture` logs and returns, leaving the
-// corresponding `cargo:rustc-env` var unset. The consequence is no
-// longer "the dependent test skips and reports green" — those tests
-// are `#[ignore]`d and hard-fail on a missing fixture, so an
-// unreachable mirror surfaces as a failing `--ignored` run naming
-// the exact env var, not as a false pass.
+// `fetch_align_fixture` logs and returns false, leaving both the
+// `cargo:rustc-env` vars and the `asry_w2v_<code>` cfg unset. The
+// consequence is no longer "the dependent test skips and reports
+// green" — with the cfg unset the test is `#[ignore]`d, so an
+// unreachable mirror surfaces as an *ignored* test naming the fixture
+// it wanted, and as a hard failure if anyone force-runs it with
+// `--ignored`. Never as a false pass.
 //
 // IMPORTANT: keep this block contiguous so a sibling Korean
 // branch's parallel additions merge mechanically.
@@ -159,6 +207,138 @@ const TOKENIZER_W2V_PT_FILENAME: &str =
 const TOKENIZER_W2V_PT_SHA256: &str =
   "841f77f1a38b2b96629e49df36eb52278f6e0181fa73f9aa934d70a19463c315";
 
+/// One language's forced-alignment fixture pair.
+///
+/// The single source of truth for the wav2vec2 fixtures: the
+/// `ASRY_FETCH_W2V` selector validates against [`Self::code`], the
+/// fetch loop walks these entries, and the `rustc-check-cfg`
+/// declarations are generated from them. Adding a language means
+/// adding one row — the selector, the fetch, and the cfg declaration
+/// cannot drift out of sync with each other.
+struct W2vFixture {
+  /// Selector token in `ASRY_FETCH_W2V`, and the suffix of the
+  /// emitted `asry_w2v_<code>` cfg. Lowercase.
+  code: &'static str,
+  /// Emitted env vars are `<env_prefix>_MODEL` and
+  /// `<env_prefix>_TOKENIZER`. English is `ASRY_W2V` (not
+  /// `ASRY_W2V_EN`) — those names predate the multi-language
+  /// fixtures and are load-bearing for the README and the tests.
+  env_prefix: &'static str,
+  /// Rounded download size, for the "this will cost you" log line.
+  approx_mb: u32,
+  model_url: &'static str,
+  model_filename: &'static str,
+  model_sha256: &'static str,
+  tokenizer_url: &'static str,
+  tokenizer_filename: &'static str,
+  tokenizer_sha256: &'static str,
+}
+
+/// Every fetchable alignment fixture. English first — it is the one
+/// the core alignment tests need, and the only one that is affordable
+/// on its own (378 MB vs ~1.2 GB for each `large-xlsr` model).
+const W2V_FIXTURES: &[W2vFixture] = &[
+  W2vFixture {
+    code: "en",
+    env_prefix: "ASRY_W2V",
+    approx_mb: 378,
+    model_url: MODEL_W2V_URL,
+    model_filename: MODEL_W2V_FILENAME,
+    model_sha256: MODEL_W2V_SHA256,
+    tokenizer_url: TOKENIZER_W2V_URL,
+    tokenizer_filename: TOKENIZER_W2V_FILENAME,
+    tokenizer_sha256: TOKENIZER_W2V_SHA256,
+  },
+  W2vFixture {
+    code: "ja",
+    env_prefix: "ASRY_W2V_JA",
+    approx_mb: 1200,
+    model_url: MODEL_W2V_JA_URL,
+    model_filename: MODEL_W2V_JA_FILENAME,
+    model_sha256: MODEL_W2V_JA_SHA256,
+    tokenizer_url: TOKENIZER_W2V_JA_URL,
+    tokenizer_filename: TOKENIZER_W2V_JA_FILENAME,
+    tokenizer_sha256: TOKENIZER_W2V_JA_SHA256,
+  },
+  W2vFixture {
+    code: "zh",
+    env_prefix: "ASRY_W2V_ZH",
+    approx_mb: 1200,
+    model_url: MODEL_W2V_ZH_URL,
+    model_filename: MODEL_W2V_ZH_FILENAME,
+    model_sha256: MODEL_W2V_ZH_SHA256,
+    tokenizer_url: TOKENIZER_W2V_ZH_URL,
+    tokenizer_filename: TOKENIZER_W2V_ZH_FILENAME,
+    tokenizer_sha256: TOKENIZER_W2V_ZH_SHA256,
+  },
+  W2vFixture {
+    code: "ko",
+    env_prefix: "ASRY_W2V_KO",
+    approx_mb: 1200,
+    model_url: MODEL_W2V_KO_URL,
+    model_filename: MODEL_W2V_KO_FILENAME,
+    model_sha256: MODEL_W2V_KO_SHA256,
+    tokenizer_url: TOKENIZER_W2V_KO_URL,
+    tokenizer_filename: TOKENIZER_W2V_KO_FILENAME,
+    tokenizer_sha256: TOKENIZER_W2V_KO_SHA256,
+  },
+  W2vFixture {
+    code: "es",
+    env_prefix: "ASRY_W2V_ES",
+    approx_mb: 1200,
+    model_url: MODEL_W2V_ES_URL,
+    model_filename: MODEL_W2V_ES_FILENAME,
+    model_sha256: MODEL_W2V_ES_SHA256,
+    tokenizer_url: TOKENIZER_W2V_ES_URL,
+    tokenizer_filename: TOKENIZER_W2V_ES_FILENAME,
+    tokenizer_sha256: TOKENIZER_W2V_ES_SHA256,
+  },
+  W2vFixture {
+    code: "fr",
+    env_prefix: "ASRY_W2V_FR",
+    approx_mb: 1200,
+    model_url: MODEL_W2V_FR_URL,
+    model_filename: MODEL_W2V_FR_FILENAME,
+    model_sha256: MODEL_W2V_FR_SHA256,
+    tokenizer_url: TOKENIZER_W2V_FR_URL,
+    tokenizer_filename: TOKENIZER_W2V_FR_FILENAME,
+    tokenizer_sha256: TOKENIZER_W2V_FR_SHA256,
+  },
+  W2vFixture {
+    code: "de",
+    env_prefix: "ASRY_W2V_DE",
+    approx_mb: 1200,
+    model_url: MODEL_W2V_DE_URL,
+    model_filename: MODEL_W2V_DE_FILENAME,
+    model_sha256: MODEL_W2V_DE_SHA256,
+    tokenizer_url: TOKENIZER_W2V_DE_URL,
+    tokenizer_filename: TOKENIZER_W2V_DE_FILENAME,
+    tokenizer_sha256: TOKENIZER_W2V_DE_SHA256,
+  },
+  W2vFixture {
+    code: "it",
+    env_prefix: "ASRY_W2V_IT",
+    approx_mb: 1200,
+    model_url: MODEL_W2V_IT_URL,
+    model_filename: MODEL_W2V_IT_FILENAME,
+    model_sha256: MODEL_W2V_IT_SHA256,
+    tokenizer_url: TOKENIZER_W2V_IT_URL,
+    tokenizer_filename: TOKENIZER_W2V_IT_FILENAME,
+    tokenizer_sha256: TOKENIZER_W2V_IT_SHA256,
+  },
+  W2vFixture {
+    code: "pt",
+    env_prefix: "ASRY_W2V_PT",
+    approx_mb: 1200,
+    model_url: MODEL_W2V_PT_URL,
+    model_filename: MODEL_W2V_PT_FILENAME,
+    model_sha256: MODEL_W2V_PT_SHA256,
+    tokenizer_url: TOKENIZER_W2V_PT_URL,
+    tokenizer_filename: TOKENIZER_W2V_PT_FILENAME,
+    tokenizer_sha256: TOKENIZER_W2V_PT_SHA256,
+  },
+];
+
 fn main() {
   println!("cargo:rerun-if-changed=build.rs");
   println!("cargo:rerun-if-changed=assets/wav2vec2_base_960h_tokenizer.json");
@@ -166,6 +346,19 @@ fn main() {
   println!("cargo:rerun-if-env-changed=ASRY_FETCH_MODEL");
   println!("cargo:rerun-if-env-changed=CARGO_FEATURE_ALIGNMENT");
   println!("cargo:rerun-if-env-changed=ASRY_FETCH_W2V");
+
+  // Declare every `asry_w2v_<code>` cfg the fetch below can emit, so
+  // the `unexpected_cfgs` lint accepts them (CI builds with
+  // `-Dwarnings`, so an undeclared cfg is a hard failure). Generated
+  // from `W2V_FIXTURES`, so a new language row declares its own cfg.
+  //
+  // Emitted BEFORE any early return: the declaration must hold for
+  // every build, including the ones that fetch nothing. Those are
+  // precisely the builds where `#[cfg(not(asry_w2v_en))]` is the arm
+  // that compiles, and an undeclared cfg would fail them.
+  for fixture in W2V_FIXTURES {
+    println!("cargo:rustc-check-cfg=cfg(asry_w2v_{})", fixture.code);
+  }
 
   // Windows: whisper.cpp's `ggml-cpu` references
   // `RegOpenKeyExA` / `RegQueryValueExA` / `RegCloseKey`
@@ -227,10 +420,17 @@ fn main() {
   // priced the alignment opt-in out of reach, and because the
   // alignment tests silently returned when the fixtures were absent,
   // the whole `Aligner` path went unexercised while still reporting
-  // green. Those tests now hard-fail rather than skip (see the
-  // `fixture_or_panic` helper in `runner::aligner::aligner`'s test
-  // module), which is only a fair gate if opting in is actually
-  // affordable. Hence: two separate, independent gates.
+  // green.
+  //
+  // Nothing about a test can force anyone to run it. All the test
+  // side can do (and now does — see `runner::aligner::test_fixtures`)
+  // is refuse to report `passed` without having executed. Whether the
+  // gate actually *runs* is decided here, by how much the opt-in
+  // costs: un-nesting the two families dropped the price of aligning
+  // from 2.0 GB to 378 MB, and `ASRY_FETCH_W2V`'s per-language
+  // selector keeps it there instead of the ~10 GB an all-languages
+  // fetch would demand. An affordable opt-in is the half of the fix
+  // that lives in the build script.
   fetch_whisper_fixtures(&models_dir);
   fetch_wav2vec2_fixtures(&models_dir);
 }
@@ -298,8 +498,8 @@ fn fetch_jfk_wav(fixture_dir: &std::path::Path) {
   }
 }
 
-/// The wav2vec2 forced-alignment encoders (English + the
-/// multi-language mirrors) and their tokenizers.
+/// The wav2vec2 forced-alignment encoders and their tokenizers, for
+/// the languages `ASRY_FETCH_W2V` selects.
 ///
 /// Opt-in via `ASRY_FETCH_W2V`, independent of `ASRY_FETCH_MODEL`:
 /// the alignment path never loads the whisper checkpoint, so
@@ -307,21 +507,53 @@ fn fetch_jfk_wav(fixture_dir: &std::path::Path) {
 /// was pure friction. Default builds still never hit the network,
 /// even when the `alignment` feature is enabled.
 ///
-/// The `cargo:rustc-env` vars emitted here are what the `Aligner`
-/// tests' `option_env!` reads. Emitting a var means "this file is on
-/// disk AND its SHA-256 matches the pin" — the tests therefore get a
-/// provenance-verified path or none at all, and a test that gets none
-/// now fails loudly instead of silently returning green.
+/// **Per-language, because ~10 GB is not an opt-in anyone takes.**
+/// `ASRY_FETCH_W2V=1` pulls all nine languages; the eight `large-xlsr`
+/// models are ~1.2 GB each. An opt-in that expensive is one nobody
+/// exercises, and a gate nobody exercises is indistinguishable from
+/// the vacuous one this replaced. `ASRY_FETCH_W2V=en` costs 378 MB and
+/// unlocks the two core alignment tests plus the pool's recovery test.
+///
+/// Each selected language emits, only on full success:
+/// `<PREFIX>_MODEL` + `<PREFIX>_TOKENIZER` (read by `option_env!`) and
+/// `asry_w2v_<code>` (the cfg the tests gate `#[ignore]` on). Emitting
+/// them means "both files are on disk AND both match their SHA-256
+/// pins" — the tests therefore get a provenance-verified fixture or
+/// nothing at all.
 fn fetch_wav2vec2_fixtures(models_dir: &std::path::Path) {
-  if std::env::var("ASRY_FETCH_W2V").is_err() {
+  let Ok(raw) = std::env::var("ASRY_FETCH_W2V") else {
+    return;
+  };
+  let selected = parse_w2v_selection(&raw);
+  if selected.is_empty() {
+    // An explicit "no" (`ASRY_FETCH_W2V=0`). A selector that is
+    // merely *unrecognised* panicked inside `parse_w2v_selection`
+    // rather than landing here — see its doc for why.
     return;
   }
+
   // Only fetch when the alignment feature is active. (Even with
   // FETCH_W2V set, an alignment-feature-off build doesn't need
-  // the wav2vec2 assets.)
+  // the wav2vec2 assets.) Say so out loud: a contributor who runs
+  // `ASRY_FETCH_W2V=en cargo test` and forgets `--features alignment`
+  // otherwise gets no download, no error, and a run in which every
+  // alignment test reports `ignored` — with nothing anywhere
+  // explaining why.
+  //
+  // `cargo:warning=`, not `eprintln!`: Cargo captures a build
+  // script's stderr and shows it only under `-vv`, so an `eprintln!`
+  // here would be invisible in exactly the run that needs it. The
+  // other `[asry build.rs]` lines in this file are progress chatter
+  // and can afford to stay captured; a misconfiguration cannot.
   if std::env::var("CARGO_FEATURE_ALIGNMENT").is_err() {
+    println!(
+      "cargo:warning=ASRY_FETCH_W2V={raw:?} was set, but the `alignment` feature is off: \
+       nothing was fetched, and the alignment tests are not compiled into this build. \
+       Re-run with `--features alignment`."
+    );
     return;
   }
+
   // No longer nested inside the whisper fetch, so create the
   // directory ourselves rather than relying on that path having run.
   if let Err(e) = fs::create_dir_all(models_dir) {
@@ -329,158 +561,144 @@ fn fetch_wav2vec2_fixtures(models_dir: &std::path::Path) {
     return;
   }
 
-  let model_path = models_dir.join(MODEL_W2V_FILENAME);
-  if !fetch_with_sha(MODEL_W2V_URL, &model_path, MODEL_W2V_SHA256) {
-    return;
+  // Independent per language: one dead mirror leaves the other
+  // selected languages fetchable. (This loop replaced a chain that
+  // `return`ed on the first failure, so a transient English 5xx used
+  // to silently skip Ja/Zh/Ko/… as well.)
+  for fixture in selected {
+    if fetch_align_fixture(models_dir, fixture) {
+      println!("cargo:rustc-cfg=asry_w2v_{}", fixture.code);
+    }
   }
-  println!("cargo:rustc-env=ASRY_W2V_MODEL={}", model_path.display());
-
-  let tokenizer_path = models_dir.join(TOKENIZER_W2V_FILENAME);
-  // Previously this path patched the downloaded tokenizer.json
-  // before storing it, so the runtime `Aligner::from_paths`
-  // only had to handle the patched form. The compat shim now
-  // lives in `Aligner::from_paths` itself
-  // (`load_tokenizer_with_compat`), which lets out-of-tree
-  // consumers load any HuggingFace wav2vec2 tokenizer.json —
-  // patched, unpatched, or in a totally different format. The
-  // build.rs path is now a plain SHA-verified fetch, identical
-  // to the model fetch shape.
-  if !fetch_with_sha(TOKENIZER_W2V_URL, &tokenizer_path, TOKENIZER_W2V_SHA256) {
-    return;
-  }
-  println!(
-    "cargo:rustc-env=ASRY_W2V_TOKENIZER={}",
-    tokenizer_path.display()
-  );
-
-  // Multi-language fixtures (Ja, Zh, ...). Mirror copies live in
-  // FinDIT-Studio's HF org as ONNX exports; build.rs fetches +
-  // SHA-verifies them under the same ASRY_FETCH_W2V opt-in
-  // as English. Each pair is independent — a Ja-only build
-  // skips the Zh fetch by env-var.
-  fetch_extra_align_fixture(
-    models_dir,
-    "ASRY_W2V_JA",
-    MODEL_W2V_JA_URL,
-    MODEL_W2V_JA_FILENAME,
-    MODEL_W2V_JA_SHA256,
-    TOKENIZER_W2V_JA_URL,
-    TOKENIZER_W2V_JA_FILENAME,
-    TOKENIZER_W2V_JA_SHA256,
-  );
-  fetch_extra_align_fixture(
-    models_dir,
-    "ASRY_W2V_ZH",
-    MODEL_W2V_ZH_URL,
-    MODEL_W2V_ZH_FILENAME,
-    MODEL_W2V_ZH_SHA256,
-    TOKENIZER_W2V_ZH_URL,
-    TOKENIZER_W2V_ZH_FILENAME,
-    TOKENIZER_W2V_ZH_SHA256,
-  );
-  fetch_extra_align_fixture(
-    models_dir,
-    "ASRY_W2V_KO",
-    MODEL_W2V_KO_URL,
-    MODEL_W2V_KO_FILENAME,
-    MODEL_W2V_KO_SHA256,
-    TOKENIZER_W2V_KO_URL,
-    TOKENIZER_W2V_KO_FILENAME,
-    TOKENIZER_W2V_KO_SHA256,
-  );
-
-  // Latin-language fixtures (Es, Fr, De, It, Pt). Same opt-in
-  // (`ASRY_FETCH_W2V`) as Ja / Zh / Ko.
-  fetch_extra_align_fixture(
-    models_dir,
-    "ASRY_W2V_ES",
-    MODEL_W2V_ES_URL,
-    MODEL_W2V_ES_FILENAME,
-    MODEL_W2V_ES_SHA256,
-    TOKENIZER_W2V_ES_URL,
-    TOKENIZER_W2V_ES_FILENAME,
-    TOKENIZER_W2V_ES_SHA256,
-  );
-  fetch_extra_align_fixture(
-    models_dir,
-    "ASRY_W2V_FR",
-    MODEL_W2V_FR_URL,
-    MODEL_W2V_FR_FILENAME,
-    MODEL_W2V_FR_SHA256,
-    TOKENIZER_W2V_FR_URL,
-    TOKENIZER_W2V_FR_FILENAME,
-    TOKENIZER_W2V_FR_SHA256,
-  );
-  fetch_extra_align_fixture(
-    models_dir,
-    "ASRY_W2V_DE",
-    MODEL_W2V_DE_URL,
-    MODEL_W2V_DE_FILENAME,
-    MODEL_W2V_DE_SHA256,
-    TOKENIZER_W2V_DE_URL,
-    TOKENIZER_W2V_DE_FILENAME,
-    TOKENIZER_W2V_DE_SHA256,
-  );
-  fetch_extra_align_fixture(
-    models_dir,
-    "ASRY_W2V_IT",
-    MODEL_W2V_IT_URL,
-    MODEL_W2V_IT_FILENAME,
-    MODEL_W2V_IT_SHA256,
-    TOKENIZER_W2V_IT_URL,
-    TOKENIZER_W2V_IT_FILENAME,
-    TOKENIZER_W2V_IT_SHA256,
-  );
-  fetch_extra_align_fixture(
-    models_dir,
-    "ASRY_W2V_PT",
-    MODEL_W2V_PT_URL,
-    MODEL_W2V_PT_FILENAME,
-    MODEL_W2V_PT_SHA256,
-    TOKENIZER_W2V_PT_URL,
-    TOKENIZER_W2V_PT_FILENAME,
-    TOKENIZER_W2V_PT_SHA256,
-  );
 }
 
-/// Fetch + SHA-verify a multi-language alignment fixture pair
-/// (`.onnx` + `tokenizer.json`) into `models_dir`, then emit
-/// `<env_prefix>_MODEL` and `<env_prefix>_TOKENIZER` env vars so
-/// `option_env!()` in tests can find them.
+/// Resolve `ASRY_FETCH_W2V`'s value into the fixtures to fetch.
 ///
-/// On any fetch / verification failure this function logs and returns
-/// without emitting the env vars, so a missing mirror never fails the
-/// *build*. It does not, however, buy the dependent test a free pass:
-/// the fixture-gated tests are `#[ignore]`d and panic on an unset var,
-/// so the absent fixture shows up as an explicit failure the moment
-/// someone opts into running them.
-#[allow(clippy::too_many_arguments)]
-fn fetch_extra_align_fixture(
-  models_dir: &std::path::Path,
-  env_prefix: &str,
-  model_url: &str,
-  model_filename: &str,
-  model_sha: &str,
-  tokenizer_url: &str,
-  tokenizer_filename: &str,
-  tokenizer_sha: &str,
-) {
-  let model_path = models_dir.join(model_filename);
-  if !fetch_with_sha(model_url, &model_path, model_sha) {
-    return;
+/// | Value | Meaning |
+/// |---|---|
+/// | `1`, `all` | every language (~10 GB) |
+/// | `en`, `en,ja`, … | a comma- or space-separated subset |
+/// | `0`, empty | fetch nothing (same as leaving the var unset) |
+///
+/// Case-insensitive. Duplicate codes collapse.
+///
+/// **An unrecognised value panics the build.** It would be easy to
+/// treat `ASRY_FETCH_W2V=eng` as "no languages matched, fetch nothing"
+/// — and that is exactly the failure mode this whole mechanism exists
+/// to kill. The contributor would get no download, no error, and a
+/// test run reporting `ignored` for the very tests they were trying to
+/// run, with nothing pointing at the typo. Fail loudly instead.
+fn parse_w2v_selection(raw: &str) -> Vec<&'static W2vFixture> {
+  let lowered = raw.trim().to_ascii_lowercase();
+  match lowered.as_str() {
+    // Explicit opt-out, so a wrapper script can disable the fetch by
+    // value rather than having to unset the variable.
+    "" | "0" | "no" | "off" | "false" => return Vec::new(),
+    // Everything. `1` is the historical spelling and keeps working.
+    "1" | "all" | "yes" | "on" | "true" => return W2V_FIXTURES.iter().collect(),
+    _ => {}
   }
+
+  let mut selected: Vec<&'static W2vFixture> = Vec::new();
+  for token in lowered.split([',', ' ', '\t']) {
+    let code = token.trim();
+    if code.is_empty() {
+      continue;
+    }
+    let Some(fixture) = W2V_FIXTURES.iter().find(|f| f.code == code) else {
+      panic!("{}", w2v_selection_error(raw, Some(code)));
+    };
+    if !selected.iter().any(|f| f.code == fixture.code) {
+      selected.push(fixture);
+    }
+  }
+
+  // Non-empty, not a recognised keyword, and yet nothing matched
+  // (e.g. `ASRY_FETCH_W2V=" , "`). Same silent-no-op hazard as a
+  // typo'd code; same loud response.
+  if selected.is_empty() {
+    panic!("{}", w2v_selection_error(raw, None));
+  }
+  selected
+}
+
+/// The diagnostic for an unusable `ASRY_FETCH_W2V`. Lists the valid
+/// codes straight from [`W2V_FIXTURES`], so it cannot go stale when a
+/// language is added.
+fn w2v_selection_error(raw: &str, offending: Option<&str>) -> String {
+  let codes: Vec<&str> = W2V_FIXTURES.iter().map(|f| f.code).collect();
+  let headline = match offending {
+    Some(code) => format!("ASRY_FETCH_W2V: unknown language code {code:?} (in {raw:?})"),
+    None => format!("ASRY_FETCH_W2V={raw:?} selects no languages"),
+  };
+  format!(
+    "{headline}\n\n\
+     Valid values:\n  \
+       ASRY_FETCH_W2V=en       one language ({en_mb} MB) — the usual choice\n  \
+       ASRY_FETCH_W2V=en,ja    a comma-separated subset\n  \
+       ASRY_FETCH_W2V=1        every language (~10 GB); `all` is a synonym\n  \
+       ASRY_FETCH_W2V=0        fetch nothing (same as leaving it unset)\n\n\
+     Known language codes: {codes}\n\n\
+     Refusing to continue. Quietly fetching nothing would leave the alignment tests\n\
+     reporting `ignored` with no hint as to why — which is the exact failure this\n\
+     opt-in was built to prevent.",
+    codes = codes.join(", "),
+    en_mb = W2V_FIXTURES
+      .iter()
+      .find(|f| f.code == "en")
+      .map_or(378, |f| f.approx_mb),
+  )
+}
+
+/// Fetch + SHA-verify one language's `.onnx` + `tokenizer.json` pair
+/// into `models_dir`, then emit `<PREFIX>_MODEL` and
+/// `<PREFIX>_TOKENIZER` so `option_env!()` in the tests can find them.
+///
+/// Returns `true` only when **both** files are on disk and match their
+/// pins. The caller keys `cargo:rustc-cfg=asry_w2v_<code>` off that
+/// return, so the cfg's meaning is exact: *this language's fixture is
+/// complete and provenance-verified*. The env vars are emitted
+/// together at the end for the same reason — the previous version
+/// emitted `_MODEL` before even attempting the tokenizer, so a
+/// tokenizer 404 left a model path exported with no tokenizer to go
+/// with it, and the dependent test failed deep inside
+/// `Aligner::from_paths` instead of at the fixture check.
+///
+/// A failed fetch logs and returns `false`; it does NOT fail the
+/// build, so one unreachable mirror doesn't block the other languages.
+/// It buys no test a free pass either: the language's tests stay
+/// `#[ignore]`d (cfg unset), and hard-fail on the absent env var if
+/// anyone forces them to run with `--ignored`.
+fn fetch_align_fixture(models_dir: &std::path::Path, fixture: &W2vFixture) -> bool {
+  eprintln!(
+    "[asry build.rs] wav2vec2 alignment fixture `{}` (~{} MB)",
+    fixture.code, fixture.approx_mb
+  );
+
+  let model_path = models_dir.join(fixture.model_filename);
+  if !fetch_with_sha(fixture.model_url, &model_path, fixture.model_sha256) {
+    return false;
+  }
+  let tokenizer_path = models_dir.join(fixture.tokenizer_filename);
+  if !fetch_with_sha(
+    fixture.tokenizer_url,
+    &tokenizer_path,
+    fixture.tokenizer_sha256,
+  ) {
+    return false;
+  }
+
   println!(
-    "cargo:rustc-env={env_prefix}_MODEL={}",
+    "cargo:rustc-env={}_MODEL={}",
+    fixture.env_prefix,
     model_path.display()
   );
-  let tokenizer_path = models_dir.join(tokenizer_filename);
-  if !fetch_with_sha(tokenizer_url, &tokenizer_path, tokenizer_sha) {
-    return;
-  }
   println!(
-    "cargo:rustc-env={env_prefix}_TOKENIZER={}",
+    "cargo:rustc-env={}_TOKENIZER={}",
+    fixture.env_prefix,
     tokenizer_path.display()
   );
+  true
 }
 
 /// Idempotent fetch + SHA-256 verify. Returns true on success
