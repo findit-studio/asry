@@ -119,8 +119,17 @@ miniz_oxide = { version = "0.9", optional = true, default-features = false, feat
 # follow semver across rc bumps.
 ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, features = ["std", "ndarray", "load-dynamic", "api-24"] }
 # tokenizers: HuggingFace WordPiece/BPE/Unigram tokenizer used to
-# read wav2vec2's tokenizer.json. ^0.20 ships pure-Rust without
-# pulling onig.
+# read wav2vec2's tokenizer.json.
+#
+# `features = ["onig"]` is NOT pure-Rust, despite what this comment
+# used to claim: it pulls `onig` -> `onig_sys`, which declares
+# `links = "onig"` and compiles Oniguruma's C sources via `cc` in its
+# build script. That native dependency rides along with EVERY feature
+# combo that enables `tokenizers`, `emissions` included, so no asry
+# feature combo is C-free. `.github/workflows/ci.yml` depends on this
+# fact when it explains why the cross / sanitizer / Miri jobs stay out
+# of scope; keep the two in sync. Verify the chain with:
+#   cargo tree --no-default-features --features emissions -i onig_sys
 tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
 
 # Optional features (Plan A scope only).
