@@ -142,6 +142,26 @@ impl core::fmt::Display for LogProbsValueClass {
 /// its [`LogProbsShapeError`] sibling. See [`LogProbsTV::new`] for
 /// the full value-domain rule (why `NaN`, `±∞`, and a finite
 /// positive value are all rejected).
+///
+/// # Examples
+///
+/// The offending element need not be non-finite — a finite value
+/// `> 0.0` is also out of domain, and is reported as
+/// [`LogProbsValueClass::Positive`], not `NaN`/`PosInf`/`NegInf`:
+///
+/// ```
+/// use asry::emissions::{LogProbsError, LogProbsTV, LogProbsValueClass};
+///
+/// let Err(err) = LogProbsTV::new(1, 1, vec![1e-7_f32]) else {
+///   panic!("expected an error");
+/// };
+/// let LogProbsError::Value(value_err) = err else {
+///   panic!("expected LogProbsError::Value");
+/// };
+/// assert_eq!(value_err.frame(), 0);
+/// assert_eq!(value_err.vocab_index(), 0);
+/// assert_eq!(value_err.class(), LogProbsValueClass::Positive);
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error(
   "log-probability out of domain (finite and ≤ 0) at frame {frame}, vocab {vocab_index}: {class}"
@@ -161,13 +181,13 @@ impl LogProbsValueError {
     }
   }
 
-  /// Frame (row) index of the first non-finite element.
+  /// Frame (row) index of the first out-of-domain element.
   #[must_use]
   pub const fn frame(&self) -> usize {
     self.frame
   }
 
-  /// Vocab (column) index of the first non-finite element.
+  /// Vocab (column) index of the first out-of-domain element.
   #[must_use]
   pub const fn vocab_index(&self) -> usize {
     self.vocab_index
@@ -254,16 +274,21 @@ impl LogProbsTV {
   ///    `exp(lp)`. A `NaN` seeds a `NaN` word confidence
   ///    (`f32::max`-based trellis comparisons silently drop it, the
   ///    end-cell finiteness guard checks a *different* cell than the
-  ///    backtrack seed reads, and the `NaN` survives `compose_words`'
-  ///    clamp into a public [`Word`](crate::types::Word), violating
-  ///    its `[0, 1]` NaN-free score contract). A finite `> 0` value
-  ///    exponentiates *out of* `[0, 1]` (`f32::MAX.exp() = +∞`,
-  ///    `(1e-7).exp() ≈ 1.0000001`) and reaches a public
-  ///    `WordSegment` score — which `align_emissions` returns
-  ///    *before* `compose_words`' clamp can defend it — so it must be
-  ///    rejected here at the seam, not downstream. `−∞` is a
-  ///    plausible caller value for `log(0)` hard-masking, but the
-  ///    internal path never produces it and the DP was never
+  ///    backtrack seed reads); a finite `> 0` value exponentiates
+  ///    *out of* `[0, 1]` (`f32::MAX.exp() = +∞`, `(1e-7).exp() ≈
+  ///    1.0000001`). Either way the bad value reaches a public
+  ///    `WordSegment` score, and `align_emissions` returns that
+  ///    `WordSegment` straight to the caller — `compose_words` is a
+  ///    separate, later, caller-invoked step (`align_emissions` does
+  ///    not call it), so whatever it would have sanitised (it maps a
+  ///    `NaN` segment score to `0.0` and clamps a positive one back
+  ///    into `[0, 1]`, keeping a composed public
+  ///    [`Word`](crate::types::Word) NaN-free and in range) is not
+  ///    yet applied to a `WordSegment` `align_emissions` has already
+  ///    handed back. Both must be rejected here at the seam, not
+  ///    left for a downstream step the caller may not even take.
+  ///    `−∞` is a plausible caller value for `log(0)` hard-masking,
+  ///    but the internal path never produces it and the DP was never
   ///    exercised against it, so it is rejected too.
   ///
   ///    A caller whose own `f32` log-softmax rounds a true `0.0` to a
@@ -725,14 +750,16 @@ pub(crate) fn validate_vocab_dim(
 ///
 /// Without this guard a NaN / ±inf in any logit produced a NaN
 /// row in the output; Viterbi then computed a non-finite final
-/// `dp_prev` and surfaced `NoAlignmentPath`, which the alignment
-/// pool classifies as recoverable — silently swallowing a backend
-/// numeric failure (model export bug, GPU / ORT regression, NaN
-/// propagation from upstream) as "no words". This helper checks
-/// each row's input and the resulting `log_z`; either non-finite
-/// returns `ModelInferenceFailed` so the runner emits
-/// `Event::Error` and the operator learns about the broken
-/// backend.
+/// `dp_prev` and surfaced `NoAlignmentPath`, which — on the
+/// `alignment`-feature pool path — the alignment pool classifies as
+/// recoverable, silently swallowing a backend numeric failure
+/// (model export bug, GPU / ORT regression, NaN propagation from
+/// upstream) as "no words". This helper checks each row's input and
+/// the resulting `log_z`; either non-finite returns
+/// `ModelInferenceFailed` instead. On the pool path the runner emits
+/// `Event::Error` so the operator learns about the broken backend;
+/// an `emissions`-only caller (no pool, no runner) gets the same
+/// typed error back directly as this function's `Result::Err`.
 ///
 /// Pulled out of `encode_log_softmax`'s body so unit tests can
 /// exercise the rejection paths without a `Session`, and so
@@ -812,7 +839,7 @@ pub fn log_softmax_with_finite_guard(
       return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
         AlignmentFailure::new(
           format_smolstr!(
-            "ORT returned non-finite logit at frame {t_idx}, vocab {bad_v}: {}",
+            "encoder supplied non-finite logit at frame {t_idx}, vocab {bad_v}: {}",
             row[bad_v]
           ),
           language.clone(),
@@ -1268,7 +1295,12 @@ mod tests {
   /// NaN logits from a broken backend must surface as fatal
   /// `ModelInferenceFailed`, not get swallowed into NaN
   /// log-probs that Viterbi later classifies as
-  /// `NoAlignmentPath` (the recoverable bucket).
+  /// `NoAlignmentPath` (the recoverable bucket). Codex round 6:
+  /// under `default-features = false, features = ["emissions"]`
+  /// `ort` isn't even linked and the input came from the
+  /// caller's own encoder, so the message must not attribute the
+  /// failure to ORT specifically — it names the generic
+  /// `encoder` instead.
   #[test]
   fn log_softmax_rejects_nan_logits_with_model_inference_failed() {
     use crate::types::Lang;
@@ -1276,13 +1308,20 @@ mod tests {
     let err = log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).unwrap_err();
     match err {
       WorkFailure::Alignment(AlignmentError::ModelInference(payload)) => {
+        let message = payload.message();
         assert!(
-          payload.message().contains("non-finite logit"),
-          "message must call out the non-finite logit; got {message}",
-          message = payload.message()
+          message.contains("non-finite logit"),
+          "message must call out the non-finite logit; got {message}"
         );
-        assert!(payload.message().contains("frame 0"));
-        assert!(payload.message().contains("vocab 1"));
+        assert!(message.contains("frame 0"));
+        assert!(message.contains("vocab 1"));
+        assert!(
+          !message.to_ascii_lowercase().contains("ort"),
+          "message must not attribute the failure to ORT specifically — \
+`log_softmax_with_finite_guard` is also reachable ort-free under the \
+`emissions` feature, where the non-finite value came from the caller's \
+own encoder; got {message:?}"
+        );
       }
       other => panic!("expected AlignmentFailed; got {other:?}"),
     }

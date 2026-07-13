@@ -27,13 +27,12 @@
 //! silently mis-aligning a stale-but-same-length payload.
 //! ```
 //!
-//! For whole-chunk alignment use [`AlignmentSet::detect_oov`]
+//! For whole-chunk alignment use `AlignmentSet::detect_oov`
+//! (an `alignment`-feature method; not linked here because
+//! `AlignmentSet` doesn't exist under a bare `emissions` build)
 //! and supply a single inner `Vec<ResolvedOov>`. For per-run
-//! alignment use [`AlignmentSet::detect_oov_per_run`] and
-//! supply one inner vec per run.
-//!
-//! [`AlignmentSet::detect_oov`]: crate::runner::aligner::AlignmentSet::detect_oov
-//! [`AlignmentSet::detect_oov_per_run`]: crate::runner::aligner::AlignmentSet::detect_oov_per_run
+//! alignment use `AlignmentSet::detect_oov_per_run` and supply
+//! one inner vec per run.
 //!
 //! ## Why the caller decides
 //!

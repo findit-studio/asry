@@ -202,8 +202,10 @@ pub trait TextNormalizer: Send {
   }
 }
 
-/// Boxed `dyn TextNormalizer` for the [`crate::Aligner`]'s
-/// per-language normaliser slot.
+/// Boxed `dyn TextNormalizer` for `Aligner`'s per-language
+/// normaliser slot (`Aligner` needs `feature = "alignment"`; not
+/// linked here because it doesn't exist under a bare `emissions`
+/// build).
 pub type DynTextNormalizer = std::boxed::Box<dyn TextNormalizer>;
 
 #[cfg(test)]

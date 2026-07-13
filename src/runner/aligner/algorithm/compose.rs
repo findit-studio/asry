@@ -19,15 +19,18 @@ use crate::{
 };
 
 /// Default minimum `speech_emissions / total_emissions` ratio
-/// for [`Aligner::min_speech_coverage`](crate::Aligner::min_speech_coverage).
+/// for `Aligner::min_speech_coverage` (the `alignment`-feature
+/// builder option of the same name; not linked here because
+/// `Aligner` doesn't exist under a bare `emissions` build).
 /// Half-coverage is the natural threshold — majority-speech
 /// words stay; mostly-masked words drop.
 pub const DEFAULT_MIN_SPEECH_COVERAGE: f32 = 0.5;
 
 /// Default maximum contiguous silent run inside a word's
-/// `[start_frame, end_frame)` span for
-/// [`Aligner::max_intra_silent_run`](crate::Aligner::max_intra_silent_run).
-/// 80 ms tolerates most unvoiced consonants (the closure of
+/// `[start_frame, end_frame)` span for `Aligner::max_intra_silent_run`
+/// (the `alignment`-feature builder option of the same name; see
+/// the note on [`DEFAULT_MIN_SPEECH_COVERAGE`] about why it's not
+/// linked). 80 ms tolerates most unvoiced consonants (the closure of
 /// `/t/`, `/k/`, `/p/` is typically 30–80 ms), glottal stops,
 /// and VAD jitter (1–2 frames) while rejecting longer gaps
 /// where a word's emissions straddle silence — usually a CTC
@@ -102,8 +105,8 @@ pub fn effective_samples_per_frame(n_samples: u64, total_frames: usize, hop_samp
 /// helpers are now in agreement on the contract.
 ///
 /// `sub_segments` must be in chunk-local sample-index space — the
-/// caller (alignment worker) wraps the segment range PTS in a
-/// 1/16000 timebase so `start_pts` == `start_sample`.
+/// caller wraps the segment range PTS in a 1/16000 timebase so
+/// `start_pts` == `start_sample`.
 ///
 /// `pub` (not `pub(crate)`): reachable at
 /// `asry::emissions::build_speech_frames` — this is asry's own
