@@ -16,6 +16,7 @@ use ort::{
 };
 use smol_str::{SmolStr, format_smolstr};
 
+use super::errors::{EmissionsError, EmissionsFailure};
 use crate::types::{AlignmentError, AlignmentFailure, Lang, WorkFailure};
 
 // NOTE on the (1, T) reshape `encode_log_softmax` uses below: the
@@ -512,8 +513,10 @@ pub(crate) fn encode_log_softmax(
   let (t, v) = validate_output_dims(shape[1], shape[2], raw.len(), language)?;
 
   // Validate logits + log-softmax for finiteness. See
-  // `log_softmax_with_finite_guard`.
-  let data = log_softmax_with_finite_guard(raw, t, v, language)?;
+  // `log_softmax_with_finite_guard`. The helper returns the neutral
+  // `EmissionsError`; the pool path re-maps it to `WorkFailure` here
+  // so `encode_log_softmax`'s observable error type is unchanged.
+  let data = log_softmax_with_finite_guard(raw, t, v).map_err(|e| e.into_work_failure(language))?;
   Ok(LogProbsTV { t, v, data })
 }
 
@@ -756,10 +759,11 @@ pub(crate) fn validate_vocab_dim(
 /// (model export bug, GPU / ORT regression, NaN propagation from
 /// upstream) as "no words". This helper checks each row's input and
 /// the resulting `log_z`; either non-finite returns
-/// `ModelInferenceFailed` instead. On the pool path the runner emits
-/// `Event::Error` so the operator learns about the broken backend;
-/// an `emissions`-only caller (no pool, no runner) gets the same
-/// typed error back directly as this function's `Result::Err`.
+/// [`EmissionsError::Numeric`] instead. On the `alignment` pool path
+/// the orchestrator re-maps that into `WorkFailure` and the runner
+/// emits `Event::Error` so the operator learns about the broken
+/// backend; an `emissions`-only caller (no pool, no runner) gets the
+/// neutral typed error back directly as this function's `Result::Err`.
 ///
 /// Pulled out of `encode_log_softmax`'s body so unit tests can
 /// exercise the rejection paths without a `Session`, and so
@@ -779,70 +783,53 @@ pub(crate) fn validate_vocab_dim(
 ///
 /// # Errors
 ///
-/// Returns [`WorkFailure::Alignment`](crate::types::WorkFailure::Alignment)
-/// wrapping
-/// [`AlignmentError::ModelInference`](crate::types::AlignmentError::ModelInference)
-/// when `v == 0` (checked first, for every `t` including `t ==
-/// 0`: a CTC vocabulary must contain at least the blank token, so
-/// a zero-length vocab axis is never valid), when
-/// `t.checked_mul(v) != Some(raw.len())`, or when any logit or
-/// output log-probability is non-finite.
+/// Returns [`EmissionsError::Shape`] when `v == 0` (checked first,
+/// for every `t` including `t == 0`: a CTC vocabulary must contain at
+/// least the blank token, so a zero-length vocab axis is never valid)
+/// or when `t.checked_mul(v) != Some(raw.len())` (product mismatch or
+/// `usize` overflow); returns [`EmissionsError::Numeric`] when any
+/// caller logit or resulting log-probability is non-finite.
 pub fn log_softmax_with_finite_guard(
   raw: &[f32],
   t: usize,
   v: usize,
-  language: &Lang,
-) -> Result<Vec<f32>, WorkFailure> {
+) -> Result<Vec<f32>, EmissionsError> {
   // V == 0 means the caller declared no vocabulary axis — never
   // legitimate, for any T (including T == 0, which would
   // otherwise skip the frame loop below entirely and return
   // `Ok(vec![])` without ever looking at V). Checked first, the
   // same discipline `validate_output_dims` applies to the
-  // ORT-sourced shape.
+  // ORT-sourced shape. Reuses the `LogProbsTV::new` shape leaf so the
+  // seam reports one dimension/product/overflow vocabulary.
   if v == 0 {
-    return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
-      AlignmentFailure::new(
-        format_smolstr!(
-          "log-softmax has a zero-length vocab dim: T={t}, V=0 (a CTC \
- vocabulary must contain at least the blank token)"
-        ),
-        language.clone(),
-      ),
+    return Err(EmissionsError::Shape(LogProbsShapeError::new(
+      t,
+      v,
+      raw.len(),
     )));
   }
-  let total = match t.checked_mul(v) {
-    Some(product) => product,
-    None => {
-      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
-        AlignmentFailure::new(
-          format_smolstr!("log-softmax dimensions overflow: T={t} × V={v} doesn't fit in usize"),
-          language.clone(),
-        ),
-      )));
-    }
+  let Some(total) = t.checked_mul(v) else {
+    return Err(EmissionsError::Shape(LogProbsShapeError::new(
+      t,
+      v,
+      raw.len(),
+    )));
   };
-  let raw_len = raw.len();
-  if total != raw_len {
-    return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
-      AlignmentFailure::new(
-        format_smolstr!(
-          "log-softmax input buffer length {raw_len} doesn't match declared T={t} × V={v} = {total}"
-        ),
-        language.clone(),
-      ),
+  if total != raw.len() {
+    return Err(EmissionsError::Shape(LogProbsShapeError::new(
+      t,
+      v,
+      raw.len(),
     )));
   }
   let mut data = Vec::with_capacity(total);
   for t_idx in 0..t {
     let row = &raw[t_idx * v..(t_idx + 1) * v];
     if let Some(bad_v) = row.iter().position(|x| !x.is_finite()) {
-      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
-        AlignmentFailure::new(
-          format_smolstr!(
-            "encoder supplied non-finite logit at frame {t_idx}, vocab {bad_v}: {}",
-            row[bad_v]
-          ),
-          language.clone(),
+      return Err(EmissionsError::Numeric(EmissionsFailure::new(
+        format_smolstr!(
+          "encoder supplied non-finite logit at frame {t_idx}, vocab {bad_v}: {}",
+          row[bad_v]
         ),
       )));
     }
@@ -874,13 +861,10 @@ pub fn log_softmax_with_finite_guard(
       // f64 input. So this branch fires only on the all-(-inf)
       // case, which the existing all-`NEG_INFINITY` regression
       // also covers.
-      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
-        AlignmentFailure::new(
-          format_smolstr!(
-            "log-softmax shifted normaliser non-finite at frame {t_idx}: \
+      return Err(EmissionsError::Numeric(EmissionsFailure::new(
+        format_smolstr!(
+          "log-softmax shifted normaliser non-finite at frame {t_idx}: \
  sum.ln()={log_z_shifted}, max={max}"
-          ),
-          language.clone(),
         ),
       )));
     }
@@ -899,13 +883,10 @@ pub fn log_softmax_with_finite_guard(
       let lp_f64 = ((x as f64) - max_f64) - log_z_shifted;
       let lp = lp_f64 as f32;
       if !lp.is_finite() {
-        return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
-          AlignmentFailure::new(
-            format_smolstr!(
-              "log-softmax output non-finite at frame {t_idx}: \
+        return Err(EmissionsError::Numeric(EmissionsFailure::new(
+          format_smolstr!(
+            "log-softmax output non-finite at frame {t_idx}: \
  x={x}, max={max}, sum_ln={log_z_shifted}, lp={lp}"
-            ),
-            language.clone(),
           ),
         )));
       }
@@ -1292,22 +1273,19 @@ mod tests {
     assert_eq!(lp.at(1, 2), -6.0);
   }
 
-  /// NaN logits from a broken backend must surface as fatal
-  /// `ModelInferenceFailed`, not get swallowed into NaN
-  /// log-probs that Viterbi later classifies as
-  /// `NoAlignmentPath` (the recoverable bucket). Codex round 6:
-  /// under `default-features = false, features = ["emissions"]`
-  /// `ort` isn't even linked and the input came from the
-  /// caller's own encoder, so the message must not attribute the
-  /// failure to ORT specifically — it names the generic
-  /// `encoder` instead.
+  /// NaN logits from a broken backend must surface as a fatal
+  /// numeric failure, not get swallowed into NaN log-probs that
+  /// Viterbi later classifies as `NoAlignmentPath` (the recoverable
+  /// bucket). Under `default-features = false, features =
+  /// ["emissions"]` `ort` isn't even linked and the input came from
+  /// the caller's own encoder, so the message must not attribute the
+  /// failure to ORT specifically — it names the generic `encoder`.
   #[test]
-  fn log_softmax_rejects_nan_logits_with_model_inference_failed() {
-    use crate::types::Lang;
+  fn log_softmax_rejects_nan_logits_with_numeric_failure() {
     let raw = vec![0.0_f32, f32::NAN, 0.0]; // 1×3
-    let err = log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).unwrap_err();
+    let err = log_softmax_with_finite_guard(&raw, 1, 3).unwrap_err();
     match err {
-      WorkFailure::Alignment(AlignmentError::ModelInference(payload)) => {
+      EmissionsError::Numeric(payload) => {
         let message = payload.message();
         assert!(
           message.contains("non-finite logit"),
@@ -1323,60 +1301,49 @@ mod tests {
 own encoder; got {message:?}"
         );
       }
-      other => panic!("expected AlignmentFailed; got {other:?}"),
+      other => panic!("expected EmissionsError::Numeric; got {other:?}"),
     }
   }
 
   #[test]
   fn log_softmax_rejects_positive_infinity_logits() {
-    use crate::types::Lang;
     let raw = vec![0.0_f32, f32::INFINITY, 0.0];
-    assert!(log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).is_err());
+    assert!(log_softmax_with_finite_guard(&raw, 1, 3).is_err());
   }
 
   #[test]
   fn log_softmax_rejects_negative_infinity_logits() {
-    use crate::types::Lang;
     let raw = vec![f32::NEG_INFINITY, 0.0, 0.0];
-    assert!(log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).is_err());
+    assert!(log_softmax_with_finite_guard(&raw, 1, 3).is_err());
   }
 
-  /// All-`-inf` row passes the per-element finiteness check
-  /// (each element IS finite under f32::is_finite for normal
-  /// numbers, but NEG_INFINITY is not finite — let me re-check).
-  /// `f32::NEG_INFINITY.is_finite()` returns false, so this
-  /// fails at the per-element check. Document that path:
-  /// even pathological all-inf rows surface as
-  /// `ModelInferenceFailed`.
+  /// `f32::NEG_INFINITY.is_finite()` returns false, so an all-`-inf`
+  /// row fails at the per-element finiteness check and surfaces as a
+  /// numeric failure rather than a NaN row Viterbi would misread.
   #[test]
   fn log_softmax_rejects_all_neg_infinity_row() {
-    use crate::types::Lang;
     let raw = vec![f32::NEG_INFINITY; 3];
-    assert!(log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).is_err());
+    assert!(log_softmax_with_finite_guard(&raw, 1, 3).is_err());
   }
 
   /// Finite extreme logits can produce a non-finite output
-  /// log-prob: `[f32::MAX, -f32::MAX]` has finite input,
-  /// finite max, finite log_z (= f32::MAX), but the second
-  /// element's `x - log_z = -f32::MAX - f32::MAX = -inf`.
-  /// The `-inf` was stored in `data`; Viterbi would
-  /// later return `NoAlignmentPath` (recoverable) hiding a
-  /// real backend numeric failure as `words: []`. The
-  /// per-element finite check now surfaces it as fatal
-  /// `ModelInferenceFailed`.
+  /// log-prob: `[f32::MAX, -f32::MAX]` has finite input, finite max,
+  /// finite log_z (= f32::MAX), but the second element's `x - log_z
+  /// = -f32::MAX - f32::MAX = -inf`. The `-inf` would be stored in
+  /// `data`; Viterbi would later return `NoAlignmentPath`
+  /// (recoverable), hiding a real numeric failure as `words: []`.
+  /// The per-element finite check surfaces it as a numeric failure.
   #[test]
   fn log_softmax_rejects_finite_extremes_that_overflow_lp() {
-    use crate::types::Lang;
     let raw = vec![f32::MAX, -f32::MAX];
-    let err = log_softmax_with_finite_guard(&raw, 1, 2, &Lang::En).unwrap_err();
-    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
-      panic!("expected AlignmentFailed");
+    let err = log_softmax_with_finite_guard(&raw, 1, 2).unwrap_err();
+    let EmissionsError::Numeric(payload) = err else {
+      panic!("expected EmissionsError::Numeric; got {err:?}");
     };
     let message = payload.message();
     assert!(
       message.contains("log-softmax output non-finite"),
       "diagnostic must call out the per-element finite check; got {message}",
-      message = message
     );
   }
 
@@ -1384,9 +1351,8 @@ own encoder; got {message:?}"
   /// log-softmax row that sums to 1 in linear space.
   #[test]
   fn log_softmax_finite_input_roundtrips() {
-    use crate::types::Lang;
     let raw = vec![1.0_f32, 2.0, 3.0];
-    let out = log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).expect("ok");
+    let out = log_softmax_with_finite_guard(&raw, 1, 3).expect("ok");
     assert_eq!(out.len(), 3);
     assert!(out.iter().all(|x| x.is_finite()));
     let sum: f32 = out.iter().map(|x| x.exp()).sum();
@@ -1407,9 +1373,8 @@ own encoder; got {message:?}"
     // subtraction of `max` in f64 (`lp_f64 = (x as f64 -
     // max_f64) - sum.ln()`) so the shifted log-prob is correct
     // regardless of `max`'s magnitude.
-    use crate::types::Lang;
     let raw = vec![1.0e20_f32, 1.0e20_f32];
-    let out = log_softmax_with_finite_guard(&raw, 1, 2, &Lang::En).expect("ok");
+    let out = log_softmax_with_finite_guard(&raw, 1, 2).expect("ok");
     assert_eq!(out.len(), 2);
     assert!(out.iter().all(|x| x.is_finite()));
     // Exp-sum should be 1.0 (i.e. softmax probabilities sum to 1).
@@ -1438,19 +1403,16 @@ own encoder; got {message:?}"
 
   /// `raw` shorter than the declared `T × V` used to index straight
   /// past the end of the last row's slice — an unchecked-slicing
-  /// panic instead of a typed error.
+  /// panic instead of a typed error. Now a typed shape rejection.
   #[test]
   fn log_softmax_rejects_undersized_buffer() {
-    use crate::types::Lang;
-    let err = log_softmax_with_finite_guard(&[0.0f32, 0.0], 2, 2, &Lang::En).unwrap_err();
-    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
-      panic!("expected AlignmentFailed");
+    let err = log_softmax_with_finite_guard(&[0.0f32, 0.0], 2, 2).unwrap_err();
+    let EmissionsError::Shape(payload) = err else {
+      panic!("expected EmissionsError::Shape; got {err:?}");
     };
-    let message = payload.message();
     assert!(
-      message.contains("doesn't match"),
-      "diagnostic must call out the length mismatch; got {message}",
-      message = message
+      payload.to_string().contains("shape mismatch"),
+      "diagnostic must call out the shape mismatch; got {payload}",
     );
   }
 
@@ -1461,12 +1423,11 @@ own encoder; got {message:?}"
   /// output before calling in).
   #[test]
   fn log_softmax_rejects_empty_buffer_with_nonzero_dims() {
-    use crate::types::Lang;
-    let err = log_softmax_with_finite_guard(&[], 1, 1, &Lang::En).unwrap_err();
-    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
-      panic!("expected AlignmentFailed");
+    let err = log_softmax_with_finite_guard(&[], 1, 1).unwrap_err();
+    let EmissionsError::Shape(payload) = err else {
+      panic!("expected EmissionsError::Shape; got {err:?}");
     };
-    assert!(payload.message().contains("doesn't match"));
+    assert!(payload.to_string().contains("shape mismatch"));
   }
 
   /// `raw` longer than the declared `T × V` never panics — the
@@ -1476,16 +1437,13 @@ own encoder; got {message:?}"
   /// signalling the shape mismatch.
   #[test]
   fn log_softmax_rejects_oversized_buffer_instead_of_silently_truncating() {
-    use crate::types::Lang;
-    let err = log_softmax_with_finite_guard(&[0.0f32, 99.0], 1, 1, &Lang::En).unwrap_err();
-    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
-      panic!("expected AlignmentFailed");
+    let err = log_softmax_with_finite_guard(&[0.0f32, 99.0], 1, 1).unwrap_err();
+    let EmissionsError::Shape(payload) = err else {
+      panic!("expected EmissionsError::Shape; got {err:?}");
     };
-    let message = payload.message();
     assert!(
-      message.contains("doesn't match"),
-      "diagnostic must call out the length mismatch; got {message}",
-      message = message
+      payload.to_string().contains("shape mismatch"),
+      "diagnostic must call out the shape mismatch; got {payload}",
     );
   }
 
@@ -1496,22 +1454,20 @@ own encoder; got {message:?}"
   /// shape mismatch.
   #[test]
   fn log_softmax_rejects_zero_t_with_nonempty_buffer_instead_of_silently_discarding() {
-    use crate::types::Lang;
-    let err = log_softmax_with_finite_guard(&[1.0f32, 2.0, 3.0], 0, 5, &Lang::En).unwrap_err();
-    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
-      panic!("expected AlignmentFailed");
+    let err = log_softmax_with_finite_guard(&[1.0f32, 2.0, 3.0], 0, 5).unwrap_err();
+    let EmissionsError::Shape(payload) = err else {
+      panic!("expected EmissionsError::Shape; got {err:?}");
     };
-    assert!(payload.message().contains("doesn't match"));
+    assert!(payload.to_string().contains("shape mismatch"));
   }
 
   /// `T = 0` with a correctly-empty `raw` (`0 * V == 0 ==
   /// raw.len()`) is legitimate degenerate input — zero frames in,
   /// zero log-probabilities out — and must stay `Ok`, not be
-  /// swept up by the new shape guard.
+  /// swept up by the shape guard.
   #[test]
   fn log_softmax_accepts_zero_t_with_empty_buffer() {
-    use crate::types::Lang;
-    let out = log_softmax_with_finite_guard(&[], 0, 5, &Lang::En).expect("ok");
+    let out = log_softmax_with_finite_guard(&[], 0, 5).expect("ok");
     assert!(out.is_empty());
   }
 
@@ -1524,16 +1480,13 @@ own encoder; got {message:?}"
   /// and the per-row loop.
   #[test]
   fn log_softmax_rejects_zero_vocab_with_zero_t() {
-    use crate::types::Lang;
-    let err = log_softmax_with_finite_guard(&[], 0, 0, &Lang::En).unwrap_err();
-    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
-      panic!("expected AlignmentFailed");
+    let err = log_softmax_with_finite_guard(&[], 0, 0).unwrap_err();
+    let EmissionsError::Shape(payload) = err else {
+      panic!("expected EmissionsError::Shape; got {err:?}");
     };
-    let message = payload.message();
     assert!(
-      message.contains("zero-length vocab"),
-      "diagnostic must call out the zero-length vocab dim; got {message}",
-      message = message
+      payload.to_string().contains("zero-length vocab"),
+      "diagnostic must call out the zero-length vocab dim; got {payload}",
     );
   }
 
@@ -1549,18 +1502,15 @@ own encoder; got {message:?}"
   /// `T == 0`.
   #[test]
   fn log_softmax_rejects_zero_vocab_with_positive_t() {
-    use crate::types::Lang;
-    let err = log_softmax_with_finite_guard(&[], 1, 0, &Lang::En).unwrap_err();
-    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
-      panic!("expected AlignmentFailed");
+    let err = log_softmax_with_finite_guard(&[], 1, 0).unwrap_err();
+    let EmissionsError::Shape(payload) = err else {
+      panic!("expected EmissionsError::Shape; got {err:?}");
     };
-    let message = payload.message();
     assert!(
-      message.contains("zero-length vocab"),
+      payload.to_string().contains("zero-length vocab"),
       "diagnostic must call out the zero-length vocab dim, not the \
  unrelated shifted-normaliser-non-finite path it used to fall \
- through to; got {message}",
-      message = message
+ through to; got {payload}",
     );
   }
 
@@ -1571,19 +1521,17 @@ own encoder; got {message:?}"
   /// allocation request) — the same overflow discipline
   /// `validate_output_dims` already applies to the ORT-sourced
   /// shape, applied here via `checked_mul` before any arithmetic
-  /// on `t`/`v` runs.
+  /// on `t`/`v` runs. An unrepresentable product folds into the
+  /// shape arm (as it does for `LogProbsTV::new`).
   #[test]
   fn log_softmax_rejects_t_v_product_overflow() {
-    use crate::types::Lang;
-    let err = log_softmax_with_finite_guard(&[], usize::MAX, 2, &Lang::En).unwrap_err();
-    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
-      panic!("expected AlignmentFailed");
+    let err = log_softmax_with_finite_guard(&[], usize::MAX, 2).unwrap_err();
+    let EmissionsError::Shape(payload) = err else {
+      panic!("expected EmissionsError::Shape; got {err:?}");
     };
-    let message = payload.message();
     assert!(
-      message.contains("overflow"),
-      "diagnostic must call out the overflow; got {message}",
-      message = message
+      payload.to_string().contains("shape mismatch"),
+      "an unrepresentable T*V product is rejected as a shape error; got {payload}",
     );
   }
 
@@ -1818,12 +1766,11 @@ own encoder; got {message:?}"
   /// (helpful for debugging upstream backend issues).
   #[test]
   fn log_softmax_locates_nan_to_specific_frame() {
-    use crate::types::Lang;
     // 3 frames × 2 vocab; frame 2's first element is NaN.
     let raw = vec![0.0_f32, 0.1, 0.0, 0.1, f32::NAN, 0.1];
-    let err = log_softmax_with_finite_guard(&raw, 3, 2, &Lang::En).unwrap_err();
-    let WorkFailure::Alignment(payload) = err else {
-      panic!("expected AlignmentFailed");
+    let err = log_softmax_with_finite_guard(&raw, 3, 2).unwrap_err();
+    let EmissionsError::Numeric(payload) = err else {
+      panic!("expected EmissionsError::Numeric; got {err:?}");
     };
     let message = payload.to_string();
     assert!(

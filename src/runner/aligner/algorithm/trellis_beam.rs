@@ -43,7 +43,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
-  runner::aligner::algorithm::{encode::LogProbsTV, tokenize::TokenizedText},
+  runner::aligner::algorithm::{
+    encode::LogProbsTV,
+    errors::{EmissionsError, EmissionsFailure},
+    tokenize::TokenizedText,
+  },
   types::{AlignmentError, AlignmentFailure, Lang, WorkFailure, WorkerHangTimeout, WorkerKind},
 };
 
@@ -92,6 +96,26 @@ const TRELLIS_CELL_BUDGET: usize = 32_000_000;
 /// chunk) while turning pathological inputs into an in-band
 /// `NoAlignmentPath` failure.
 const BEAM_NODE_BUDGET: usize = 2_000_000;
+
+/// Seam-level cap on the reconstructed CTC path length — one
+/// [`PathPointPublic`] per emissions frame, so exactly `T` points —
+/// that [`align_emissions`] will attempt.
+///
+/// The `alignment` pool path bounds `T` structurally: the encoder
+/// stride check (`validate_stride_extent`) requires `T · hop ≈ chunk
+/// samples`, so a real 30 s chunk yields `T ≈ 1500`. A bare
+/// `emissions` caller supplies [`LogProbsTV`] directly with no such
+/// bound, so a degenerate `num_tokens = 1, T = 32 M` lattice — under
+/// the `T · num_tokens ≤ 32 M` trellis-cell cap, so [`get_trellis`]
+/// admits it, and with `final_j = 0` the beam loop and its
+/// [`BEAM_NODE_BUDGET`] guard never run — reaches `backtrack_beam`'s
+/// `Vec::with_capacity(T)` path reconstruction and allocates ~768 MB
+/// before any abort poll. This budget rejects `T` beyond it at the
+/// seam boundary, BEFORE the pinned DP allocates. 2 M frames ≈ 48 MB
+/// of `PathPointPublic`, far above any realistic chunk (30 min at 50
+/// fps ≈ 90 k frames) while turning the degenerate case into a fast
+/// typed [`EmissionsError::PathBudget`].
+const SEAM_PATH_FRAME_BUDGET: usize = 2_000_000;
 
 /// One char-level alignment segment, the output of
 /// `merge_repeats`. Mirrors WhisperX `Segment(label, start, end,
@@ -1045,12 +1069,14 @@ pub fn align_to_word_segments(
 #[derive(Debug, Clone)]
 pub struct AlignEmissionsConfig {
   /// CTC blank-token id. Must be `< log_probs.v()`; validated
-  /// inside [`get_trellis`], which surfaces a mismatch as
-  /// [`AlignmentError::ModelInference`].
+  /// inside [`get_trellis`], and surfaced by [`align_emissions`] as
+  /// [`EmissionsError::Config`].
   blank_token_id: u32,
-  /// Language tag attached to any [`AlignmentError`] this call
-  /// produces. Purely diagnostic — it does not affect the
-  /// alignment result.
+  /// Language tag threaded to the pinned DP for its internal
+  /// diagnostics. Purely diagnostic — it does not affect the
+  /// alignment result, and it is stripped at the seam boundary: the
+  /// backend-neutral [`EmissionsError`] this call returns carries no
+  /// language.
   language: Lang,
 }
 
@@ -1093,31 +1119,50 @@ impl AlignEmissionsConfig {
 /// orchestrator) calls internally. Same algorithm, same
 /// WhisperX-parity behaviour, no edits: `align_emissions` only
 /// changes the error type at the boundary. `align_to_word_segments`
-/// returns [`WorkFailure`] (a pool/worker-oriented type whose
-/// `WorkerHang` variant carries a `WorkerKind` liveness framing
-/// that has no meaning for a bare function call with no pool or
-/// worker behind it); `align_emissions` unwraps
-/// `WorkFailure::Alignment` down to the inner `AlignmentError`, and
-/// re-expresses a would-be `WorkFailure::WorkerHang` (the
-/// `abort_flag` cancellation path) as [`AlignmentError::Aborted`].
+/// returns the pool-oriented [`WorkFailure`] (whose `WorkerHang`
+/// variant carries a `WorkerKind` liveness framing that has no
+/// meaning for a bare function call with no pool or worker behind
+/// it); `align_emissions` re-expresses that as the backend-neutral
+/// [`EmissionsError`] a bare caller can honestly act on, via the
+/// internal `into_emissions_error` boundary mapper.
 ///
 /// # Errors
 ///
-/// Returns [`AlignmentError::NoAlignmentPath`] when the CTC lattice
-/// admits no finite path (audio shorter than the token count, a
-/// non-finite trellis boundary cell, or the trellis/beam
-/// cell-or-node budget is exceeded); [`AlignmentError::Tokenization`]
-/// when `tokenized` carries a token id that doesn't fit
-/// `log_probs`'s vocab dimension or a non-wildcard negative id;
-/// [`AlignmentError::ModelInference`] when `config.blank_token_id()`
-/// doesn't fit `log_probs`'s vocab dimension; [`AlignmentError::Aborted`]
-/// when `abort_flag` is observed set before the pipeline completes.
+/// Returns [`EmissionsError::PathBudget`] when `log_probs.t()`
+/// exceeds the seam frame budget (rejected before any allocation);
+/// [`EmissionsError::NoAlignmentPath`] when the CTC
+/// lattice admits no finite path (emissions shorter than the token
+/// count, an empty token sequence, a non-finite trellis boundary
+/// cell, or the trellis/beam cell-or-node budget is exceeded);
+/// [`EmissionsError::Tokenization`] when `tokenized` carries a token
+/// id that doesn't fit `log_probs`'s vocab dimension or a
+/// non-wildcard negative id; [`EmissionsError::Config`] when
+/// `config.blank_token_id()` doesn't fit `log_probs`'s vocab
+/// dimension; and [`EmissionsError::Aborted`] when `abort_flag` is
+/// observed set before the pipeline completes.
 pub fn align_emissions(
   log_probs: &LogProbsTV,
   tokenized: &TokenizedText,
   abort_flag: &AtomicBool,
   config: &AlignEmissionsConfig,
-) -> Result<Vec<WordSegment>, AlignmentError> {
+) -> Result<Vec<WordSegment>, EmissionsError> {
+  // Finding-2 preflight: bound the reconstructed CTC path (one
+  // `PathPointPublic` per emissions frame) BEFORE the pinned
+  // trellis/beam DP allocates. See `SEAM_PATH_FRAME_BUDGET` for why
+  // the bare-caller seam needs this guard the pool path gets for
+  // free from the encoder stride check.
+  let t = log_probs.t();
+  if t > SEAM_PATH_FRAME_BUDGET {
+    return Err(EmissionsError::PathBudget(EmissionsFailure::new(
+      format_smolstr!(
+        "emissions frame count T={t} exceeds the seam path-reconstruction budget of \
+ {SEAM_PATH_FRAME_BUDGET} frames; the CTC path holds one point per frame, so aligning \
+ at this T would reserve ~{} MiB up front. Supply emissions with a realistic frame \
+ count (frames \u{2248} audio_samples / encoder_hop).",
+        t.saturating_mul(core::mem::size_of::<PathPointPublic>()) >> 20
+      ),
+    )));
+  }
   align_to_word_segments(
     log_probs,
     tokenized.token_ids(),
@@ -1127,35 +1172,47 @@ pub fn align_emissions(
     abort_flag,
     config.language(),
   )
-  .map_err(|err| into_alignment_error(err, config.language()))
+  .map_err(into_emissions_error)
 }
 
-/// Translate the internal call chain's pool-oriented [`WorkFailure`]
-/// into the plain [`AlignmentError`] [`align_emissions`] promises.
-/// `align_to_word_segments` only ever produces
-/// `WorkFailure::Alignment` (unwrapped directly here) or
-/// `WorkFailure::WorkerHang` (the `abort_flag` cancellation path,
-/// re-expressed as [`AlignmentError::Aborted`]); the other two
-/// `WorkFailure` variants (`Asr`, `LanguageUnsupported`) belong to
-/// ASR/registry code this call chain never touches. Handled with a
-/// typed fallback rather than `unreachable!()` so a future change
-/// to the wrapped function's error surface fails safe instead of
-/// aborting the process.
-fn into_alignment_error(err: WorkFailure, language: &Lang) -> AlignmentError {
+/// Translate the pinned DP call chain's pool-oriented [`WorkFailure`]
+/// into the backend-neutral [`EmissionsError`] the public
+/// [`align_emissions`] surface promises. The pinned bodies
+/// (`get_trellis` / `backtrack_beam` / `align_to_word_segments`) still
+/// build `WorkFailure` internally; this is the one place the seam
+/// re-expresses it, dropping the language stamp and every
+/// worker/pool concept.
+///
+/// The classification is exact for this call chain:
+/// `AlignmentError::ModelInference` can only be the
+/// blank-id-out-of-range check in `get_trellis` here, so it maps to
+/// [`EmissionsError::Config`]; `WorkFailure::WorkerHang` is the
+/// `abort_flag` cancellation path (no worker/pool behind a bare
+/// call), re-expressed as [`EmissionsError::Aborted`]. The two
+/// ASR/registry `WorkFailure` variants this chain never produces map
+/// to a typed diagnostic rather than `unreachable!()` so a future
+/// change fails safe.
+fn into_emissions_error(err: WorkFailure) -> EmissionsError {
+  let neutral = |f: AlignmentFailure| EmissionsFailure::new(f.message().clone());
   match err {
-    WorkFailure::Alignment(e) => e,
-    WorkFailure::WorkerHang(_timeout) => AlignmentError::Aborted(AlignmentFailure::new(
+    WorkFailure::Alignment(inner) => match inner {
+      AlignmentError::ModelInference(f) => EmissionsError::Config(neutral(f)),
+      AlignmentError::Tokenization(f) => EmissionsError::Tokenization(neutral(f)),
+      AlignmentError::NoAlignmentPath(f) => EmissionsError::NoAlignmentPath(neutral(f)),
+      AlignmentError::SemanticOutOfVocab(f) => EmissionsError::SemanticOutOfVocab(neutral(f)),
+      AlignmentError::Aborted(f) => EmissionsError::Aborted(neutral(f)),
+      AlignmentError::Normalization(f) | AlignmentError::EmptyText(f) => {
+        EmissionsError::Tokenization(neutral(f))
+      }
+    },
+    WorkFailure::WorkerHang(_timeout) => EmissionsError::Aborted(EmissionsFailure::new(
       format_smolstr!("align_emissions aborted via abort_flag before completing"),
-      language.clone(),
     )),
     other @ (WorkFailure::Asr(_) | WorkFailure::LanguageUnsupported(_)) => {
-      AlignmentError::ModelInference(AlignmentFailure::new(
-        format_smolstr!(
-          "align_emissions: internal call chain produced an unexpected WorkFailure \
+      EmissionsError::Config(EmissionsFailure::new(format_smolstr!(
+        "align_emissions: internal call chain produced an unexpected WorkFailure \
 variant ({other:?}); this indicates a bug in the relocation, not the algorithm"
-        ),
-        language.clone(),
-      ))
+      )))
     }
   }
 }
@@ -1858,8 +1915,8 @@ mod tests {
   /// `align_emissions` has no pool/worker to attach a
   /// `WorkerHangTimeout` to, so the `abort_flag` cancellation path
   /// (internally `WorkFailure::WorkerHang`) must surface as
-  /// [`AlignmentError::Aborted`] — a variant native to the plain
-  /// `AlignmentError` this function returns — not leak the
+  /// [`EmissionsError::Aborted`] — a variant native to the neutral
+  /// `EmissionsError` this function returns — not leak the
   /// pool-oriented `WorkFailure` type or silently become some
   /// unrelated variant like `NoAlignmentPath`. The payload text
   /// must match: `align_emissions` has no worker and no timeout,
@@ -1876,8 +1933,8 @@ mod tests {
     let abort = AtomicBool::new(true);
 
     let err = align_emissions(&log_probs, &tokenized, &abort, &config).unwrap_err();
-    let AlignmentError::Aborted(payload) = &err else {
-      panic!("expected AlignmentError::Aborted; got {err:?}");
+    let EmissionsError::Aborted(payload) = &err else {
+      panic!("expected EmissionsError::Aborted; got {err:?}");
     };
     let message = payload.message().to_ascii_lowercase();
     assert!(
@@ -1895,9 +1952,9 @@ to a bare align_emissions call; got {message:?}"
 
   /// A token id past `log_probs.v()` is a `Tokenization` failure
   /// under the raw `align_to_word_segments` call chain; confirm
-  /// `align_emissions` unwraps `WorkFailure::Alignment` down to
-  /// that same `AlignmentError::Tokenization` rather than wrapping
-  /// it in something else.
+  /// `align_emissions` re-expresses `WorkFailure::Alignment` down to
+  /// the neutral [`EmissionsError::Tokenization`] rather than
+  /// wrapping it in something else or leaking the pool type.
   #[test]
   fn align_emissions_surfaces_tokenization_errors_unwrapped() {
     let v = 3;
@@ -1909,9 +1966,91 @@ to a bare align_emissions call; got {message:?}"
 
     let err = align_emissions(&log_probs, &tokenized, never(), &config).unwrap_err();
     assert!(
-      matches!(err, AlignmentError::Tokenization(_)),
-      "expected AlignmentError::Tokenization; got {err:?}"
+      matches!(err, EmissionsError::Tokenization(_)),
+      "expected EmissionsError::Tokenization; got {err:?}"
     );
+  }
+
+  /// A blank-token id `>= log_probs.v()` is a caller-supplied
+  /// *configuration* fault, not model inference: `align_emissions`
+  /// surfaces it as [`EmissionsError::Config`], and the `Display`
+  /// leaks no ORT / worker / pool / `Event::Error` vocabulary.
+  #[test]
+  fn align_emissions_reports_bad_blank_id_as_config() {
+    let v = 3;
+    let t = 4;
+    let log_probs = lp(t, v, vec![-1.0_f32; t * v]);
+    let tokenized = TokenizedText::new(vec![1, 2], vec![Some(0), Some(0)], None);
+    // Blank id 99 is out of the V=3 vocab range.
+    let config = AlignEmissionsConfig::new(99, Lang::En);
+
+    let err = align_emissions(&log_probs, &tokenized, never(), &config).unwrap_err();
+    assert!(
+      matches!(err, EmissionsError::Config(_)),
+      "an out-of-range blank id must surface as Config; got {err:?}"
+    );
+    let s = err.to_string();
+    for banned in [
+      "ORT",
+      "worker",
+      "pool",
+      "Event::Error",
+      "ASR text preserved",
+    ] {
+      assert!(!s.contains(banned), "Config Display leaked {banned:?}: {s}");
+    }
+  }
+
+  /// Finding 2 (codex round 7): a single-token, huge-`T` lattice
+  /// slips under the `T · num_tokens` trellis-cell cap (num_tokens =
+  /// 1) and its `final_j = 0` skips the beam loop's node-budget
+  /// guard, so `backtrack_beam`'s `Vec::with_capacity(T)` would
+  /// allocate hundreds of MB. `align_emissions` must reject `T`
+  /// beyond [`SEAM_PATH_FRAME_BUDGET`] BEFORE that allocation, with
+  /// the neutral [`EmissionsError::PathBudget`] discriminant — and
+  /// still align a realistic lattice.
+  #[test]
+  fn align_emissions_rejects_oversized_frame_count_before_allocating() {
+    // `T` one past the budget; `V = 1` keeps the constructed input
+    // at ~8 MB — the point is the *reconstruction* allocation the
+    // preflight prevents, not this buffer. The preflight reads
+    // `log_probs.t()` and returns before `align_to_word_segments`
+    // touches the trellis or the path `Vec`, so a hard peak-RSS
+    // assertion isn't portable here; we assert the early typed error
+    // instead.
+    let t = SEAM_PATH_FRAME_BUDGET + 1;
+    let log_probs = lp(t, 1, vec![-1.0_f32; t]);
+    let tokenized = TokenizedText::new(vec![0], vec![Some(0)], None);
+    let config = AlignEmissionsConfig::new(0, Lang::En);
+
+    let err = align_emissions(&log_probs, &tokenized, never(), &config).unwrap_err();
+    assert!(
+      matches!(err, EmissionsError::PathBudget(_)),
+      "an oversized frame count must fail fast as PathBudget; got {err:?}"
+    );
+    let s = err.to_string();
+    assert!(
+      s.contains("path budget"),
+      "Display should name the exceeded budget; got {s}"
+    );
+    for banned in ["ORT", "worker", "pool", "Event::Error"] {
+      assert!(
+        !s.contains(banned),
+        "PathBudget Display leaked {banned:?}: {s}"
+      );
+    }
+
+    // A realistic-size lattice still aligns end to end.
+    let mut ok_data = vec![-100.0_f32; 12];
+    ok_data[1] = -0.1;
+    ok_data[3] = -0.1;
+    ok_data[8] = -0.1;
+    ok_data[9] = -0.1;
+    let ok_log_probs = lp(4, 3, ok_data);
+    let ok_tokens = TokenizedText::new(vec![1, 2], vec![Some(0), Some(0)], None);
+    let words = align_emissions(&ok_log_probs, &ok_tokens, never(), &config)
+      .expect("a normal-size lattice must still align");
+    assert!(!words.is_empty(), "normal lattice must produce a word");
   }
 
   /// Round-5 closure property (HIGH): with `LogProbsTV::new`'s domain

@@ -150,6 +150,7 @@ pub mod emissions {
           LogProbsError, LogProbsShapeError, LogProbsTV, LogProbsValueClass, LogProbsValueError,
           log_softmax_with_finite_guard,
         },
+        errors::{EmissionsError, EmissionsFailure},
         tokenize::{TokenizedText, detect_oov_events, tokenize_with_word_map},
         trellis_beam::{
           ALIGN_BEAM_WIDTH, AlignEmissionsConfig, WILDCARD_TOKEN_ID, WordSegment, align_emissions,

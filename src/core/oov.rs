@@ -218,13 +218,15 @@ pub enum OovDecision {
   /// alignment at the cost of plausible-but-wrong timing on
   /// pronounced symbols.
   Wildcard,
-  /// Drop the chunk's word alignment entirely; the ASR
-  /// transcript still ships in the resulting
-  /// [`Transcript`](crate::types::Transcript) but
-  /// `Transcript::words()` is empty for this chunk. Surfaces
-  /// as [`AlignmentError::SemanticOutOfVocab`](crate::types::AlignmentError::SemanticOutOfVocab)
-  /// in the chunk's failure record. Honest at the cost of
-  /// dropped timing.
+  /// Drop the word alignment entirely. On the `alignment` pool
+  /// path the cached ASR transcript still ships in the resulting
+  /// [`Transcript`](crate::types::Transcript) — `Transcript::words()`
+  /// is just empty for this chunk — and the drop is recorded as
+  /// [`AlignmentError::SemanticOutOfVocab`](crate::types::AlignmentError::SemanticOutOfVocab).
+  /// A bare `emissions` caller (no ASR transcript, no pool) instead
+  /// gets `EmissionsError::SemanticOutOfVocab` back from
+  /// `tokenize_with_word_map` and owns whatever text it tokenised.
+  /// Honest at the cost of dropped timing.
   FailClosed,
 }
 

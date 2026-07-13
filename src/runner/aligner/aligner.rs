@@ -205,6 +205,9 @@ impl Aligner {
       }
     };
     let n_words = normalized.normalized().split_whitespace().count();
+    // `detect_oov_events` returns the backend-neutral `EmissionsError`;
+    // re-map it to the pool `WorkFailure` at this orchestration
+    // boundary so the aligner's public error type is unchanged.
     detect_oov_events(
       &self.tokenizer,
       normalized.normalized(),
@@ -214,6 +217,7 @@ impl Aligner {
       &self.language,
       normalized.wildcard_boundary_per_word(),
     )
+    .map_err(|e| e.into_work_failure(&self.language))
   }
 
   /// Audio sample rate the model expects. Hardcoded to 16 kHz
@@ -657,7 +661,11 @@ impl Aligner {
       // `allow_wildcard` policy; slice 4 of the OOV refactor
       // deletes that arm.
       oov_decisions,
-    )?;
+    )
+    // `tokenize_with_word_map` returns the backend-neutral
+    // `EmissionsError`; re-map it to the pool `WorkFailure` at this
+    // orchestration boundary so `align`'s error type is unchanged.
+    .map_err(|e| e.into_work_failure(&self.language))?;
 
     // No-alignable-tokens short-circuit: a chunk like `"1000"`
     // against the uppercase-only English vocab legitimately
