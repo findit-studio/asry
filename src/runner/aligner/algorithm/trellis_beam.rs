@@ -1097,8 +1097,9 @@ impl AlignEmissionsConfig {
     self.blank_token_id
   }
 
-  /// Language tag attached to any [`AlignmentError`] this call
-  /// produces.
+  /// The diagnostic language tag. Threaded to the pinned DP only;
+  /// the backend-neutral [`EmissionsError`] [`align_emissions`]
+  /// returns carries no language.
   #[must_use]
   pub const fn language(&self) -> &Lang {
     &self.language
