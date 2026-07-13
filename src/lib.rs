@@ -99,68 +99,6 @@ pub use runner::{
 #[cfg_attr(docsrs, doc(cfg(feature = "alignment")))]
 pub use ort;
 
-/// Ort-free forced-alignment building blocks: the post-encoder
-/// pipeline (trellis → beam → merge_repeats → merge_words, via
-/// [`emissions::align_emissions`]), tokenisation
-/// ([`emissions::tokenize_with_word_map`]), the per-language
-/// normalizers ([`emissions::default_normalizer_for`]), the
-/// Sans-I/O OOV surface, and silence-aware composition
-/// ([`emissions::compose_words`]). Everything here operates on a
-/// caller-supplied [`emissions::LogProbsTV`] — no ONNX Runtime
-/// session, no whisper.cpp.
-///
-/// A consumer with its own acoustic encoder (e.g. a CoreML
-/// wav2vec2 port) depends on `asry` with `default-features =
-/// false, features = ["emissions"]` to reach this module without
-/// linking `ort` or `whispercpp`. `feature = "alignment"` (ort +
-/// whisper.cpp) depends on this feature and layers `Aligner` /
-/// `AlignmentSet` on the SAME implementation on top — one
-/// algorithm, not a fork — so this module stays reachable under
-/// `alignment` too.
-///
-/// Typical flow for a caller with its own encoder: normalise +
-/// tokenise the transcript ([`emissions::tokenize_with_word_map`],
-/// after resolving any [`emissions::detect_oov_events`] output
-/// through [`emissions::default_oov_decisions`] or a custom
-/// [`emissions::OovDecision`] policy), run the encoder and wrap its
-/// output in a [`emissions::LogProbsTV`] (applying
-/// [`emissions::log_softmax_with_finite_guard`] first if the
-/// encoder emits raw logits rather than log-probabilities), call
-/// [`emissions::align_emissions`], then [`emissions::compose_words`]
-/// (fed a [`emissions::build_speech_frames`] mask) for the final
-/// `AlignmentResult`.
-#[cfg(feature = "emissions")]
-#[cfg_attr(docsrs, doc(cfg(feature = "emissions")))]
-pub mod emissions {
-  pub use crate::{
-    core::oov::{
-      OovDecision, OovEvent, OovKind, ResolvedOov, default_oov_decisions,
-      fail_closed_all_decisions, wildcard_all_decisions,
-    },
-    runner::aligner::{
-      ChineseNormalizer, DynTextNormalizer, EnglishNormalizer, JapaneseNormalizer,
-      KoreanNormalizer, LatinNormalizer, NormalizationError, NormalizedText, TextNormalizer,
-      WildcardBoundary,
-      algorithm::{
-        compose::{
-          DEFAULT_MAX_INTRA_SILENT_RUN, DEFAULT_MIN_SPEECH_COVERAGE, build_speech_frames,
-          compose_words, effective_samples_per_frame,
-        },
-        encode::{
-          LogProbsError, LogProbsShapeError, LogProbsTV, LogProbsValueClass, LogProbsValueError,
-          log_softmax_with_finite_guard,
-        },
-        errors::{EmissionsError, EmissionsFailure},
-        tokenize::{TokenizedText, detect_oov_events, tokenize_with_word_map},
-        trellis_beam::{
-          ALIGN_BEAM_WIDTH, AlignEmissionsConfig, WILDCARD_TOKEN_ID, WordSegment, align_emissions,
-        },
-      },
-      default_normalizer_for,
-    },
-  };
-}
-
 /// **Internal use only — gated on `feature = "bench-internals"`.**
 ///
 /// Re-exports the alignment pipeline's `pub(crate)` SIMD/scalar
