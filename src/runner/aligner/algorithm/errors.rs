@@ -155,12 +155,19 @@ impl From<LogProbsError> for EmissionsError {
   }
 }
 
-#[cfg(feature = "alignment")]
 impl EmissionsError {
   /// Re-express this neutral algorithm error as the pool-oriented
   /// [`WorkFailure`](crate::types::WorkFailure) the `alignment`
   /// thread pool surfaces via `Event::Error`, stamping it with the
   /// `language` the pool is aligning.
+  ///
+  /// Ungated (it was `#[cfg(feature = "alignment")]`): the feature-
+  /// neutral `AlignerCore` — which `EmissionsAligner` contains, not
+  /// just `Aligner` — keeps `WorkFailure` as its internal error, and
+  /// `WorkFailure` / `AlignmentError` / `AlignmentFailure` all live in
+  /// `crate::types` and compile with zero features. The gate named a
+  /// consumer, not a dependency. Same de-gating as the construction
+  /// guards.
   ///
   /// The mapping preserves the exact `AlignmentError` variant the
   /// pool historically emitted for each failure class, so wrapping a
