@@ -115,7 +115,7 @@ const BEAM_NODE_BUDGET: usize = 2_000_000;
 /// of `PathPointPublic`, far above any realistic chunk (30 min at 50
 /// fps ≈ 90 k frames) while turning the degenerate case into a fast
 /// typed [`EmissionsError::PathBudget`].
-const SEAM_PATH_FRAME_BUDGET: usize = 2_000_000;
+pub(crate) const SEAM_PATH_FRAME_BUDGET: usize = 2_000_000;
 
 /// One char-level alignment segment, the output of
 /// `merge_repeats`. Mirrors WhisperX `Segment(label, start, end,

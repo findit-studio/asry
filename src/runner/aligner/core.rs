@@ -46,9 +46,9 @@ use crate::{
       tokenize::{TokenizedText, detect_oov_events, tokenize_with_word_map},
       trellis_beam::align_to_word_segments,
     },
+    emissions_api::{SpeechCoverage, SpeechSpans},
     normalizer::{DynTextNormalizer, NormalizationError, NormalizedText},
   },
-  time::SAMPLE_RATE_HZ,
   types::{AlignmentError, AlignmentFailure, Lang, WorkFailure, WorkerHangTimeout, WorkerKind},
 };
 
@@ -507,7 +507,11 @@ pub(crate) struct AlignerCore {
   /// `V` MUST equal this — [`finish`](Self::finish) enforces it. See
   /// [`capture_vocab_size`] for why it is `NonZeroUsize`.
   tokenizer_vocab_size: NonZeroUsize,
-  min_speech_coverage: f32,
+  /// Already-valid by construction: `SpeechCoverage` cannot hold a
+  /// `NaN`, so `compose_words`'s `coverage < threshold` test is a total
+  /// order with no trapdoor. There is no public `f32` slot for this
+  /// anywhere any more.
+  min_speech_coverage: SpeechCoverage,
   max_intra_silent_run: Duration,
 }
 
@@ -535,7 +539,9 @@ struct PreparedInner<'a> {
   /// The chunk's REAL audio length (`samples.len()`), before padding.
   /// Drives the stride check and word-range clamping.
   real_samples: usize,
-  sub_segments: &'a [TimeRange],
+  /// The coalesced VAD spans, in sample space. Carried here so `finish`
+  /// cannot be handed a DIFFERENT set than `prepare` masked with.
+  speech: SpeechSpans,
   normalized: NormalizedText<'a>,
   tokenized: TokenizedText,
 }
@@ -573,7 +579,7 @@ impl AlignerCore {
     unk_token_id: Option<u32>,
     vocab_uppercase_only: bool,
     tokenizer_vocab_size: NonZeroUsize,
-    min_speech_coverage: f32,
+    min_speech_coverage: SpeechCoverage,
     max_intra_silent_run: Duration,
   ) -> Self {
     Self {
@@ -610,16 +616,12 @@ impl AlignerCore {
     self.tokenizer_vocab_size
   }
 
-  pub(crate) const fn min_speech_coverage(&self) -> f32 {
+  pub(crate) const fn min_speech_coverage(&self) -> SpeechCoverage {
     self.min_speech_coverage
   }
 
-  /// Store an ALREADY-COERCED coverage threshold. Both front ends
-  /// route through [`coerce_speech_coverage`] first, so the field is
-  /// valid by construction and `compose_words`'s `coverage <
-  /// threshold` comparison has no NaN trapdoor.
-  pub(crate) const fn set_min_speech_coverage(&mut self, coerced: f32) {
-    self.min_speech_coverage = coerced;
+  pub(crate) const fn set_min_speech_coverage(&mut self, value: SpeechCoverage) {
+    self.min_speech_coverage = value;
   }
 
   pub(crate) const fn max_intra_silent_run(&self) -> Duration {
@@ -677,7 +679,7 @@ impl AlignerCore {
   pub(crate) fn prepare<'a>(
     &self,
     samples: &[f32],
-    sub_segments: &'a [TimeRange],
+    speech: &SpeechSpans,
     text: &'a str,
     oov_decisions: &[crate::core::ResolvedOov],
     abort_flag: &AtomicBool,
@@ -715,7 +717,7 @@ impl AlignerCore {
         ),
       )));
     }
-    let speech_mask = build_speech_mask(samples.len(), sub_segments, &self.language)?;
+    let speech_mask = build_speech_mask(samples.len(), speech);
 
     if abort_flag.load(Ordering::Relaxed) {
       return Err(timed_out());
@@ -836,7 +838,7 @@ impl AlignerCore {
       inner: Some(PreparedInner {
         encoder_input,
         real_samples: samples.len(),
-        sub_segments,
+        speech: speech.clone(),
         normalized,
         tokenized,
       }),
@@ -1049,7 +1051,7 @@ impl AlignerCore {
       samples_per_frame,
       encoder_n_samples,
       real_n_samples,
-      prepared.sub_segments,
+      &prepared.speech,
     );
     Ok(compose_words(
       &word_segments,
@@ -1085,65 +1087,42 @@ fn timed_out() -> WorkFailure {
 }
 
 /// Build a per-sample boolean speech mask for step 0.
-/// `sub_segments` are in chunk-local 1/16000 timebase per the
-/// `align` contract; `start_pts` / `end_pts` are sample indices
-/// that get clamped to `[0, n_samples]` via i64 saturation.
 ///
-/// Two contract details worth highlighting:
+/// **Infallible now, and that is the point.** This used to take
+/// `&[TimeRange]` and return a `Result`, because it had to *check* that
+/// the caller's ranges were in the chunk-local 1/16000 timebase — a
+/// millisecond-timebase PTS read as a sample index masks the wrong
+/// samples and produces plausible-but-wrong word alignments. The check
+/// has not been weakened; it has been **moved into the type**.
+/// [`SpeechSpans`] carries no timebase, so there is nothing left to get
+/// wrong here, and the strict bridge
+/// ([`SpeechSpans::from_time_ranges`]) is where a foreign timebase is
+/// rejected — with the same error and the same message the ORT path has
+/// always produced.
 ///
-/// 1. A non-1/16000 timebase fails the chunk in BOTH debug and
-/// release with a `WorkFailure::AlignmentFailed`. Previously
-/// the check was a `debug_assert!` only, so release builds
-/// silently misinterpreted (e.g.) a millisecond-timebase PTS
-/// as a sample index, masking the wrong samples and producing
-/// plausible-but-wrong word alignments. Internal callers
-/// always wrap in 1/16000 (`managed_transcriber.rs`); external
-/// callers of `align_chunk` are documented to do the same and
-/// now hit a clear runtime error if they don't.
-/// 2. `i64 → usize` is via `.clamp(0, n_samples_i64) as usize`, NOT
-/// `as u64 as usize`. The old cast wrapped negative `start_pts`
-/// to a huge u64, which then got clamped to `n_samples` and the
-/// `if end > start` guard dropped the sub-segment entirely.
-/// Negative-overlap ranges (sub-segment whose head extends past
-/// the chunk start) now get their head trimmed and their tail
-/// masked, matching `compose::build_speech_frames`'s `.max(0)`.
-pub(crate) fn build_speech_mask(
-  n_samples: usize,
-  sub_segments: &[TimeRange],
-  language: &Lang,
-) -> Result<Vec<bool>, WorkFailure> {
+/// Span bounds are clamped to `[0, n_samples]`. A span whose head runs
+/// off the front of the chunk was already clamped to zero at
+/// construction; one that overshoots the end is trimmed here (
+/// `all_speech()` runs to `MAX_SAMPLE` on purpose and relies on this).
+pub(crate) fn build_speech_mask(n_samples: usize, speech: &SpeechSpans) -> Vec<bool> {
   let mut mask = vec![false; n_samples];
-  let n_samples_i64 = n_samples as i64;
-  for &seg in sub_segments {
-    if seg.timebase().num() != 1 || seg.timebase().den().get() != SAMPLE_RATE_HZ {
-      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
-        AlignmentFailure::new(
-          format_smolstr!(
-            "Aligner::align expects sub_segments in chunk-local 1/{} timebase, \
- got {}/{}; caller passed sub_segments in the wrong timebase \
- (samples will not match audio if we proceed).",
-            SAMPLE_RATE_HZ,
-            seg.timebase().num(),
-            seg.timebase().den().get(),
-          ),
-          language.clone(),
-        ),
-      )));
-    }
-    let start = seg.start_pts().clamp(0, n_samples_i64) as usize;
-    let end = seg.end_pts().clamp(0, n_samples_i64) as usize;
+  let n_samples_u64 = n_samples as u64;
+  for span in speech.as_slice() {
+    let start = span.start().min(n_samples_u64) as usize;
+    let end = span.end().min(n_samples_u64) as usize;
     if end > start {
       for slot in &mut mask[start..end] {
         *slot = true;
       }
     }
   }
-  Ok(mask)
+  mask
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::time::SAMPLE_RATE_HZ;
 
   /// Regression: the upstream wav2vec2 tokenizer.json (HF format,
   /// no `model.type` discriminator) loaded directly via
@@ -1584,16 +1563,29 @@ mod tests {
   }
 
   // --- build_speech_mask: silence-mask coordinate contract ---
+  //
+  // The mask itself is now INFALLIBLE and timebase-free: it takes
+  // `SpeechSpans`. Every assertion below is byte-identical to what it
+  // was when the mask took `&[TimeRange]` — only the setup changed, and
+  // the two timebase tests moved to the strict bridge that now owns the
+  // rejection (asserting the same variant and the same message
+  // substrings).
 
   fn analysis_tb() -> mediatime::Timebase {
     mediatime::Timebase::new(1, core::num::NonZeroU32::new(SAMPLE_RATE_HZ).unwrap())
   }
 
+  /// Build the spans the mask consumes from chunk-local 1/16000 ranges,
+  /// exactly as `Aligner::align` does.
+  fn spans(ranges: &[TimeRange]) -> SpeechSpans {
+    SpeechSpans::from_time_ranges(ranges).expect("test ranges are in the analysis timebase")
+  }
+
   #[test]
   fn build_speech_mask_marks_inrange_segments() {
     // Plain in-range segment: bits set exactly inside [start, end).
-    let segs = [TimeRange::new(2, 5, analysis_tb())];
-    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
+    let segs = spans(&[TimeRange::new(2, 5, analysis_tb())]);
+    let mask = build_speech_mask(8, &segs);
     assert_eq!(
       mask,
       vec![false, false, true, true, true, false, false, false]
@@ -1606,9 +1598,10 @@ mod tests {
     // start_pts to a huge value, then `.min(samples.len())`
     // clamped to len, and `if end > start` dropped the segment
     // entirely. Now the head trims to 0 and the tail (within
-    // the chunk) gets masked.
-    let segs = [TimeRange::new(-3, 4, analysis_tb())];
-    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
+    // the chunk) gets masked. The clamp lives in `SampleSpan`'s
+    // bridge now; the observable mask is the same.
+    let segs = spans(&[TimeRange::new(-3, 4, analysis_tb())]);
+    let mask = build_speech_mask(8, &segs);
     assert_eq!(
       mask,
       vec![true, true, true, true, false, false, false, false]
@@ -1618,8 +1611,8 @@ mod tests {
   #[test]
   fn build_speech_mask_clamps_overshoot_to_buffer_end() {
     // end_pts past `n_samples` clamps to len; start in range.
-    let segs = [TimeRange::new(5, 100, analysis_tb())];
-    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
+    let segs = spans(&[TimeRange::new(5, 100, analysis_tb())]);
+    let mask = build_speech_mask(8, &segs);
     assert_eq!(
       mask,
       vec![false, false, false, false, false, true, true, true]
@@ -1629,38 +1622,39 @@ mod tests {
   #[test]
   fn build_speech_mask_drops_fully_negative_range() {
     // Both bounds negative: clamps to [0, 0), no bits set.
-    let segs = [TimeRange::new(-10, -3, analysis_tb())];
-    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
+    let segs = spans(&[TimeRange::new(-10, -3, analysis_tb())]);
+    let mask = build_speech_mask(8, &segs);
     assert_eq!(mask, vec![false; 8]);
   }
 
   #[test]
   fn build_speech_mask_drops_fully_overshoot_range() {
     // Both bounds past len: clamps to [len, len), no bits set.
-    let segs = [TimeRange::new(20, 30, analysis_tb())];
-    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
+    let segs = spans(&[TimeRange::new(20, 30, analysis_tb())]);
+    let mask = build_speech_mask(8, &segs);
     assert_eq!(mask, vec![false; 8]);
   }
 
   #[test]
   fn build_speech_mask_zero_width_range_is_dropped() {
-    // start == end: `if end > start` skips, no bits set.
+    // start == end: zero-width spans are dropped at construction.
     // (`TimeRange::new` panics on `end < start`, so a literal
     // inverted-range case can't be constructed via the public
     // API and isn't reachable through the silence-mask path.)
-    let segs = [TimeRange::new(5, 5, analysis_tb())];
-    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
+    let segs = spans(&[TimeRange::new(5, 5, analysis_tb())]);
+    let mask = build_speech_mask(8, &segs);
     assert_eq!(mask, vec![false; 8]);
   }
 
   #[test]
   fn build_speech_mask_unions_overlapping_segments() {
     // Mask is a per-sample OR of all segments; overlap is fine.
-    let segs = [
+    // `SpeechSpans` coalesces up front, which cannot change an OR.
+    let segs = spans(&[
       TimeRange::new(1, 4, analysis_tb()),
       TimeRange::new(3, 6, analysis_tb()),
-    ];
-    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
+    ]);
+    let mask = build_speech_mask(8, &segs);
     assert_eq!(
       mask,
       vec![false, true, true, true, true, true, false, false]
@@ -1669,49 +1663,26 @@ mod tests {
 
   #[test]
   fn build_speech_mask_empty_buffer_returns_empty_mask() {
-    let segs = [TimeRange::new(0, 0, analysis_tb())];
-    let mask = build_speech_mask(0, &segs, &Lang::En).expect("ok");
+    let segs = spans(&[TimeRange::new(0, 0, analysis_tb())]);
+    let mask = build_speech_mask(0, &segs);
     assert!(mask.is_empty());
   }
 
+  /// The trap `all_speech()` closes: an EMPTY span list means total
+  /// silence, and the coverage filter then drops every word. A VAD-less
+  /// caller must say `all_speech()` instead.
   #[test]
-  fn build_speech_mask_errors_on_non_analysis_timebase() {
-    // Promoted from the previous `debug_assert!`-only check: a
-    // non-1/16000 timebase now fails the chunk in BOTH debug and
-    // release. round-tripped this as a
-    // medium-severity finding because release builds silently
-    // misinterpreted (e.g.) a millisecond-timebase PTS as a
-    // 16 kHz sample index, masking the wrong samples and
-    // producing plausible-but-wrong word alignments.
-    let ms_tb = mediatime::Timebase::new(1, core::num::NonZeroU32::new(1000).unwrap());
-    let segs = [TimeRange::new(0, 100, ms_tb)];
-    let err = build_speech_mask(16_000, &segs, &Lang::En).expect_err("must error");
-    match err {
-      WorkFailure::Alignment(AlignmentError::ModelInference(payload)) => {
-        let message = payload.message();
-        assert!(
-          message.contains("chunk-local 1/16000 timebase"),
-          "error message must cite the contract; got: {message}"
-        );
-        assert!(
-          message.contains("1/1000"),
-          "error message must cite the offending timebase; got: {message}"
-        );
-      }
-      other => panic!("expected ModelInference, got {other:?}"),
-    }
+  fn build_speech_mask_distinguishes_no_vad_from_all_silence() {
+    let silence = build_speech_mask(8, &SpeechSpans::new([]));
+    assert_eq!(silence, vec![false; 8], "an empty span list IS all silence");
+
+    let all = build_speech_mask(8, &SpeechSpans::all_speech());
+    assert_eq!(all, vec![true; 8], "all_speech() covers the whole chunk");
   }
 
-  #[test]
-  fn build_speech_mask_errors_on_output_timebase() {
-    // Codex's example was milliseconds (1/1000); a 1/48000
-    // (output-rate) PTS is the more realistic foot-gun: a
-    // production caller passing the output-timebase ranges they
-    // were going to emit, instead of converting back to
-    // chunk-local 1/16000. Same fail-loud behaviour required.
-    let out_tb = mediatime::Timebase::new(1, core::num::NonZeroU32::new(48_000).unwrap());
-    let segs = [TimeRange::new(0, 1000, out_tb)];
-    let err = build_speech_mask(16_000, &segs, &Lang::En).expect_err("must error");
-    assert!(matches!(err, WorkFailure::Alignment(_)));
-  }
+  // The two timebase-rejection tests moved to `aligner.rs`, next to
+  // `spans_from_sub_segments` — the function that now owns the
+  // rejection and maps it back to the ORT path's exact
+  // `WorkFailure` variant + message. They assert the same variant and
+  // the same message substrings they always did.
 }

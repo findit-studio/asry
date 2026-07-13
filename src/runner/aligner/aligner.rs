@@ -13,10 +13,11 @@ use crate::{
     RunnerError,
     aligner::{
       core::{
-        AlignerCore, AlignerCoreLoadError, capture_vocab_size, coerce_speech_coverage,
-        detect_blank_token_id, detect_unk_token_id, detect_vocab_uppercase_only,
-        load_tokenizer_with_compat, validate_word_delimiter_present,
+        AlignerCore, AlignerCoreLoadError, capture_vocab_size, detect_blank_token_id,
+        detect_unk_token_id, detect_vocab_uppercase_only, load_tokenizer_with_compat,
+        validate_word_delimiter_present,
       },
+      emissions_api::{SpanError, SpeechCoverage, SpeechSpans},
       normalizer::DynTextNormalizer,
     },
   },
@@ -36,6 +37,41 @@ fn lift_core_load_error(err: AlignerCoreLoadError) -> RunnerError {
   RunnerError::AlignerLoad {
     message: err.message().clone(),
   }
+}
+
+/// Convert the caller's chunk-local `TimeRange` sub-segments into the
+/// timebase-free [`SpeechSpans`] the core works in.
+///
+/// The timebase check MOVED here; it did not change. `build_speech_mask`
+/// used to reject a non-1/16000 timebase itself; now
+/// `SpeechSpans::from_time_ranges` is strict about it and this function
+/// re-expresses the rejection as the *identical*
+/// `WorkFailure::Alignment(AlignmentError::ModelInference(..))` with the
+/// *identical* message, so `Aligner::align`'s observable behaviour on a
+/// wrong-timebase caller is unchanged.
+fn spans_from_sub_segments(
+  sub_segments: &[TimeRange],
+  language: &Lang,
+) -> Result<SpeechSpans, WorkFailure> {
+  SpeechSpans::from_time_ranges(sub_segments).map_err(|e| match e {
+    SpanError::Timebase { num, den, .. } => {
+      WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(
+        format_smolstr!(
+          "Aligner::align expects sub_segments in chunk-local 1/{} timebase, \
+ got {}/{}; caller passed sub_segments in the wrong timebase \
+ (samples will not match audio if we proceed).",
+          SAMPLE_RATE_HZ,
+          num,
+          den,
+        ),
+        language.clone(),
+      )))
+    }
+    other => WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(
+      format_smolstr!("invalid sub_segment: {other}"),
+      language.clone(),
+    ))),
+  })
 }
 
 /// Default frame stride in 16 kHz samples: 320 = 20 ms, the
@@ -170,7 +206,7 @@ impl Aligner {
         unk_token_id,
         vocab_uppercase_only,
         tokenizer_vocab_size,
-        crate::runner::aligner::algorithm::compose::DEFAULT_MIN_SPEECH_COVERAGE,
+        SpeechCoverage::DEFAULT,
         crate::runner::aligner::algorithm::compose::DEFAULT_MAX_INTRA_SILENT_RUN,
       ),
     })
@@ -263,7 +299,7 @@ impl Aligner {
   /// required for a word to survive the alignment composer's
   /// post-pass. Default: `0.5` (`DEFAULT_MIN_SPEECH_COVERAGE`).
   pub const fn min_speech_coverage(&self) -> f32 {
-    self.core.min_speech_coverage()
+    self.core.min_speech_coverage().get()
   }
 
   /// Set [`Self::min_speech_coverage`].
@@ -288,7 +324,7 @@ impl Aligner {
   pub const fn set_min_speech_coverage(&mut self, value: f32) {
     self
       .core
-      .set_min_speech_coverage(coerce_speech_coverage(value));
+      .set_min_speech_coverage(SpeechCoverage::clamped(value));
   }
 
   /// Builder-style override for [`Self::min_speech_coverage`].
@@ -298,7 +334,7 @@ impl Aligner {
   pub const fn with_min_speech_coverage(mut self, value: f32) -> Self {
     self
       .core
-      .set_min_speech_coverage(coerce_speech_coverage(value));
+      .set_min_speech_coverage(SpeechCoverage::clamped(value));
     self
   }
 
@@ -505,9 +541,13 @@ impl Aligner {
 
     // Steps 0-2. Same body, same order, same short-circuits — it just
     // lives in the core now, where `EmissionsAligner` reaches it too.
+    // The timebase check moved into the type: `SpeechSpans` carries no
+    // timebase, so nothing downstream can silently ignore one. The
+    // rejection is byte-identical to what `build_speech_mask` produced.
+    let speech = spans_from_sub_segments(sub_segments, self.core.language())?;
     let prepared = self
       .core
-      .prepare(samples, sub_segments, text, oov_decisions, abort_flag)?;
+      .prepare(samples, &speech, text, oov_decisions, abort_flag)?;
 
     // Empty normalised text, or zero alignable tokens. Skip the
     // encoder entirely and surface the cached ASR transcript with
@@ -720,6 +760,66 @@ mod tests {
       WorkFailure::Alignment(AlignmentError::ModelInference(_)) => {}
       other => panic!("non-aborted encode error must pass through unchanged; got {other:?}"),
     }
+  }
+
+  fn analysis_tb() -> mediatime::Timebase {
+    mediatime::Timebase::new(1, core::num::NonZeroU32::new(SAMPLE_RATE_HZ).unwrap())
+  }
+
+  /// The timebase check MOVED (into the span type) but did NOT change.
+  /// `build_speech_mask` used to reject a non-1/16000 sub-segment
+  /// itself; `SpeechSpans::from_time_ranges` is strict about it now and
+  /// `spans_from_sub_segments` re-expresses the rejection as the
+  /// identical `WorkFailure` variant with the identical message. Same
+  /// assertions the mask's test made.
+  #[test]
+  fn build_speech_mask_errors_on_non_analysis_timebase() {
+    // Promoted from the previous `debug_assert!`-only check: a
+    // non-1/16000 timebase fails the chunk in BOTH debug and release.
+    // Release builds silently misinterpreted (e.g.) a
+    // millisecond-timebase PTS as a 16 kHz sample index, masking the
+    // wrong samples and producing plausible-but-wrong word alignments.
+    let ms_tb = mediatime::Timebase::new(1, core::num::NonZeroU32::new(1000).unwrap());
+    let segs = [TimeRange::new(0, 100, ms_tb)];
+    let err = spans_from_sub_segments(&segs, &Lang::En).expect_err("must error");
+    match err {
+      WorkFailure::Alignment(AlignmentError::ModelInference(payload)) => {
+        let message = payload.message();
+        assert!(
+          message.contains("chunk-local 1/16000 timebase"),
+          "error message must cite the contract; got: {message}"
+        );
+        assert!(
+          message.contains("1/1000"),
+          "error message must cite the offending timebase; got: {message}"
+        );
+      }
+      other => panic!("expected ModelInference, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn build_speech_mask_errors_on_output_timebase() {
+    // Codex's example was milliseconds (1/1000); a 1/48000
+    // (output-rate) PTS is the more realistic foot-gun: a production
+    // caller passing the output-timebase ranges they were going to
+    // emit, instead of converting back to chunk-local 1/16000. Same
+    // fail-loud behaviour required.
+    let out_tb = mediatime::Timebase::new(1, core::num::NonZeroU32::new(48_000).unwrap());
+    let segs = [TimeRange::new(0, 1000, out_tb)];
+    let err = spans_from_sub_segments(&segs, &Lang::En).expect_err("must error");
+    assert!(matches!(err, WorkFailure::Alignment(_)));
+  }
+
+  /// The analysis timebase passes through and yields the same spans the
+  /// mask always masked.
+  #[test]
+  fn spans_from_sub_segments_accepts_the_analysis_timebase() {
+    let segs = [TimeRange::new(2, 5, analysis_tb())];
+    let spans = spans_from_sub_segments(&segs, &Lang::En).expect("1/16000 is the contract");
+    assert_eq!(spans.as_slice().len(), 1);
+    assert_eq!(spans.as_slice()[0].start(), 2);
+    assert_eq!(spans.as_slice()[0].end(), 5);
   }
 
   /// The de-gating must not move `Aligner::from_paths`'s observable

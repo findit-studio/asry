@@ -14,8 +14,13 @@ use mediatime::{TimeRange, Timebase};
 use smol_str::SmolStr;
 
 use crate::{
-  core::AlignmentResult, runner::aligner::algorithm::trellis_beam::WordSegment,
-  time::SAMPLE_RATE_HZ, types::Word,
+  core::AlignmentResult,
+  runner::aligner::{
+    algorithm::trellis_beam::WordSegment,
+    emissions_api::{SpeechCoverage, SpeechSpans},
+  },
+  time::SAMPLE_RATE_HZ,
+  types::Word,
 };
 
 /// Default minimum `speech_emissions / total_emissions` ratio
@@ -188,7 +193,16 @@ pub fn build_speech_frames(
   // as silence, and `compose_words` drops every word.  // this argument did not exist; callers passed
   // `encoder_n_samples` for the single `n_samples` slot.
   real_n_samples: u64,
-  sub_segments: &[mediatime::TimeRange],
+  // Speech regions in SAMPLE SPACE. This used to be
+  // `&[mediatime::TimeRange]`, and this function never looked at
+  // `TimeRange::timebase` — so a caller handing it millisecond-timebase
+  // VAD got a plausible, confidently-wrong mask with no error. The
+  // timebase axis is now *deleted from the type*, not checked: a
+  // `SampleSpan` has no timebase to ignore. Already sorted and
+  // coalesced at construction, so the per-frame accumulator's "≥50 % of
+  // the frame's samples are inside the VAD speech UNION" contract holds
+  // without a second coalescing pass here.
+  speech: &SpeechSpans,
 ) -> Vec<bool> {
   if !samples_per_frame.is_finite() || samples_per_frame <= 0.0 {
     return vec![false; n_frames];
@@ -270,30 +284,26 @@ pub fn build_speech_frames(
   // overshoot here lets `compose_words` keep CTC word spans
   // over silence/padding. this clamped to
   // `n_samples_i64` (encoder length).
-  let mut clamped_segs: Vec<(i64, i64)> = sub_segments
+  //
+  // `SpeechSpans` sorts + coalesces at construction and `SampleSpan`
+  // bounds are `<= i64::MAX` by construction, so the only work left
+  // here is the clamp to the REAL audio extent — which must stay: a
+  // span may legitimately overshoot the chunk (`all_speech()` runs to
+  // `MAX_SAMPLE` on purpose), and crediting a frame with overlap from
+  // samples that do not exist would let `compose_words` keep word spans
+  // over silence or padding. Clamping is monotone and the spans arrive
+  // sorted and disjoint, so the result is still sorted and disjoint.
+  let merged_segs: Vec<(i64, i64)> = speech
+    .as_slice()
     .iter()
     .map(|s| {
       (
-        s.start_pts().clamp(0, real_n_samples_i64),
-        s.end_pts().clamp(0, real_n_samples_i64),
+        (s.start() as i64).clamp(0, real_n_samples_i64),
+        (s.end() as i64).clamp(0, real_n_samples_i64),
       )
     })
     .filter(|(s, e)| e > s)
     .collect();
-  clamped_segs.sort_by_key(|&(s, _)| s);
-  let mut merged_segs: Vec<(i64, i64)> = Vec::with_capacity(clamped_segs.len());
-  for (s, e) in clamped_segs {
-    match merged_segs.last_mut() {
-      // Touching (`s == last.1`) or overlapping (`s < last.1`)
-      // → extend the existing range.
-      Some(last) if s <= last.1 => {
-        if e > last.1 {
-          last.1 = e;
-        }
-      }
-      _ => merged_segs.push((s, e)),
-    }
-  }
 
   let mut overlap_per_frame = vec![0_i64; n_frames];
   for &(seg_start, seg_end) in &merged_segs {
@@ -447,7 +457,13 @@ pub fn compose_words<F>(
   // sample-per-frame terms here).
   total_frames: usize,
   samples_to_output_range: F,
-  min_speech_coverage: f32,
+  // Retyped from a bare `f32`. The defect: `NaN` silently disabled this
+  // filter, because the `coverage < min_speech_coverage` test below is
+  // always false against `NaN` — so a misconfigured caller got every
+  // low-coverage word instead of an error. `SpeechCoverage` cannot hold
+  // a `NaN`, so the comparison is a total order. Value-identical for the
+  // ORT path, whose value was already always coerced.
+  min_speech_coverage: SpeechCoverage,
   max_intra_silent_run: Duration,
 ) -> AlignmentResult
 where
@@ -516,7 +532,7 @@ where
       continue;
     }
     let coverage = (speech_count as f32) / (span_len as f32);
-    if coverage < min_speech_coverage {
+    if coverage < min_speech_coverage.get() {
       continue;
     }
     if max_run > max_silent_run_frames {
@@ -569,6 +585,19 @@ where
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Build `SpeechSpans` from chunk-local 1/16000 ranges — the same
+  /// strict bridge `Aligner::align` uses. Named `sp` (not `spans`)
+  /// because the totality test already binds `spans` to frame corners.
+  fn sp(ranges: Vec<TimeRange>) -> SpeechSpans {
+    SpeechSpans::from_time_ranges(&ranges).expect("test ranges use the analysis timebase")
+  }
+
+  /// No speech at all. NOTE the distinction `SpeechSpans::all_speech()`
+  /// exists to make explicit: this means TOTAL SILENCE, not "no VAD".
+  fn no_speech() -> SpeechSpans {
+    SpeechSpans::new([])
+  }
   use core::num::NonZeroU32;
   use mediatime::Timebase;
 
@@ -630,7 +659,7 @@ mod tests {
       5 * 320,
       5,
       fake_samples_to_output_range,
-      DEFAULT_MIN_SPEECH_COVERAGE,
+      SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     // Function may emit zero or one word depending on whether
@@ -718,7 +747,7 @@ mod tests {
                           seen.borrow_mut().push((s, e));
                           fake_samples_to_output_range(s, e)
                         },
-                        DEFAULT_MIN_SPEECH_COVERAGE,
+                        SpeechCoverage::DEFAULT,
                         DEFAULT_MAX_INTRA_SILENT_RUN,
                       );
                       let ctx = format!(
@@ -769,7 +798,7 @@ mod tests {
       5 * 320,
       5,
       fake_samples_to_output_range,
-      DEFAULT_MIN_SPEECH_COVERAGE,
+      SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert!(result.words().is_empty());
@@ -789,7 +818,7 @@ mod tests {
       3 * 320,
       3,
       fake_samples_to_output_range,
-      DEFAULT_MIN_SPEECH_COVERAGE,
+      SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert_eq!(result.words()[0].text(), "Hello!");
@@ -817,7 +846,7 @@ mod tests {
       3 * 320,
       3,
       fake_samples_to_output_range,
-      DEFAULT_MIN_SPEECH_COVERAGE,
+      SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert_eq!(
@@ -852,7 +881,7 @@ mod tests {
       3 * 320,
       3,
       fake_samples_to_output_range,
-      DEFAULT_MIN_SPEECH_COVERAGE,
+      SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert!(result.words().is_empty());
@@ -876,7 +905,7 @@ mod tests {
       480_000,
       1500,
       fake_samples_to_output_range,
-      DEFAULT_MIN_SPEECH_COVERAGE,
+      SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert_eq!(result.words().len(), 1);
@@ -903,7 +932,7 @@ mod tests {
       5 * 320,
       5,
       fake_samples_to_output_range,
-      DEFAULT_MIN_SPEECH_COVERAGE,
+      SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert!(result.words().is_empty());
@@ -924,7 +953,7 @@ mod tests {
       5 * 320,
       5,
       fake_samples_to_output_range,
-      DEFAULT_MIN_SPEECH_COVERAGE,
+      SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert_eq!(result.words().len(), 1);
@@ -947,7 +976,7 @@ mod tests {
       21 * 320,
       21,
       fake_samples_to_output_range,
-      DEFAULT_MIN_SPEECH_COVERAGE,
+      SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert!(result.words().is_empty());
@@ -968,7 +997,7 @@ mod tests {
       5 * 320,
       5,
       fake_samples_to_output_range,
-      DEFAULT_MIN_SPEECH_COVERAGE,
+      SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert!(result.words().is_empty());
@@ -990,7 +1019,7 @@ mod tests {
       1_000,
       4,
       fake_samples_to_output_range,
-      DEFAULT_MIN_SPEECH_COVERAGE,
+      SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert_eq!(result.words().len(), 1);
@@ -1014,7 +1043,7 @@ mod tests {
       900,
       4,
       fake_samples_to_output_range,
-      DEFAULT_MIN_SPEECH_COVERAGE,
+      SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert!(result.words().is_empty());
@@ -1026,7 +1055,7 @@ mod tests {
     use mediatime::{TimeRange, Timebase};
 
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
-    let segs = vec![TimeRange::new(320, 960, tb_16k)];
+    let segs = sp(vec![TimeRange::new(320, 960, tb_16k)]);
     let mask = build_speech_frames(
       /* n_frames: */ 5, /* samples_per_frame: */ 320.0, /* n_samples: */ 1600,
       /* real_n_samples: */ 1600, &segs,
@@ -1036,7 +1065,7 @@ mod tests {
 
   #[test]
   fn build_speech_frames_handles_no_segments() {
-    let mask = build_speech_frames(4, 320.0, 1280, 1280, &[]);
+    let mask = build_speech_frames(4, 320.0, 1280, 1280, &no_speech());
     assert_eq!(mask, vec![false; 4]);
   }
 
@@ -1063,7 +1092,7 @@ mod tests {
   fn build_speech_frames_saturates_u64_max_sample_extents() {
     let n = u64::MAX;
     let spf = effective_samples_per_frame(n, 2, 320);
-    let mask = build_speech_frames(2, spf, n, n, &[]);
+    let mask = build_speech_frames(2, spf, n, n, &no_speech());
     assert_eq!(
       mask,
       vec![false, false],
@@ -1084,7 +1113,7 @@ mod tests {
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
     let n = u64::MAX;
     let spf = effective_samples_per_frame(n, 2, 320);
-    let segs = vec![TimeRange::new(0, 16_000, tb_16k)];
+    let segs = sp(vec![TimeRange::new(0, 16_000, tb_16k)]);
     let mask = build_speech_frames(2, spf, n, n, &segs);
     // Frame 0 spans `[0, i64::MAX)` of "real" audio, so its majority
     // threshold is ~2^62 samples; a 16 000-sample segment is nowhere
@@ -1119,7 +1148,7 @@ mod tests {
 
   #[test]
   fn build_speech_frames_hop_one_with_no_segments_is_all_silence() {
-    let mask = build_speech_frames(8, 1.0, 8, 8, &[]);
+    let mask = build_speech_frames(8, 1.0, 8, 8, &no_speech());
     assert_eq!(mask, vec![false; 8]);
   }
 
@@ -1138,7 +1167,7 @@ mod tests {
     // Encoder length 400 (padded), real audio length 100,
     // single 320-sample-per-frame frame, sub-segment covers
     // the entire real audio [0, 100).
-    let segs = vec![mediatime::TimeRange::new(0, 100, tb_16k)];
+    let segs = sp(vec![mediatime::TimeRange::new(0, 100, tb_16k)]);
     let mask = build_speech_frames(
       /* n_frames: */ 1, /* samples_per_frame: */ 320.0, /* n_samples: */ 400,
       /* real_n_samples: */ 100, &segs,
@@ -1172,7 +1201,7 @@ mod tests {
     // clamped to [0, 100] before overlap math → frame 0 is
     // speech (100 samples ≥ 50-sample real-window threshold),
     // frames 1 and 2 stay silent (real_width=0).
-    let segs = vec![mediatime::TimeRange::new(0, 600, tb_16k)];
+    let segs = sp(vec![mediatime::TimeRange::new(0, 600, tb_16k)]);
     let mask = build_speech_frames(
       /* n_frames: */ 3, /* samples_per_frame: */ 320.0, /* n_samples: */ 960,
       /* real_n_samples: */ 100, &segs,
@@ -1197,7 +1226,7 @@ mod tests {
     // for frame 0. Frame 0's real_width is 50 → threshold is
     // ceil(50/2)=25; 10 < 25 → silent. Frame 1 has
     // real_width=0 → silent.
-    let segs = vec![mediatime::TimeRange::new(40, 320, tb_16k)];
+    let segs = sp(vec![mediatime::TimeRange::new(40, 320, tb_16k)]);
     let mask = build_speech_frames(
       /* n_frames: */ 2, /* samples_per_frame: */ 320.0, /* n_samples: */ 640,
       /* real_n_samples: */ 50, &segs,
@@ -1224,7 +1253,7 @@ mod tests {
     // real_width=0). Sub-segment covers only padded territory
     // (clamped to [0, 100] so it ends up [0, 100], frame 0 is
     // speech, frame 1 stays silent).
-    let segs = vec![mediatime::TimeRange::new(0, 100, tb_16k)];
+    let segs = sp(vec![mediatime::TimeRange::new(0, 100, tb_16k)]);
     let mask = build_speech_frames(
       /* n_frames: */ 2, /* samples_per_frame: */ 320.0, /* n_samples: */ 640,
       /* real_n_samples: */ 100, &segs,
@@ -1242,11 +1271,11 @@ mod tests {
     use mediatime::{TimeRange, Timebase};
 
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
-    let segs = vec![TimeRange::new(0, 1, tb_16k)];
+    let segs = sp(vec![TimeRange::new(0, 1, tb_16k)]);
     let mask = build_speech_frames(4, 3.0, 12, 12, &segs);
     assert_eq!(mask, vec![false; 4]);
 
-    let segs_at = vec![TimeRange::new(0, 2, tb_16k)];
+    let segs_at = sp(vec![TimeRange::new(0, 2, tb_16k)]);
     let mask_at = build_speech_frames(4, 3.0, 12, 12, &segs_at);
     assert!(mask_at[0]);
   }
@@ -1257,12 +1286,12 @@ mod tests {
     use mediatime::{TimeRange, Timebase};
 
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
-    let segs_at = vec![TimeRange::new(0, 160, tb_16k)];
+    let segs_at = sp(vec![TimeRange::new(0, 160, tb_16k)]);
     assert_eq!(
       build_speech_frames(2, 320.0, 640, 640, &segs_at),
       vec![true, false]
     );
-    let segs_under = vec![TimeRange::new(0, 159, tb_16k)];
+    let segs_under = sp(vec![TimeRange::new(0, 159, tb_16k)]);
     assert_eq!(
       build_speech_frames(2, 320.0, 640, 640, &segs_under),
       vec![false, false]
@@ -1275,10 +1304,10 @@ mod tests {
     use mediatime::{TimeRange, Timebase};
 
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
-    let segs = vec![
+    let segs = sp(vec![
       TimeRange::new(0, 80, tb_16k),
       TimeRange::new(160, 240, tb_16k),
-    ];
+    ]);
     assert_eq!(
       build_speech_frames(2, 320.0, 640, 640, &segs),
       vec![true, false]
@@ -1305,7 +1334,7 @@ mod tests {
     // = 160 samples (=min_overlap_samples threshold), marking
     // it as speech. With clamping, seg becomes [320, 320] →
     // empty, no overlap, frame 1 stays silent.
-    let segs = vec![TimeRange::new(320, 480, tb_16k)];
+    let segs = sp(vec![TimeRange::new(320, 480, tb_16k)]);
     let mask = build_speech_frames(
       /* n_frames: */ 2, 320.0, /* n_samples: */ 320, /* real_n_samples: */ 320,
       &segs,
@@ -1322,7 +1351,7 @@ mod tests {
     // threshold → still silent. Without clamping, the unclamped
     // seg would let frame 1 inherit phantom overlap from
     // [320, 480) and might trip the threshold.
-    let partial = vec![TimeRange::new(200, 480, tb_16k)];
+    let partial = sp(vec![TimeRange::new(200, 480, tb_16k)]);
     let mask_partial = build_speech_frames(2, 320.0, 320, 320, &partial);
     assert!(
       !mask_partial[1],
@@ -1347,10 +1376,10 @@ mod tests {
     use mediatime::{TimeRange, Timebase};
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
 
-    let overlapping = vec![
+    let overlapping = sp(vec![
       TimeRange::new(0, 100, tb_16k),
       TimeRange::new(50, 150, tb_16k),
-    ];
+    ]);
     let mask = build_speech_frames(
       /* n_frames: */ 1,
       320.0,
@@ -1367,20 +1396,20 @@ mod tests {
     // Sanity counter-test: two segs whose UNION crosses the
     // threshold MUST classify speech. Picks ranges that
     // overlap but whose merged extent comfortably exceeds 160.
-    let union_speech = vec![
+    let union_speech = sp(vec![
       TimeRange::new(0, 100, tb_16k),
       TimeRange::new(80, 200, tb_16k), // union = [0, 200] = 200 samples
-    ];
+    ]);
     let mask_speech = build_speech_frames(1, 320.0, 320, 320, &union_speech);
     assert_eq!(mask_speech, vec![true]);
 
     // Triple-overlap stress: three segs all overlapping the
     // same prefix. Sum can be ≥ 3× union; union must still win.
-    let triple = vec![
+    let triple = sp(vec![
       TimeRange::new(0, 80, tb_16k),
       TimeRange::new(20, 100, tb_16k),
       TimeRange::new(40, 120, tb_16k),
-    ];
+    ]);
     let mask_triple = build_speech_frames(1, 320.0, 320, 320, &triple);
     // Union = [0, 120] = 120 < 160 → silent.
     assert_eq!(
@@ -1400,10 +1429,10 @@ mod tests {
     use core::num::NonZeroU32;
     use mediatime::{TimeRange, Timebase};
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
-    let touching = vec![
+    let touching = sp(vec![
       TimeRange::new(0, 80, tb_16k),
       TimeRange::new(80, 160, tb_16k),
-    ];
+    ]);
     let mask = build_speech_frames(1, 320.0, 320, 320, &touching);
     assert_eq!(mask, vec![true]);
   }
@@ -1459,7 +1488,7 @@ mod tests {
     // Pick a VAD segment in the middle of the chunk so the
     // small per-frame drift across many frames can shift
     // boundary frames between the two mappings.
-    let mid_segment = vec![TimeRange::new(240_000, 240_640, tb_16k)];
+    let mid_segment = sp(vec![TimeRange::new(240_000, 240_640, tb_16k)]);
     let mask_eff = build_speech_frames(
       total_frames,
       samples_per_frame,
@@ -1530,7 +1559,7 @@ mod tests {
       200, // real_n_samples
       3,
       fake_samples_to_output_range,
-      DEFAULT_MIN_SPEECH_COVERAGE,
+      SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert_eq!(result.words().len(), 1);
@@ -1557,7 +1586,7 @@ mod tests {
       3 * 320,
       3,
       fake_samples_to_output_range,
-      DEFAULT_MIN_SPEECH_COVERAGE,
+      SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     let s = result.words()[0].score();
@@ -1588,7 +1617,7 @@ mod tests {
       12 * 320,
       12,
       fake_samples_to_output_range,
-      DEFAULT_MIN_SPEECH_COVERAGE,
+      SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert!(
@@ -1609,7 +1638,7 @@ mod tests {
       12 * 320,
       12,
       fake_samples_to_output_range,
-      DEFAULT_MIN_SPEECH_COVERAGE,
+      SpeechCoverage::DEFAULT,
       Duration::from_millis(200),
     );
     assert_eq!(permissive.words().len(), 1);
@@ -1632,7 +1661,7 @@ mod tests {
       5 * 320,
       5,
       fake_samples_to_output_range,
-      DEFAULT_MIN_SPEECH_COVERAGE,
+      SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert_eq!(default_result.words().len(), 1);
@@ -1647,7 +1676,7 @@ mod tests {
       5 * 320,
       5,
       fake_samples_to_output_range,
-      0.9,
+      SpeechCoverage::clamped(0.9),
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert!(strict.words().is_empty());

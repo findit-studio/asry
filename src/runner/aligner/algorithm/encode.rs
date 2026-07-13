@@ -354,6 +354,26 @@ impl LogProbsTV {
     Ok(Self { t, v, data })
   }
 
+  /// Build from parts whose contract has ALREADY been established by
+  /// the caller — the two internal producers of log-probabilities.
+  ///
+  /// `pub(crate)`, and it must stay that way. Both callers earn the
+  /// skip: `encode_log_softmax` and `Emissions::from_logits` each run
+  /// [`log_softmax_with_finite_guard`], whose output is finite and
+  /// `<= 0` **by construction** (`lp = (x − max) − ln Σ exp(x − max)`;
+  /// the `max` element contributes `exp(0) = 1`, so `ln Σ >= 0` and
+  /// every output is `(<= 0) − (>= 0)`). Re-running [`new`](Self::new)'s
+  /// `O(T·V)` value-domain scan on that output would be re-deriving a
+  /// fact the log-softmax identity already guarantees — and would put a
+  /// new per-chunk cost on the ORT hot path, which previously reached
+  /// this shape through a bare struct literal.
+  ///
+  /// This is NOT a public escape hatch, and `Emissions` deliberately has
+  /// no equivalent. The seam has exactly one door.
+  pub(crate) const fn from_parts_unchecked(t: usize, v: usize, data: Vec<f32>) -> Self {
+    Self { t, v, data }
+  }
+
   /// Time dimension (number of wav2vec2 output frames).
   #[must_use]
   pub const fn t(&self) -> usize {
@@ -558,7 +578,10 @@ pub(crate) fn encode_log_softmax(
   // `EmissionsError`; the pool path re-maps it to `WorkFailure` here
   // so `encode_log_softmax`'s observable error type is unchanged.
   let data = log_softmax_with_finite_guard(raw, t, v).map_err(|e| e.into_work_failure(language))?;
-  Ok(LogProbsTV { t, v, data })
+  // Named constructor for what used to be a bare struct literal. Same
+  // cost (no scan): `log_softmax_with_finite_guard`'s output is finite
+  // and `<= 0` by construction. See `from_parts_unchecked`.
+  Ok(LogProbsTV::from_parts_unchecked(t, v, data))
 }
 
 /// Validate the `(T, V)` output dimensions before allocation /
