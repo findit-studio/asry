@@ -70,10 +70,24 @@ fi
 mv "$TMP" models/wav2vec2-base-960h.onnx
 ```
 
-(Asry's `build.rs` can fetch both fixtures for you when
-`ASRY_FETCH_MODEL=1` / `ASRY_FETCH_W2V=1` are set on a
-`cargo build`. The script enforces the same SHA-256 pins. Plain
-`cargo build` makes no network requests.)
+(Asry's `build.rs` can fetch these for you. The two opt-ins are
+independent: `ASRY_FETCH_MODEL=1` fetches the whisper checkpoint,
+`ASRY_FETCH_W2V=1` fetches the wav2vec2 alignment encoders — you do
+not need the 1.6 GB whisper checkpoint just to align. The script
+enforces the same SHA-256 pins. Plain `cargo build` makes no network
+requests.)
+
+The forced-alignment tests are `#[ignore]`d, because they cannot run
+without the wav2vec2 fixture above — and a test that quietly returns
+`ok` when its model is missing is not a test. Run them explicitly:
+
+```sh
+ASRY_FETCH_W2V=1 cargo test --features alignment -- --ignored
+```
+
+`ort` is built `load-dynamic`, so point it at an ONNX Runtime shared
+library first (e.g. `export
+ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib`).
 
 ### Run an end-to-end alignment
 

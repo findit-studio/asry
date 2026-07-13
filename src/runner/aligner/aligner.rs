@@ -655,6 +655,50 @@ fn classify_encode_abort(
 mod tests {
   use super::*;
 
+  /// How to run the fixture-gated alignment tests in this module.
+  ///
+  /// They are `#[ignore]`d, so `cargo test` reports them as *ignored*
+  /// and never claims they passed. Opt in with:
+  ///
+  /// ```sh
+  /// ASRY_FETCH_W2V=1 cargo test --features alignment -- --ignored
+  /// ```
+  const FIXTURE_OPT_IN: &str = "ASRY_FETCH_W2V=1 cargo test --features alignment -- --ignored";
+
+  /// Resolve a `build.rs`-emitted alignment-fixture path, or **panic**.
+  ///
+  /// These tests used to open with `let Some(p) = option_env!(..) else
+  /// { return; }`. That is a fake gate: with the fixture absent — which
+  /// is *every* CI run and every default `cargo test`, because build.rs
+  /// only emits these vars under `ASRY_FETCH_W2V` — the body never ran
+  /// and libtest printed `ok`. Ten tests that each load a 378 MB ONNX
+  /// encoder "passed" in 0.00s. A test that reports success without
+  /// executing is worse than no test: it occupies the slot where a real
+  /// gate would go, and asry's `Aligner` is the parity reference other
+  /// crates grade themselves against.
+  ///
+  /// So: `#[ignore]` makes the opt-in visible and honest (an unrun test
+  /// is reported as *ignored*, never as *passed*), and this helper makes
+  /// the opted-in run fail loudly when the fixture it needs isn't there.
+  /// The one outcome that is no longer reachable is the one that mattered:
+  /// green without having run.
+  ///
+  /// `option_env!` is compile-time, so `None` here means build.rs did not
+  /// emit the var — either the opt-in was unset, or the download/SHA-256
+  /// check failed. Both are reported the same way, because both mean "no
+  /// provenance-verified fixture on disk".
+  #[track_caller]
+  fn fixture_or_panic(path: Option<&'static str>, env_var: &str) -> &'static str {
+    path.unwrap_or_else(|| {
+      panic!(
+        "alignment fixture missing: build.rs never emitted `{env_var}`, so there is no \
+         SHA-verified model on disk to align against. This test is `#[ignore]`d precisely \
+         so it can demand the fixture instead of silently passing without it. Fetch it and \
+         re-run:\n\n    {FIXTURE_OPT_IN}\n"
+      )
+    })
+  }
+
   /// when the
   /// alignment watchdog flips `abort_flag` and ORT returns an
   /// error from terminate(), the encode-failure classifier
@@ -805,11 +849,11 @@ mod tests {
   /// test exercises that path without ONNX inference (the
   /// short-circuit returns before `encode_log_softmax` runs).
   ///
-  /// Skips when the build.rs fixture isn't present (offline /
-  /// `ASRY_OFFLINE=1`); aligner_load already verifies the
-  /// fixture loads, so we know `Aligner::from_paths` succeeds
-  /// when the env vars are set.
+  /// Needs the English wav2vec2 fixture to construct the `Aligner`.
+  /// Absent fixture ⇒ hard failure, never a silent pass — see
+  /// [`fixture_or_panic`].
   #[test]
+  #[ignore = "requires the English wav2vec2 fixture (ASRY_FETCH_W2V=1; see FIXTURE_OPT_IN)"]
   fn empty_normalised_text_returns_empty_alignment_result() {
     use core::sync::atomic::AtomicBool;
 
@@ -817,14 +861,8 @@ mod tests {
 
     use crate::runner::aligner::normalizers::EnglishNormalizer;
 
-    let model_path = match option_env!("ASRY_W2V_MODEL") {
-      Some(p) => p,
-      None => return,
-    };
-    let tokenizer_path = match option_env!("ASRY_W2V_TOKENIZER") {
-      Some(p) => p,
-      None => return,
-    };
+    let model_path = fixture_or_panic(option_env!("ASRY_W2V_MODEL"), "ASRY_W2V_MODEL");
+    let tokenizer_path = fixture_or_panic(option_env!("ASRY_W2V_TOKENIZER"), "ASRY_W2V_TOKENIZER");
 
     let mut aligner = Aligner::from_paths(
       Lang::En,
@@ -880,6 +918,7 @@ mod tests {
   /// 25 ms or less, the chunk cannot contain a meaningful
   /// CTC path through any non-trivial transcript.
   #[test]
+  #[ignore = "requires the English wav2vec2 fixture (ASRY_FETCH_W2V=1; see FIXTURE_OPT_IN)"]
   fn sub_400_sample_chunk_short_circuits_to_empty_result() {
     use core::sync::atomic::AtomicBool;
 
@@ -887,14 +926,8 @@ mod tests {
 
     use crate::runner::aligner::normalizers::EnglishNormalizer;
 
-    let model_path = match option_env!("ASRY_W2V_MODEL") {
-      Some(p) => p,
-      None => return,
-    };
-    let tokenizer_path = match option_env!("ASRY_W2V_TOKENIZER") {
-      Some(p) => p,
-      None => return,
-    };
+    let model_path = fixture_or_panic(option_env!("ASRY_W2V_MODEL"), "ASRY_W2V_MODEL");
+    let tokenizer_path = fixture_or_panic(option_env!("ASRY_W2V_TOKENIZER"), "ASRY_W2V_TOKENIZER");
 
     let mut aligner = Aligner::from_paths(
       Lang::En,
@@ -940,9 +973,8 @@ mod tests {
 
   /// Smoke test: load the Japanese wav2vec2 fixture (downloaded
   /// via `tests/parity_whisperx/python/fetch_align_model.py ja`
-  /// — see `multi-lang-alignment` branch). Skips when the
-  /// fixture isn't present so default `cargo test` runs stay
-  /// network/disk-free.
+  /// — see `multi-lang-alignment` branch). `#[ignore]`d so default
+  /// `cargo test` runs stay network/disk-free.
   ///
   /// Verifies the multi-lang path end-to-end on the loader side:
   /// `Aligner::from_paths` accepts the jonatasgrosman tokenizer
@@ -951,6 +983,7 @@ mod tests {
   /// short-circuit returns Ok(empty AlignmentResult) just like
   /// the English aligner.
   #[test]
+  #[ignore = "requires the Japanese wav2vec2 fixture (ASRY_FETCH_W2V=1; see FIXTURE_OPT_IN)"]
   fn japanese_aligner_loads_and_short_circuits_on_empty_text() {
     use core::sync::atomic::AtomicBool;
 
@@ -958,14 +991,11 @@ mod tests {
 
     use crate::runner::aligner::default_normalizer_for;
 
-    let model_path = match option_env!("ASRY_W2V_JA_MODEL") {
-      Some(p) => p,
-      None => return,
-    };
-    let tokenizer_path = match option_env!("ASRY_W2V_JA_TOKENIZER") {
-      Some(p) => p,
-      None => return,
-    };
+    let model_path = fixture_or_panic(option_env!("ASRY_W2V_JA_MODEL"), "ASRY_W2V_JA_MODEL");
+    let tokenizer_path = fixture_or_panic(
+      option_env!("ASRY_W2V_JA_TOKENIZER"),
+      "ASRY_W2V_JA_TOKENIZER",
+    );
 
     let normalizer = default_normalizer_for(&Lang::Ja).expect("Ja normalizer must exist");
     let mut aligner = Aligner::from_paths(
@@ -1003,8 +1033,9 @@ mod tests {
   }
 
   /// Smoke test: load the Chinese wav2vec2 fixture. Mirrors the
-  /// Japanese smoke test above; skips when fixture absent.
+  /// Japanese smoke test above; hard-fails when the fixture is absent.
   #[test]
+  #[ignore = "requires the Chinese wav2vec2 fixture (ASRY_FETCH_W2V=1; see FIXTURE_OPT_IN)"]
   fn chinese_aligner_loads_and_short_circuits_on_empty_text() {
     use core::sync::atomic::AtomicBool;
 
@@ -1012,14 +1043,11 @@ mod tests {
 
     use crate::runner::aligner::default_normalizer_for;
 
-    let model_path = match option_env!("ASRY_W2V_ZH_MODEL") {
-      Some(p) => p,
-      None => return,
-    };
-    let tokenizer_path = match option_env!("ASRY_W2V_ZH_TOKENIZER") {
-      Some(p) => p,
-      None => return,
-    };
+    let model_path = fixture_or_panic(option_env!("ASRY_W2V_ZH_MODEL"), "ASRY_W2V_ZH_MODEL");
+    let tokenizer_path = fixture_or_panic(
+      option_env!("ASRY_W2V_ZH_TOKENIZER"),
+      "ASRY_W2V_ZH_TOKENIZER",
+    );
 
     let normalizer = default_normalizer_for(&Lang::Zh).expect("Zh normalizer must exist");
     let mut aligner = Aligner::from_paths(
@@ -1057,17 +1085,16 @@ mod tests {
   }
 
   /// Smoke test: load the Korean wav2vec2 fixture. Mirrors the
-  /// Japanese / Chinese smoke tests above; skips when the
-  /// fixture isn't present so default `cargo test` runs (and CI
-  /// without the FinDIT-Studio mirror upload) stay
-  /// network/disk-free.
+  /// Japanese / Chinese smoke tests above; `#[ignore]`d so default
+  /// `cargo test` runs stay network/disk-free.
   ///
   /// Verifies the multi-lang path end-to-end on the loader side:
-  /// `Aligner::from_paths` accepts the jonatasgrosman tokenizer
+  /// `Aligner::from_paths` accepts the kresnik tokenizer
   /// shape, the KoreanNormalizer is wired up via
   /// `default_normalizer_for(Lang::Ko)`, and the empty-input
   /// short-circuit returns Ok(empty AlignmentResult).
   #[test]
+  #[ignore = "requires the Korean wav2vec2 fixture (ASRY_FETCH_W2V=1; see FIXTURE_OPT_IN)"]
   fn korean_aligner_loads_and_short_circuits_on_empty_text() {
     use core::sync::atomic::AtomicBool;
 
@@ -1075,14 +1102,11 @@ mod tests {
 
     use crate::runner::aligner::default_normalizer_for;
 
-    let model_path = match option_env!("ASRY_W2V_KO_MODEL") {
-      Some(p) => p,
-      None => return,
-    };
-    let tokenizer_path = match option_env!("ASRY_W2V_KO_TOKENIZER") {
-      Some(p) => p,
-      None => return,
-    };
+    let model_path = fixture_or_panic(option_env!("ASRY_W2V_KO_MODEL"), "ASRY_W2V_KO_MODEL");
+    let tokenizer_path = fixture_or_panic(
+      option_env!("ASRY_W2V_KO_TOKENIZER"),
+      "ASRY_W2V_KO_TOKENIZER",
+    );
 
     let normalizer = default_normalizer_for(&Lang::Ko).expect("Ko normalizer must exist");
     let mut aligner = Aligner::from_paths(
@@ -1120,24 +1144,32 @@ mod tests {
   }
 
   /// Helper for the Latin-language smoke tests below. Loads the
-  /// per-language wav2vec2 fixture (when present), wires in the
-  /// per-language `LatinNormalizer` via `default_normalizer_for`,
-  /// and exercises the empty-text short-circuit path that
-  /// doesn't require ONNX inference. Returns `None` when the
-  /// fixture isn't on disk so the calling test gracefully skips.
-  fn try_smoke_latin_aligner(
+  /// per-language wav2vec2 fixture, wires in the per-language
+  /// `LatinNormalizer` via `default_normalizer_for`, and exercises the
+  /// empty-text short-circuit path that doesn't require ONNX inference.
+  ///
+  /// This used to return `Option<()>` and bail via `?` on an absent
+  /// fixture, and every caller discarded the result with `let _ = ..`.
+  /// So all five Latin tests reported `ok` while doing nothing at all.
+  /// It now panics through [`fixture_or_panic`] instead: the callers are
+  /// `#[ignore]`d, so the *unrun* case is reported as ignored, and the
+  /// *run-without-fixture* case is reported as a failure. Neither is
+  /// reported as a pass.
+  fn smoke_latin_aligner(
     lang: Lang,
     model_env: Option<&'static str>,
+    model_var: &str,
     tokenizer_env: Option<&'static str>,
-  ) -> Option<()> {
+    tokenizer_var: &str,
+  ) {
     use core::sync::atomic::AtomicBool;
 
     use mediatime::{TimeRange, Timebase};
 
     use crate::runner::aligner::default_normalizer_for;
 
-    let model_path = model_env?;
-    let tokenizer_path = tokenizer_env?;
+    let model_path = fixture_or_panic(model_env, model_var);
+    let tokenizer_path = fixture_or_panic(tokenizer_env, tokenizer_var);
 
     let normalizer = default_normalizer_for(&lang).expect("Latin lang must resolve a normalizer");
     let mut aligner = Aligner::from_paths(
@@ -1175,61 +1207,70 @@ mod tests {
       result.words().is_empty(),
       "{lang:?} aligner empty-text must yield zero words"
     );
-    Some(())
   }
 
-  /// Spanish smoke test — gracefully skips when the ES fixture
-  /// isn't on disk (mirror SHA still TODO).
+  /// Spanish smoke test.
   #[test]
+  #[ignore = "requires the Spanish wav2vec2 fixture (ASRY_FETCH_W2V=1; see FIXTURE_OPT_IN)"]
   fn spanish_aligner_loads_and_short_circuits_on_empty_text() {
-    let _ = try_smoke_latin_aligner(
+    smoke_latin_aligner(
       Lang::Es,
       option_env!("ASRY_W2V_ES_MODEL"),
+      "ASRY_W2V_ES_MODEL",
       option_env!("ASRY_W2V_ES_TOKENIZER"),
+      "ASRY_W2V_ES_TOKENIZER",
     );
   }
 
-  /// French smoke test — gracefully skips when the FR fixture
-  /// isn't on disk.
+  /// French smoke test.
   #[test]
+  #[ignore = "requires the French wav2vec2 fixture (ASRY_FETCH_W2V=1; see FIXTURE_OPT_IN)"]
   fn french_aligner_loads_and_short_circuits_on_empty_text() {
-    let _ = try_smoke_latin_aligner(
+    smoke_latin_aligner(
       Lang::Fr,
       option_env!("ASRY_W2V_FR_MODEL"),
+      "ASRY_W2V_FR_MODEL",
       option_env!("ASRY_W2V_FR_TOKENIZER"),
+      "ASRY_W2V_FR_TOKENIZER",
     );
   }
 
-  /// German smoke test — gracefully skips when the DE fixture
-  /// isn't on disk.
+  /// German smoke test.
   #[test]
+  #[ignore = "requires the German wav2vec2 fixture (ASRY_FETCH_W2V=1; see FIXTURE_OPT_IN)"]
   fn german_aligner_loads_and_short_circuits_on_empty_text() {
-    let _ = try_smoke_latin_aligner(
+    smoke_latin_aligner(
       Lang::De,
       option_env!("ASRY_W2V_DE_MODEL"),
+      "ASRY_W2V_DE_MODEL",
       option_env!("ASRY_W2V_DE_TOKENIZER"),
+      "ASRY_W2V_DE_TOKENIZER",
     );
   }
 
-  /// Italian smoke test — gracefully skips when the IT fixture
-  /// isn't on disk.
+  /// Italian smoke test.
   #[test]
+  #[ignore = "requires the Italian wav2vec2 fixture (ASRY_FETCH_W2V=1; see FIXTURE_OPT_IN)"]
   fn italian_aligner_loads_and_short_circuits_on_empty_text() {
-    let _ = try_smoke_latin_aligner(
+    smoke_latin_aligner(
       Lang::It,
       option_env!("ASRY_W2V_IT_MODEL"),
+      "ASRY_W2V_IT_MODEL",
       option_env!("ASRY_W2V_IT_TOKENIZER"),
+      "ASRY_W2V_IT_TOKENIZER",
     );
   }
 
-  /// Portuguese smoke test — gracefully skips when the PT
-  /// fixture isn't on disk.
+  /// Portuguese smoke test.
   #[test]
+  #[ignore = "requires the Portuguese wav2vec2 fixture (ASRY_FETCH_W2V=1; see FIXTURE_OPT_IN)"]
   fn portuguese_aligner_loads_and_short_circuits_on_empty_text() {
-    let _ = try_smoke_latin_aligner(
+    smoke_latin_aligner(
       Lang::Pt,
       option_env!("ASRY_W2V_PT_MODEL"),
+      "ASRY_W2V_PT_MODEL",
       option_env!("ASRY_W2V_PT_TOKENIZER"),
+      "ASRY_W2V_PT_TOKENIZER",
     );
   }
 }
