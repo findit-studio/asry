@@ -8,7 +8,10 @@ use mediatime::Timebase;
 use super::*;
 use crate::{
   core::oov::default_oov_decisions,
-  runner::aligner::emissions_api::{SampleSpan, SpanError},
+  runner::aligner::{
+    emissions_api::{SampleSpan, SpanError},
+    normalizer::{NormalizationError, NormalizedText, TextNormalizer},
+  },
 };
 
 /// A wav2vec2-base-960h-shape tokenizer: uppercase-only vocab, `<pad>`
@@ -163,7 +166,7 @@ fn prepare_pads_short_audio_to_the_receptive_field_and_zeroes_non_speech() {
   // Speech only over the first 100 samples.
   let speech = SpeechSpans::new([SampleSpan::new(0, 100).expect("ok")]);
   let prepared = a
-    .prepare(&samples, &speech, "hello", &[])
+    .prepare(&samples, &speech, "hello", &[], &AtomicBool::new(false))
     .expect("prepare must succeed");
 
   let buf = prepared.encoder_input();
@@ -188,7 +191,7 @@ fn prepare_rejects_non_finite_audio_even_outside_the_speech_spans() {
   samples[700] = f32::NAN; // outside the speech span below
   let speech = SpeechSpans::new([SampleSpan::new(0, 100).expect("ok")]);
   // `PreparedChunk` has no `Debug` either — it carries the encoder buffer.
-  let Err(err) = a.prepare(&samples, &speech, "hello", &[]) else {
+  let Err(err) = a.prepare(&samples, &speech, "hello", &[], &AtomicBool::new(false)) else {
     panic!("a NaN anywhere in the raw audio is a hard error");
   };
   assert!(
@@ -206,7 +209,7 @@ fn trivial_chunks_skip_the_encoder() {
   let speech = SpeechSpans::all_speech();
 
   let prepared = a
-    .prepare(&samples, &speech, "!!!...", &[])
+    .prepare(&samples, &speech, "!!!...", &[], &AtomicBool::new(false))
     .expect("punctuation-only normalises to empty; that is not a failure");
   assert!(prepared.is_trivial());
   assert!(prepared.encoder_input().is_empty());
@@ -237,7 +240,9 @@ fn finish_rejects_a_vocab_dim_that_disagrees_with_the_tokenizer() {
   let a = aligner();
   let samples = vec![0.1_f32; 3200];
   let speech = SpeechSpans::all_speech();
-  let prepared = a.prepare(&samples, &speech, "hello", &[]).expect("prepare");
+  let prepared = a
+    .prepare(&samples, &speech, "hello", &[], &AtomicBool::new(false))
+    .expect("prepare");
 
   let t = prepared.encoder_input().len() / 320;
   // A 29-wide head against a 32-entry tokenizer — exactly the shape of a
@@ -267,7 +272,9 @@ fn finish_rejects_a_frame_count_that_cannot_match_the_audio() {
   let a = aligner();
   let samples = vec![0.1_f32; 3200]; // 10 frames at hop 320
   let speech = SpeechSpans::all_speech();
-  let prepared = a.prepare(&samples, &speech, "hello", &[]).expect("prepare");
+  let prepared = a
+    .prepare(&samples, &speech, "hello", &[], &AtomicBool::new(false))
+    .expect("prepare");
 
   // Emissions from a 30 s chunk, handed to a 0.2 s one.
   let t = 1500;
@@ -317,7 +324,13 @@ fn prepare_rejects_oov_decisions_resolved_for_another_language() {
     OovDecision::Wildcard,
   )];
 
-  let Err(err) = a.prepare(&samples, &SpeechSpans::all_speech(), "&", &foreign) else {
+  let Err(err) = a.prepare(
+    &samples,
+    &SpeechSpans::all_speech(),
+    "&",
+    &foreign,
+    &AtomicBool::new(false),
+  ) else {
     panic!("a Korean decision must not drive an English aligner's OOV policy");
   };
   let EmissionsError::Tokenization(f) = err else {
@@ -351,6 +364,7 @@ fn prepare_accepts_oov_decisions_resolved_for_its_own_language() {
     &SpeechSpans::all_speech(),
     "hello & world",
     &decisions,
+    &AtomicBool::new(false),
   )
   .expect("decisions detected from THIS aligner carry its language");
 }
@@ -388,7 +402,13 @@ fn finish_rejects_a_prepared_chunk_from_a_different_aligner() {
 
   let samples = vec![0.2_f32; 16_000];
   let prepared_from_a = a
-    .prepare(&samples, &SpeechSpans::all_speech(), "hello", &[])
+    .prepare(
+      &samples,
+      &SpeechSpans::all_speech(),
+      "hello",
+      &[],
+      &AtomicBool::new(false),
+    )
     .expect("prepare on A");
   assert!(!prepared_from_a.is_trivial(), "'hello' has tokens to align");
 
@@ -425,7 +445,13 @@ fn finish_rejects_a_foreign_trivial_chunk_too() {
   let samples = vec![0.2_f32; 1600];
   // Punctuation-only → trivial: no encoder buffer, no tokens.
   let prepared_from_a = a
-    .prepare(&samples, &SpeechSpans::all_speech(), "!!!...", &[])
+    .prepare(
+      &samples,
+      &SpeechSpans::all_speech(),
+      "!!!...",
+      &[],
+      &AtomicBool::new(false),
+    )
     .expect("prepare on A");
   assert!(prepared_from_a.is_trivial());
 
@@ -449,7 +475,13 @@ fn finish_accepts_the_chunk_its_own_prepare_minted() {
   let a = aligner();
   let samples = vec![0.2_f32; 16_000];
   let prepared = a
-    .prepare(&samples, &SpeechSpans::all_speech(), "hello", &[])
+    .prepare(
+      &samples,
+      &SpeechSpans::all_speech(),
+      "hello",
+      &[],
+      &AtomicBool::new(false),
+    )
     .expect("prepare");
   let (t, logits) = fake_encoder(&prepared, 320);
   let emissions = Emissions::from_logits(t, a.vocab_size(), logits).expect("ok");
@@ -497,7 +529,7 @@ fn alignkit_call_site_aligns_end_to_end() {
   let speech = SpeechSpans::all_speech();
 
   let prepared = aligner
-    .prepare(&samples, &speech, transcript, &decisions)
+    .prepare(&samples, &speech, transcript, &decisions, &abort)
     .expect("prepare");
   if prepared.is_trivial() {
     panic!("'hello world' is not trivial");
@@ -537,7 +569,13 @@ fn prepared_chunk_is_consumed_by_finish() {
   let a = aligner();
   let samples = vec![0.2_f32; 16_000];
   let prepared = a
-    .prepare(&samples, &SpeechSpans::all_speech(), "hello", &[])
+    .prepare(
+      &samples,
+      &SpeechSpans::all_speech(),
+      "hello",
+      &[],
+      &AtomicBool::new(false),
+    )
     .expect("prepare");
   let (t, logits) = fake_encoder(&prepared, 320);
   let emissions = Emissions::from_logits(t, a.vocab_size(), logits).expect("ok");
@@ -554,7 +592,13 @@ fn finish_honours_the_abort_flag() {
   let a = aligner();
   let samples = vec![0.2_f32; 16_000];
   let prepared = a
-    .prepare(&samples, &SpeechSpans::all_speech(), "hello", &[])
+    .prepare(
+      &samples,
+      &SpeechSpans::all_speech(),
+      "hello",
+      &[],
+      &AtomicBool::new(false),
+    )
     .expect("prepare");
   let (t, logits) = fake_encoder(&prepared, 320);
   let emissions = Emissions::from_logits(t, a.vocab_size(), logits).expect("ok");
@@ -565,6 +609,120 @@ fn finish_honours_the_abort_flag() {
     .finish(prepared, &emissions, clock, &aborted)
     .expect_err("a set abort flag must stop the pipeline");
   assert!(matches!(err, EmissionsError::Aborted(_)));
+}
+
+// —————————————————— prepare-stage cancellation ——————————————————
+
+/// A normalizer that MUST NOT be called: it panics on invocation.
+///
+/// The normalise step is where a public, caller-supplied normalizer runs
+/// over unbounded text — the O(n) work `prepare`'s abort poll exists to get
+/// ahead of. Building an aligner with this normalizer turns "did `prepare`
+/// reach the normalise step?" into a hard pass/fail: if the guard is dead,
+/// the panic fires.
+struct PanicNormalizer;
+
+impl TextNormalizer for PanicNormalizer {
+  fn normalize<'a>(&self, _text: &'a str) -> Result<NormalizedText<'a>, NormalizationError> {
+    panic!(
+      "prepare invoked the custom normalizer despite an already-set abort flag — the \
+       prepare-stage cancellation guard is dead"
+    );
+  }
+
+  // English-shape: TOKENIZER_JSON carries a `|`, so the build-time
+  // word-delimiter guard is satisfied.
+  fn use_word_delimiter(&self) -> bool {
+    true
+  }
+}
+
+fn aligner_with_panic_normalizer() -> EmissionsAligner {
+  EmissionsAligner::builder(Lang::En, TOKENIZER_JSON.as_bytes())
+    .normalizer(Box::new(PanicNormalizer))
+    .build()
+    .expect("build with the sentinel normalizer")
+}
+
+/// **`prepare` aborts BEFORE doing the O(n) work.**
+///
+/// The seam used to hand `AlignerCore::prepare` a permanently-false flag, so
+/// none of its cancellation polls could fire: a watchdog that had already
+/// tripped could not stop the seam from scanning, masking, normalising (via
+/// a public custom normalizer), and tokenising over unbounded audio + text.
+///
+/// With an already-SET abort flag and an empty (hence valid) decision
+/// payload, `prepare` must return [`EmissionsError::Aborted`] at the first
+/// poll — ahead of the normalise step. [`PanicNormalizer`] panics if it is
+/// ever reached, so this test passing is a direct proof that the O(n) work
+/// was skipped. Against the old `never`-flag seam it would instead panic.
+#[test]
+fn prepare_aborts_before_the_custom_normalizer_runs() {
+  let a = aligner_with_panic_normalizer();
+  let samples = vec![0.2_f32; 16_000];
+  let aborted = AtomicBool::new(true);
+
+  let Err(err) = a.prepare(
+    &samples,
+    &SpeechSpans::all_speech(),
+    "hello world",
+    &[],
+    &aborted,
+  ) else {
+    panic!("an already-set abort flag must stop prepare before it does any work");
+  };
+  assert!(
+    matches!(err, EmissionsError::Aborted(_)),
+    "a set abort flag must abort prepare; got {err:?}"
+  );
+}
+
+/// **A malformed decision payload wins over cancellation.**
+///
+/// The cross-language decision check runs FIRST in `AlignerCore::prepare` —
+/// ahead of the first abort poll — exactly as the ORT direct path orders it:
+/// a cross-language payload is a caller bug that stays a caller bug even
+/// after a watchdog has fired, and the specific diagnostic is worth more
+/// than a generic timeout. So with the abort flag SET, a foreign-language
+/// decision must still surface as the language/decision error, NOT as
+/// `Aborted` — cancellation does not mask it.
+///
+/// [`PanicNormalizer`] also proves the check precedes the normalise step:
+/// neither the abort poll nor the normalizer is reached.
+#[test]
+fn a_malformed_decision_wins_over_a_set_abort_flag() {
+  use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
+
+  let a = aligner_with_panic_normalizer();
+  let samples = vec![0.2_f32; 16_000];
+
+  // A Korean decision whose positional fields match an English detection, so
+  // only the language separates them — the exact payload the guard rejects.
+  let foreign = vec![ResolvedOov::new(
+    OovEvent::new(OovKind::Symbol('&'), 0, 0, Lang::Ko),
+    OovDecision::Wildcard,
+  )];
+  let aborted = AtomicBool::new(true);
+
+  let Err(err) = a.prepare(
+    &samples,
+    &SpeechSpans::all_speech(),
+    "&",
+    &foreign,
+    &aborted,
+  ) else {
+    panic!("a cross-language decision must be rejected even under cancellation");
+  };
+  let EmissionsError::Tokenization(f) = err else {
+    panic!("cancellation must not mask the language error; got {err:?}");
+  };
+  assert!(
+    f.message().contains("oov_decisions[0].event.language")
+      && f.message().contains("Ko")
+      && f.message().contains("En"),
+    "the decision error must win over abort and name both languages; got {}",
+    f.message()
+  );
 }
 
 /// The rescale opt-in, end to end: a caller whose VAD is in milliseconds
@@ -584,7 +742,7 @@ fn rescaled_vad_spans_reach_prepare() {
   let a = aligner();
   let samples = vec![0.2_f32; 16_000];
   let prepared = a
-    .prepare(&samples, &spans, "hello", &[])
+    .prepare(&samples, &spans, "hello", &[], &AtomicBool::new(false))
     .expect("prepare with rescaled spans");
   let buf = prepared.encoder_input();
   assert!(buf[..8_000].iter().all(|&s| s == 0.2), "speech survives");
