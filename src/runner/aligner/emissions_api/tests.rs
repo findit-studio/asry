@@ -24,6 +24,13 @@ fn ms_tb() -> Timebase {
   Timebase::new(1, NonZeroU32::new(1000).expect("1000 != 0"))
 }
 
+/// A degenerate `0/den` timebase. `Timebase::new` permits it — only the
+/// denominator is `NonZeroU32` — which is exactly why the seam has to
+/// reject it explicitly.
+fn zero_numerator_tb() -> Timebase {
+  Timebase::new(0, NonZeroU32::new(16_000).expect("16000 != 0"))
+}
+
 // ————————————————————— SpeechCoverage —————————————————————
 
 /// The defect: `min_speech_coverage = NaN` silently disabled the
@@ -62,6 +69,23 @@ fn speech_coverage_clamped_matches_the_historical_coercion() {
   assert_eq!(SpeechCoverage::clamped(-100.0).get(), 0.0);
   assert_eq!(SpeechCoverage::clamped(f32::NEG_INFINITY).get(), 0.0);
   assert_eq!(SpeechCoverage::clamped(0.25).get(), 0.25);
+}
+
+/// **`clamped` is genuinely TOTAL — no debug-build trapdoor.**
+///
+/// The doc promises "NaN resets to DEFAULT". It used to delegate to a
+/// helper carrying a `debug_assert!(!is_nan)`, so a debug build PANICKED
+/// on the very input the doc said it handled — a total constructor that
+/// is not total. This test is un-gated: it runs identically under `cargo
+/// test` (debug) and `cargo test --release`, and must return the default
+/// both times rather than panicking in one.
+#[test]
+fn speech_coverage_clamped_is_total_on_nan_in_every_profile() {
+  assert_eq!(
+    SpeechCoverage::clamped(f32::NAN),
+    SpeechCoverage::DEFAULT,
+    "NaN must clamp to DEFAULT without panicking, in debug and release alike"
+  );
 }
 
 /// Excluding NaN makes the ordering total — which is the whole reason
@@ -127,9 +151,24 @@ fn sample_span_from_time_range_accepts_the_analysis_timebase() {
 #[test]
 fn sample_span_rescaled_converts_milliseconds_to_samples() {
   let span = SampleSpan::from_time_range_rescaled(TimeRange::new(0, 20, ms_tb()))
-    .expect("rescale is infallible here");
+    .expect("rescale from a valid timebase succeeds");
   assert_eq!(span.start(), 0);
   assert_eq!(span.end(), 320, "20 ms at 16 kHz is 320 samples");
+}
+
+/// A `0/den` SOURCE timebase scales every pts to `0`, collapsing a
+/// non-empty VAD segment to `0..0` — which would silently mask all
+/// speech. The rescale bridge rejects it instead. (The strict bridge
+/// `from_time_range` already rejects it as a non-1/16000 timebase; this
+/// is the rescale door, which does its own numerator check.)
+#[test]
+fn sample_span_rescaled_rejects_a_zero_numerator_source_timebase() {
+  let err = SampleSpan::from_time_range_rescaled(TimeRange::new(0, 20, zero_numerator_tb()))
+    .expect_err("a 0/den source would collapse every range to 0..0");
+  assert!(
+    matches!(err, SpanError::ZeroNumeratorTimebase { den: 16_000 }),
+    "must cite the zero-numerator timebase; got {err:?}"
+  );
 }
 
 /// A VAD segment whose head runs off the front of the chunk clamps to
@@ -219,6 +258,19 @@ fn speech_spans_rescaled_is_the_opt_in() {
   assert_eq!(spans.as_slice()[0].end(), 320);
 }
 
+/// The zero-numerator rejection propagates through the plural rescale
+/// bridge too — one bad range fails the whole build rather than
+/// vanishing into an empty span set.
+#[test]
+fn speech_spans_rescaled_rejects_a_zero_numerator_source_timebase() {
+  let err = SpeechSpans::from_time_ranges_rescaled(&[TimeRange::new(0, 20, zero_numerator_tb())])
+    .expect_err("a 0/den source must be rejected, not silently dropped");
+  assert!(matches!(
+    err,
+    SpanError::ZeroNumeratorTimebase { den: 16_000 }
+  ));
+}
+
 // ————————————————————— OutputClock —————————————————————
 
 /// The latent defect this replaces: `compose_words` took an
@@ -228,7 +280,7 @@ fn speech_spans_rescaled_is_the_opt_in() {
 /// caller code left to get it wrong.
 #[test]
 fn output_clock_saturates_instead_of_inverting_the_pair() {
-  let clock = OutputClock::new(0, analysis_tb(), 0);
+  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   // Sample indices above `i64::MAX`: a bare `as i64` cast would make
   // these negative and invert the pair.
   let range = clock.range(u64::MAX - 1, u64::MAX);
@@ -244,12 +296,34 @@ fn output_clock_saturates_instead_of_inverting_the_pair() {
 fn output_clock_matches_the_buffer_bridge_math() {
   // 1/16000 in, 1/1000 out, anchored at PTS 5000.
   let out_tb = ms_tb();
-  let clock = OutputClock::new(0, out_tb, 5_000);
+  let clock = OutputClock::new(0, out_tb, 5_000).expect("1/1000 is a valid output timebase");
   let range = clock.range(16_000, 32_000);
   // 16000 samples == 1000 ms; 32000 == 2000 ms. Plus the 5000 base.
   assert_eq!(range.start_pts(), 6_000);
   assert_eq!(range.end_pts(), 7_000);
   assert_eq!(range.timebase(), out_tb);
+}
+
+/// **The panic this closes.** `range()` rescales TO the output timebase,
+/// so a `0/den` timebase there is a division by zero: a later successful,
+/// non-empty `finish` would PANIC deep inside `mediatime`. `new` rejects
+/// it at construction with a typed error instead, and `range` is
+/// panic-free by that invariant.
+#[test]
+fn output_clock_rejects_a_zero_numerator_output_timebase() {
+  let err = OutputClock::new(0, zero_numerator_tb(), 0)
+    .expect_err("a 0/den output timebase would divide by zero in range()");
+  assert!(
+    matches!(err, SpanError::ZeroNumeratorTimebase { den: 16_000 }),
+    "must cite the zero-numerator timebase; got {err:?}"
+  );
+}
+
+/// The dual: a valid output timebase still constructs.
+#[test]
+fn output_clock_accepts_a_valid_output_timebase() {
+  assert!(OutputClock::new(0, ms_tb(), 0).is_ok());
+  assert!(OutputClock::new(0, analysis_tb(), 0).is_ok());
 }
 
 // ————————————————————— Emissions —————————————————————
