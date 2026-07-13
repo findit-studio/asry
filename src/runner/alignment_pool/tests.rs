@@ -35,6 +35,119 @@ fn data_dependent_failures_are_recoverable() {
   }
 }
 
+/// The pool layer's half of the too-short-chunk contract: a real
+/// aligner's real `NoAlignmentPath` is absorbed into `Ok(empty)`, and
+/// the ASR transcript survives.
+///
+/// # What this covers that the unit tests above do not
+///
+/// `data_dependent_failures_are_recoverable` feeds
+/// `alignment_failure_is_recoverable` a **hand-constructed**
+/// `NoAlignmentPath`. Nothing connected that predicate to the error a
+/// real `Aligner` actually emits. If the aligner ever reclassified a
+/// too-short chunk as (say) `ModelInference`, the predicate test would
+/// still pass — and the pool would start turning short chunks into
+/// `Event::Error`, destroying a perfectly good ASR transcript. This
+/// test is the wiring between the two layers, and it runs the real
+/// 378 MB ONNX encoder to get it.
+///
+/// # The other half
+///
+/// `runner::aligner::aligner::tests::sub_400_sample_chunk_surfaces_no_alignment_path`
+/// pins the same input at the layer below: `Aligner::align` returns
+/// `Err(NoAlignmentPath)`. The two together are the whole contract —
+/// the aligner reports honestly that no CTC path exists, and the pool
+/// decides that this particular failure is not worth a chunk over.
+/// Neither test alone would catch an `Ok(empty)` short-circuit smuggled
+/// into the aligner: this one would still pass, because it cannot see
+/// *why* the words vec is empty. That is what the paired test is for.
+#[test]
+#[cfg_attr(
+  not(asry_w2v_en),
+  ignore = "needs the English wav2vec2 fixture: ASRY_FETCH_W2V=en cargo test --features alignment"
+)]
+fn too_short_chunk_recovers_to_empty_result_with_asr_text_preserved() {
+  use core::num::NonZeroU32;
+
+  use mediatime::Timebase;
+
+  use crate::runner::aligner::{
+    AlignerKey, AlignmentSetBuilder, EnglishNormalizer, test_fixtures::english_aligner,
+  };
+
+  const ASR_TEXT: &str = "hello world";
+
+  let set = AlignmentSetBuilder::new()
+    // `Error`, deliberately, rather than the `SkipChunk` default: under
+    // `SkipChunk` a registry MISS *also* returns `Ok(empty)`, which is
+    // byte-identical to the recovery under test — so a broken
+    // registration would let this test pass without an aligner ever
+    // running. With `Error`, a miss surfaces as `LanguageUnsupported`
+    // and fails the `expect` below. The `Ok(empty)` this test accepts
+    // can only have come from a real alignment attempt.
+    .with_fallback(AlignmentFallback::Error)
+    .register(
+      AlignerKey::Lang(Lang::En),
+      english_aligner(Box::new(EnglishNormalizer::new())),
+    )
+    .build();
+  assert!(
+    matches!(set.lookup(&Lang::En), AlignmentLookup::Hit { .. }),
+    "the recovery under test lives on the Hit path; a Miss would prove nothing"
+  );
+
+  let job = AlignWorkItem {
+    chunk_id: ChunkId::from_raw(0),
+    // 200 samples = 12.5 ms. The aligner pads it to 400 ⇒ T=1 frame,
+    // against 11 chars ⇒ no CTC path. Byte-for-byte the input
+    // `sub_400_sample_chunk_surfaces_no_alignment_path` hands to
+    // `Aligner::align`, so the two tests really are describing one
+    // contract from two sides.
+    samples: Arc::from(vec![0.0_f32; 200]),
+    sub_segments: Vec::new(),
+    text: SmolStr::new(ASR_TEXT),
+    language: Lang::En,
+    // Empty ⇒ the whole-chunk path ⇒ `run_under_lock` ⇒ `Aligner::align`.
+    runs: Vec::new(),
+    abort_flag: Arc::new(AtomicBool::new(false)),
+    chunk_first_sample_in_stream: 0,
+    samples_to_output_range: Arc::new(|start, end| {
+      TimeRange::new(
+        start as i64,
+        end as i64,
+        Timebase::new(1, NonZeroU32::new(16_000).unwrap()),
+      )
+    }),
+    oov_decisions: Vec::new(),
+  };
+  let run_options = RunOptions::new().expect("RunOptions::new");
+
+  let result = run_one_alignment(&set, &job, &run_options).expect(
+    "`NoAlignmentPath` is classified recoverable, so the pool must absorb it into Ok(empty). \
+     An Err here would reach `handle_failure` upstream and turn a chunk carrying a perfectly \
+     good ASR transcript into Event::Error — alignment is best-effort, never destructive.",
+  );
+
+  assert!(
+    result.words().is_empty(),
+    "a dropped alignment contributes no words; got {:?}",
+    result.words()
+  );
+
+  // What "the ASR text is preserved" actually cashes out to: `Ok` routes
+  // the chunk to `Transcriber::handle_alignment`, which builds
+  // `Transcript::new(.., asr.text().clone(), result.into_words(), ..)` —
+  // text kept, `words: []`. An `Err` would route it to `handle_failure`
+  // instead, which resolves the chunk to `Event::Error` and throws the
+  // transcript away. The `Ok` above *is* the preservation; the work item
+  // still carries the text the caller needs in order to emit it.
+  assert_eq!(
+    job.text().as_str(),
+    ASR_TEXT,
+    "the ASR transcript must survive the alignment drop intact"
+  );
+}
+
 /// Backend / configuration alignment failures must stay fatal —
 /// otherwise they get silently swallowed into `Ok(empty)`, masking
 /// broken backends.
