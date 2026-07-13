@@ -99,6 +99,65 @@ pub use runner::{
 #[cfg_attr(docsrs, doc(cfg(feature = "alignment")))]
 pub use ort;
 
+/// Forced alignment for a caller who owns the acoustic encoder — no
+/// ONNX Runtime, no whisper.cpp.
+///
+/// Depend on `asry` with `default-features = false, features =
+/// ["emissions"]` and drive [`EmissionsAligner`](emissions::EmissionsAligner):
+///
+/// ```text
+///   prepare()  ->  [YOUR encoder runs]  ->  finish()
+/// ```
+///
+/// `feature = "alignment"` layers the ORT encoder and the
+/// `Aligner` / `AlignmentSet` orchestration on the SAME core — one
+/// algorithm, not a fork — so both paths run the same preprocessing, the
+/// same validators, and the same composition.
+///
+/// # What this surface will not let you do
+///
+/// This module used to re-export the algorithm's raw building blocks:
+/// fourteen public functions taking bare `(t, v, Vec<f32>)`,
+/// `&[TimeRange]`, `f32`, `usize` scalars that they had to cross-validate
+/// against one another and largely did not. Eleven adversarial review
+/// rounds each found a different instance of the same class. They are all
+/// crate-internal now, and what replaces them is a surface on which those
+/// mistakes are not expressible:
+///
+/// | You cannot | because |
+/// |---|---|
+/// | pass a `NaN` coverage threshold (which silently disabled the filter) | [`SpeechCoverage`](emissions::SpeechCoverage) excludes it — the comparison is a total order |
+/// | pass VAD in the wrong timebase (which was silently ignored) | [`SampleSpan`](emissions::SampleSpan) has no timebase; the bridge from `TimeRange` is strict |
+/// | mean "no VAD" and get "all silence" (which dropped every word) | [`SpeechSpans::all_speech()`](emissions::SpeechSpans::all_speech) says it out loud |
+/// | supply a non-total sample→time closure (which panicked in your own code) | [`OutputClock`](emissions::OutputClock) is data; asry owns the saturation |
+/// | supply `V = 0`, a `T` that OOMs, or a non-log-probability | [`Emissions`](emissions::Emissions) is the one door, and it checks all three |
+/// | disagree with asry about the sample count, frame count, or stride | asry derives all three from slices that physically exist |
+/// | run a CTC head whose width disagrees with the tokenizer | `finish` validates it — the check this seam has NEVER run |
+#[cfg(feature = "emissions")]
+#[cfg_attr(docsrs, doc(cfg(feature = "emissions")))]
+pub mod emissions {
+  pub use crate::{
+    core::oov::{
+      OovDecision, OovEvent, OovKind, ResolvedOov, default_oov_decisions,
+      fail_closed_all_decisions, wildcard_all_decisions,
+    },
+    runner::aligner::{
+      ChineseNormalizer, DynTextNormalizer, EnglishNormalizer, JapaneseNormalizer,
+      KoreanNormalizer, LatinNormalizer, NormalizationError, NormalizedText, TextNormalizer,
+      WildcardBoundary,
+      algorithm::{
+        compose::{DEFAULT_MAX_INTRA_SILENT_RUN, DEFAULT_MIN_SPEECH_COVERAGE},
+        encode::{LogProbsShapeError, LogProbsValueClass, LogProbsValueError},
+        errors::{EmissionsError, EmissionsFailure},
+      },
+      core::PreparedChunk,
+      default_normalizer_for,
+      emissions_aligner::{EmissionsAligner, EmissionsAlignerBuilder},
+      emissions_api::{Emissions, OutputClock, SampleSpan, SpanError, SpeechCoverage, SpeechSpans},
+    },
+  };
+}
+
 /// **Internal use only — gated on `feature = "bench-internals"`.**
 ///
 /// Re-exports the alignment pipeline's `pub(crate)` SIMD/scalar

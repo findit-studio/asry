@@ -524,7 +524,7 @@ pub(crate) struct AlignerCore {
 /// sample count, a frame count, or a stride that disagrees with the
 /// audio the encoder actually saw. Every extent in here is a slice
 /// length, not a caller integer.
-pub(crate) struct PreparedChunk<'a> {
+pub struct PreparedChunk<'a> {
   /// `None` for the two short-circuits `Aligner::align` has always
   /// had: normalisation produced empty text, or tokenisation produced
   /// zero alignable tokens. The encoder should be skipped entirely and
@@ -546,17 +546,33 @@ struct PreparedInner<'a> {
   tokenized: TokenizedText,
 }
 
-impl<'a> PreparedChunk<'a> {
-  /// The buffer to feed the encoder: silence-zeroed and zero-padded
-  /// to 400 samples. Empty when [`is_trivial`](Self::is_trivial).
-  pub(crate) fn encoder_input(&self) -> &[f32] {
+impl PreparedChunk<'_> {
+  /// **Feed EXACTLY this to your encoder.** Silence-zeroed and
+  /// zero-padded to wav2vec2's 400-sample receptive field — identical to
+  /// the buffer `Aligner` hands ORT.
+  ///
+  /// You do not re-implement the mask, the zeroing, or the pad, which is
+  /// the point: byte-parity with the ORT path is asry's problem, not
+  /// yours.
+  ///
+  /// Empty when [`is_trivial`](Self::is_trivial).
+  #[must_use]
+  pub fn encoder_input(&self) -> &[f32] {
     self.inner.as_ref().map_or(&[], |i| &i.encoder_input)
   }
 
   /// True when normalisation produced empty text or zero alignable
   /// tokens. Skip the encoder; `finish` returns an empty result.
-  pub(crate) const fn is_trivial(&self) -> bool {
+  #[must_use]
+  pub const fn is_trivial(&self) -> bool {
     self.inner.is_none()
+  }
+
+  /// The chunk's REAL audio length, before padding. A slice length, not
+  /// a caller integer — which is exactly why `finish` cannot be lied to
+  /// about it.
+  pub(crate) fn real_samples(&self) -> usize {
+    self.inner.as_ref().map_or(0, |i| i.real_samples)
   }
 }
 

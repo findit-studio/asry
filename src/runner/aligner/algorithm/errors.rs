@@ -106,6 +106,48 @@ pub enum EmissionsError {
   #[error("invalid configuration: {0}")]
   Config(EmissionsFailure),
 
+  /// The encoder returned a frame count that cannot correspond to the
+  /// audio it was handed: `T · hop` is outside `real_samples ± 2·hop`.
+  ///
+  /// Either the model's stride differs from the configured
+  /// `hop_samples`, or the emissions came from *different audio than the
+  /// `PreparedChunk` they were paired with*. Left unchecked, composition
+  /// emits word ranges past the chunk's audio (stride too small) or
+  /// compresses every word into its first portion (stride too large) —
+  /// plausible-looking timings that are simply wrong.
+  ///
+  /// **The seam never ran this check before.** The ORT path has been
+  /// protected by it for a long time; the emissions surface was not.
+  #[error("encoder stride mismatch: {0}")]
+  StrideMismatch(EmissionsFailure),
+
+  /// The encoder's vocab dimension `V` does not equal the tokenizer's
+  /// vocab size.
+  ///
+  /// A CTC head trained on a different alphabet — or a hidden-states
+  /// tensor leaked out in place of the logits — passes the per-token id
+  /// bounds check whenever the chunk's ids happen to fit, and then reads
+  /// posteriors from columns that do not correspond to the tokenizer's
+  /// tokens. The result is a believable, corrupt alignment.
+  ///
+  /// **The seam never ran this check before either.** Hand-shake against
+  /// `EmissionsAligner::vocab_size()` to fail earlier and louder.
+  #[error("encoder vocab dim mismatch: {0}")]
+  VocabMismatch(EmissionsFailure),
+
+  /// The audio contains a non-finite (`NaN` / `±inf`) sample.
+  ///
+  /// Rejected against the RAW samples, before the speech mask zeroes
+  /// anything outside VAD — otherwise upstream audio corruption in a
+  /// VAD-excluded region gets silently zeroed away and disappears
+  /// without a diagnostic.
+  #[error("non-finite audio: {0}")]
+  NonFiniteAudio(EmissionsFailure),
+
+  /// Text normalisation failed for the supplied transcript.
+  #[error("normalization failed: {0}")]
+  Normalization(EmissionsFailure),
+
   /// The tokenised input is malformed for the supplied emissions: a
   /// token id outside `[0, v)` (or a non-wildcard negative id), a
   /// `token_ids`/`word_idx_per_token` length disagreement, an OOV
@@ -188,9 +230,13 @@ impl EmissionsError {
     let inner = match self {
       Self::Shape(e) => AlignmentError::ModelInference(failure(e.to_string().into())),
       Self::Value(e) => AlignmentError::ModelInference(failure(e.to_string().into())),
-      Self::Numeric(f) => AlignmentError::ModelInference(failure(f.message)),
-      Self::Config(f) => AlignmentError::ModelInference(failure(f.message)),
+      Self::Numeric(f)
+      | Self::Config(f)
+      | Self::StrideMismatch(f)
+      | Self::VocabMismatch(f)
+      | Self::NonFiniteAudio(f) => AlignmentError::ModelInference(failure(f.message)),
       Self::Tokenization(f) => AlignmentError::Tokenization(failure(f.message)),
+      Self::Normalization(f) => AlignmentError::Normalization(failure(f.message)),
       Self::SemanticOutOfVocab(f) => AlignmentError::SemanticOutOfVocab(failure(f.message)),
       Self::NoAlignmentPath(f) | Self::PathBudget(f) => {
         AlignmentError::NoAlignmentPath(failure(f.message))
