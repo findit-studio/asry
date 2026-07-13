@@ -36,6 +36,36 @@ const TOKENIZER_JSON: &str = r#"{
  }
  }"#;
 
+/// A vocabulary of exactly the SAME WIDTH as [`TOKENIZER_JSON`], with two
+/// tokens' ids **permuted**: `E` and `T` swap columns 5 and 6.
+///
+/// Same vocab size, same `<pad>` blank at 0, same `|` delimiter at 4, same
+/// default hop. So every dimension check `finish` runs — `validate_vocab_dim`,
+/// `validate_stride_extent` — is satisfied by *either* aligner's emissions.
+/// The only thing that differs is which COLUMN a token means, and that is
+/// precisely the difference no dimension check can see.
+const PERMUTED_TOKENIZER_JSON: &str = r#"{
+ "version": "1.0",
+ "truncation": null,
+ "padding": null,
+ "added_tokens": [],
+ "normalizer": null,
+ "pre_tokenizer": {"type": "Split", "pattern": {"Regex": ""}, "behavior": "Isolated", "invert": false},
+ "post_processor": null,
+ "decoder": null,
+ "model": {
+ "type": "WordLevel",
+ "vocab": {
+ "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3, "|": 4,
+ "T": 5, "E": 6, "A": 7, "O": 8, "N": 9, "I": 10, "H": 11, "S": 12,
+ "R": 13, "D": 14, "L": 15, "U": 16, "M": 17, "W": 18, "C": 19, "F": 20,
+ "G": 21, "Y": 22, "P": 23, "B": 24, "V": 25, "K": 26, "'": 27, "X": 28,
+ "J": 29, "Q": 30, "Z": 31
+ },
+ "unk_token": "<unk>"
+ }
+ }"#;
+
 /// The vocab above has 32 entries.
 const VOCAB_SIZE: usize = 32;
 
@@ -253,6 +283,109 @@ fn finish_rejects_a_frame_count_that_cannot_match_the_audio() {
     matches!(err, EmissionsError::StrideMismatch(_)),
     "must be StrideMismatch, not Config; got {err:?}"
   );
+}
+
+// —————————————— The check no DIMENSION check can make ——————————————
+
+/// **Cross-aligner mispairing is rejected, not silently mis-aligned.**
+///
+/// Two aligners with equal vocab widths, equal blank ids, and equal hops,
+/// but PERMUTED token-to-column mappings. `A.prepare(...)` →
+/// `B.finish(A's chunk, B's emissions)`.
+///
+/// Every dimension/extent check in the seam PASSES here — that is the whole
+/// point of the test. `validate_vocab_dim` sees 32 == 32;
+/// `validate_stride_extent` sees the same `T` from the same audio length.
+/// Without an identity, the DP would then apply A's token ids to B's columns
+/// under B's blank id and B's config, and emit a plausible, wrong alignment.
+///
+/// This is NOT the disclosed-and-accepted "same-length emissions from
+/// different audio" limitation, which is irreducible because a raw tensor
+/// carries no identity. The originating aligner IS known at `prepare` time,
+/// so it is bound there and checked here.
+#[test]
+fn finish_rejects_a_prepared_chunk_from_a_different_aligner() {
+  let a = aligner();
+  let b = EmissionsAligner::builder(Lang::En, PERMUTED_TOKENIZER_JSON.as_bytes())
+    .build()
+    .expect("the permuted vocab is well-formed");
+
+  // Establish that every check the seam HAS would pass: same width, same
+  // blank, same hop. Nothing but an identity can separate these two.
+  assert_eq!(a.vocab_size(), b.vocab_size(), "same width");
+  assert_eq!(a.blank_token_id(), b.blank_token_id(), "same blank id");
+  assert_eq!(a.hop_samples(), b.hop_samples(), "same hop");
+
+  let samples = vec![0.2_f32; 16_000];
+  let prepared_from_a = a
+    .prepare(&samples, &SpeechSpans::all_speech(), "hello", &[])
+    .expect("prepare on A");
+  assert!(!prepared_from_a.is_trivial(), "'hello' has tokens to align");
+
+  // Emissions from B's encoder: correct width, correct T for this audio.
+  let (t, logits) = fake_encoder(&prepared_from_a, 320);
+  let emissions_from_b = Emissions::from_logits(t, b.vocab_size(), logits).expect("well-formed");
+
+  let clock = OutputClock::new(0, analysis_tb(), 0);
+  let err = b
+    .finish(
+      prepared_from_a,
+      &emissions_from_b,
+      clock,
+      &AtomicBool::new(false),
+    )
+    .expect_err("A's chunk must not be finishable on B");
+  assert!(
+    matches!(err, EmissionsError::AlignerMismatch(_)),
+    "must be AlignerMismatch — every dimension check PASSES here, which is \
+     exactly why an identity is required; got {err:?}"
+  );
+}
+
+/// The ownership check runs BEFORE the trivial short-circuit, so a foreign
+/// chunk is reported as crossed wiring rather than quietly returning an
+/// empty result the caller reads as "nothing to align".
+#[test]
+fn finish_rejects_a_foreign_trivial_chunk_too() {
+  let a = aligner();
+  let b = EmissionsAligner::builder(Lang::En, PERMUTED_TOKENIZER_JSON.as_bytes())
+    .build()
+    .expect("build");
+
+  let samples = vec![0.2_f32; 1600];
+  // Punctuation-only → trivial: no encoder buffer, no tokens.
+  let prepared_from_a = a
+    .prepare(&samples, &SpeechSpans::all_speech(), "!!!...", &[])
+    .expect("prepare on A");
+  assert!(prepared_from_a.is_trivial());
+
+  let emissions = Emissions::from_log_probs(
+    1,
+    NonZeroUsize::new(VOCAB_SIZE).expect("32 != 0"),
+    vec![-1.0; VOCAB_SIZE],
+  )
+  .expect("ok");
+  let clock = OutputClock::new(0, analysis_tb(), 0);
+  let err = b
+    .finish(prepared_from_a, &emissions, clock, &AtomicBool::new(false))
+    .expect_err("even an empty chunk from another aligner is crossed wiring");
+  assert!(matches!(err, EmissionsError::AlignerMismatch(_)));
+}
+
+/// The dual: an aligner always accepts its OWN chunk. The identity check
+/// must not become a false positive that breaks the normal path.
+#[test]
+fn finish_accepts_the_chunk_its_own_prepare_minted() {
+  let a = aligner();
+  let samples = vec![0.2_f32; 16_000];
+  let prepared = a
+    .prepare(&samples, &SpeechSpans::all_speech(), "hello", &[])
+    .expect("prepare");
+  let (t, logits) = fake_encoder(&prepared, 320);
+  let emissions = Emissions::from_logits(t, a.vocab_size(), logits).expect("ok");
+  let clock = OutputClock::new(0, analysis_tb(), 0);
+  a.finish(prepared, &emissions, clock, &AtomicBool::new(false))
+    .expect("an aligner finishes the chunk it prepared");
 }
 
 // ————————————————————— The full alignkit call site (spec §5) —————————————————————

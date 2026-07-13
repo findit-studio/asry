@@ -135,6 +135,24 @@ pub enum EmissionsError {
   #[error("encoder vocab dim mismatch: {0}")]
   VocabMismatch(EmissionsFailure),
 
+  /// The `PreparedChunk` handed to `finish` was produced by a
+  /// **different** `EmissionsAligner`.
+  ///
+  /// A prepared chunk carries token ids, a word map, and OOV decisions
+  /// resolved against its own aligner's tokenizer, blank id, and
+  /// language. Two aligners with the same vocab size and the same hop
+  /// have identical geometry — so every dimension check passes — while
+  /// mapping tokens to *different* columns. Finishing A's chunk on B
+  /// therefore reads posteriors from columns that do not correspond to
+  /// A's tokens and emits a believable, wrong alignment.
+  ///
+  /// Unlike "emissions computed from different audio of the same length"
+  /// (irreducible — a raw tensor carries no identity), this one is
+  /// preventable: the originating aligner is known at `prepare` time, so
+  /// it is bound there and checked here.
+  #[error("prepared chunk belongs to a different aligner: {0}")]
+  AlignerMismatch(EmissionsFailure),
+
   /// The audio contains a non-finite (`NaN` / `±inf`) sample.
   ///
   /// Rejected against the RAW samples, before the speech mask zeroes
@@ -234,6 +252,7 @@ impl EmissionsError {
       | Self::Config(f)
       | Self::StrideMismatch(f)
       | Self::VocabMismatch(f)
+      | Self::AlignerMismatch(f)
       | Self::NonFiniteAudio(f) => AlignmentError::ModelInference(failure(f.message)),
       Self::Tokenization(f) => AlignmentError::Tokenization(failure(f.message)),
       Self::Normalization(f) => AlignmentError::Normalization(failure(f.message)),

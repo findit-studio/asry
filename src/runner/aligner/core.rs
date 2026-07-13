@@ -27,8 +27,8 @@
 //! text moves.
 
 use core::{
-  num::{NonZeroU32, NonZeroUsize},
-  sync::atomic::{AtomicBool, Ordering},
+  num::{NonZeroU32, NonZeroU64, NonZeroUsize},
+  sync::atomic::{AtomicBool, AtomicU64, Ordering},
   time::Duration,
 };
 use std::path::Path;
@@ -467,6 +467,51 @@ fn has_top_level_key(bytes: &[u8], start: usize, end: usize, key: &[u8]) -> bool
   false
 }
 
+/// The identity of one `AlignerCore` instance.
+///
+/// **Unforgeable outside this module.** The inner `NonZeroU64` is
+/// private and the only constructor is [`AlignerId::next`], which is
+/// itself private to `core` — so no front end, no test, and no external
+/// caller can mint one or spell an `AlignerId` that names an aligner it
+/// does not own. It exists to be *stamped* by
+/// [`AlignerCore::prepare`] and *compared* by [`AlignerCore::finish`],
+/// and for nothing else.
+///
+/// # Why an identity is needed at all
+///
+/// Every extent `finish` consumes is a slice length, so the seam cannot
+/// be lied to about geometry. But two aligners with the *same* vocab
+/// size and the *same* hop have identical geometry while carrying
+/// *different token-to-column mappings* — a permuted vocabulary, a
+/// different blank id, a different language's OOV policy. Pairing
+/// aligner A's `PreparedChunk` with aligner B's emissions passes every
+/// dimension check there is, and then applies A's token ids to B's
+/// columns: a plausible, confidently wrong alignment.
+///
+/// That is *not* the irreducible "same-length emissions from different
+/// audio" limitation — a raw tensor genuinely carries no identity. This
+/// one is preventable, because the originating aligner **is** known at
+/// `prepare` time. So it gets bound.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct AlignerId(NonZeroU64);
+
+impl AlignerId {
+  /// Mint the next process-unique id.
+  ///
+  /// Starts at 1 and only ever increments, so an id is never reused
+  /// within a process — including after an aligner is dropped, which is
+  /// what makes a stale `PreparedChunk` from a dead aligner detectable
+  /// rather than aliasing onto a fresh one.
+  fn next() -> Self {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let raw = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Unreachable: exhausting this needs 2^64 aligner constructions.
+    // Typed rather than wrapped, so the impossible case cannot silently
+    // hand out id 0 twice.
+    Self(NonZeroU64::new(raw).expect("AlignerId counter overflowed u64"))
+  }
+}
+
 /// Everything an aligner owns **except** the encoder.
 ///
 /// This is the sealed middle of the sandwich: `Aligner` is
@@ -489,6 +534,11 @@ fn has_top_level_key(bytes: &[u8], start: usize, end: usize, key: &[u8]) -> bool
 /// at *its own* boundary with a mapper that is honest for *its* call
 /// chain.
 pub(crate) struct AlignerCore {
+  /// This core's unforgeable identity, minted at construction. Stamped
+  /// into every `PreparedChunk` this core mints and checked by
+  /// [`finish`](Self::finish), so a chunk prepared by one aligner
+  /// cannot be finished by another.
+  id: AlignerId,
   tokenizer: Tokenizer,
   language: Lang,
   normalizer: DynTextNormalizer,
@@ -524,7 +574,17 @@ pub(crate) struct AlignerCore {
 /// sample count, a frame count, or a stride that disagrees with the
 /// audio the encoder actually saw. Every extent in here is a slice
 /// length, not a caller integer.
+///
+/// It also carries the identity of the aligner that minted it (see
+/// [`AlignerId`]), which `finish` checks. A chunk prepared by one
+/// aligner and finished by another is rejected rather than aligned
+/// against the wrong vocabulary.
 pub struct PreparedChunk<'a> {
+  /// The aligner that produced this chunk. Sits OUTSIDE `inner` on
+  /// purpose: a trivial chunk carries no encoder buffer, but it is
+  /// still bound to its originating aligner, so the ownership check
+  /// runs before the trivial short-circuit rather than after it.
+  owner: AlignerId,
   /// `None` for the two short-circuits `Aligner::align` has always
   /// had: normalisation produced empty text, or tokenisation produced
   /// zero alignable tokens. The encoder should be skipped entirely and
@@ -580,13 +640,17 @@ impl AlignerCore {
   /// Assemble from already-validated parts. Every guard in this module
   /// has run by the time this is called; both front ends' constructors
   /// funnel through here so neither can skip one.
+  ///
+  /// Not `const` any more: the identity is drawn from a process-global
+  /// atomic counter, which a `const fn` cannot read. Both front ends'
+  /// constructors are ordinary functions, so nothing observable moves.
   #[allow(
     clippy::too_many_arguments,
     reason = "one field per argument; the guards that produce them run \
  in the front ends' constructors, and bundling them into a struct \
  would just move the same list one level out"
   )]
-  pub(crate) const fn from_parts(
+  pub(crate) fn from_parts(
     tokenizer: Tokenizer,
     language: Lang,
     normalizer: DynTextNormalizer,
@@ -599,6 +663,7 @@ impl AlignerCore {
     max_intra_silent_run: Duration,
   ) -> Self {
     Self {
+      id: AlignerId::next(),
       tokenizer,
       language,
       normalizer,
@@ -610,6 +675,18 @@ impl AlignerCore {
       min_speech_coverage,
       max_intra_silent_run,
     }
+  }
+
+  /// Whether `prepared` was minted by THIS core.
+  ///
+  /// [`finish`](Self::finish) enforces this itself — it is the guard,
+  /// and it runs for both front ends because there is only one `finish`.
+  /// This accessor exists so a front end can ask the question *before*
+  /// calling the core and report the failure in its own taxonomy (the
+  /// same shape `EmissionsAligner::finish` already uses for the stride
+  /// and vocab-dim checks: classify in front, guard underneath).
+  pub(crate) fn owns(&self, prepared: &PreparedChunk<'_>) -> bool {
+    prepared.owner == self.id
   }
 
   pub(crate) const fn language(&self) -> &Lang {
@@ -751,7 +828,10 @@ impl AlignerCore {
     let normalized = match self.normalizer.normalize(text) {
       Ok(nt) => nt,
       Err(NormalizationError::EmptyText) => {
-        return Ok(PreparedChunk { inner: None });
+        return Ok(PreparedChunk {
+          owner: self.id,
+          inner: None,
+        });
       }
       Err(NormalizationError::RuleFailed { detail }) => {
         return Err(WorkFailure::Alignment(AlignmentError::Normalization(
@@ -798,7 +878,10 @@ impl AlignerCore {
     // `Event::Error` — alignment becoming optional, not a data-loss
     // path.
     if tokenized.token_ids().is_empty() {
-      return Ok(PreparedChunk { inner: None });
+      return Ok(PreparedChunk {
+        owner: self.id,
+        inner: None,
+      });
     }
 
     if abort_flag.load(Ordering::Relaxed) {
@@ -851,6 +934,7 @@ impl AlignerCore {
     };
 
     Ok(PreparedChunk {
+      owner: self.id,
       inner: Some(PreparedInner {
         encoder_input,
         real_samples: samples.len(),
@@ -886,6 +970,37 @@ impl AlignerCore {
   where
     F: Fn(u64, u64) -> TimeRange,
   {
+    // The chunk must have been prepared by THIS aligner.
+    //
+    // Checked before the trivial short-circuit below, so a foreign
+    // trivial chunk is rejected too rather than quietly returning an
+    // empty result — "your chunks are crossed" is worth saying even when
+    // this particular one had nothing to align.
+    //
+    // Every other cross-pairing guard is a dimension check, and a
+    // dimension check cannot see this: two aligners with equal vocab
+    // sizes and equal hops have identical geometry. What differs is the
+    // token-to-column MAPPING — a permuted vocabulary, another blank id,
+    // another language's OOV policy. The DP would happily apply A's token
+    // ids to B's columns and emit a plausible, wrong alignment.
+    if !self.owns(&prepared) {
+      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
+        AlignmentFailure::new(
+          format_smolstr!(
+            "PreparedChunk was produced by a different aligner (prepared by aligner \
+ {:?}, finished on aligner {:?}). A PreparedChunk carries token ids, a word map, and \
+ OOV decisions resolved against ITS aligner's tokenizer, blank id, and language; \
+ applying them to another aligner's emissions reads posteriors from columns that do \
+ not correspond to those tokens — a believable but incorrect alignment. Call `finish` \
+ on the same aligner that called `prepare`.",
+            prepared.owner,
+            self.id,
+          ),
+          self.language.clone(),
+        ),
+      )));
+    }
+
     let Some(prepared) = prepared.inner else {
       // Trivial chunk: `prepare` short-circuited (empty normalised
       // text or zero alignable tokens). No encoder output to consume.
