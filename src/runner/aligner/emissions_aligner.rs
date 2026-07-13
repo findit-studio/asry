@@ -281,7 +281,9 @@ impl EmissionsAligner {
   /// with [`vocab_size`](Self::vocab_size); [`EmissionsError::Config`]
   /// if the blank id does not fit the vocab;
   /// [`EmissionsError::NoAlignmentPath`] if the lattice admits no finite
-  /// path; [`EmissionsError::Aborted`] if `abort_flag` is observed set.
+  /// path; [`EmissionsError::Aborted`] if `abort_flag` is observed set;
+  /// [`EmissionsError::AlignerMismatch`] if `prepared` came from a
+  /// *different* `EmissionsAligner`.
   pub fn finish(
     &self,
     prepared: PreparedChunk<'_>,
@@ -289,6 +291,30 @@ impl EmissionsAligner {
     clock: OutputClock,
     abort_flag: &AtomicBool,
   ) -> Result<AlignmentResult, EmissionsError> {
+    // ——— The chunk must be OURS ———
+    //
+    // Ahead of everything else, including the trivial short-circuit: a
+    // chunk from another aligner is a crossed-wires bug regardless of
+    // whether this particular one had tokens to align.
+    //
+    // `AlignerCore::finish` enforces this itself — that is the guard, and
+    // it covers both front ends because there is only one `finish`. The
+    // check here is the classifier in front of it, exactly as for the
+    // stride and vocab-dim checks below: inside the core the failure is an
+    // undifferentiated `ModelInference`, and calling "you crossed two
+    // aligners" a *model inference* fault sends the caller to debug their
+    // encoder instead of their wiring.
+    if !self.core.owns(&prepared) {
+      return Err(EmissionsError::AlignerMismatch(EmissionsFailure::new(
+        format_smolstr!(
+          "this PreparedChunk was produced by a DIFFERENT EmissionsAligner. It carries \
+ token ids, a word map, and OOV decisions resolved against that aligner's tokenizer, \
+ blank id, and language — none of which need match this one's, even when the vocab \
+ sizes and hops are identical. Call `finish` on the same aligner that called `prepare`."
+        ),
+      )));
+    }
+
     // A trivial chunk never saw the encoder, so there is nothing to
     // validate the emissions against. Short-circuit exactly as the ORT
     // path does.
