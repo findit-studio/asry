@@ -28,9 +28,11 @@ use std::sync::{Arc, atomic::AtomicBool};
 
 use crate::{
   core::{AsrParams, AsrResult},
-  types::{AsrError, AsrFailure, ChunkId, WorkFailure},
+  types::{ChunkId, WorkFailure},
 };
 
+#[cfg(feature = "runner")]
+use crate::types::{AsrError, AsrFailure};
 #[cfg(feature = "runner")]
 use smol_str::format_smolstr;
 #[cfg(feature = "runner")]
