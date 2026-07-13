@@ -92,11 +92,13 @@ const TOKENIZER_W2V_KO_SHA256: &str =
 // `FinDIT-Studio/wav2vec2-large-xlsr-53-{lang}-onnx`. Each pair is
 // SHA-verified after upload via `curl -L <url> | sha256sum`.
 //
-// SHAs marked TODO will resolve once the corresponding ONNX file
-// is uploaded to the FinDIT-Studio mirror; until then build.rs's
-// fetch step short-circuits on the SHA mismatch and the
-// dependent integration tests skip via `option_env!()`. List of
-// pending uploads is tracked in the branch report.
+// A fetch that 404s or fails its SHA check does NOT fail the build:
+// `fetch_extra_align_fixture` logs and returns, leaving the
+// corresponding `cargo:rustc-env` var unset. The consequence is no
+// longer "the dependent test skips and reports green" — those tests
+// are `#[ignore]`d and hard-fail on a missing fixture, so an
+// unreachable mirror surfaces as a failing `--ignored` run naming
+// the exact env var, not as a false pass.
 //
 // IMPORTANT: keep this block contiguous so a sibling Korean
 // branch's parallel additions merge mechanically.
@@ -198,105 +200,83 @@ fn main() {
   // CI) and surprises anyone who didn't expect a build.rs to
   // phone home.
   //
-  // New gate: the user must explicitly set `ASRY_FETCH_MODEL`
-  // (and `ASRY_FETCH_W2V` for alignment) before any
-  // download happens. The `ASRY_OFFLINE` knob stays as a
-  // belt-and-braces "definitely don't fetch" override; in the
-  // new design it's redundant with "don't set FETCH" but
-  // existing scripts that rely on `ASRY_OFFLINE=1` keep
-  // working.
+  // Gate: the user must explicitly set `ASRY_FETCH_MODEL` (whisper
+  // checkpoint) or `ASRY_FETCH_W2V` (wav2vec2 alignment encoders)
+  // before any download happens. The `ASRY_OFFLINE` knob stays as a
+  // belt-and-braces "definitely don't fetch" override; it's
+  // redundant with "don't set FETCH" but existing scripts that rely
+  // on `ASRY_OFFLINE=1` keep working.
   if std::env::var("ASRY_OFFLINE").is_ok() {
     eprintln!("[asry build.rs] ASRY_OFFLINE set; skipping model fetch");
     return;
   }
-  let fetch_whisper_opt_in = std::env::var("ASRY_FETCH_MODEL").is_ok();
-  if !fetch_whisper_opt_in {
+
+  // `models/` (in-tree, gitignored): big ML model files. Lives
+  // alongside the source so a developer can `ls models/` to see
+  // what's been downloaded; survives `cargo clean`.
+  let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+  let models_dir = manifest_dir.join("models");
+
+  // The two fixture families are INDEPENDENT opt-ins.
+  //
+  // They used to be nested: `fetch_wav2vec2_fixtures` was reachable
+  // only from inside the `ASRY_FETCH_MODEL` success path, so
+  // `ASRY_FETCH_W2V=1` on its own did nothing — the alignment
+  // fixtures could be obtained only by ALSO downloading the 1.6 GB
+  // whisper checkpoint, which the alignment path never loads. That
+  // priced the alignment opt-in out of reach, and because the
+  // alignment tests silently returned when the fixtures were absent,
+  // the whole `Aligner` path went unexercised while still reporting
+  // green. Those tests now hard-fail rather than skip (see the
+  // `fixture_or_panic` helper in `runner::aligner::aligner`'s test
+  // module), which is only a fair gate if opting in is actually
+  // affordable. Hence: two separate, independent gates.
+  fetch_whisper_fixtures(&models_dir);
+  fetch_wav2vec2_fixtures(&models_dir);
+}
+
+/// Whisper checkpoint (~1.6 GB) plus the jfk.wav sample clip.
+///
+/// Opt-in via `ASRY_FETCH_MODEL`, and only when the `runner` feature
+/// — the thing that actually loads the checkpoint — is active.
+fn fetch_whisper_fixtures(models_dir: &std::path::Path) {
+  if std::env::var("ASRY_FETCH_MODEL").is_err() {
     // Default: skip silently. Only test infrastructure that
     // actually needs the fixture sets the env var.
     return;
   }
-
-  // The 'runner' feature gates whether the test fixture is even
-  // applicable. Builds without the runner feature
-  // (--no-default-features) skip anyway, even with FETCH_MODEL
-  // set.
-  let runner_active = std::env::var("CARGO_FEATURE_RUNNER").is_ok();
-  if !runner_active {
+  // Builds without the runner feature (--no-default-features) skip
+  // anyway, even with ASRY_FETCH_MODEL set.
+  if std::env::var("CARGO_FEATURE_RUNNER").is_err() {
     return;
   }
 
-  // Two distinct directories:
-  // - `models/` (in-tree, gitignored): big ML model files. Lives
-  //   alongside the source so a developer can `ls models/` to
-  //   see what's been downloaded; survives `cargo clean`.
-  // - `target/asry-test-fixtures/`: transient test data
-  //   (jfk.wav). Cargo-managed; can be wiped without losing
-  //   gigabytes of model weights.
-  let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-  let models_dir = manifest_dir.join("models");
-  if let Err(e) = fs::create_dir_all(&models_dir) {
-    eprintln!("[asry build.rs] cannot create {:?}: {}", models_dir, e);
+  if let Err(e) = fs::create_dir_all(models_dir) {
+    eprintln!("[asry build.rs] cannot create {models_dir:?}: {e}");
     return;
   }
-  let target_dir = match find_target_dir() {
-    Some(p) => p,
-    None => {
-      eprintln!("[asry build.rs] cannot determine target dir; skipping fetch");
-      return;
-    }
+  // `target/asry-test-fixtures/`: transient test data (jfk.wav).
+  // Cargo-managed; can be wiped without losing gigabytes of model
+  // weights.
+  let Some(target_dir) = find_target_dir() else {
+    eprintln!("[asry build.rs] cannot determine target dir; skipping fetch");
+    return;
   };
   let fixture_dir = target_dir.join("asry-test-fixtures");
   if let Err(e) = fs::create_dir_all(&fixture_dir) {
-    eprintln!("[asry build.rs] cannot create {:?}: {}", fixture_dir, e);
+    eprintln!("[asry build.rs] cannot create {fixture_dir:?}: {e}");
     return;
   }
+
   let model_path = models_dir.join(MODEL_FILENAME);
-
-  if model_path.exists() {
-    if let Ok(true) = verify_sha256(&model_path, MODEL_SHA256) {
-      // Already-good cached file — nothing to do.
-      println!(
-        "cargo:rustc-env=ASRY_WHISPER_MODEL={}",
-        model_path.display()
-      );
-      fetch_jfk_wav(&fixture_dir);
-      fetch_wav2vec2_fixtures(&models_dir);
-      return;
-    } else {
-      eprintln!(
-        "[asry build.rs] cached {:?} has wrong checksum; re-downloading",
-        model_path
-      );
-      let _ = fs::remove_file(&model_path);
-    }
-  }
-
-  eprintln!(
-    "[asry build.rs] downloading {} ({})",
-    MODEL_FILENAME, MODEL_URL
-  );
-  if let Err(e) = download(MODEL_URL, &model_path) {
-    eprintln!("[asry build.rs] download failed: {}", e);
-    let _ = fs::remove_file(&model_path);
+  if !fetch_with_sha(MODEL_URL, &model_path, MODEL_SHA256) {
     return;
   }
-  match verify_sha256(&model_path, MODEL_SHA256) {
-    Ok(true) => {
-      println!(
-        "cargo:rustc-env=ASRY_WHISPER_MODEL={}",
-        model_path.display()
-      );
-      fetch_jfk_wav(&fixture_dir);
-      fetch_wav2vec2_fixtures(&models_dir);
-    }
-    Ok(false) => {
-      eprintln!("[asry build.rs] downloaded model has wrong checksum; aborting");
-      let _ = fs::remove_file(&model_path);
-    }
-    Err(e) => {
-      eprintln!("[asry build.rs] sha256 verification I/O error: {}", e);
-    }
-  }
+  println!(
+    "cargo:rustc-env=ASRY_WHISPER_MODEL={}",
+    model_path.display()
+  );
+  fetch_jfk_wav(&fixture_dir);
 }
 
 fn fetch_jfk_wav(fixture_dir: &std::path::Path) {
@@ -318,21 +298,34 @@ fn fetch_jfk_wav(fixture_dir: &std::path::Path) {
   }
 }
 
+/// The wav2vec2 forced-alignment encoders (English + the
+/// multi-language mirrors) and their tokenizers.
+///
+/// Opt-in via `ASRY_FETCH_W2V`, independent of `ASRY_FETCH_MODEL`:
+/// the alignment path never loads the whisper checkpoint, so
+/// requiring a 1.6 GB download to obtain a 378 MB alignment encoder
+/// was pure friction. Default builds still never hit the network,
+/// even when the `alignment` feature is enabled.
+///
+/// The `cargo:rustc-env` vars emitted here are what the `Aligner`
+/// tests' `option_env!` reads. Emitting a var means "this file is on
+/// disk AND its SHA-256 matches the pin" — the tests therefore get a
+/// provenance-verified path or none at all, and a test that gets none
+/// now fails loudly instead of silently returning green.
 fn fetch_wav2vec2_fixtures(models_dir: &std::path::Path) {
-  // Opt-in via ASRY_FETCH_W2V. Same gate shape as the
-  // parent `main`'s ASRY_FETCH_MODEL check — default builds
-  // never hit the network, even when the alignment feature is
-  // enabled. A user who wants the bundled fixture sets both env
-  // vars together.
-  let fetch_w2v_opt_in = std::env::var("ASRY_FETCH_W2V").is_ok();
-  if !fetch_w2v_opt_in {
+  if std::env::var("ASRY_FETCH_W2V").is_err() {
     return;
   }
   // Only fetch when the alignment feature is active. (Even with
   // FETCH_W2V set, an alignment-feature-off build doesn't need
   // the wav2vec2 assets.)
-  let alignment_active = std::env::var("CARGO_FEATURE_ALIGNMENT").is_ok();
-  if !alignment_active {
+  if std::env::var("CARGO_FEATURE_ALIGNMENT").is_err() {
+    return;
+  }
+  // No longer nested inside the whisper fetch, so create the
+  // directory ourselves rather than relying on that path having run.
+  if let Err(e) = fs::create_dir_all(models_dir) {
+    eprintln!("[asry build.rs] cannot create {models_dir:?}: {e}");
     return;
   }
 
@@ -385,13 +378,6 @@ fn fetch_wav2vec2_fixtures(models_dir: &std::path::Path) {
     TOKENIZER_W2V_ZH_FILENAME,
     TOKENIZER_W2V_ZH_SHA256,
   );
-  // Ko fixture: SHA-256 is currently `TODO_…` because the
-  // FinDIT-Studio Ko ONNX mirror hasn't been uploaded yet. The
-  // function logs + silently returns false on fetch / SHA
-  // mismatch, so the build stays green and the Ko smoke test
-  // skips via `option_env!()`. Once the upload + checksum step
-  // lands, the placeholders flip to real hex digests and Ko
-  // joins Ja/Zh as a real fixture.
   fetch_extra_align_fixture(
     models_dir,
     "ASRY_W2V_KO",
@@ -404,11 +390,7 @@ fn fetch_wav2vec2_fixtures(models_dir: &std::path::Path) {
   );
 
   // Latin-language fixtures (Es, Fr, De, It, Pt). Same opt-in
-  // (`ASRY_FETCH_W2V`) as Ja / Zh / Ko. Each entry's SHA is
-  // `TODO` until the corresponding ONNX is uploaded to
-  // FinDIT-Studio's HF mirror; `fetch_extra_align_fixture`
-  // short-circuits on SHA mismatch and the dependent
-  // integration tests skip via `option_env!()`.
+  // (`ASRY_FETCH_W2V`) as Ja / Zh / Ko.
   fetch_extra_align_fixture(
     models_dir,
     "ASRY_W2V_ES",
@@ -466,10 +448,12 @@ fn fetch_wav2vec2_fixtures(models_dir: &std::path::Path) {
 /// `<env_prefix>_MODEL` and `<env_prefix>_TOKENIZER` env vars so
 /// `option_env!()` in tests can find them.
 ///
-/// On any fetch / verification failure, this function logs and
-/// returns silently — tests guard the fixtures with `option_env!`,
-/// so a partial-fixture state just makes the corresponding test
-/// skip rather than fail the build.
+/// On any fetch / verification failure this function logs and returns
+/// without emitting the env vars, so a missing mirror never fails the
+/// *build*. It does not, however, buy the dependent test a free pass:
+/// the fixture-gated tests are `#[ignore]`d and panic on an unset var,
+/// so the absent fixture shows up as an explicit failure the moment
+/// someone opts into running them.
 #[allow(clippy::too_many_arguments)]
 fn fetch_extra_align_fixture(
   models_dir: &std::path::Path,
