@@ -550,12 +550,36 @@ impl Emissions {
   /// case into a fast typed error instead of an OOM.
   pub const FRAME_BUDGET: usize = SEAM_PATH_FRAME_BUDGET;
 
-  /// The caller already applied log-softmax. Runs the shape, budget,
-  /// **and value-domain** checks.
+  /// Your encoder's graph **already ends in log-softmax** — its final
+  /// op is a `log_softmax`, or a `softmax` followed by a `log`. Runs the
+  /// shape, budget, **and value-domain** checks.
   ///
-  /// The value-domain scan is `O(T·V)`. If your encoder emits raw
-  /// logits, prefer [`from_logits`](Self::from_logits) — it produces the
-  /// domain by construction and never pays the scan.
+  /// Pick between this and [`from_logits`](Self::from_logits) by what
+  /// your model's **final op** is, not by which runtime you execute it
+  /// on. See [`from_logits`](Self::from_logits) for why the runtime tells
+  /// you nothing.
+  ///
+  /// # The `O(T·V)` scan is a feature, not just a cost
+  ///
+  /// The value-domain scan is the reason to *prefer* this constructor
+  /// whenever the model genuinely emits log-probs: it doubles as a
+  /// **contract check on the model artifact**. If a future revision of
+  /// your `.mlmodelc` / `.onnx` quietly ships a raw-logit head, the
+  /// emitted values will have positive maxes, and this constructor fails
+  /// loudly with [`EmissionsError::Value`] naming the first offending
+  /// `(frame, vocab)`. Feed those same raw logits to
+  /// [`from_logits`](Self::from_logits) and it would **silently
+  /// re-normalise** them into a perfectly plausible log-prob domain and
+  /// align on them forever — a model swap would degrade your timings with
+  /// nothing anywhere reporting an error.
+  ///
+  /// Note what the hazard is **not**. Re-applying log-softmax to true
+  /// log-probs is a mathematical no-op — log-softmax is exactly
+  /// idempotent, since `lse(x − lse(x)) = ln 1 = 0`. Passing log-probs to
+  /// `from_logits` does not corrupt them by "double normalisation"; it
+  /// returns the same values. What you lose is precisely this check: the
+  /// one thing standing between a silently-changed model artifact and
+  /// silently-wrong word timings.
   ///
   /// # Errors
   ///
@@ -569,7 +593,38 @@ impl Emissions {
     Ok(Self { inner, vocab: v })
   }
 
-  /// The caller has raw CTC logits — **the CoreML path**.
+  /// Your encoder's graph **ends in a bare CTC head** — a final `linear`
+  /// / `matmul` with no normalisation after it — so it emits **raw
+  /// logits**: unbounded scores whose per-frame max is typically
+  /// positive. asry applies the log-softmax for you.
+  ///
+  /// # Choose by the model's final op, never by the runtime
+  ///
+  /// The question is *"what is the last op in the graph?"*, which is a
+  /// property of the **model**, not of the engine executing it. This doc
+  /// used to call `from_logits` "the CoreML path", which is both wrong
+  /// and dangerous — it is exactly backwards for the actual CoreML
+  /// consumer:
+  ///
+  /// * asry's own **ONNX** wav2vec2 ends in a bare `linear` CTC head →
+  ///   raw logits → `from_logits` is correct.
+  /// * A **CoreML** export may **bake the log-softmax into the graph**
+  ///   (`softmax` → `log` ops living inside the `.mlmodelc`) → that model
+  ///   emits log-probs → [`from_log_probs`](Self::from_log_probs) is
+  ///   correct, and `from_logits` is wrong.
+  ///
+  /// So "I'm on CoreML" tells you nothing. Inspect the `.mlmodelc`'s
+  /// actual output ops: some CoreML callers need this constructor, some
+  /// need [`from_log_probs`](Self::from_log_probs).
+  ///
+  /// Getting it wrong in the log-probs → `from_logits` direction is
+  /// **silent**: log-softmax is idempotent, so the values survive intact
+  /// and nothing errors. What you forfeit is the value-domain scan that
+  /// would have caught the *opposite* mistake later — see
+  /// [`from_log_probs`](Self::from_log_probs)'s contract-check note. When
+  /// your model already emits log-probs, prefer that constructor.
+  ///
+  /// # Domain by construction
   ///
   /// Shape + budget + finite-input checks, then asry's own
   /// finiteness-guarded log-softmax. The output is finite and `<= 0` BY
