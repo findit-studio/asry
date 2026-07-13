@@ -405,6 +405,11 @@ impl Aligner {
     // supply explicit decisions.
     let oov_events = self.detect_oov(text)?;
     let oov_decisions = crate::core::default_oov_decisions(&oov_events);
+    // Self-generated decisions, so they carry this aligner's language by
+    // construction; naming it as the key is a tautology here, and that is
+    // exactly the point — there is no call path into the core that does
+    // not state one.
+    let expected = self.core.language().clone();
     self.align(
       samples,
       sub_segments,
@@ -414,6 +419,7 @@ impl Aligner {
       &abort_flag,
       &run_options,
       &oov_decisions,
+      &expected,
     )
   }
 
@@ -460,22 +466,12 @@ impl Aligner {
   where
     F: Fn(u64, u64) -> TimeRange,
   {
-    // dispatcher
-    // path validates `oov_decisions[i].event.language` against
-    // the run's requested language in `run_one_alignment`'s
-    // `validate_oov_decision_languages`. The public direct
-    // aligner path (this method) is reached without going
-    // through the dispatcher, so a direct caller (parity test,
-    // benchmark, external power-user) could pass cross-language
-    // decisions whose positional fields happen to match. The
-    // tokenizer's identity check via `OovEvent::matches_position`
-    // deliberately ignores `language` (so Any-fallback works),
-    // and would silently apply them.
-    //
-    // No `Any` fallback at this layer — `align_chunk_with_abort`
-    // is bound to a specific `Aligner`, so `self.language` IS
-    // the validation key. Reject mismatches loudly here.
-    validate_direct_decision_languages(oov_decisions, self.core.language())?;
+    // No `Any` fallback at this layer — `align_chunk_with_abort` is
+    // bound to a specific `Aligner`, so `self.language` IS the key the
+    // caller's OOV policy was resolved against. The check itself lives
+    // in `AlignerCore::prepare` now (so the emissions front end gets it
+    // too); this call site's only job is to name the right key.
+    let expected = self.core.language().clone();
     self.align(
       samples,
       sub_segments,
@@ -485,6 +481,7 @@ impl Aligner {
       abort_flag,
       run_options,
       oov_decisions,
+      &expected,
     )
   }
 
@@ -533,6 +530,14 @@ impl Aligner {
     // `detect_oov_events` would have produced them. Threaded through
     // to `tokenize_with_word_map`.
     oov_decisions: &[crate::core::ResolvedOov],
+    // The language `oov_decisions` were resolved against — the caller's
+    // POLICY key, which is not always `self.language()`. The dispatcher
+    // may land a chunk on the multilingual `AlignerKey::Any` aligner,
+    // whose own `Lang` is a registry detail; the decisions still carry
+    // the REQUESTED language (`job.language`, or `run.language()` per
+    // run). Validating against the fallback aligner's `Lang` instead
+    // would reject every correct `AnyFallback` payload.
+    expected_decision_language: &Lang,
   ) -> Result<AlignmentResult, WorkFailure>
   where
     F: Fn(u64, u64) -> TimeRange,
@@ -545,9 +550,14 @@ impl Aligner {
     // timebase, so nothing downstream can silently ignore one. The
     // rejection is byte-identical to what `build_speech_mask` produced.
     let speech = spans_from_sub_segments(sub_segments, self.core.language())?;
-    let prepared = self
-      .core
-      .prepare(samples, &speech, text, oov_decisions, abort_flag)?;
+    let prepared = self.core.prepare(
+      samples,
+      &speech,
+      text,
+      oov_decisions,
+      expected_decision_language,
+      abort_flag,
+    )?;
 
     // Empty normalised text, or zero alignable tokens. Skip the
     // encoder entirely and surface the cached ASR transcript with
@@ -587,48 +597,17 @@ impl Aligner {
   }
 }
 
-/// validate
-/// every supplied `ResolvedOov.event.language` matches
-/// `expected_lang`.
-///
-/// Used by `Aligner::align_chunk_with_abort` (the public
-/// direct path). The dispatcher path (`run_one_alignment` →
-/// `validate_oov_decision_languages`) has its own boundary
-/// check against the chunk/run requested language; the
-/// in-tokenizer identity check via `OovEvent::matches_position`
-/// deliberately ignores `language` so `AlignerKey::Any`
-/// fallback works. That leaves the direct public aligner
-/// entrypoint as a hole: a parity-test / external power-user
-/// caller could pass cross-language `ResolvedOov` whose
-/// positional fields happen to match and silently apply
-/// wildcard timings the caller intended to fail-closed.
-///
-/// `Aligner::align_chunk_with_abort` is bound to one Aligner
-/// instance — no `Any` fallback applies — so `self.language`
-/// is the correct validation key.
-fn validate_direct_decision_languages(
-  oov_decisions: &[crate::core::ResolvedOov],
-  expected_lang: &Lang,
-) -> Result<(), WorkFailure> {
-  for (i, resolved) in oov_decisions.iter().enumerate() {
-    if resolved.event().language() != expected_lang {
-      return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
-        AlignmentFailure::new(
-          format_smolstr!(
-            "align_chunk_with_abort: oov_decisions[{i}].event.language = {:?} \
- but this aligner's language is {:?}. Direct callers must pass \
- ResolvedOov produced for THIS aligner's language. Recompute via \
- `Self::detect_oov(text)` + a policy helper from `crate::core::oov`.",
-            resolved.event().language(),
-            expected_lang,
-          ),
-          expected_lang.clone(),
-        ),
-      )));
-    }
-  }
-  Ok(())
-}
+// `validate_direct_decision_languages` MOVED into `AlignerCore` as
+// `validate_decision_languages`, and `AlignerCore::prepare` now runs it
+// unconditionally against a caller-named key.
+//
+// It was the last genuinely-shared guard still living in the ORT front
+// end, which meant `EmissionsAligner` — the other front end of the same
+// core — silently did not have it. That is the exact defect class the
+// sealed sandwich exists to close, so the guard went where every other
+// shared guard already is. This front end's remaining job is to name its
+// key (`self.core.language()`, since a bound aligner has no
+// requested-language concept); the dispatcher names its own.
 
 /// Classify an `encode_log_softmax` failure based on whether the
 /// alignment watchdog already flipped `abort_flag` (Codex
@@ -695,54 +674,10 @@ mod tests {
     }
   }
 
-  /// the public
-  /// direct-aligner path validates that every supplied
-  /// `ResolvedOov.event.language` matches the aligner's
-  /// language. a parity test / power-user caller could
-  /// pass cross-language decisions whose positional fields
-  /// happen to match and silently apply wildcard timings the
-  /// caller intended to fail-closed.
-  #[test]
-  fn validate_direct_decision_languages_rejects_cross_language_payload() {
-    use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
-    // Payload was made for Korean.
-    let stale = vec![ResolvedOov::new(
-      OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::Ko),
-      OovDecision::Wildcard,
-    )];
-    let result = validate_direct_decision_languages(&stale, &Lang::En);
-    match result {
-      Err(WorkFailure::Alignment(AlignmentError::Tokenization(payload))) => assert!(
-        payload
-          .message()
-          .contains("oov_decisions[0].event.language")
-          && payload.message().contains("Ko")
-          && payload.message().contains("En"),
-        "diagnostic should cite the offending index + the languages; got {message}",
-        message = payload.message(),
-      ),
-      other => panic!("expected TokenizationFailed cross-language; got {other:?}"),
-    }
-  }
-
-  /// Same-language payload passes through unchanged.
-  #[test]
-  fn validate_direct_decision_languages_accepts_matching_payload() {
-    use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
-    let ok = vec![ResolvedOov::new(
-      OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::En),
-      OovDecision::Wildcard,
-    )];
-    assert!(validate_direct_decision_languages(&ok, &Lang::En).is_ok());
-  }
-
-  /// Empty payload passes ("no OOV expected"). The aligner
-  /// surfaces `TokenizationFailed` downstream if a chunk hits
-  /// any OOV anyway via `tokenize_with_word_map`'s preflight.
-  #[test]
-  fn validate_direct_decision_languages_accepts_empty() {
-    assert!(validate_direct_decision_languages(&[], &Lang::En).is_ok());
-  }
+  // The three `validate_direct_decision_languages` tests MOVED to
+  // `core.rs`, next to `validate_decision_languages` — the function that
+  // owns the rejection now, for BOTH front ends. Their assertions are
+  // byte-identical; only the name being called changed.
 
   /// And the dual: a genuine model failure (no abort) must
   /// pass through unchanged, so callers don't get spurious
@@ -919,6 +854,7 @@ mod tests {
         &abort,
         &run_options,
         &[],
+        &Lang::En,
       )
       .expect("EmptyText must short-circuit to Ok, not propagate as AlignmentFailed");
     assert!(
@@ -987,6 +923,7 @@ mod tests {
         &abort,
         &run_options,
         &[],
+        &Lang::En,
       )
       .expect("sub-400-sample chunks must Ok(empty), not propagate as AlignmentFailed");
     assert!(
@@ -1054,6 +991,7 @@ mod tests {
         &abort,
         &run_options,
         &[],
+        &Lang::Ja,
       )
       .expect("Ja aligner empty-text must short-circuit Ok");
     assert!(result.words().is_empty());
@@ -1107,6 +1045,7 @@ mod tests {
         &abort,
         &run_options,
         &[],
+        &Lang::Zh,
       )
       .expect("Zh aligner empty-text must short-circuit Ok");
     assert!(result.words().is_empty());
@@ -1169,6 +1108,7 @@ mod tests {
         &abort,
         &run_options,
         &[],
+        &Lang::Ko,
       )
       .expect("Ko aligner empty-text must short-circuit Ok");
     assert!(result.words().is_empty());
@@ -1223,6 +1163,7 @@ mod tests {
         &abort,
         &run_options,
         &[],
+        &lang,
       )
       .expect("Latin aligner empty-text must short-circuit Ok");
     assert!(

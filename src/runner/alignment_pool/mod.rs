@@ -673,6 +673,12 @@ fn run_under_lock(
     .first()
     .map(|v| v.as_slice())
     .unwrap_or(&[]);
+  // The key is the REQUESTED language, not `guard.language()`: a registry
+  // miss may have landed this chunk on the multilingual `AlignerKey::Any`
+  // aligner, whose own `Lang` is a registry detail. The caller's policy was
+  // resolved against `job.language`, and `validate_oov_decision_languages`
+  // above already enforced that — so this is the same key, now re-checked
+  // inside the core where BOTH front ends run it.
   guard.align(
     &job.samples,
     &job.sub_segments,
@@ -682,6 +688,7 @@ fn run_under_lock(
     abort_flag,
     run_options,
     chunk_decisions,
+    &job.language,
   )
 }
 
@@ -1169,6 +1176,10 @@ fn run_one_per_run(
     Err(poisoned) => poisoned.into_inner(),
   };
   let bound = samples_to_output_range.clone();
+  // Per-run key: `run.language()`, the language THIS run's decisions were
+  // resolved against (see `validate_oov_decision_languages`'s per-run
+  // branch). Not `guard.language()` — the run may have resolved onto the
+  // `Any` fallback aligner.
   guard.align(
     run_samples,
     run_sub_segments,
@@ -1178,6 +1189,7 @@ fn run_one_per_run(
     abort_flag,
     run_options,
     oov_decisions,
+    run.language(),
   )
 }
 

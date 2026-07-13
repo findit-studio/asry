@@ -174,6 +174,64 @@ pub(crate) fn validate_word_delimiter_present(
   )))
 }
 
+/// Validate that every supplied `ResolvedOov.event.language` equals
+/// `expected_lang` — the language the caller's OOV *policy* was keyed on.
+///
+/// **The guard this module exists to hold.** It used to live in
+/// `Aligner::align_chunk_with_abort`, which meant the emissions seam —
+/// the other front end of the same core — simply did not have it. An
+/// English `EmissionsAligner` handed a Korean decision whose event kind,
+/// word index, and char index happened to match would apply the *Korean*
+/// wildcard / fail-closed policy to English text, silently.
+///
+/// It is preventable precisely because the positional identity check
+/// ([`OovEvent::matches_position`](crate::core::OovEvent::matches_position))
+/// deliberately ignores `language` — it has to, so that `AlignerKey::Any`
+/// fallback works — which leaves nothing else looking at the language.
+///
+/// # Why the key is a parameter and not `self.language`
+///
+/// The two front ends validate against *different* keys, on purpose:
+///
+/// - A **bound** aligner (`Aligner::align_chunk_with_abort`,
+///   `EmissionsAligner::prepare`) has no requested-language concept. The
+///   aligner IS the key, so it passes its own `language`.
+/// - The **dispatcher** (`run_one_alignment`) may resolve a chunk onto the
+///   multilingual `AlignerKey::Any` aligner, whose own `Lang` is a registry
+///   detail and generally is NOT the chunk's language. The caller's policy
+///   was keyed on the REQUESTED language (`job.language`, or `run.language()`
+///   per run), so that is what the decisions must carry — and validating
+///   against the fallback aligner's own `Lang` would reject every correct
+///   `AnyFallback` payload.
+///
+/// Making the key an argument is what lets one implementation serve both
+/// without weakening either: `prepare` cannot be called without naming a
+/// key, so a future third front end cannot forget the check.
+pub(crate) fn validate_decision_languages(
+  oov_decisions: &[crate::core::ResolvedOov],
+  expected_lang: &Lang,
+) -> Result<(), WorkFailure> {
+  for (i, resolved) in oov_decisions.iter().enumerate() {
+    if resolved.event().language() != expected_lang {
+      return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+        AlignmentFailure::new(
+          format_smolstr!(
+            "oov_decisions[{i}].event.language = {:?} but the decisions for this chunk \
+ must carry {:?}. A ResolvedOov's positional identity (kind, char_index, word_index) \
+ deliberately ignores language, so a foreign-language decision landing at a matching \
+ position would silently apply ANOTHER language's wildcard / fail-closed policy. \
+ Recompute via `detect_oov(text)` + a policy helper from `crate::core::oov`.",
+            resolved.event().language(),
+            expected_lang,
+          ),
+          expected_lang.clone(),
+        ),
+      )));
+    }
+  }
+  Ok(())
+}
+
 /// Coerce a user-supplied speech-coverage threshold into the
 /// valid `[0.0, 1.0]` range. NaN resets to the default.
 ///
@@ -769,14 +827,28 @@ impl AlignerCore {
   ///
   /// The body is `Aligner::align`'s, unchanged. The only thing that
   /// moved is where it stops.
+  ///
+  /// `expected_decision_language` is the language the caller's OOV policy
+  /// was keyed on — see [`validate_decision_languages`] for why it is an
+  /// argument rather than `self.language`, and why passing the wrong one
+  /// would break `AlignerKey::Any` fallback. It is not optional: the check
+  /// runs here, so no front end can be written that skips it.
   pub(crate) fn prepare<'a>(
     &self,
     samples: &[f32],
     speech: &SpeechSpans,
     text: &'a str,
     oov_decisions: &[crate::core::ResolvedOov],
+    expected_decision_language: &Lang,
     abort_flag: &AtomicBool,
   ) -> Result<PreparedChunk<'a>, WorkFailure> {
+    // FIRST — ahead of the abort poll, which is where the ORT direct path
+    // ran it (in `align_chunk_with_abort`, before entering `align`). A
+    // cross-language payload is a caller bug that stays a caller bug even
+    // when a watchdog has already fired, and the diagnostic is worth more
+    // than a timeout.
+    validate_decision_languages(oov_decisions, expected_decision_language)?;
+
     if abort_flag.load(Ordering::Relaxed) {
       return Err(timed_out());
     }
@@ -1475,6 +1547,83 @@ mod tests {
   #[should_panic(expected = "min_speech_coverage = NaN")]
   fn coerce_speech_coverage_panics_on_nan_in_debug() {
     let _ = coerce_speech_coverage(f32::NAN);
+  }
+
+  // --- OOV decision language validation ---
+  //
+  // MOVED here from `aligner.rs` with byte-identical assertions. The guard
+  // used to live in `Aligner::align_chunk_with_abort`, which is precisely
+  // why `EmissionsAligner` did not have it. It now lives in the core and
+  // `AlignerCore::prepare` runs it unconditionally, so both front ends are
+  // covered by one implementation.
+
+  /// the public
+  /// direct-aligner path validates that every supplied
+  /// `ResolvedOov.event.language` matches the aligner's
+  /// language. a parity test / power-user caller could
+  /// pass cross-language decisions whose positional fields
+  /// happen to match and silently apply wildcard timings the
+  /// caller intended to fail-closed.
+  #[test]
+  fn validate_direct_decision_languages_rejects_cross_language_payload() {
+    use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
+    // Payload was made for Korean.
+    let stale = vec![ResolvedOov::new(
+      OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::Ko),
+      OovDecision::Wildcard,
+    )];
+    let result = validate_decision_languages(&stale, &Lang::En);
+    match result {
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(payload))) => assert!(
+        payload
+          .message()
+          .contains("oov_decisions[0].event.language")
+          && payload.message().contains("Ko")
+          && payload.message().contains("En"),
+        "diagnostic should cite the offending index + the languages; got {message}",
+        message = payload.message(),
+      ),
+      other => panic!("expected TokenizationFailed cross-language; got {other:?}"),
+    }
+  }
+
+  /// Same-language payload passes through unchanged.
+  #[test]
+  fn validate_direct_decision_languages_accepts_matching_payload() {
+    use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
+    let ok = vec![ResolvedOov::new(
+      OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::En),
+      OovDecision::Wildcard,
+    )];
+    assert!(validate_decision_languages(&ok, &Lang::En).is_ok());
+  }
+
+  /// Empty payload passes ("no OOV expected"). The aligner
+  /// surfaces `TokenizationFailed` downstream if a chunk hits
+  /// any OOV anyway via `tokenize_with_word_map`'s preflight.
+  #[test]
+  fn validate_direct_decision_languages_accepts_empty() {
+    assert!(validate_decision_languages(&[], &Lang::En).is_ok());
+  }
+
+  /// The dispatcher's key is the REQUESTED language, not the aligner's
+  /// own — `AlignerKey::Any` resolves a chunk onto a multilingual aligner
+  /// whose `Lang` is a registry detail. Validating an `AnyFallback`
+  /// payload against the requested language must therefore PASS even
+  /// though the aligner running it has a different `Lang`. This pins the
+  /// reason the key is a parameter: hardcoding `self.language` here would
+  /// reject every correct fallback dispatch.
+  #[test]
+  fn validate_decision_languages_accepts_a_fallback_payload_keyed_on_the_request() {
+    use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
+    // The caller asked for French and resolved its policy against French.
+    let decisions = vec![ResolvedOov::new(
+      OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::Fr),
+      OovDecision::Wildcard,
+    )];
+    // The registry landed it on the multilingual `Any` aligner (say, En).
+    // The key is the REQUEST, so this passes.
+    assert!(validate_decision_languages(&decisions, &Lang::Fr).is_ok());
   }
 
   // --- Word-delimiter validation ---

@@ -246,6 +246,13 @@ impl EmissionsAligner {
   /// infinity; [`EmissionsError::Normalization`] /
   /// [`EmissionsError::Tokenization`] / [`EmissionsError::SemanticOutOfVocab`]
   /// from the text pipeline.
+  ///
+  /// [`EmissionsError::Tokenization`] also covers a cross-language
+  /// `oov_decisions` payload: every [`ResolvedOov`] must carry THIS
+  /// aligner's language. Positional matching deliberately ignores
+  /// language, so a foreign decision at a matching position would
+  /// otherwise apply another language's wildcard / fail-closed policy
+  /// silently.
   pub fn prepare<'a>(
     &self,
     samples: &[f32],
@@ -257,9 +264,15 @@ impl EmissionsAligner {
     // abort flag guards `finish`, which is where the DP lives and where
     // a pathological input can actually burn time.
     let never = AtomicBool::new(false);
+    // An `EmissionsAligner` is bound to one language and there is no
+    // registry above it, so there is no requested-language concept and no
+    // `Any` fallback: this aligner's own language IS the key the caller's
+    // OOV policy must have been resolved against. The check itself is the
+    // core's — see `AlignerCore::prepare`.
+    let expected = self.core.language().clone();
     self
       .core
-      .prepare(samples, speech, text, oov_decisions, &never)
+      .prepare(samples, speech, text, oov_decisions, &expected, &never)
       .map_err(|e| to_emissions_error(e, Stage::Prepare))
   }
 
