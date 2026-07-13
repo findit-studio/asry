@@ -144,25 +144,10 @@ impl core::fmt::Display for LogProbsValueClass {
 /// the full value-domain rule (why `NaN`, `±∞`, and a finite
 /// positive value are all rejected).
 ///
-/// # Examples
-///
 /// The offending element need not be non-finite — a finite value
 /// `> 0.0` is also out of domain, and is reported as
-/// [`LogProbsValueClass::Positive`], not `NaN`/`PosInf`/`NegInf`:
-///
-/// ```
-/// use asry::emissions::{LogProbsError, LogProbsTV, LogProbsValueClass};
-///
-/// let Err(err) = LogProbsTV::new(1, 1, vec![1e-7_f32]) else {
-///   panic!("expected an error");
-/// };
-/// let LogProbsError::Value(value_err) = err else {
-///   panic!("expected LogProbsError::Value");
-/// };
-/// assert_eq!(value_err.frame(), 0);
-/// assert_eq!(value_err.vocab_index(), 0);
-/// assert_eq!(value_err.class(), LogProbsValueClass::Positive);
-/// ```
+/// [`LogProbsValueClass::Positive`], not `NaN`/`PosInf`/`NegInf`.
+/// Pinned by `new_rejects_tiny_positive_value`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error(
   "log-probability out of domain (finite and ≤ 0) at frame {frame}, vocab {vocab_index}: {class}"
