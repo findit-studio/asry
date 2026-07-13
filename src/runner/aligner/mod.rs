@@ -24,6 +24,14 @@ pub(crate) mod algorithm;
 mod aligner;
 #[cfg(feature = "alignment")]
 mod builder;
+/// Feature-neutral construction guards (tokenizer load + compat shim,
+/// blank/unk id resolution, uppercase probe, vocab-size capture,
+/// delimiter validation, coverage coercion). Ungated: the enclosing
+/// `aligner` module is already `cfg(any(alignment, emissions))`, and
+/// every guard here is ort-free — which is the point. `Aligner` and
+/// the emissions front end share ONE set of guards rather than the
+/// seam getting a second, weaker set.
+mod core;
 #[cfg(feature = "alignment")]
 mod key;
 mod normalizer;

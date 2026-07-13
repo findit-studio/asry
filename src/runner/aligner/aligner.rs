@@ -5,15 +5,39 @@ use std::{borrow::Cow, path::Path};
 
 use mediatime::TimeRange;
 use ort::session::{RunOptions, Session};
-use smol_str::{SmolStr, format_smolstr};
+use smol_str::format_smolstr;
 use tokenizers::Tokenizer;
 
 use crate::{
   core::AlignmentResult,
-  runner::{RunnerError, aligner::normalizer::DynTextNormalizer},
+  runner::{
+    RunnerError,
+    aligner::{
+      core::{
+        AlignerCoreLoadError, capture_vocab_size, coerce_speech_coverage, detect_blank_token_id,
+        detect_unk_token_id, detect_vocab_uppercase_only, load_tokenizer_with_compat,
+        validate_word_delimiter_present,
+      },
+      normalizer::DynTextNormalizer,
+    },
+  },
   time::SAMPLE_RATE_HZ,
   types::{AlignmentError, AlignmentFailure, Lang, WorkFailure, WorkerHangTimeout},
 };
+
+/// Re-express a feature-neutral core load failure as the `Aligner`'s
+/// public load error, carrying the diagnostic through verbatim.
+///
+/// The core cannot name [`RunnerError::AlignerLoad`] — that variant is
+/// itself `#[cfg(feature = "alignment")]` — so it returns its own
+/// message-carrying error and this is the one place the `alignment`
+/// front end lifts it back. `Aligner::from_paths`'s public error type
+/// and message text are therefore unchanged by the de-gating.
+fn lift_core_load_error(err: AlignerCoreLoadError) -> RunnerError {
+  RunnerError::AlignerLoad {
+    message: err.message().clone(),
+  }
+}
 
 /// Per-language forced-alignment engine. Loads a wav2vec2 ONNX
 /// model, its HuggingFace tokenizer, and the language's text
@@ -110,7 +134,7 @@ impl Aligner {
       .map_err(|e| RunnerError::AlignerLoad {
         message: format_smolstr!("commit_from_file({}) failed: {e}", model_path.display()),
       })?;
-    let tokenizer = load_tokenizer_with_compat(tokenizer_path)?;
+    let tokenizer = load_tokenizer_with_compat(tokenizer_path).map_err(lift_core_load_error)?;
 
     let blank_token_id =
       detect_blank_token_id(&tokenizer).ok_or_else(|| RunnerError::AlignerLoad {
@@ -118,22 +142,17 @@ impl Aligner {
           "tokenizer has no <pad> / [PAD] entry; cannot determine CTC blank token"
         ),
       })?;
-    let unk_token_id = tokenizer
-      .token_to_id("<unk>")
-      .or_else(|| tokenizer.token_to_id("[UNK]"));
+    let unk_token_id = detect_unk_token_id(&tokenizer);
     // wav2vec2-base-960h's vocab is uppercase-only; en/de/fr CTC
-    // checkpoints typically follow the same convention. Detect by
-    // probing a single ASCII letter pair — sufficient because the
-    // vocab either has both cases (mixed-case alphabet) or one
-    // (case-folded alphabet).
-    let vocab_uppercase_only =
-      tokenizer.token_to_id("A").is_some() && tokenizer.token_to_id("a").is_none();
+    // checkpoints typically follow the same convention.
+    let vocab_uppercase_only = detect_vocab_uppercase_only(&tokenizer);
 
     // When the normaliser declares `use_word_delimiter == true`
     // (the English-shape default), the tokenizer MUST expose a
     // `|` token. See [`validate_word_delimiter_present`] for the
     // rationale.
-    validate_word_delimiter_present(&tokenizer, normalizer.use_word_delimiter())?;
+    validate_word_delimiter_present(&tokenizer, normalizer.use_word_delimiter())
+      .map_err(lift_core_load_error)?;
 
     // Snapshot the tokenizer's vocab size (including added
     // tokens) so per-align validation can reject ORT outputs
@@ -141,7 +160,19 @@ impl Aligner {
     // checks in `ctc_viterbi` would pass whenever the chunk's
     // tokens happen to fit, then read posteriors from
     // mis-aligned columns.
-    let tokenizer_vocab_size = tokenizer.get_vocab_size(true);
+    //
+    // `None` is unreachable here: `detect_blank_token_id` above
+    // already required a `<pad>` / `[PAD]` / `<blank>` entry, so the
+    // vocab has at least one item. Typed rather than asserted so a
+    // future reordering fails with a diagnostic instead of a panic.
+    let tokenizer_vocab_size = capture_vocab_size(&tokenizer)
+      .ok_or_else(|| RunnerError::AlignerLoad {
+        message: format_smolstr!(
+          "tokenizer reports a zero-size vocab; a CTC vocabulary must contain at least \
+ the blank token"
+        ),
+      })?
+      .get();
 
     Ok(Self {
       session,
@@ -1094,341 +1125,11 @@ fn build_speech_mask(
   Ok(mask)
 }
 
-/// Read the CTC blank-token id from a HuggingFace tokenizer.
-fn detect_blank_token_id(tok: &Tokenizer) -> Option<u32> {
-  // Standard wav2vec2 convention: pad token == CTC blank.
-  if let Some(id) = tok.token_to_id("<pad>") {
-    return Some(id);
-  }
-  if let Some(id) = tok.token_to_id("[PAD]") {
-    return Some(id);
-  }
-  if let Some(id) = tok.token_to_id("<blank>") {
-    return Some(id);
-  }
-  None
-}
-
 // `DEFAULT_ALIGN_TIMEOUT` was the per-job timeout the legacy
 // `WhisperPool` / `ManagedTranscriber` watchdog used; both
 // removed in the Sans-I/O pivot. Cancellation lives entirely on
 // the caller's side now (`abort_flag` + `RunOptions::terminate`).
 // Constant deleted rather than kept as a dead public-crate item.
-
-/// Validate that the tokenizer exposes the wav2vec2 `|`
-/// word-delimiter token whenever the normaliser declared
-/// `use_word_delimiter == true`.
-///
-/// Without this check, a missing `|` token slips through silently
-/// — `tokenize_with_word_map` would simply emit no inter-word
-/// delimiter, glueing adjacent words together in the CTC graph.
-/// Word timings would then be plausible but wrong with no
-/// configuration error visible to the caller.
-///
-/// Char-segmented normalisers (`use_word_delimiter == false`)
-/// don't need the delimiter and pass through.
-///
-/// Pulled out as a free function so unit tests can exercise it
-/// against an in-memory tokenizer without spinning up ORT.
-fn validate_word_delimiter_present(
-  tokenizer: &Tokenizer,
-  use_word_delimiter: bool,
-) -> Result<(), RunnerError> {
-  if !use_word_delimiter {
-    return Ok(());
-  }
-  if tokenizer.token_to_id("|").is_some() {
-    return Ok(());
-  }
-  Err(RunnerError::AlignerLoad {
-    message: SmolStr::from(
-      "tokenizer is missing the `|` word-delimiter token, but the language's normaliser \
- declared `use_word_delimiter = true`. wav2vec2 word-segmented vocabularies require \
- a `|` token between spoken words. Either swap to a tokenizer that exposes `|`, or \
- supply a normaliser whose `use_word_delimiter` returns false (char-level segmentation).",
-    ),
-  })
-}
-
-/// Coerce a user-supplied speech-coverage threshold into the
-/// valid `[0.0, 1.0]` range. NaN resets to the default. Used by
-/// [`Aligner::set_min_speech_coverage`] and
-/// [`Aligner::with_min_speech_coverage`]. Extracted as a free
-/// function so it can be tested without standing up an ORT
-/// session + tokenizer fixture.
-const fn coerce_speech_coverage(value: f32) -> f32 {
-  // NaN coercion is intentional release behaviour (avoid
-  // panicking in production for a config typo), but dev
-  // builds should surface the bug — silently getting the
-  // default for `f32::NAN` is the kind of mistake that hides
-  // for months.
-  debug_assert!(
-    !value.is_nan(),
-    "min_speech_coverage = NaN — likely a programming error; release builds coerce to default"
-  );
-  // Order matters: `value < 0.0` and `value > 1.0` are both
-  // false when `value` is NaN, so the NaN branch must come
-  // first. `const fn` permits `is_nan()` and the comparison
-  // operators on f32.
-  if value.is_nan() {
-    crate::runner::aligner::algorithm::compose::DEFAULT_MIN_SPEECH_COVERAGE
-  } else if value < 0.0 {
-    0.0
-  } else if value > 1.0 {
-    1.0
-  } else {
-    value
-  }
-}
-
-/// Load a HuggingFace tokenizer.json with `tokenizers 0.20`
-/// compatibility shimming.
-///
-/// The canonical wav2vec2 tokenizer.json (e.g.,
-/// `facebook/wav2vec2-base-960h`, `onnx-community/wav2vec2-base-960h-ONNX`)
-/// ships in an older HF format whose `model` object carries
-/// only `vocab` — no `type` discriminator. `tokenizers 0.20`'s
-/// `ModelUntagged` deserialiser rejects that with `data did not
-/// match any variant of untagged enum ModelUntagged`. The repo's
-/// `build.rs` patches the build-time fixture, but a downstream
-/// consumer following the public `Aligner::from_paths` API with
-/// their own tokenizer file would have hit the same load
-/// failure.
-///
-/// We try the raw file first so already-compliant tokenizer
-/// JSONs (BPE / Unigram models, or modern WordLevel exports
-/// with `type`) take the fast path. On failure, we attempt one
-/// patch — inject `"type": "WordLevel"` and `"unk_token":
-/// "<unk>"` immediately inside the `"model": {` block — and
-/// retry. If the retry still fails we surface the *original*
-/// error, not the patched-version error, since the patch is
-/// only meaningful for the wav2vec2 shape.
-fn load_tokenizer_with_compat(path: &Path) -> Result<Tokenizer, RunnerError> {
-  let bytes = std::fs::read(path).map_err(|e| RunnerError::AlignerLoad {
-    message: format_smolstr!("read tokenizer {}: {e}", path.display()),
-  })?;
-
-  let original_err = match Tokenizer::from_bytes(&bytes) {
-    Ok(tok) => return Ok(tok),
-    Err(e) => format_smolstr!("{e:?}"),
-  };
-
-  if let Some(patched) = inject_wordlevel_model_type(&bytes)
-    && let Ok(tok) = Tokenizer::from_bytes(&patched)
-  {
-    return Ok(tok);
-  }
-
-  Err(RunnerError::AlignerLoad {
-    message: format_smolstr!(
-      "Tokenizer::from_file({}) failed: {original_err}",
-      path.display()
-    ),
-  })
-}
-
-/// Inject `"type": "WordLevel"` and `"unk_token": "<unk>"` into
-/// the `model` object of an HF tokenizer.json. Returns `None` if
-/// the file already has a `type:` (no patch needed) or if we
-/// can't find the `"model": {` boundary (different schema —
-/// don't guess).
-///
-/// Implemented with a hand-rolled quote-aware JSON scanner rather
-/// than a full `serde_json::Value` round-trip, because asry
-/// avoids the `serde_json` runtime dep on the alignment feature
-/// (the bundled vocab is parsed at build time; parity-dump JSON
-/// is hand-formatted). Flagged that the previous
-/// implementation used naive substring searches (`s.find(...)`,
-/// `s[..].contains(...)`) without quote-awareness, so a tokenizer
-/// JSON whose string values happened to contain `"model"` or
-/// `"type"` substrings could be misdetected and patched at the
-/// wrong byte range. The scanner below tracks `in_string` /
-/// `escape` state so quoted content is invisible to key matching.
-fn inject_wordlevel_model_type(bytes: &[u8]) -> Option<Vec<u8>> {
-  // Validate UTF-8 once; thereafter operate on raw bytes.
-  let _ = core::str::from_utf8(bytes).ok()?;
-
-  // Find `{` that opens the top-level value of `"model"`.
-  let model_open = find_top_level_object_value_open(bytes, b"model")?;
-
-  // Find the matching close brace.
-  let model_close = find_matching_close_brace(bytes, model_open)?;
-
-  // Already discriminated (has a top-level `"type"` key inside
-  // model's body)? Leave it alone.
-  if has_top_level_key(bytes, model_open + 1, model_close, b"type") {
-    return None;
-  }
-
-  // Inject the discriminator fields right after `{`.
-  let injection = b"\n \"type\": \"WordLevel\",\n \"unk_token\": \"<unk>\",";
-  let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + injection.len());
-  out.extend_from_slice(&bytes[..=model_open]);
-  out.extend_from_slice(injection);
-  out.extend_from_slice(&bytes[model_open + 1..]);
-  Some(out)
-}
-
-/// Quote-aware scan to find the `{` byte index that opens the
-/// VALUE of the named top-level (depth-1) JSON key. Returns
-/// `None` if the key isn't found at depth-1 or its value isn't
-/// a JSON object.
-///
-/// "Top-level" means depth-1 relative to the root JSON value
-/// (which is an object — `{...}` outermost). Depth tracking
-/// ignores `"..."`-quoted regions, so a string value containing
-/// `"model"` substring or `{` braces won't trip the scanner.
-fn find_top_level_object_value_open(bytes: &[u8], key: &[u8]) -> Option<usize> {
-  let mut in_string = false;
-  let mut escape = false;
-  let mut depth = 0_i32;
-  let mut i = 0;
-  while i < bytes.len() {
-    let c = bytes[i];
-    if escape {
-      escape = false;
-      i += 1;
-      continue;
-    }
-    if in_string {
-      match c {
-        b'\\' => escape = true,
-        b'"' => in_string = false,
-        _ => {}
-      }
-      i += 1;
-      continue;
-    }
-    match c {
-      b'"' => {
-        // Potential start of a string. If we're at depth-1 and
-        // this string equals `key`, AND it's a key (followed by
-        // `:`), this is our hit.
-        let key_end = i + 1 + key.len();
-        if depth == 1
-          && key_end < bytes.len()
-          && &bytes[i + 1..key_end] == key
-          && bytes[key_end] == b'"'
-        {
-          // Skip whitespace, expect `:`, then skip whitespace,
-          // then expect `{`.
-          let mut j = key_end + 1;
-          while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
-            j += 1;
-          }
-          if j >= bytes.len() || bytes[j] != b':' {
-            return None;
-          }
-          j += 1;
-          while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
-            j += 1;
-          }
-          if j < bytes.len() && bytes[j] == b'{' {
-            return Some(j);
-          }
-          return None;
-        }
-        in_string = true;
-      }
-      b'{' | b'[' => depth += 1,
-      b'}' | b']' => depth -= 1,
-      _ => {}
-    }
-    i += 1;
-  }
-  None
-}
-
-/// Walk forward from `open` (which must point at a `{`) and
-/// return the byte index of the matching `}`. Quote/escape-aware.
-fn find_matching_close_brace(bytes: &[u8], open: usize) -> Option<usize> {
-  if bytes.get(open) != Some(&b'{') {
-    return None;
-  }
-  let mut in_string = false;
-  let mut escape = false;
-  let mut depth = 1_i32;
-  let mut i = open + 1;
-  while i < bytes.len() {
-    let c = bytes[i];
-    if escape {
-      escape = false;
-      i += 1;
-      continue;
-    }
-    if in_string {
-      match c {
-        b'\\' => escape = true,
-        b'"' => in_string = false,
-        _ => {}
-      }
-      i += 1;
-      continue;
-    }
-    match c {
-      b'"' => in_string = true,
-      b'{' => depth += 1,
-      b'}' => {
-        depth -= 1;
-        if depth == 0 {
-          return Some(i);
-        }
-      }
-      _ => {}
-    }
-    i += 1;
-  }
-  None
-}
-
-/// Quote-aware scan over `bytes[start..end]` (the interior of a
-/// JSON object, excluding the outer braces) for the named key at
-/// depth-0 of that interior. Returns `true` iff the key is
-/// present as a JSON key (string immediately followed by `:`) at
-/// the top level of this object.
-fn has_top_level_key(bytes: &[u8], start: usize, end: usize, key: &[u8]) -> bool {
-  let mut in_string = false;
-  let mut escape = false;
-  let mut depth = 0_i32;
-  let mut i = start;
-  while i < end {
-    let c = bytes[i];
-    if escape {
-      escape = false;
-      i += 1;
-      continue;
-    }
-    if in_string {
-      match c {
-        b'\\' => escape = true,
-        b'"' => in_string = false,
-        _ => {}
-      }
-      i += 1;
-      continue;
-    }
-    match c {
-      b'"' => {
-        let key_end = i + 1 + key.len();
-        if depth == 0 && key_end < end && &bytes[i + 1..key_end] == key && bytes[key_end] == b'"' {
-          let mut j = key_end + 1;
-          while j < end && (bytes[j] as char).is_ascii_whitespace() {
-            j += 1;
-          }
-          if j < end && bytes[j] == b':' {
-            return true;
-          }
-        }
-        in_string = true;
-      }
-      b'{' | b'[' => depth += 1,
-      b'}' | b']' => depth -= 1,
-      _ => {}
-    }
-    i += 1;
-  }
-  false
-}
 
 #[cfg(test)]
 mod tests {
@@ -1525,371 +1226,28 @@ mod tests {
     }
   }
 
-  // Unit tests for `from_paths` are tricky: they require real
-  // wav2vec2 ONNX + tokenizer.json files. The end-to-end test
-  // exercises the actual loader against the build.rs-fetched
-  // fixture. Here we lock in the type-level invariants and the
-  // blank-token-id detection helper.
-
-  /// Regression: the upstream wav2vec2 tokenizer.json (HF format,
-  /// no `model.type` discriminator) loaded directly via
-  /// `Aligner::from_paths` used to fail with `tokenizers 0.20`'s
-  /// ModelUntagged deserialiser. The build.rs fixture got
-  /// patched, but a downstream consumer loading their own copy
-  /// from HuggingFace would have hit a load-time error.
-  ///
-  /// Fix: `load_tokenizer_with_compat` patches in-memory and
-  /// retries. This test exercises that path with the canonical
-  /// minimal upstream shape — exactly what Hugging Face serves
-  /// for `facebook/wav2vec2-base-960h`'s `tokenizer.json`.
+  /// The de-gating must not move `Aligner::from_paths`'s observable
+  /// error. The core returns its own message-carrying load error;
+  /// `lift_core_load_error` puts it back into
+  /// `RunnerError::AlignerLoad` with the diagnostic byte-identical.
+  /// This pins the lift, so the message a caller reads for (e.g.) a
+  /// missing `|` delimiter is the same string it was before the guards
+  /// moved out of this file.
   #[test]
-  fn load_tokenizer_with_compat_handles_unpatched_hf_format() {
-    // Minimal upstream HF tokenizer.json shape — `model` has
-    // only `vocab`, no `type` discriminator. `tokenizers 0.20`
-    // rejects this raw; the compat shim must inject the
-    // missing fields and retry.
-    let raw = br#"{
- "version": "1.0",
- "truncation": null,
- "padding": null,
- "added_tokens": [],
- "normalizer": null,
- "pre_tokenizer": {"type": "Split", "pattern": {"Regex": ""}, "behavior": "Isolated", "invert": false},
- "post_processor": null,
- "decoder": null,
- "model": {
- "vocab": {
- "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3, "|": 4,
- "A": 5, "B": 6, "C": 7
- }
- }
- }"#;
-    // Confirm the raw form really does fail (otherwise the
-    // shim is exercising nothing). If `tokenizers` upstream
-    // ever relaxes its parser, this assert catches it.
-    assert!(
-      Tokenizer::from_bytes(raw).is_err(),
-      "tokenizers 0.20 unexpectedly accepted raw upstream HF format; \
- the compat shim is no longer necessary"
+  fn lift_core_load_error_preserves_variant_and_message() {
+    let core_err = AlignerCoreLoadError::new(
+      "tokenizer is missing the `|` word-delimiter token, but the language's normaliser \
+ declared `use_word_delimiter = true`."
+        .into(),
     );
-
-    // Shim must accept and patch.
-    let patched =
-      inject_wordlevel_model_type(raw).expect("inject_wordlevel_model_type must succeed");
-    let tok = Tokenizer::from_bytes(&patched).expect("patched JSON must parse");
-    assert_eq!(tok.token_to_id("A"), Some(5));
-    assert_eq!(tok.token_to_id("<unk>"), Some(3));
-  }
-
-  /// The shim must NOT mangle a tokenizer that already carries
-  /// a `type` discriminator (modern HF format, BPE / Unigram
-  /// models). It returns `None` and leaves the file untouched.
-  #[test]
-  fn load_tokenizer_with_compat_skips_already_patched_input() {
-    let already_typed = br#"{
- "model": {
- "type": "WordLevel",
- "vocab": {"<unk>": 0, "A": 1},
- "unk_token": "<unk>"
- }
- }"#;
-    assert!(inject_wordlevel_model_type(already_typed).is_none());
-  }
-
-  /// The patcher must use a quote-aware scanner — a naive
-  /// substring search (`s.find("\"model\"")`) would match a
-  /// `"model"` substring inside any string value before
-  /// reaching the real top-level `"model"` key. Skip `"model"`
-  /// text appearing inside strings and inject at the actual
-  /// top-level key.
-  ///
-  /// Test strategy: byte-level — we don't go through the
-  /// `Tokenizer::from_bytes` schema validator because the
-  /// upstream tokenizers crate rejects unknown top-level fields,
-  /// which would force us to embed the decoy inside a known
-  /// field's regex/pattern (clouds the test). Instead we verify
-  /// directly: the injection's byte offset MUST land after the
-  /// real `"model": {` boundary, not inside the decoy field's
-  /// string value.
-  #[test]
-  fn inject_wordlevel_model_type_ignores_model_substring_inside_strings() {
-    // Decoy: a string value containing the escape-quoted text
-    // `\"model\"`. A naive `s.find("\"model\"")` would land here.
-    // The real `"model": {` key sits AFTER the decoy.
-    let raw = br#"{
- "decoy": "this string mentions \"model\" with escape-quoted braces",
- "model": {
- "vocab": {"<pad>": 0, "<unk>": 1, "|": 2, "A": 3}
- }
- }"#;
-    let patched = inject_wordlevel_model_type(raw)
-      .expect("patcher must locate the real top-level model key, not the decoy substring");
-    let s = core::str::from_utf8(&patched).expect("UTF-8");
-    let inj = s
-      .find("\"type\": \"WordLevel\"")
-      .expect("patched output must contain injected discriminator");
-    let real_model_key = s
-      .find("\n \"model\": {")
-      .expect("real model key must remain in output");
-    assert!(
-      inj > real_model_key,
-      "injection at offset {inj} must come AFTER real model key at offset {real_model_key}; \
- the decoy substring would have placed it earlier"
-    );
-  }
-
-  /// The close-brace finder must skip braces inside strings.
-  /// Naive brace counting would count braces even inside string
-  /// values, so a description like
-  /// `"value with {curly} braces"` would skew the depth tracker
-  /// and the scanner would lose the model body's matching close
-  /// brace.
-  ///
-  /// Test strategy: verify the injection successfully completes
-  /// without a `None` bail, AND the patched output contains the
-  /// discriminator. With the previous brace-counting scanner,
-  /// stray braces inside the decoy string would cause the
-  /// `find_matching_close_brace` walker to either (a) return a
-  /// premature `}` belonging to a nested object reached too
-  /// early, OR (b) walk past the real close brace — both produce
-  /// a wrong byte range, and the early-skip check
-  /// (`s[brace_pos..close_pos].contains("\"type\"")`) would then
-  /// scan the wrong slice. The new quote-aware walker isolates
-  /// it.
-  #[test]
-  fn inject_wordlevel_model_type_ignores_braces_inside_strings() {
-    let raw = br#"{
- "decoy": "value with { braces } and more { } inside",
- "model": {
- "vocab": {"<pad>": 0, "<unk>": 1, "|": 2, "B": 3}
- }
- }"#;
-    let patched = inject_wordlevel_model_type(raw)
-      .expect("patcher must skip braces inside string values when finding model body close");
-    let s = core::str::from_utf8(&patched).expect("UTF-8");
-    assert!(
-      s.contains("\"type\": \"WordLevel\""),
-      "patched output must contain injected discriminator"
-    );
-    // The decoy must remain intact (we didn't touch it).
-    assert!(
-      s.contains("\"decoy\": \"value with { braces } and more { } inside\""),
-      "decoy field must remain byte-identical"
-    );
-  }
-
-  /// The discriminator pre-check must only match `"type"` when
-  /// it's a JSON key (followed by `:`) at the top level of the
-  /// model object. A naive substring search would treat
-  /// `"type"` anywhere inside the model body — including
-  /// string values like `"_note": "the type of ..."` — as
-  /// evidence that the discriminator was already present, and
-  /// skip patching.
-  #[test]
-  fn inject_wordlevel_model_type_does_not_treat_quoted_type_as_discriminator() {
-    let raw = br#"{
- "model": {
- "_note": "the type of model is wav2vec2",
- "vocab": {"<pad>": 0, "<unk>": 1, "|": 2, "C": 3}
- }
- }"#;
-    let patched = inject_wordlevel_model_type(raw).expect(
-      "patcher must NOT short-circuit on a quoted `type` substring inside a string value; \
- it must inject the real discriminator key",
-    );
-    let s = core::str::from_utf8(&patched).expect("UTF-8");
-    assert!(
-      s.contains("\"type\": \"WordLevel\""),
-      "patched output must contain the injected discriminator key"
-    );
-  }
-
-  // --- Coverage coercion (finding 1) ---
-  //
-  // Per user direction: don't panic on bad inputs — coerce them
-  // toward a valid threshold so misconfigured callers still
-  // produce useful output.
-
-  #[test]
-  fn coerce_speech_coverage_passes_through_valid_values() {
-    assert_eq!(coerce_speech_coverage(0.0), 0.0);
-    assert_eq!(coerce_speech_coverage(0.25), 0.25);
-    assert_eq!(coerce_speech_coverage(0.5), 0.5);
-    assert_eq!(coerce_speech_coverage(0.99), 0.99);
-    assert_eq!(coerce_speech_coverage(1.0), 1.0);
-  }
-
-  #[test]
-  fn coerce_speech_coverage_clamps_above_one() {
-    assert_eq!(coerce_speech_coverage(1.5), 1.0);
-    assert_eq!(coerce_speech_coverage(100.0), 1.0);
-    assert_eq!(coerce_speech_coverage(f32::INFINITY), 1.0);
-  }
-
-  #[test]
-  fn coerce_speech_coverage_clamps_below_zero() {
-    assert_eq!(coerce_speech_coverage(-0.1), 0.0);
-    assert_eq!(coerce_speech_coverage(-100.0), 0.0);
-    assert_eq!(coerce_speech_coverage(f32::NEG_INFINITY), 0.0);
-  }
-
-  /// In debug builds the `debug_assert!` fires so a NaN
-  /// config value is loud during development. Release builds
-  /// fall through to the coerce-to-default path so a typo
-  /// doesn't take down production.
-  #[test]
-  #[cfg(not(debug_assertions))]
-  fn coerce_speech_coverage_treats_nan_as_default_in_release() {
-    assert_eq!(
-      coerce_speech_coverage(f32::NAN),
-      crate::runner::aligner::algorithm::compose::DEFAULT_MIN_SPEECH_COVERAGE,
-    );
-  }
-
-  #[test]
-  #[cfg(debug_assertions)]
-  #[should_panic(expected = "min_speech_coverage = NaN")]
-  fn coerce_speech_coverage_panics_on_nan_in_debug() {
-    let _ = coerce_speech_coverage(f32::NAN);
-  }
-
-  // --- Word-delimiter validation ---
-
-  /// In-memory tokenizer with a `|` token. Use for "valid"
-  /// cases where the delimiter check should pass.
-  fn tokenizer_with_pipe_delimiter() -> Tokenizer {
-    let json = r#"{
- "version": "1.0",
- "truncation": null,
- "padding": null,
- "added_tokens": [],
- "normalizer": null,
- "pre_tokenizer": {"type": "Split", "pattern": {"Regex": ""}, "behavior": "Isolated", "invert": false},
- "post_processor": null,
- "decoder": null,
- "model": {
- "type": "WordLevel",
- "vocab": {"<unk>": 0, "<pad>": 1, "|": 2, "A": 3, "B": 4},
- "unk_token": "<unk>"
- }
- }"#;
-    Tokenizer::from_bytes(json.as_bytes()).expect("parse")
-  }
-
-  /// Same shape WITHOUT the `|` token. Reproduces the
-  /// configuration mistake the delimiter check catches.
-  fn tokenizer_without_pipe_delimiter() -> Tokenizer {
-    let json = r#"{
- "version": "1.0",
- "truncation": null,
- "padding": null,
- "added_tokens": [],
- "normalizer": null,
- "pre_tokenizer": {"type": "Split", "pattern": {"Regex": ""}, "behavior": "Isolated", "invert": false},
- "post_processor": null,
- "decoder": null,
- "model": {
- "type": "WordLevel",
- "vocab": {"<unk>": 0, "<pad>": 1, "A": 2, "B": 3},
- "unk_token": "<unk>"
- }
- }"#;
-    Tokenizer::from_bytes(json.as_bytes()).expect("parse")
-  }
-
-  #[test]
-  fn delimiter_check_passes_when_token_present_and_required() {
-    let tok = tokenizer_with_pipe_delimiter();
-    assert!(validate_word_delimiter_present(&tok, true).is_ok());
-  }
-
-  #[test]
-  fn delimiter_check_fails_when_required_but_missing() {
-    let tok = tokenizer_without_pipe_delimiter();
-    let err = validate_word_delimiter_present(&tok, true).unwrap_err();
-    let RunnerError::AlignerLoad { message } = err else {
-      panic!("expected AlignerLoad");
+    let expected = core_err.message().clone();
+    let RunnerError::AlignerLoad { message } = lift_core_load_error(core_err) else {
+      panic!("core load failures must surface as RunnerError::AlignerLoad");
     };
-    assert!(
-      message.contains("`|` word-delimiter"),
-      "must call out the missing delimiter; got {message}"
+    assert_eq!(
+      message, expected,
+      "the diagnostic must cross the front-end boundary verbatim"
     );
-  }
-
-  #[test]
-  fn delimiter_check_passes_for_char_segmented_normalizers() {
-    // CJK-shape normaliser: `use_word_delimiter == false`.
-    // Missing `|` is fine — char-segmented inputs don't use
-    // inter-word delimiters in the CTC graph.
-    let tok = tokenizer_without_pipe_delimiter();
-    assert!(validate_word_delimiter_present(&tok, false).is_ok());
-  }
-
-  // --- BERT-style specials at non-zero ids (kresnik Korean shape) ---
-  //
-  // `kresnik/wav2vec2-large-xlsr-korean` (the 604k-download Korean
-  // wav2vec2 we ship after `jonatasgrosman/...-korean` was removed
-  // from HF) places `[PAD]` and `[UNK]` at the END of the vocab
-  // (ids 1204 and 1203 of 1205) — the inverse of jonatasgrosman's
-  // `<pad>=0, <unk>=3` layout. The resolver helpers must work
-  // regardless of where the specials sit.
-
-  /// Inline kresnik-shape tokenizer: Hangul syllables at low ids
-  /// with `|` mixed in, then `[UNK]` and `[PAD]` at the top.
-  /// Compact stand-in for the 1205-entry vocab; the index gap
-  /// (1..1203) doesn't affect the resolver since `token_to_id`
-  /// is content-addressed, not contiguous-range.
-  fn tokenizer_kresnik_shape() -> Tokenizer {
-    let json = r#"{
- "version": "1.0",
- "truncation": null,
- "padding": null,
- "added_tokens": [],
- "normalizer": null,
- "pre_tokenizer": {"type": "Split", "pattern": {"Regex": ""}, "behavior": "Isolated", "invert": false},
- "post_processor": null,
- "decoder": null,
- "model": {
- "type": "WordLevel",
- "vocab": {"안": 0, "녕": 1, "하": 2, "세": 3, "요": 4, "|": 859, "[UNK]": 1203, "[PAD]": 1204},
- "unk_token": "[UNK]"
- }
- }"#;
-    Tokenizer::from_bytes(json.as_bytes()).expect("parse")
-  }
-
-  #[test]
-  fn detect_blank_token_id_resolves_bracket_pad_at_high_index() {
-    // kresnik places `[PAD]` at id 1204; the helper must return
-    // it. risk: a resolver that hardcoded id 0 (the
-    // jonatasgrosman convention) would silently misalign every
-    // CTC frame to the first syllable instead of the blank.
-    let tok = tokenizer_kresnik_shape();
-    assert_eq!(detect_blank_token_id(&tok), Some(1204));
-  }
-
-  #[test]
-  fn unk_fallback_resolves_bracket_unk() {
-    // Mirror of the `unk_token_id` resolution in
-    // `Aligner::from_paths` (lines 121-123): try `<unk>` first,
-    // then `[UNK]`. A vocab missing `<unk>` but exposing
-    // `[UNK]` (BERT convention) must resolve to the latter.
-    let tok = tokenizer_kresnik_shape();
-    let unk = tok
-      .token_to_id("<unk>")
-      .or_else(|| tok.token_to_id("[UNK]"));
-    assert_eq!(unk, Some(1203));
-  }
-
-  #[test]
-  fn delimiter_check_for_korean_normalizer_passes_even_with_pipe_present() {
-    // kresnik's vocab does carry a `|` token (id 859), but
-    // `KoreanNormalizer::use_word_delimiter()` returns `false`
-    // — char-segmented across Hangul syllables. The delimiter
-    // check must short-circuit on `false` regardless of whether
-    // the tokenizer happens to expose `|`.
-    let tok = tokenizer_kresnik_shape();
-    assert!(validate_word_delimiter_present(&tok, false).is_ok());
   }
 
   // --- build_speech_mask: silence-mask coordinate contract ---
