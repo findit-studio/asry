@@ -26,11 +26,31 @@
 //! is carried through verbatim in both directions, so no observable
 //! text moves.
 
-use core::num::NonZeroUsize;
+use core::{
+  num::{NonZeroU32, NonZeroUsize},
+  sync::atomic::{AtomicBool, Ordering},
+  time::Duration,
+};
 use std::path::Path;
 
+use mediatime::TimeRange;
 use smol_str::{SmolStr, format_smolstr};
 use tokenizers::Tokenizer;
+
+use crate::{
+  core::AlignmentResult,
+  runner::aligner::{
+    algorithm::{
+      compose::{build_speech_frames, compose_words, effective_samples_per_frame},
+      encode::{LogProbsTV, validate_stride_extent, validate_vocab_dim},
+      tokenize::{TokenizedText, detect_oov_events, tokenize_with_word_map},
+      trellis_beam::align_to_word_segments,
+    },
+    normalizer::{DynTextNormalizer, NormalizationError, NormalizedText},
+  },
+  time::SAMPLE_RATE_HZ,
+  types::{AlignmentError, AlignmentFailure, Lang, WorkFailure, WorkerHangTimeout, WorkerKind},
+};
 
 /// Why the feature-neutral aligner core refused to construct.
 ///
@@ -445,6 +465,680 @@ fn has_top_level_key(bytes: &[u8], start: usize, end: usize, key: &[u8]) -> bool
     i += 1;
   }
   false
+}
+
+/// Everything an aligner owns **except** the encoder.
+///
+/// This is the sealed middle of the sandwich: `Aligner` is
+/// `{ ort::Session, AlignerCore }` and `EmissionsAligner` is
+/// `{ AlignerCore }`. Both front ends therefore run the *same*
+/// preprocessing, the *same* tokenisation, the *same* validators, and
+/// the *same* composition — because there is only one copy of them.
+///
+/// The seam is [`prepare`](Self::prepare) → *caller's encoder runs* →
+/// [`finish`](Self::finish). `Aligner::align` puts ORT in that hole;
+/// `EmissionsAligner` lets the caller put CoreML there. Neither front
+/// end can widen the contract, because neither owns any of the
+/// derived quantities: every sample extent `finish` uses is the length
+/// of a slice that physically exists, never an integer a caller chose.
+///
+/// Errors stay [`WorkFailure`] here rather than being re-typed at this
+/// layer. That is deliberate: the ORT path's error taxonomy is load-
+/// bearing for the `Transcriber` state machine, and re-typing inside
+/// the core would silently reclassify it. The emissions front end maps
+/// at *its own* boundary with a mapper that is honest for *its* call
+/// chain.
+pub(crate) struct AlignerCore {
+  tokenizer: Tokenizer,
+  language: Lang,
+  normalizer: DynTextNormalizer,
+  /// Frame stride in 16 kHz samples. `NonZeroU32`: a zero hop would
+  /// collapse the frame→sample conversion in `compose_words` (every
+  /// word landing at the chunk's first sample) and silently corrupt
+  /// every timing. `Aligner`'s public `u32` setters keep their
+  /// `assert!(value > 0)` and build the `NonZeroU32` after it, so the
+  /// panic a caller sees is unchanged; the emissions builder simply
+  /// cannot spell zero.
+  hop_samples: NonZeroU32,
+  blank_token_id: u32,
+  unk_token_id: Option<u32>,
+  vocab_uppercase_only: bool,
+  /// Tokenizer vocab size, captured at construction. The encoder's
+  /// `V` MUST equal this — [`finish`](Self::finish) enforces it. See
+  /// [`capture_vocab_size`] for why it is `NonZeroUsize`.
+  tokenizer_vocab_size: NonZeroUsize,
+  min_speech_coverage: f32,
+  max_intra_silent_run: Duration,
+}
+
+/// A chunk that has been through steps 0-2 and is ready for an
+/// encoder — the capability token the seam hands out.
+///
+/// Constructible **only** by [`AlignerCore::prepare`]. That is the
+/// whole point: it carries the masked + zero-padded encoder buffer and
+/// the geometry derived from it, so a caller cannot hand `finish` a
+/// sample count, a frame count, or a stride that disagrees with the
+/// audio the encoder actually saw. Every extent in here is a slice
+/// length, not a caller integer.
+pub(crate) struct PreparedChunk<'a> {
+  /// `None` for the two short-circuits `Aligner::align` has always
+  /// had: normalisation produced empty text, or tokenisation produced
+  /// zero alignable tokens. The encoder should be skipped entirely and
+  /// the result is an empty `AlignmentResult`.
+  inner: Option<PreparedInner<'a>>,
+}
+
+struct PreparedInner<'a> {
+  /// Silence-zeroed and zero-padded to wav2vec2's 400-sample
+  /// receptive field — the exact buffer `Aligner` hands ORT.
+  encoder_input: Vec<f32>,
+  /// The chunk's REAL audio length (`samples.len()`), before padding.
+  /// Drives the stride check and word-range clamping.
+  real_samples: usize,
+  sub_segments: &'a [TimeRange],
+  normalized: NormalizedText<'a>,
+  tokenized: TokenizedText,
+}
+
+impl<'a> PreparedChunk<'a> {
+  /// The buffer to feed the encoder: silence-zeroed and zero-padded
+  /// to 400 samples. Empty when [`is_trivial`](Self::is_trivial).
+  pub(crate) fn encoder_input(&self) -> &[f32] {
+    self.inner.as_ref().map_or(&[], |i| &i.encoder_input)
+  }
+
+  /// True when normalisation produced empty text or zero alignable
+  /// tokens. Skip the encoder; `finish` returns an empty result.
+  pub(crate) const fn is_trivial(&self) -> bool {
+    self.inner.is_none()
+  }
+}
+
+impl AlignerCore {
+  /// Assemble from already-validated parts. Every guard in this module
+  /// has run by the time this is called; both front ends' constructors
+  /// funnel through here so neither can skip one.
+  #[allow(
+    clippy::too_many_arguments,
+    reason = "one field per argument; the guards that produce them run \
+ in the front ends' constructors, and bundling them into a struct \
+ would just move the same list one level out"
+  )]
+  pub(crate) const fn from_parts(
+    tokenizer: Tokenizer,
+    language: Lang,
+    normalizer: DynTextNormalizer,
+    hop_samples: NonZeroU32,
+    blank_token_id: u32,
+    unk_token_id: Option<u32>,
+    vocab_uppercase_only: bool,
+    tokenizer_vocab_size: NonZeroUsize,
+    min_speech_coverage: f32,
+    max_intra_silent_run: Duration,
+  ) -> Self {
+    Self {
+      tokenizer,
+      language,
+      normalizer,
+      hop_samples,
+      blank_token_id,
+      unk_token_id,
+      vocab_uppercase_only,
+      tokenizer_vocab_size,
+      min_speech_coverage,
+      max_intra_silent_run,
+    }
+  }
+
+  pub(crate) const fn language(&self) -> &Lang {
+    &self.language
+  }
+
+  pub(crate) const fn hop_samples(&self) -> NonZeroU32 {
+    self.hop_samples
+  }
+
+  pub(crate) const fn set_hop_samples(&mut self, value: NonZeroU32) {
+    self.hop_samples = value;
+  }
+
+  pub(crate) const fn blank_token_id(&self) -> u32 {
+    self.blank_token_id
+  }
+
+  pub(crate) const fn vocab_size(&self) -> NonZeroUsize {
+    self.tokenizer_vocab_size
+  }
+
+  pub(crate) const fn min_speech_coverage(&self) -> f32 {
+    self.min_speech_coverage
+  }
+
+  /// Store an ALREADY-COERCED coverage threshold. Both front ends
+  /// route through [`coerce_speech_coverage`] first, so the field is
+  /// valid by construction and `compose_words`'s `coverage <
+  /// threshold` comparison has no NaN trapdoor.
+  pub(crate) const fn set_min_speech_coverage(&mut self, coerced: f32) {
+    self.min_speech_coverage = coerced;
+  }
+
+  pub(crate) const fn max_intra_silent_run(&self) -> Duration {
+    self.max_intra_silent_run
+  }
+
+  pub(crate) const fn set_max_intra_silent_run(&mut self, value: Duration) {
+    self.max_intra_silent_run = value;
+  }
+
+  /// Detect out-of-vocab characters in `text` against this core's
+  /// vocab + normalizer, without making any policy decision.
+  ///
+  /// Lifted verbatim out of `Aligner::detect_oov` so both front ends
+  /// share it — the caller never supplies the tokenizer, the word
+  /// count, the uppercase flag, the unk id, or the boundary map, so
+  /// none of them can be got wrong.
+  pub(crate) fn detect_oov(&self, text: &str) -> Result<Vec<crate::core::OovEvent>, WorkFailure> {
+    let normalized = match self.normalizer.normalize(text) {
+      Ok(n) => n,
+      Err(NormalizationError::EmptyText) => {
+        return Ok(Vec::new());
+      }
+      Err(e) => {
+        return Err(WorkFailure::Alignment(AlignmentError::Normalization(
+          AlignmentFailure::new(
+            format_smolstr!("normalize failed: {e}"),
+            self.language.clone(),
+          ),
+        )));
+      }
+    };
+    let n_words = normalized.normalized().split_whitespace().count();
+    // `detect_oov_events` returns the backend-neutral `EmissionsError`;
+    // re-map it to the pool `WorkFailure` at this orchestration
+    // boundary so the aligner's public error type is unchanged.
+    detect_oov_events(
+      &self.tokenizer,
+      normalized.normalized(),
+      n_words,
+      self.vocab_uppercase_only,
+      self.unk_token_id,
+      &self.language,
+      normalized.wildcard_boundary_per_word(),
+    )
+    .map_err(|e| e.into_work_failure(&self.language))
+  }
+
+  /// Steps 0-2 of the alignment pipeline, up to (but not including)
+  /// the encoder: non-finite sample scan → speech mask → zero
+  /// non-speech → pad to 400 → normalise → tokenise.
+  ///
+  /// The body is `Aligner::align`'s, unchanged. The only thing that
+  /// moved is where it stops.
+  pub(crate) fn prepare<'a>(
+    &self,
+    samples: &[f32],
+    sub_segments: &'a [TimeRange],
+    text: &'a str,
+    oov_decisions: &[crate::core::ResolvedOov],
+    abort_flag: &AtomicBool,
+  ) -> Result<PreparedChunk<'a>, WorkFailure> {
+    if abort_flag.load(Ordering::Relaxed) {
+      return Err(timed_out());
+    }
+
+    // Step 0: silence-aware preprocessing.
+    //
+    // `sub_segments` are in chunk-local 1/16000 timebase per the
+    // method-level contract — `start_pts()` / `end_pts()` are
+    // chunk-local sample indices, NOT output-timebase ticks.
+    //
+    // Scan the RAW samples for finiteness BEFORE the speech-mask
+    // zeroes everything outside VAD. `encode_log_softmax`'s
+    // finite-sample guard only sees the masked buffer, so a NaN/Inf in
+    // a VAD-excluded region was silently zeroed away — upstream audio
+    // corruption disappeared without any diagnostic. Reject loudly
+    // here; the caller can fix the upstream pipeline rather than chase
+    // mysterious intermittent failures inside the encoder.
+    if let Some((idx, val)) = samples
+      .iter()
+      .copied()
+      .enumerate()
+      .find(|(_, s)| !s.is_finite())
+    {
+      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
+        AlignmentFailure::new(
+          format_smolstr!(
+            "non-finite sample at index {idx} (value {val:?}); upstream audio corruption — \
+ refuse to encode, masking-as-silence would only hide the bug"
+          ),
+          self.language.clone(),
+        ),
+      )));
+    }
+    let speech_mask = build_speech_mask(samples.len(), sub_segments, &self.language)?;
+
+    if abort_flag.load(Ordering::Relaxed) {
+      return Err(timed_out());
+    }
+
+    // Step 1: normalise.
+    //
+    // `NormalizationError::EmptyText` (punctuation-only or
+    // whitespace-only ASR output) is *not* an error here — it
+    // mirrors the empty-tokens short-circuit below. Returning a
+    // TRIVIAL chunk (→ `Ok(empty AlignmentResult)`) lets the cached
+    // ASR transcript surface as `Transcript { text, words: [] }`
+    // instead of `Event::Error`. Otherwise this would be a data-loss
+    // path that contradicts the `AlignmentResult` contract.
+    let normalized = match self.normalizer.normalize(text) {
+      Ok(nt) => nt,
+      Err(NormalizationError::EmptyText) => {
+        return Ok(PreparedChunk { inner: None });
+      }
+      Err(NormalizationError::RuleFailed { detail }) => {
+        return Err(WorkFailure::Alignment(AlignmentError::Normalization(
+          AlignmentFailure::new(detail, self.language.clone()),
+        )));
+      }
+    };
+
+    let n_words = normalized.original_words().len();
+
+    if abort_flag.load(Ordering::Relaxed) {
+      return Err(timed_out());
+    }
+
+    // Step 2: tokenise with word index map. The normaliser's
+    // `use_word_delimiter` policy gates inter-word `|` insertion
+    // (true for word-segmented English; false for char-segmented
+    // Chinese/Japanese where whitespace is an indexing artefact).
+    // `vocab_uppercase_only` triggers ASCII case projection so a
+    // lowercase normaliser doesn't feed <unk>s into a vocab like
+    // wav2vec2-base-960h's. `unk_token_id` is the per-character
+    // skip target.
+    let tokenized = tokenize_with_word_map(
+      &self.tokenizer,
+      normalized.normalized(),
+      n_words,
+      self.normalizer.use_word_delimiter(),
+      self.vocab_uppercase_only,
+      self.unk_token_id,
+      normalized.wildcard_boundary_per_word(),
+      &self.language,
+      oov_decisions,
+    )
+    // `tokenize_with_word_map` returns the backend-neutral
+    // `EmissionsError`; re-map it to the pool `WorkFailure` at this
+    // orchestration boundary so the error type is unchanged.
+    .map_err(|e| e.into_work_failure(&self.language))?;
+
+    // No-alignable-tokens short-circuit: a chunk like `"1000"`
+    // against the uppercase-only English vocab legitimately
+    // produces zero in-vocab tokens (every digit is <unk>).
+    // A trivial chunk makes the dispatch emit the cached ASR
+    // transcript with `words: []` instead of converting it into
+    // `Event::Error` — alignment becoming optional, not a data-loss
+    // path.
+    if tokenized.token_ids().is_empty() {
+      return Ok(PreparedChunk { inner: None });
+    }
+
+    if abort_flag.load(Ordering::Relaxed) {
+      return Err(timed_out());
+    }
+
+    // **WhisperX parity:** WhisperX's `alignment.py` feeds the **raw**
+    // waveform to `Wav2Vec2ForCTC.forward` (line 255 — the HF
+    // processor's mean/var normalisation step is skipped). The
+    // wav2vec2-base architecture has GroupNorm on the first conv layer
+    // so it tolerates unnormalised audio in `[-1, 1]`, but the
+    // resulting emissions differ materially from the
+    // processor-normalised path: per-frame argmax disagrees on ~14 % of
+    // frames over a 24 s segment, and individual blank
+    // log-probabilities differ by up to 5+ nats. To match the de facto
+    // reference's frame-level timing decisions we drop the pre-encode
+    // mean/var normalisation and feed the silence-masked but otherwise
+    // raw audio buffer to the encoder. The model's GroupNorm absorbs
+    // the global scale; the silence-mask contract — `false` positions →
+    // exactly `0.0_f32` going into the encoder — is preserved by
+    // zeroing non-speech samples before handoff.
+    let normalized_samples: Vec<f32> = samples
+      .iter()
+      .zip(speech_mask.iter())
+      .map(|(&s, &is_speech)| if is_speech { s } else { 0.0_f32 })
+      .collect();
+
+    // wav2vec2's CNN front-end has a minimum input length (the
+    // receptive field of the first stride-conv) of 400 samples at
+    // 16 kHz. WhisperX's `align()` pads with zeros to 400 if the slice
+    // is shorter (`alignment.py:243-247`). Without this padding, the
+    // model's first conv produces a degenerate output for very short
+    // segments — typical for a 1-2 word segment after Whisper splits on
+    // a brief utterance — and the encoder either errors out or emits
+    // T=0 frames. We append zeros to the silence-masked buffer; the
+    // padded samples are zero (silent) by construction, so the existing
+    // speech-mask doesn't need updating to track them.
+    //
+    // Owned rather than the `Cow` this was: `PreparedChunk` carries the
+    // buffer across the seam, so it must own it. Same values, same
+    // allocation count — the `>= 400` arm moves the vec instead of
+    // borrowing it.
+    let encoder_input: Vec<f32> = if normalized_samples.len() < 400 {
+      let mut buf = Vec::with_capacity(400);
+      buf.extend_from_slice(&normalized_samples);
+      buf.resize(400, 0.0_f32);
+      buf
+    } else {
+      normalized_samples
+    };
+
+    Ok(PreparedChunk {
+      inner: Some(PreparedInner {
+        encoder_input,
+        real_samples: samples.len(),
+        sub_segments,
+        normalized,
+        tokenized,
+      }),
+    })
+  }
+
+  /// Steps 3-9: validate the encoder's output against the geometry
+  /// `prepare` derived, run the pinned DP, and compose timed words.
+  ///
+  /// CONSUMES `prepared`, so a chunk cannot be finished twice.
+  ///
+  /// Runs `validate_stride_extent` **and** `validate_vocab_dim` —
+  /// neither of which the emissions seam has ever run. A CoreML head
+  /// whose `V` disagreed with the tokenizer used to align silently and
+  /// wrongly; now it cannot.
+  ///
+  /// The body is `Aligner::align`'s, unchanged. `samples.len()` became
+  /// `prepared.real_samples` and `padded_samples.len()` became
+  /// `prepared.encoder_input.len()` — both the same numbers, now read
+  /// off slices that physically exist rather than re-derived.
+  pub(crate) fn finish<F>(
+    &self,
+    prepared: PreparedChunk<'_>,
+    log_probs: &LogProbsTV,
+    chunk_first_sample_in_stream: u64,
+    samples_to_output_range: F,
+    abort_flag: &AtomicBool,
+  ) -> Result<AlignmentResult, WorkFailure>
+  where
+    F: Fn(u64, u64) -> TimeRange,
+  {
+    let Some(prepared) = prepared.inner else {
+      // Trivial chunk: `prepare` short-circuited (empty normalised
+      // text or zero alignable tokens). No encoder output to consume.
+      return Ok(AlignmentResult::new(Vec::new()));
+    };
+    let tokenized = &prepared.tokenized;
+
+    // Diagnostic: when the parity harness sets
+    // `ASRY_PARITY_DUMP_TRELLIS` to a directory, write a per-segment
+    // `wy_seg<N>.emission.bin` and (after the trellis step below)
+    // `wy_seg<N>.trellis.bin` plus a `wy_seg<N>.tokens.json`
+    // companion. The `<N>` counter is a monotonic integer drawn from a
+    // process-global atomic so each alignment call against the harness
+    // gets a unique slot.
+    //
+    // Lives behind the `parity-dump-emission` feature so the env hook
+    // + JSON formatter don't compile into the prod aligner.
+    #[cfg(feature = "parity-dump-emission")]
+    {
+      use core::sync::atomic::AtomicUsize;
+      static SEG_COUNTER: AtomicUsize = AtomicUsize::new(0);
+      if let Ok(dir) = std::env::var("ASRY_PARITY_DUMP_TRELLIS") {
+        let n = SEG_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir_path = std::path::PathBuf::from(dir);
+        let _ = std::fs::create_dir_all(&dir_path);
+        let em_path = dir_path.join(format!("wy_seg{n}.emission.bin"));
+        if let Ok(mut f) = std::fs::File::create(&em_path) {
+          use std::io::Write;
+          let _ = f.write_all(&(log_probs.t() as u32).to_le_bytes());
+          let _ = f.write_all(&(log_probs.v() as u32).to_le_bytes());
+          // Write as f32 LE one cell at a time. The dump path is
+          // diagnostic-only; the per-cell `to_le_bytes` is acceptable
+          // overhead for the few-K-cells * once-per-segment frequency.
+          let mut buf: Vec<u8> = Vec::with_capacity(log_probs.data().len() * 4);
+          for v in log_probs.data() {
+            buf.extend_from_slice(&v.to_le_bytes());
+          }
+          let _ = f.write_all(&buf);
+        }
+        let tok_path = dir_path.join(format!("wy_seg{n}.tokens.json"));
+        if let Ok(mut f) = std::fs::File::create(&tok_path) {
+          use std::io::Write;
+          // Hand-format JSON to avoid the serde_json prod dep.
+          let mut payload = format!("{{\"blank_id\":{},\"tokens\":[", self.blank_token_id);
+          for (i, t) in tokenized.token_ids().iter().enumerate() {
+            if i > 0 {
+              payload.push(',');
+            }
+            payload.push_str(&format!("{t}"));
+          }
+          payload.push_str(&format!(
+            "],\"n_samples\":{},\"T\":{},\"V\":{}}}",
+            prepared.encoder_input.len(),
+            log_probs.t(),
+            log_probs.v()
+          ));
+          let _ = f.write_all(payload.as_bytes());
+        }
+      }
+    }
+
+    // Two-sided stride check: the encoded time `T * hop_samples` must
+    // lie within `real_samples ± 2*hop_samples`. Catches both
+    // stride-too-small (T*hop overshoots — `compose_words` would emit
+    // ranges past the chunk's audio) and stride-too-large (T*hop
+    // undershoots — `compose_words` would compress every word into the
+    // first portion of the chunk). Fatal: the only recovery is fixing
+    // the model / `hop_samples` config, not retrying.
+    //
+    // Fed the REAL, unpadded extent — `samples.len()` at the original
+    // call site, `prepared.real_samples` now. Same value. The emissions
+    // seam has never run this check at all.
+    validate_stride_extent(
+      log_probs.t(),
+      self.hop_samples.get(),
+      prepared.real_samples,
+      &self.language,
+    )?;
+
+    // Vocab-axis check: encoder output `V` must equal the tokenizer's
+    // vocab size. A mismatch (e.g. wrong CTC head wired into the
+    // export, or a hidden-states tensor leaked out as the logits
+    // output) would otherwise let the per-token id check inside the DP
+    // pass whenever the chunk's token ids happened to fit, then read
+    // posteriors from columns that don't correspond to the tokenizer's
+    // tokens — emitting plausible but corrupt timings. The emissions
+    // seam has never run this check either.
+    validate_vocab_dim(
+      log_probs.v(),
+      self.tokenizer_vocab_size.get(),
+      &self.language,
+    )?;
+
+    if abort_flag.load(Ordering::Relaxed) {
+      return Err(timed_out());
+    }
+
+    // Steps 5-6: WhisperX-bit-exact trellis + beam-search backtrack +
+    // char→word grouping. Same cooperative-cancellation contract as
+    // before — the DP checks `abort_flag` periodically so a
+    // hallucinated long token sequence can't run past the deadline and
+    // starve every chunk queued behind it.
+    let word_segments = align_to_word_segments(
+      log_probs,
+      tokenized.token_ids(),
+      tokenized.word_idx_per_token(),
+      tokenized.separator_token_id(),
+      self.blank_token_id,
+      abort_flag,
+      &self.language,
+    )?;
+
+    // Companion to the emission dump above: rebuild the trellis
+    // diagnostically and dump it. We don't capture it from
+    // `align_to_word_segments` to avoid leaking the trellis allocation
+    // into a prod-facing return type. Recomputation is O(T*N) and only
+    // fires when the env var is set on a parity harness run.
+    #[cfg(feature = "parity-dump-emission")]
+    {
+      use core::sync::atomic::AtomicUsize;
+      static TRELLIS_COUNTER: AtomicUsize = AtomicUsize::new(0);
+      if let Ok(dir) = std::env::var("ASRY_PARITY_DUMP_TRELLIS") {
+        let n = TRELLIS_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir_path = std::path::PathBuf::from(dir);
+        let trellis = crate::runner::aligner::algorithm::trellis_beam::get_trellis(
+          log_probs,
+          tokenized.token_ids(),
+          self.blank_token_id,
+          abort_flag,
+          &self.language,
+        );
+        if let Ok(trellis) = trellis {
+          let path = dir_path.join(format!("wy_seg{n}.trellis.bin"));
+          if let Ok(mut f) = std::fs::File::create(&path) {
+            use std::io::Write;
+            let _ = f.write_all(&(log_probs.t() as u32).to_le_bytes());
+            let _ = f.write_all(&(tokenized.token_ids().len() as u32).to_le_bytes());
+            let mut buf: Vec<u8> = Vec::with_capacity(trellis.len() * 4);
+            for v in &trellis {
+              buf.extend_from_slice(&v.to_le_bytes());
+            }
+            let _ = f.write_all(&buf);
+          }
+        }
+      }
+    }
+
+    if abort_flag.load(Ordering::Relaxed) {
+      return Err(timed_out());
+    }
+
+    // Steps 7-9: per-word state + surface-form recovery. The
+    // speech-frame mask comes from the same `sub_segments` the
+    // silence-mask step zeroed, so words whose CTC-forced assignment
+    // lands entirely inside masked silence drop from the result rather
+    // than emit fabricated timings.
+    //
+    // `samples_per_frame` is derived ONCE, here, and fed to BOTH
+    // `build_speech_frames` (which maps encoder frames back to sample
+    // ranges for VAD overlap classification) and `compose_words` (which
+    // uses the same mapping to emit word timestamps). They must not
+    // drift: on a 30 s chunk where wav2vec2 truncates one frame
+    // (T=1499 vs nominal 1500) a nominal-vs-effective mismatch reaches
+    // ~40 ms by the chunk end, enough to misclassify boundary words.
+    // The seam cannot re-derive it differently, because it never sees
+    // it.
+    //
+    // For short slices padded to 400, the stride math runs against the
+    // PADDED length (what the encoder actually saw) while the per-frame
+    // threshold and word-range clamp run against the REAL length —
+    // padded frames carry no VAD overlap, so `min_speech_coverage`
+    // drops any word landing there.
+    let encoder_n_samples = prepared.encoder_input.len() as u64;
+    let samples_per_frame =
+      effective_samples_per_frame(encoder_n_samples, log_probs.t(), self.hop_samples.get());
+    let real_n_samples = prepared.real_samples as u64;
+    let speech_frames = build_speech_frames(
+      log_probs.t(),
+      samples_per_frame,
+      encoder_n_samples,
+      real_n_samples,
+      prepared.sub_segments,
+    );
+    Ok(compose_words(
+      &word_segments,
+      prepared.normalized.original_words(),
+      &speech_frames,
+      chunk_first_sample_in_stream,
+      self.hop_samples.get(),
+      encoder_n_samples,
+      real_n_samples,
+      log_probs.t(),
+      samples_to_output_range,
+      self.min_speech_coverage,
+      self.max_intra_silent_run,
+    ))
+  }
+}
+
+/// Produce a `WorkerHangTimeout` when the watchdog has already flipped
+/// `abort_flag`.
+///
+/// `elapsed` is left as ZERO: `run_one_alignment` (the worker) holds
+/// the canonical `Instant::now()` reference and overwrites
+/// unconditionally when `abort_flag` is set, so the value here is
+/// purely diagnostic. The in-pipeline checks exist so a long encode
+/// (1+ seconds for 30 s of audio) bails out at the next stage boundary
+/// instead of compounding the hang by running CTC + Viterbi + compose
+/// on probably-bogus data.
+fn timed_out() -> WorkFailure {
+  WorkFailure::WorkerHang(WorkerHangTimeout::new(
+    WorkerKind::Alignment,
+    Duration::ZERO,
+  ))
+}
+
+/// Build a per-sample boolean speech mask for step 0.
+/// `sub_segments` are in chunk-local 1/16000 timebase per the
+/// `align` contract; `start_pts` / `end_pts` are sample indices
+/// that get clamped to `[0, n_samples]` via i64 saturation.
+///
+/// Two contract details worth highlighting:
+///
+/// 1. A non-1/16000 timebase fails the chunk in BOTH debug and
+/// release with a `WorkFailure::AlignmentFailed`. Previously
+/// the check was a `debug_assert!` only, so release builds
+/// silently misinterpreted (e.g.) a millisecond-timebase PTS
+/// as a sample index, masking the wrong samples and producing
+/// plausible-but-wrong word alignments. Internal callers
+/// always wrap in 1/16000 (`managed_transcriber.rs`); external
+/// callers of `align_chunk` are documented to do the same and
+/// now hit a clear runtime error if they don't.
+/// 2. `i64 → usize` is via `.clamp(0, n_samples_i64) as usize`, NOT
+/// `as u64 as usize`. The old cast wrapped negative `start_pts`
+/// to a huge u64, which then got clamped to `n_samples` and the
+/// `if end > start` guard dropped the sub-segment entirely.
+/// Negative-overlap ranges (sub-segment whose head extends past
+/// the chunk start) now get their head trimmed and their tail
+/// masked, matching `compose::build_speech_frames`'s `.max(0)`.
+pub(crate) fn build_speech_mask(
+  n_samples: usize,
+  sub_segments: &[TimeRange],
+  language: &Lang,
+) -> Result<Vec<bool>, WorkFailure> {
+  let mut mask = vec![false; n_samples];
+  let n_samples_i64 = n_samples as i64;
+  for &seg in sub_segments {
+    if seg.timebase().num() != 1 || seg.timebase().den().get() != SAMPLE_RATE_HZ {
+      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
+        AlignmentFailure::new(
+          format_smolstr!(
+            "Aligner::align expects sub_segments in chunk-local 1/{} timebase, \
+ got {}/{}; caller passed sub_segments in the wrong timebase \
+ (samples will not match audio if we proceed).",
+            SAMPLE_RATE_HZ,
+            seg.timebase().num(),
+            seg.timebase().den().get(),
+          ),
+          language.clone(),
+        ),
+      )));
+    }
+    let start = seg.start_pts().clamp(0, n_samples_i64) as usize;
+    let end = seg.end_pts().clamp(0, n_samples_i64) as usize;
+    if end > start {
+      for slot in &mut mask[start..end] {
+        *slot = true;
+      }
+    }
+  }
+  Ok(mask)
 }
 
 #[cfg(test)]
@@ -887,5 +1581,137 @@ mod tests {
       "diagnostic must name the origin; got {}",
       err.message()
     );
+  }
+
+  // --- build_speech_mask: silence-mask coordinate contract ---
+
+  fn analysis_tb() -> mediatime::Timebase {
+    mediatime::Timebase::new(1, core::num::NonZeroU32::new(SAMPLE_RATE_HZ).unwrap())
+  }
+
+  #[test]
+  fn build_speech_mask_marks_inrange_segments() {
+    // Plain in-range segment: bits set exactly inside [start, end).
+    let segs = [TimeRange::new(2, 5, analysis_tb())];
+    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
+    assert_eq!(
+      mask,
+      vec![false, false, true, true, true, false, false, false]
+    );
+  }
+
+  #[test]
+  fn build_speech_mask_clamps_negative_overlap_to_zero() {
+    // Regression: pre-fix, `as u64 as usize` wrapped negative
+    // start_pts to a huge value, then `.min(samples.len())`
+    // clamped to len, and `if end > start` dropped the segment
+    // entirely. Now the head trims to 0 and the tail (within
+    // the chunk) gets masked.
+    let segs = [TimeRange::new(-3, 4, analysis_tb())];
+    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
+    assert_eq!(
+      mask,
+      vec![true, true, true, true, false, false, false, false]
+    );
+  }
+
+  #[test]
+  fn build_speech_mask_clamps_overshoot_to_buffer_end() {
+    // end_pts past `n_samples` clamps to len; start in range.
+    let segs = [TimeRange::new(5, 100, analysis_tb())];
+    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
+    assert_eq!(
+      mask,
+      vec![false, false, false, false, false, true, true, true]
+    );
+  }
+
+  #[test]
+  fn build_speech_mask_drops_fully_negative_range() {
+    // Both bounds negative: clamps to [0, 0), no bits set.
+    let segs = [TimeRange::new(-10, -3, analysis_tb())];
+    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
+    assert_eq!(mask, vec![false; 8]);
+  }
+
+  #[test]
+  fn build_speech_mask_drops_fully_overshoot_range() {
+    // Both bounds past len: clamps to [len, len), no bits set.
+    let segs = [TimeRange::new(20, 30, analysis_tb())];
+    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
+    assert_eq!(mask, vec![false; 8]);
+  }
+
+  #[test]
+  fn build_speech_mask_zero_width_range_is_dropped() {
+    // start == end: `if end > start` skips, no bits set.
+    // (`TimeRange::new` panics on `end < start`, so a literal
+    // inverted-range case can't be constructed via the public
+    // API and isn't reachable through the silence-mask path.)
+    let segs = [TimeRange::new(5, 5, analysis_tb())];
+    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
+    assert_eq!(mask, vec![false; 8]);
+  }
+
+  #[test]
+  fn build_speech_mask_unions_overlapping_segments() {
+    // Mask is a per-sample OR of all segments; overlap is fine.
+    let segs = [
+      TimeRange::new(1, 4, analysis_tb()),
+      TimeRange::new(3, 6, analysis_tb()),
+    ];
+    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
+    assert_eq!(
+      mask,
+      vec![false, true, true, true, true, true, false, false]
+    );
+  }
+
+  #[test]
+  fn build_speech_mask_empty_buffer_returns_empty_mask() {
+    let segs = [TimeRange::new(0, 0, analysis_tb())];
+    let mask = build_speech_mask(0, &segs, &Lang::En).expect("ok");
+    assert!(mask.is_empty());
+  }
+
+  #[test]
+  fn build_speech_mask_errors_on_non_analysis_timebase() {
+    // Promoted from the previous `debug_assert!`-only check: a
+    // non-1/16000 timebase now fails the chunk in BOTH debug and
+    // release. round-tripped this as a
+    // medium-severity finding because release builds silently
+    // misinterpreted (e.g.) a millisecond-timebase PTS as a
+    // 16 kHz sample index, masking the wrong samples and
+    // producing plausible-but-wrong word alignments.
+    let ms_tb = mediatime::Timebase::new(1, core::num::NonZeroU32::new(1000).unwrap());
+    let segs = [TimeRange::new(0, 100, ms_tb)];
+    let err = build_speech_mask(16_000, &segs, &Lang::En).expect_err("must error");
+    match err {
+      WorkFailure::Alignment(AlignmentError::ModelInference(payload)) => {
+        let message = payload.message();
+        assert!(
+          message.contains("chunk-local 1/16000 timebase"),
+          "error message must cite the contract; got: {message}"
+        );
+        assert!(
+          message.contains("1/1000"),
+          "error message must cite the offending timebase; got: {message}"
+        );
+      }
+      other => panic!("expected ModelInference, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn build_speech_mask_errors_on_output_timebase() {
+    // Codex's example was milliseconds (1/1000); a 1/48000
+    // (output-rate) PTS is the more realistic foot-gun: a
+    // production caller passing the output-timebase ranges they
+    // were going to emit, instead of converting back to
+    // chunk-local 1/16000. Same fail-loud behaviour required.
+    let out_tb = mediatime::Timebase::new(1, core::num::NonZeroU32::new(48_000).unwrap());
+    let segs = [TimeRange::new(0, 1000, out_tb)];
+    let err = build_speech_mask(16_000, &segs, &Lang::En).expect_err("must error");
+    assert!(matches!(err, WorkFailure::Alignment(_)));
   }
 }
