@@ -2,6 +2,7 @@
 
 pub(crate) mod compose;
 pub(crate) mod encode;
+pub(crate) mod errors;
 pub(crate) mod normalize;
 pub(crate) mod silence_mask;
 pub(crate) mod tokenize;
