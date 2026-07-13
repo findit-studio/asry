@@ -92,13 +92,26 @@ jobs:
   #   * is meaningfully sanitizable / miri-evaluable from
   #     downstream — any UB those tools would find lives in
   #     whisper.cpp / ORT, which test themselves upstream.
-  # `emissions` is exactly the meaningful pure-Rust subset this
-  # comment used to say would justify a scoped job (the trellis/
+  # `emissions` is exactly the meaningful ORT/whisper.cpp-free subset
+  # this comment used to say would justify a scoped job (the trellis/
   # beam/tokenize/normalize/compose algorithm factored out of
   # `runner` — see Cargo.toml's `emissions` feature doc); it now has
-  # build/test/clippy coverage below. `cross`/`sanitizer`/`miri`
-  # specifically remain out of scope — revisit only if a concrete
-  # need shows up.
+  # build/test/clippy coverage below.
+  #
+  # ORT/whisper.cpp-free is NOT pure-Rust, and the distinction is
+  # exactly the one this comment turns on. `emissions` enables
+  # `tokenizers` with `features = ["onig"]`, which pulls
+  # `onig v6.5.3` -> `onig_sys v69.9.3`; `onig_sys` declares
+  # `links = "onig"` and compiles ~57 C files of Oniguruma through
+  # `cc` in its build script. Verify with:
+  #   cargo tree --no-default-features --features emissions -i onig_sys
+  # So `emissions` still has a native C dependency and a `links` key,
+  # and the cross-compilation / sanitizer / Miri objections above are
+  # NOT lifted for it — they are only narrowed from
+  # "whisper.cpp + ORT" to "Oniguruma". `cross`/`sanitizer`/`miri`
+  # therefore remain out of scope for every feature combo, `emissions`
+  # included — revisit only if a concrete need shows up (dropping the
+  # `onig` tokenizer feature would be the prerequisite).
 
   build:
     name: build
