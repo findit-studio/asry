@@ -105,13 +105,26 @@ jobs:
   # `links = "onig"` and compiles ~57 C files of Oniguruma through
   # `cc` in its build script. Verify with:
   #   cargo tree --no-default-features --features emissions -i onig_sys
-  # So `emissions` still has a native C dependency and a `links` key,
-  # and the cross-compilation / sanitizer / Miri objections above are
-  # NOT lifted for it — they are only narrowed from
-  # "whisper.cpp + ORT" to "Oniguruma". `cross`/`sanitizer`/`miri`
-  # therefore remain out of scope for every feature combo, `emissions`
-  # included — revisit only if a concrete need shows up (dropping the
-  # `onig` tokenizer feature would be the prerequisite).
+  #
+  # Do NOT read that as "Oniguruma is the only thing keeping cross /
+  # sanitizer / Miri out of scope" — an earlier version of this comment
+  # did, and it was overbroad. asry ALREADY compiles C under every
+  # feature combo, `--no-default-features` included, because
+  # `[build-dependencies] ureq` pulls `rustls` -> `ring` -> `cc`:
+  #   cargo tree --no-default-features -e normal,build -i cc
+  #
+  # The two are not interchangeable. `ring` is a BUILD-dependency: it is
+  # host-compiled, never linked into the library, and invisible to Miri
+  # (which interprets the target crate graph, not build scripts) and to
+  # the target's sanitizers. `onig_sys` is a NORMAL dependency with a
+  # `links` key that rides into the built artifact. So `emissions` is the
+  # combo that adds native code to the LIBRARY; it is not the combo that
+  # first introduces a C compiler to the BUILD.
+  #
+  # Net: `cross`/`sanitizer`/`miri` stay out of scope for every feature
+  # combo — but for two independent reasons, and dropping the `onig`
+  # tokenizer feature would only remove one of them. Keep in sync with
+  # the `tokenizers` comment in Cargo.toml.
 
   build:
     name: build

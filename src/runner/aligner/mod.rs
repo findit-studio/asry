@@ -32,7 +32,10 @@ mod builder;
 /// is already `cfg(any(alignment, emissions))`, and everything here is
 /// ort-free, which is the point. Both front ends share ONE set of
 /// guards rather than the seam getting a second, weaker set.
-mod core;
+pub(crate) mod core;
+/// The guarded front end for a caller with its own acoustic encoder —
+/// the other half of the sealed sandwich.
+pub(crate) mod emissions_aligner;
 /// The validated seam types (`Emissions`, `SpeechSpans`, `SampleSpan`,
 /// `SpeechCoverage`, `OutputClock`, `SpanError`) — the only vocabulary
 /// an external-encoder caller speaks. Each one deletes a domain that a
@@ -132,28 +135,9 @@ pub mod bundled {
 pub use builder::AlignmentSetBuilder;
 #[cfg(feature = "alignment")]
 pub use key::{AlignerKey, AlignmentFallback};
-// Un-publishing `asry::emissions` left these re-exports without a
-// consumer under an `emissions`-only build: the deleted `pub mod
-// emissions` block was the ONLY thing that named them, which is
-// precisely the reachability fact that step's experiment set out to
-// establish (no source file outside `lib.rs` needed a *visibility*
-// edit — only lib.rs's re-export lines were load-bearing). Under
-// `alignment`, `runner/mod.rs` still re-exports all but
-// `WildcardBoundary`. The `allow` is transient: the rebuilt
-// `asry::emissions` facade names them again.
-#[allow(
-  unused_imports,
-  reason = "sole consumer was lib.rs's `pub mod emissions`, deleted while the \
- guarded facade that replaces it is built; restored by that facade"
-)]
 pub use normalizer::{
   DynTextNormalizer, NormalizationError, NormalizedText, TextNormalizer, WildcardBoundary,
 };
-#[allow(
-  unused_imports,
-  reason = "sole consumer was lib.rs's `pub mod emissions`, deleted while the \
- guarded facade that replaces it is built; restored by that facade"
-)]
 pub use normalizers::{
   ChineseNormalizer, EnglishNormalizer, JapaneseNormalizer, KoreanNormalizer, LatinNormalizer,
   default_normalizer_for,

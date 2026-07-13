@@ -121,15 +121,27 @@ ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, fea
 # tokenizers: HuggingFace WordPiece/BPE/Unigram tokenizer used to
 # read wav2vec2's tokenizer.json.
 #
-# `features = ["onig"]` is NOT pure-Rust, despite what this comment
-# used to claim: it pulls `onig` -> `onig_sys`, which declares
-# `links = "onig"` and compiles Oniguruma's C sources via `cc` in its
-# build script. That native dependency rides along with EVERY feature
-# combo that enables `tokenizers`, `emissions` included, so no asry
-# feature combo is C-free. `.github/workflows/ci.yml` depends on this
-# fact when it explains why the cross / sanitizer / Miri jobs stay out
-# of scope; keep the two in sync. Verify the chain with:
+# `features = ["onig"]` is NOT pure-Rust: it pulls `onig` -> `onig_sys`,
+# which declares `links = "onig"` and compiles Oniguruma's C sources via
+# `cc` in its build script. That native dependency rides along with every
+# feature combo that enables `tokenizers`, `emissions` included.
+#
+# It is NOT, however, the reason "no asry feature combo is C-free" — an
+# earlier version of this comment claimed that, and it was overbroad.
+# asry compiles C at build time under EVERY feature combo, including
+# `--no-default-features`, because `[build-dependencies] ureq` pulls
+# `rustls` -> `ring` -> `cc`. Verify both chains:
 #   cargo tree --no-default-features --features emissions -i onig_sys
+#   cargo tree --no-default-features -e normal,build -i cc
+#
+# The distinction that actually matters: `ring` is a BUILD-dependency
+# (host-compiled, never linked into the library, invisible to Miri and to
+# the target's sanitizers), while `onig_sys` is a NORMAL dependency with
+# a `links` key that rides into the built artifact. `emissions` is
+# therefore the combo that adds a native dep to the LIBRARY, not the
+# combo that first introduces a C compiler to the build.
+# `.github/workflows/ci.yml` turns on this distinction; keep the two in
+# sync.
 tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
 
 # Optional features (Plan A scope only).

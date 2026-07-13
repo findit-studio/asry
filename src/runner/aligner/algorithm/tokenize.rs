@@ -207,19 +207,32 @@ fn boundary_fail_closed(position: &str) -> EmissionsError {
 /// must produce decisions in the same order, with each
 /// `ResolvedOov.event` matching the event at its position.
 ///
-/// `is_skippable_internal_punct` chars (currently `.`) are
-/// NOT surfaced — they're stripped silently and replaced with
-/// a wildcard token at the same position; that's a tokenizer-
-/// internal detail, not a policy decision.
+/// `is_skippable_internal_punct` chars (currently `.`) ARE surfaced,
+/// as [`OovKind::InternalPunct`](crate::core::OovKind::InternalPunct)
+/// events — one per occurrence. They are then stripped and replaced
+/// with a wildcard token at the same position, but the caller still
+/// sees them and still decides: `fail_closed_all_decisions` refuses
+/// them like any other OOV. (This doc used to claim they were "NOT
+/// surfaced"; `U.S.A` emits two `InternalPunct` events, as
+/// `detect_oov_events_surfaces_internal_punct` pins.)
 ///
-/// pinned the contract that pronounced
-/// non-alphanumeric OOV chars (`&`, `@`, `%`, `,`) are
-/// observable rather than silently dropped — this function
-/// makes them observable to the caller as data.
+/// Pronounced non-alphanumeric OOV chars (`&`, `@`, `%`, `,`) are
+/// surfaced as [`OovKind::Symbol`](crate::core::OovKind::Symbol)
+/// rather than silently dropped.
 ///
-/// Returns an error only on tokenizer-engine failures
-/// (`encode(..)` itself errored). OOV detection itself never
-/// fails — every detected char becomes an event.
+/// # Errors
+///
+/// [`EmissionsError::Tokenization`] on a tokenizer-engine failure
+/// (`encode(..)` itself errored), on a `word_count` that disagrees with
+/// the whitespace-word count of `normalized`, and on a
+/// `wildcard_boundary_per_word` that is neither empty nor exactly
+/// `word_count` long. (This doc used to claim errors were engine-only;
+/// the two length checks below return `Tokenization` too, and a
+/// caller that mis-sizes either argument would otherwise get an
+/// index-skew between detect and tokenize.)
+///
+/// OOV *detection* itself never fails — every detected char becomes an
+/// event.
 pub fn detect_oov_events(
   tokenizer: &Tokenizer,
   normalized: &str,
@@ -361,9 +374,18 @@ pub fn detect_oov_events(
 /// * length mismatch — caller pre-sized too few or too many
 /// decisions for this text;
 /// * per-position identity mismatch — caller's payload was
-/// produced for different text (different char_index,
-/// word_index, kind, or language) and would silently
-/// misalign if applied;
+/// produced for different text (different `char_index`,
+/// `word_index`, or `kind`) and would silently misalign if
+/// applied. **`language` is deliberately NOT part of the identity**:
+/// under `AlignerKey::Any` the fallback aligner re-detects events
+/// stamped with its own construction language while the caller's
+/// decisions carry the run's requested language, and comparing the
+/// two would reject every legitimate `Any`-fallback payload. (This
+/// doc used to list `language` as part of the check; the fallback
+/// test `tokenize_with_word_map_accepts_mismatched_language_under_any_fallback`
+/// requires the opposite.) The direct `Aligner` path — which has no
+/// `Any` fallback — closes that gap at its own boundary with
+/// `validate_direct_decision_languages`;
 /// * mid-loop too-short consumption — defense-in-depth if the
 /// preflight is somehow bypassed.
 ///
