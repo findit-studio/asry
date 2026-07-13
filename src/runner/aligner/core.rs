@@ -240,16 +240,20 @@ pub(crate) fn validate_decision_languages(
 /// `SpeechCoverage::clamped`, which is this function plus a newtype —
 /// so both front ends coerce identically and there is no second
 /// interpretation of "what is a valid coverage threshold".
+///
+/// **Genuinely total, in every build profile.** This used to carry a
+/// `debug_assert!(!value.is_nan())` on the theory that a NaN config value
+/// should be loud during development. But `SpeechCoverage::clamped` — the
+/// public seam constructor — documents itself as *total* ("NaN resets to
+/// default"), and a total constructor that panics in debug is not total:
+/// a caller who read the contract and passed a NaN got a panic in their
+/// debug build and the documented default in release. Two behaviours from
+/// one call is exactly the trapdoor this whole module exists to remove, so
+/// the assert is gone. NaN coerces to the default in debug and release
+/// alike, matching the documented contract and the user direction ("don't
+/// panic on bad inputs — coerce them toward a valid threshold"). Release
+/// behaviour is unchanged; only the debug-build panic is removed.
 pub(crate) const fn coerce_speech_coverage(value: f32) -> f32 {
-  // NaN coercion is intentional release behaviour (avoid
-  // panicking in production for a config typo), but dev
-  // builds should surface the bug — silently getting the
-  // default for `f32::NAN` is the kind of mistake that hides
-  // for months.
-  debug_assert!(
-    !value.is_nan(),
-    "min_speech_coverage = NaN — likely a programming error; release builds coerce to default"
-  );
   // Order matters: `value < 0.0` and `value > 1.0` are both
   // false when `value` is NaN, so the NaN branch must come
   // first. `const fn` permits `is_nan()` and the comparison
@@ -1529,24 +1533,20 @@ mod tests {
     assert_eq!(coerce_speech_coverage(f32::NEG_INFINITY), 0.0);
   }
 
-  /// In debug builds the `debug_assert!` fires so a NaN
-  /// config value is loud during development. Release builds
-  /// fall through to the coerce-to-default path so a typo
-  /// doesn't take down production.
+  /// **Total in every profile.** NaN coerces to the default in debug AND
+  /// release — no `#[cfg(debug_assertions)]` gate, no `#[should_panic]`.
+  /// This test is compiled and run identically under both profiles, and
+  /// the coercion is genuinely total: `SpeechCoverage::clamped` documents
+  /// itself as total, and it delegates here, so a debug-build panic would
+  /// make that a lie. Run under `cargo test` (debug) and `cargo test
+  /// --release` to confirm identical behaviour.
   #[test]
-  #[cfg(not(debug_assertions))]
-  fn coerce_speech_coverage_treats_nan_as_default_in_release() {
+  fn coerce_speech_coverage_treats_nan_as_default_in_both_profiles() {
     assert_eq!(
       coerce_speech_coverage(f32::NAN),
       crate::runner::aligner::algorithm::compose::DEFAULT_MIN_SPEECH_COVERAGE,
+      "NaN must coerce to the default without panicking, in debug and release alike"
     );
-  }
-
-  #[test]
-  #[cfg(debug_assertions)]
-  #[should_panic(expected = "min_speech_coverage = NaN")]
-  fn coerce_speech_coverage_panics_on_nan_in_debug() {
-    let _ = coerce_speech_coverage(f32::NAN);
   }
 
   // --- OOV decision language validation ---

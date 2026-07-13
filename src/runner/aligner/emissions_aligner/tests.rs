@@ -217,7 +217,7 @@ fn trivial_chunks_skip_the_encoder() {
     vec![-1.0; VOCAB_SIZE],
   )
   .expect("ok");
-  let clock = OutputClock::new(0, analysis_tb(), 0);
+  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   let result = a
     .finish(prepared, &emissions, clock, &AtomicBool::new(false))
     .expect("a trivial chunk finishes as an empty result, not an error");
@@ -246,7 +246,7 @@ fn finish_rejects_a_vocab_dim_that_disagrees_with_the_tokenizer() {
   let emissions =
     Emissions::from_logits(t, wrong_v, vec![0.5_f32; t * 29]).expect("well-formed 29-wide logits");
 
-  let clock = OutputClock::new(0, analysis_tb(), 0);
+  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   let err = a
     .finish(prepared, &emissions, clock, &AtomicBool::new(false))
     .expect_err("a V mismatch must be a hard error, not a corrupt alignment");
@@ -275,7 +275,7 @@ fn finish_rejects_a_frame_count_that_cannot_match_the_audio() {
   let emissions =
     Emissions::from_logits(t, v, vec![0.5_f32; t * VOCAB_SIZE]).expect("well-formed logits");
 
-  let clock = OutputClock::new(0, analysis_tb(), 0);
+  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   let err = a
     .finish(prepared, &emissions, clock, &AtomicBool::new(false))
     .expect_err("T * hop must land within the chunk's real extent");
@@ -396,7 +396,7 @@ fn finish_rejects_a_prepared_chunk_from_a_different_aligner() {
   let (t, logits) = fake_encoder(&prepared_from_a, 320);
   let emissions_from_b = Emissions::from_logits(t, b.vocab_size(), logits).expect("well-formed");
 
-  let clock = OutputClock::new(0, analysis_tb(), 0);
+  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   let err = b
     .finish(
       prepared_from_a,
@@ -435,7 +435,7 @@ fn finish_rejects_a_foreign_trivial_chunk_too() {
     vec![-1.0; VOCAB_SIZE],
   )
   .expect("ok");
-  let clock = OutputClock::new(0, analysis_tb(), 0);
+  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   let err = b
     .finish(prepared_from_a, &emissions, clock, &AtomicBool::new(false))
     .expect_err("even an empty chunk from another aligner is crossed wiring");
@@ -453,7 +453,7 @@ fn finish_accepts_the_chunk_its_own_prepare_minted() {
     .expect("prepare");
   let (t, logits) = fake_encoder(&prepared, 320);
   let emissions = Emissions::from_logits(t, a.vocab_size(), logits).expect("ok");
-  let clock = OutputClock::new(0, analysis_tb(), 0);
+  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   a.finish(prepared, &emissions, clock, &AtomicBool::new(false))
     .expect("an aligner finishes the chunk it prepared");
 }
@@ -510,7 +510,7 @@ fn alignkit_call_site_aligns_end_to_end() {
   let emissions = Emissions::from_logits(t, vocab, logits).expect("one door, all the guards");
 
   // —— timed words out ————————————————————————————————————————
-  let clock = OutputClock::new(0, analysis_tb(), 0);
+  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   let result = aligner
     .finish(prepared, &emissions, clock, &abort)
     .expect("finish");
@@ -541,7 +541,7 @@ fn prepared_chunk_is_consumed_by_finish() {
     .expect("prepare");
   let (t, logits) = fake_encoder(&prepared, 320);
   let emissions = Emissions::from_logits(t, a.vocab_size(), logits).expect("ok");
-  let clock = OutputClock::new(0, analysis_tb(), 0);
+  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
 
   let _first = a.finish(prepared, &emissions, clock, &AtomicBool::new(false));
   // let _second = a.finish(prepared, &emissions, clock, &AtomicBool::new(false));
@@ -558,7 +558,7 @@ fn finish_honours_the_abort_flag() {
     .expect("prepare");
   let (t, logits) = fake_encoder(&prepared, 320);
   let emissions = Emissions::from_logits(t, a.vocab_size(), logits).expect("ok");
-  let clock = OutputClock::new(0, analysis_tb(), 0);
+  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
 
   let aborted = AtomicBool::new(true);
   let err = a

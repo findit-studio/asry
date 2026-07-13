@@ -165,6 +165,26 @@ pub enum SpanError {
     /// [`SampleSpan::MAX_SAMPLE`].
     max: u64,
   },
+
+  /// A timebase had a **zero numerator** (`0/den`).
+  ///
+  /// A `0/den` timebase carries no time, and `mediatime::Timebase::new`
+  /// permits it (only the denominator is `NonZeroU32`). Rescaling *to* it
+  /// divides by zero — a successful non-empty [`OutputClock::range`] would
+  /// PANIC; rescaling *from* it collapses every range to `0..0`, which
+  /// silently masks ALL speech. asry already rejects a zero-numerator
+  /// timebase at its other API boundaries
+  /// (`Transcriber::handle_samples`) for exactly this reason ("would panic
+  /// later"); the seam rejects it too, at both timebase doors:
+  /// [`OutputClock::new`] (the output timebase) and
+  /// [`SampleSpan::from_time_range_rescaled`] /
+  /// [`SpeechSpans::from_time_ranges_rescaled`] (the rescale source).
+  #[error("timebase numerator must be non-zero (got 0/{den})")]
+  ZeroNumeratorTimebase {
+    /// The timebase's denominator. The numerator is zero by definition
+    /// of this variant.
+    den: u32,
+  },
 }
 
 /// A chunk-local span of 16 kHz samples.
@@ -248,11 +268,21 @@ impl SampleSpan {
   ///
   /// # Errors
   ///
-  /// Currently infallible in practice; returns `Result` for symmetry
-  /// with [`from_time_range`](Self::from_time_range) and so a future
-  /// bound can be added without a breaking change.
+  /// [`SpanError::ZeroNumeratorTimebase`] if `range`'s timebase has a zero
+  /// numerator: a `0/den` source scales every pts to `0`, collapsing the
+  /// range to `0..0`, which would silently mask all speech. (This is the
+  /// "future bound" the signature reserved a `Result` for.)
   pub fn from_time_range_rescaled(range: TimeRange) -> Result<Self, SpanError> {
     let tb = range.timebase();
+    // A zero-numerator SOURCE does not divide by zero (the target,
+    // ANALYSIS_TIMEBASE, has numerator 1) — it silently collapses every
+    // pts to 0, so a whole VAD segment would vanish. Reject it rather than
+    // mask all speech without a diagnostic.
+    if tb.num() == 0 {
+      return Err(SpanError::ZeroNumeratorTimebase {
+        den: tb.den().get(),
+      });
+    }
     let start = Timebase::rescale_pts(range.start_pts(), tb, ANALYSIS_TIMEBASE);
     let end = Timebase::rescale_pts(range.end_pts(), tb, ANALYSIS_TIMEBASE);
     Self::from_analysis_pts(start, end)
@@ -410,13 +440,31 @@ pub struct OutputClock {
 impl OutputClock {
   /// Construct from the chunk's stream anchor, the output timebase, and
   /// the PTS that anchor corresponds to.
-  #[must_use]
-  pub const fn new(chunk_first_sample_in_stream: u64, timebase: Timebase, base_pts: i64) -> Self {
-    Self {
+  ///
+  /// # Errors
+  ///
+  /// [`SpanError::ZeroNumeratorTimebase`] if `timebase` has a zero
+  /// numerator. `mediatime::Timebase::new` permits `0/den`, and
+  /// [`range`](Self::range) rescales *to* this timebase — a `0` numerator
+  /// there is a division by zero, so a later successful, non-empty
+  /// `finish` would PANIC. Rejecting at construction turns that into a
+  /// typed error the caller acts on up front, and makes `range`
+  /// panic-free by invariant.
+  pub const fn new(
+    chunk_first_sample_in_stream: u64,
+    timebase: Timebase,
+    base_pts: i64,
+  ) -> Result<Self, SpanError> {
+    if timebase.num() == 0 {
+      return Err(SpanError::ZeroNumeratorTimebase {
+        den: timebase.den().get(),
+      });
+    }
+    Ok(Self {
       chunk_first_sample_in_stream,
       timebase,
       base_pts,
-    }
+    })
   }
 
   /// The chunk's first sample index in stream coordinates.
@@ -429,6 +477,10 @@ impl OutputClock {
   /// [`TimeRange`]. Total over every `(u64, u64)` with `start <= end`:
   /// the `u64 → i64` reach saturates rather than truncating, so the
   /// pair can never invert.
+  ///
+  /// Panic-free by invariant: [`new`](Self::new) rejects a zero-numerator
+  /// `timebase`, so the `rescale_pts` *to* `self.timebase` below cannot
+  /// divide by zero.
   pub(crate) fn range(&self, start_sample: u64, end_sample: u64) -> TimeRange {
     let to_pts = |sample: u64| -> i64 {
       let clamped = i64::try_from(sample).unwrap_or(i64::MAX);
