@@ -130,7 +130,11 @@ fn load_error(err: AlignerCoreLoadError) -> EmissionsError {
 /// Holds everything `Aligner` holds except the `ort::Session` — the same
 /// tokenizer, the same normalizer, the same guards, the same validators,
 /// the same composition. Not a parallel implementation: literally the
-/// same [`AlignerCore`].
+/// same [`AlignerCore`]. And, like the ORT path, it is cancellable
+/// throughout: both [`prepare`](Self::prepare) and [`finish`](Self::finish)
+/// thread the caller's abort flag straight into that core, so a watchdog
+/// that fires mid-`prepare` stops it before the O(n) scan / mask /
+/// normalise / tokenise rather than after the work is already spent.
 ///
 /// Build one per language with [`builder`](Self::builder), then drive it
 /// per chunk with [`prepare`](Self::prepare) → your encoder →
@@ -245,25 +249,37 @@ impl EmissionsAligner {
   /// [`EmissionsError::NonFiniteAudio`] if `samples` holds a `NaN` or an
   /// infinity; [`EmissionsError::Normalization`] /
   /// [`EmissionsError::Tokenization`] / [`EmissionsError::SemanticOutOfVocab`]
-  /// from the text pipeline.
+  /// from the text pipeline; [`EmissionsError::Aborted`] if `abort_flag` is
+  /// observed set — polled before the audio scan and again after the speech
+  /// mask, the normalise, and the tokenise, so cancellation lands before
+  /// each O(n) stage rather than after its work is already spent.
   ///
   /// [`EmissionsError::Tokenization`] also covers a cross-language
   /// `oov_decisions` payload: every [`ResolvedOov`] must carry THIS
   /// aligner's language. Positional matching deliberately ignores
   /// language, so a foreign decision at a matching position would
   /// otherwise apply another language's wildcard / fail-closed policy
-  /// silently.
+  /// silently. This check runs FIRST — ahead of the first abort poll — so a
+  /// malformed payload is still reported as the caller bug it is even when
+  /// `abort_flag` is already set; cancellation does not mask it.
   pub fn prepare<'a>(
     &self,
     samples: &[f32],
     speech: &SpeechSpans,
     text: &'a str,
     oov_decisions: &[ResolvedOov],
+    abort_flag: &AtomicBool,
   ) -> Result<PreparedChunk<'a>, EmissionsError> {
-    // `prepare` is the cheap half — a mask, a normalise, a tokenise. The
-    // abort flag guards `finish`, which is where the DP lives and where
-    // a pathological input can actually burn time.
-    let never = AtomicBool::new(false);
+    // Cancellable throughout, symmetric with `finish`. `prepare` is the
+    // cheaper half, but "cheaper" is not "bounded": the speech scan, the
+    // normalise (a public, caller-supplied normalizer runs here), and the
+    // tokenise are each O(n) over unbounded audio + text, so a watchdog that
+    // has already fired must be able to stop it. Thread the caller's flag
+    // straight into `AlignerCore::prepare`, which polls it before the audio
+    // scan and after each stage — exactly as the ORT path does. Handing a
+    // permanently-false flag here would leave those polls dead; that WAS the
+    // seam's cancellation gap, and it is closed by passing the real flag on.
+    //
     // An `EmissionsAligner` is bound to one language and there is no
     // registry above it, so there is no requested-language concept and no
     // `Any` fallback: this aligner's own language IS the key the caller's
@@ -272,7 +288,7 @@ impl EmissionsAligner {
     let expected = self.core.language().clone();
     self
       .core
-      .prepare(samples, speech, text, oov_decisions, &expected, &never)
+      .prepare(samples, speech, text, oov_decisions, &expected, abort_flag)
       .map_err(|e| to_emissions_error(e, Stage::Prepare))
   }
 

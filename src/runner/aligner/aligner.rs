@@ -601,13 +601,18 @@ impl Aligner {
 // `validate_decision_languages`, and `AlignerCore::prepare` now runs it
 // unconditionally against a caller-named key.
 //
-// It was the last genuinely-shared guard still living in the ORT front
-// end, which meant `EmissionsAligner` — the other front end of the same
-// core — silently did not have it. That is the exact defect class the
-// sealed sandwich exists to close, so the guard went where every other
-// shared guard already is. This front end's remaining job is to name its
-// key (`self.core.language()`, since a bound aligner has no
-// requested-language concept); the dispatcher names its own.
+// It was ONE of the shared guards still living only in the ORT front end,
+// which meant `EmissionsAligner` — the other front end of the same core —
+// silently did not have it. It was NOT the last: the seam's `prepare` also
+// handed `AlignerCore` a permanently-false abort flag, leaving every
+// prepare-stage cancellation poll dead on that path. Both are the same
+// defect class the sealed sandwich exists to close — a guard in the shared
+// core fed a neutered input by one front end — and both now run through the
+// core on the caller's real inputs: the decision key here, and the abort
+// flag `EmissionsAligner::prepare` now threads through instead of a `never`.
+// This front end's remaining job is to name its key
+// (`self.core.language()`, since a bound aligner has no requested-language
+// concept); the dispatcher names its own.
 
 /// Classify an `encode_log_softmax` failure based on whether the
 /// alignment watchdog already flipped `abort_flag` (Codex
