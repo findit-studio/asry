@@ -295,11 +295,12 @@ pub enum AlignmentError {
   #[error("alignment semantic-OOV: {0}")]
   SemanticOutOfVocab(AlignmentFailure),
   /// Alignment was cancelled via the cooperative `abort_flag`
-  /// before it produced a result. Used by the `emissions`-feature
-  /// entry point `align_emissions`, which re-expresses the
-  /// pool-oriented `WorkFailure::WorkerHang` cancellation signal
-  /// as a plain `AlignmentError` since a bare `align_emissions`
-  /// call has no worker/pool context to attach.
+  /// before it produced a result. The `emissions`-feature entry
+  /// point `align_emissions` re-expresses this abort — and the
+  /// pool-oriented `WorkFailure::WorkerHang` cancellation signal —
+  /// as `EmissionsError::Aborted`, the backend-neutral variant a
+  /// bare `align_emissions` call returns (it has no worker/pool
+  /// context to attach).
   #[error("alignment aborted before completing: {0}")]
   Aborted(AlignmentFailure),
 }
