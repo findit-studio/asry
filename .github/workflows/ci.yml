@@ -67,6 +67,8 @@ jobs:
         cargo clippy --features alignment -- -D warnings
         cargo clippy --features alignment,serde -- -D warnings
         cargo clippy --features alignment,bench-internals -- -D warnings
+        cargo clippy --no-default-features --features emissions -- -D warnings
+        cargo clippy --no-default-features --features emissions,serde -- -D warnings
         if [ "$RUNNER_OS" = "macOS" ]; then
           cargo clippy --features alignment,metal,coreml -- -D warnings
         fi
@@ -75,10 +77,14 @@ jobs:
   # Run tests on some extra platforms
   # `cross`, `sanitizer`, `miri-sb`, `miri-tb` removed: they are
   # template defaults that don't fit asry's architecture.
-  # `Lang` is re-exported from `whispercpp` (gated on `runner`),
-  # so even the "pure Rust" build path requires linking
-  # whisper.cpp (cmake + C++) and — on the alignment path — ONNX
-  # Runtime via load-dynamic. Neither dependency:
+  # `Lang` is asry's own native pure-Rust enum (`src/types/lang.rs`),
+  # not re-exported from `whispercpp`, so the `emissions`-only combo
+  # (no `runner`, no `alignment`) compiles and clippy-passes without
+  # whisper.cpp or ONNX Runtime — see the `clippy`/`build`/`test`
+  # jobs' `--no-default-features --features emissions[,serde]` lines
+  # below. The default (`runner`) and `alignment` combos still
+  # require linking whisper.cpp (cmake + C++) and, for `alignment`,
+  # ONNX Runtime via load-dynamic. Neither dependency:
   #   * cross-compiles cleanly to the cross-job target list
   #     (wasm, i686, android, etc.) — `cmake + Foundation`
   #     framework lookups fail before we ever see asry
@@ -86,9 +92,13 @@ jobs:
   #   * is meaningfully sanitizable / miri-evaluable from
   #     downstream — any UB those tools would find lives in
   #     whisper.cpp / ORT, which test themselves upstream.
-  # If a meaningful subset of pure-Rust code emerges later (e.g.
-  # the SIMD normalizer kernels factored out from `runner`),
-  # reintroduce a scoped job at that point.
+  # `emissions` is exactly the meaningful pure-Rust subset this
+  # comment used to say would justify a scoped job (the trellis/
+  # beam/tokenize/normalize/compose algorithm factored out of
+  # `runner` — see Cargo.toml's `emissions` feature doc); it now has
+  # build/test/clippy coverage below. `cross`/`sanitizer`/`miri`
+  # specifically remain out of scope — revisit only if a concrete
+  # need shows up.
 
   build:
     name: build
@@ -116,11 +126,15 @@ jobs:
       run: rustup update stable --no-self-update && rustup default stable
     - name: Run build
       # Explicit feature combos rather than `cargo hack
-      # --feature-powerset`: asry's features aren't
-      # orthogonal — `Lang` is re-exported from `whispercpp`
-      # (gated on `runner`), so any combo without `runner`
-      # fails to compile. Apple-only `metal` / `coreml` only
-      # build on macOS; diagnostic toggles
+      # --feature-powerset`: asry's features aren't fully
+      # orthogonal (`alignment` implies `runner` + `emissions`), and
+      # a full powerset would waste CI time on combos that can't
+      # build on some runners or are redundant with `alignment`.
+      # `Lang` is asry's own native pure-Rust enum
+      # (`src/types/lang.rs`), not re-exported from `whispercpp`, so
+      # the `emissions`-only combo below compiles without `runner`
+      # (no whisper.cpp, no ONNX Runtime). Apple-only `metal` /
+      # `coreml` only build on macOS; diagnostic toggles
       # (`parity-dump-emission`, `bench-internals`) ship
       # internals, never on the production surface.
       run: |
@@ -129,6 +143,8 @@ jobs:
         cargo build --features alignment
         cargo build --features alignment,serde
         cargo build --features alignment,bench-internals
+        cargo build --no-default-features --features emissions
+        cargo build --no-default-features --features emissions,serde
         if [ "$RUNNER_OS" = "macOS" ]; then
           cargo build --features alignment,metal,coreml
         fi
@@ -178,7 +194,9 @@ jobs:
         cargo test --features alignment
         cargo test --features alignment,serde
         cargo test --features alignment,bench-internals
-      shell: bash 
+        cargo test --no-default-features --features emissions
+        cargo test --no-default-features --features emissions,serde
+      shell: bash
 
   coverage:
     name: coverage
