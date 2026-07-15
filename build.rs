@@ -563,7 +563,14 @@ fn fetch_wav2vec2_fixtures(models_dir: &std::path::Path) {
   // No longer nested inside the whisper fetch, so create the
   // directory ourselves rather than relying on that path having run.
   if let Err(e) = fs::create_dir_all(models_dir) {
-    eprintln!("[asry build.rs] cannot create {models_dir:?}: {e}");
+    // `cargo:warning=`, not `eprintln!`: Cargo swallows build-script
+    // stderr unless `-vv`, so a captured error here would leave every
+    // selected language's alignment tests reporting `ignored` with the
+    // cause invisible.
+    println!(
+      "cargo:warning=ASRY_FETCH_W2V: cannot create {models_dir:?}: {e}; no alignment \
+       fixtures were fetched, so the alignment tests will report `ignored`, not run."
+    );
     return;
   }
 
@@ -575,9 +582,18 @@ fn fetch_wav2vec2_fixtures(models_dir: &std::path::Path) {
     match fetch_align_fixture(models_dir, fixture) {
       Ok(()) => println!("cargo:rustc-cfg=asry_w2v_{}", fixture.code),
       // Fixture absent or its mirror failed: leave the cfg unset so the
-      // language's tests stay honestly `#[ignore]`d. A *cached* pin
-      // mismatch never reaches here — `obtain_pinned` panics on it.
-      Err(_cause) => {}
+      // language's tests stay honestly `#[ignore]`d, but say so out loud.
+      // Cargo swallows build-script stderr, so a captured error would
+      // leave the run reporting `ignored` with no hint why — and the
+      // ignore message tells the user to run the very command they just
+      // ran. A *cached* pin mismatch never reaches here: `obtain_pinned`
+      // panics on it (a hard build error, not this soft warning).
+      Err(cause) => println!(
+        "cargo:warning=ASRY_FETCH_W2V: `{}` fixture unavailable — {cause}. Its alignment \
+         tests will report `ignored`, not run. This is a fetch/mirror failure, not a \
+         request to re-run the same command.",
+        fixture.code
+      ),
     }
   }
 }
