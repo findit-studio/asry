@@ -559,27 +559,44 @@ impl Emissions {
   /// on. See [`from_logits`](Self::from_logits) for why the runtime tells
   /// you nothing.
   ///
-  /// # The `O(T·V)` scan is a feature, not just a cost
+  /// # The `O(T·V)` scan is a domain check, not a provenance check
   ///
-  /// The value-domain scan is the reason to *prefer* this constructor
-  /// whenever the model genuinely emits log-probs: it doubles as a
-  /// **contract check on the model artifact**. If a future revision of
-  /// your `.mlmodelc` / `.onnx` quietly ships a raw-logit head, the
-  /// emitted values will have positive maxes, and this constructor fails
-  /// loudly with [`EmissionsError::Value`] naming the first offending
-  /// `(frame, vocab)`. Feed those same raw logits to
-  /// [`from_logits`](Self::from_logits) and it would **silently
-  /// re-normalise** them into a perfectly plausible log-prob domain and
-  /// align on them forever — a model swap would degrade your timings with
-  /// nothing anywhere reporting an error.
+  /// The value-domain scan verifies exactly one property: every element
+  /// is finite and `<= 0` — the domain of a log-probability. It is worth
+  /// stating precisely what that does and does not buy you, because it is
+  /// tempting to overread it as a "contract check on the model artifact",
+  /// which it is not.
   ///
-  /// Note what the hazard is **not**. Re-applying log-softmax to true
-  /// log-probs is a mathematical no-op — log-softmax is exactly
-  /// idempotent, since `lse(x − lse(x)) = ln 1 = 0`. Passing log-probs to
-  /// `from_logits` does not corrupt them by "double normalisation"; it
-  /// returns the same values. What you lose is precisely this check: the
-  /// one thing standing between a silently-changed model artifact and
-  /// silently-wrong word timings.
+  /// It **often** catches a raw-logit head fed here by mistake: an
+  /// unnormalised CTC head usually emits at least one positive score per
+  /// frame, and a single `> 0` element trips [`EmissionsError::Value`]
+  /// naming the first offending `(frame, vocab)`. But *usual* is not
+  /// *guaranteed*. A bare linear head can emit all-negative logits —
+  /// `[-10.0, -11.0]`, or any row after a large negative bias shift —
+  /// which are finite and `<= 0`, so this constructor **accepts them**
+  /// even though `exp(-10) + exp(-11) ≪ 1`: wildly unnormalised, yet in
+  /// domain. The elementwise `(-∞, 0]` scan is NOT the row-normalisation
+  /// invariant `logsumexp(row) ≈ 0`; it cannot see a row that fails to
+  /// sum to one in probability space, and it cannot prove the producing
+  /// graph's final op was a `log_softmax`. It is a **domain check, not an
+  /// artifact-provenance check.**
+  ///
+  /// So this scan does not, on its own, protect you from a model swap
+  /// that quietly ships a raw-logit head. Establishing the graph's final
+  /// op is the **caller's** responsibility, done externally — e.g.
+  /// alignkit pins its model's graph contract in its own `model_io`
+  /// tests, checks per-frame `logsumexp ≈ 0` empirically on real
+  /// emissions, and parses the shipped MIL to confirm the terminal op.
+  /// Choose this constructor vs [`from_logits`](Self::from_logits) by
+  /// that externally-verified final op, not by the presence of this scan.
+  ///
+  /// Note what the hazard of the *opposite* mistake is **not**.
+  /// Re-applying log-softmax to true log-probs is a mathematical no-op —
+  /// log-softmax is exactly idempotent, since `lse(x − lse(x)) = ln 1 =
+  /// 0`. Passing log-probs to `from_logits` does not corrupt them by
+  /// "double normalisation"; it returns the same values. What you forgo
+  /// by routing log-probs through `from_logits` is merely this domain
+  /// check — not a normalisation guarantee it never provided.
   ///
   /// # Errors
   ///
@@ -619,10 +636,11 @@ impl Emissions {
   ///
   /// Getting it wrong in the log-probs → `from_logits` direction is
   /// **silent**: log-softmax is idempotent, so the values survive intact
-  /// and nothing errors. What you forfeit is the value-domain scan that
-  /// would have caught the *opposite* mistake later — see
-  /// [`from_log_probs`](Self::from_log_probs)'s contract-check note. When
-  /// your model already emits log-probs, prefer that constructor.
+  /// and nothing errors. What you forfeit is the value-domain scan —
+  /// which *often* (not always) flags a raw-logit head sent the other
+  /// way; see [`from_log_probs`](Self::from_log_probs)'s note on why that
+  /// scan is a domain check, not a provenance check. When your model
+  /// already emits log-probs, prefer that constructor.
   ///
   /// # Domain by construction
   ///
