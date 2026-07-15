@@ -36,8 +36,12 @@ fn data_dependent_failures_are_recoverable() {
 }
 
 /// The pool layer's half of the too-short-chunk contract: a real
-/// aligner's real `NoAlignmentPath` is absorbed into `Ok(empty)`, and
-/// the ASR transcript survives.
+/// aligner's real `NoAlignmentPath` is absorbed into `Ok(empty)`
+/// rather than escaping as an error. This test proves only that the
+/// pool *returns* the recovered empty result; the emission-side
+/// guarantee — that the dispatcher then rebuilds a `Transcript` still
+/// carrying the ASR text — is a separate contract, pinned by
+/// `core::dispatch::tests::empty_alignment_result_preserves_asr_text_and_emits_no_error`.
 ///
 /// # What this covers that the unit tests above do not
 ///
@@ -66,7 +70,7 @@ fn data_dependent_failures_are_recoverable() {
   not(asry_w2v_en),
   ignore = "needs the English wav2vec2 fixture: ASRY_FETCH_W2V=en cargo test --features alignment"
 )]
-fn too_short_chunk_recovers_to_empty_result_with_asr_text_preserved() {
+fn too_short_chunk_recovers_to_empty_result() {
   use core::num::NonZeroU32;
 
   use mediatime::Timebase;
@@ -134,17 +138,18 @@ fn too_short_chunk_recovers_to_empty_result_with_asr_text_preserved() {
     result.words()
   );
 
-  // What "the ASR text is preserved" actually cashes out to: `Ok` routes
-  // the chunk to `Transcriber::handle_alignment`, which builds
-  // `Transcript::new(.., asr.text().clone(), result.into_words(), ..)` —
-  // text kept, `words: []`. An `Err` would route it to `handle_failure`
-  // instead, which resolves the chunk to `Event::Error` and throws the
-  // transcript away. The `Ok` above *is* the preservation; the work item
-  // still carries the text the caller needs in order to emit it.
+  // Input sanity, NOT a preservation proof: `run_one_alignment` borrows
+  // `&job` and never mutates it, so this can only confirm the work item
+  // still carries the text the dispatcher will later read — it says
+  // nothing about what gets emitted. The emission-side preservation
+  // (that `handle_alignment` rebuilds `Transcript::new(.., asr.text(),
+  // result.into_words(), ..)` — text kept, `words: []` — instead of
+  // routing an `Err` to `Event::Error`) is pinned separately by
+  // `core::dispatch::tests::empty_alignment_result_preserves_asr_text_and_emits_no_error`.
   assert_eq!(
     job.text().as_str(),
     ASR_TEXT,
-    "the ASR transcript must survive the alignment drop intact"
+    "the input work item still carries the ASR text (input sanity, not the preservation proof)"
   );
 }
 

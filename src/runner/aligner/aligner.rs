@@ -881,7 +881,7 @@ mod tests {
   /// by `alignment_pool`, which names "a too-short chunk" as its
   /// canonical cause, converts it to an empty `AlignmentResult`, keeps
   /// the ASR transcript, and logs the drop. See
-  /// `alignment_pool::tests::too_short_chunk_recovers_to_empty_result_with_asr_text_preserved`,
+  /// `alignment_pool::tests::too_short_chunk_recovers_to_empty_result`,
   /// which pins that half against this exact input.
   ///
   /// Collapsing the two would be a regression, not a simplification:

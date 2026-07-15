@@ -1207,6 +1207,85 @@ mod tests {
     assert!(matches!(r, Err(TranscriberError::UnknownChunk(_))));
   }
 
+  /// The emission side of the best-effort-alignment contract: a chunk
+  /// whose alignment was dropped (recovered by the pool into an EMPTY
+  /// `AlignmentResult`) must still surface the ASR transcript — the
+  /// cached text intact, `words` empty — and must NEVER become an
+  /// `Event::Error`. A chunk with no word timings keeps the words the
+  /// caller can already display; alignment is additive, never
+  /// destructive.
+  ///
+  /// This drives the real `Dispatch::handle_alignment` path and
+  /// asserts on the emitted `Event`, which is the only place a
+  /// regression that discarded the cached text, emitted an empty
+  /// transcript, or routed the empty result to `Event::Error` would
+  /// actually show up. The pool-layer recovery test
+  /// (`runner::alignment_pool::tests::too_short_chunk_recovers_to_empty_result`)
+  /// can only prove the recovery returns `Ok(empty)`; it borrows the
+  /// immutable work item and cannot observe what the dispatcher builds
+  /// from it.
+  #[test]
+  fn empty_alignment_result_preserves_asr_text_and_emits_no_error() {
+    const ASR_TEXT: &str = "hello world";
+
+    // `word_alignment = true` so a non-empty ASR result parks the
+    // chunk in `AwaitingAlignment` (caching the ASR text) rather than
+    // emitting a Transcript straight from ASR — that parking is the
+    // precondition for `handle_alignment` to run at all.
+    let mut d = Dispatch::new(
+      AsrParams::default(),
+      /* word_alignment = */ true,
+      /* max_in_flight = */ 4,
+      LanguagePolicy::Auto,
+    );
+    let mut b = make_buffer_with_samples(10_000);
+
+    d.on_emit(fake_chunk(0, 2_000), ChunkId::from_raw(0), &b);
+    d.handle_asr(
+      ChunkId::from_raw(0),
+      AsrResult::new(SmolStr::new(ASR_TEXT), Lang::En, -0.5, 0.05, 0.0),
+    )
+    .expect("a non-empty ASR result under word_alignment parks the chunk in AwaitingAlignment");
+
+    // The result a dropped alignment recovers to: zero words.
+    d.handle_alignment(
+      ChunkId::from_raw(0),
+      crate::core::command::AlignmentResult::new(Vec::new()),
+    )
+    .expect("an empty AlignmentResult must resolve the chunk to Ready, not error");
+
+    d.after_inject(&mut b, None, u64::MAX);
+
+    assert_eq!(
+      d.pending_events.len(),
+      1,
+      "exactly one event — the preserved transcript — must be emitted; got {:?}",
+      d.pending_events,
+    );
+    match d
+      .pending_events
+      .front()
+      .expect("one event was just asserted")
+    {
+      Event::Transcript(t) => {
+        assert_eq!(t.chunk_id().as_u64(), 0);
+        assert_eq!(
+          t.text(),
+          ASR_TEXT,
+          "the ASR transcript text must survive an empty alignment intact",
+        );
+        assert!(
+          t.words().is_empty(),
+          "a dropped alignment contributes no words; got {:?}",
+          t.words(),
+        );
+      }
+      Event::Error { error, .. } => {
+        panic!("an empty alignment must never route the chunk to Event::Error; got {error:?}")
+      }
+    }
+  }
+
   /// A failure aimed at a chunk already in `Ready` phase must
   /// be rejected — it must not retroactively turn a successful
   /// Transcript into an Error.
