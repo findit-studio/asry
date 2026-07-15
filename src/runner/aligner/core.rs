@@ -690,10 +690,21 @@ impl PreparedChunk<'_> {
     self.inner.is_none()
   }
 
-  /// The chunk's REAL audio length, before padding. A slice length, not
-  /// a caller integer — which is exactly why `finish` cannot be lied to
-  /// about it.
-  pub(crate) fn real_samples(&self) -> usize {
+  /// The chunk's REAL audio length in 16 kHz samples, BEFORE the 400-sample
+  /// receptive-field zero-padding that [`encoder_input`](Self::encoder_input)
+  /// carries — a slice length (`samples.len()`), never a caller integer, which
+  /// is exactly why `finish` cannot be lied to about it. Zero when
+  /// [`is_trivial`](Self::is_trivial).
+  ///
+  /// Public and read-only so a caller composing `prepare` → their own encoder
+  /// → `finish` can truncate their encoder's frames from the SAME authoritative
+  /// extent `finish` validates against, instead of mis-deriving it from
+  /// `encoder_input().len()` — the PADDED length, which for a short chunk is one
+  /// or more frames longer and would silently keep frames that are all
+  /// zero-pad. Fixed at `prepare` time from the audio itself; there is no
+  /// setter, and reading it cannot change what `finish` sees.
+  #[must_use]
+  pub fn real_samples(&self) -> usize {
     self.inner.as_ref().map_or(0, |i| i.real_samples)
   }
 }
