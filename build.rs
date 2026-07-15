@@ -139,14 +139,20 @@ const TOKENIZER_W2V_KO_SHA256: &str =
 // `FinDIT-Studio/wav2vec2-large-xlsr-53-{lang}-onnx`. Each pair is
 // SHA-verified after upload via `curl -L <url> | sha256sum`.
 //
-// A fetch that 404s or fails its SHA check does NOT fail the build:
-// `fetch_align_fixture` logs and returns false, leaving both the
-// `cargo:rustc-env` vars and the `asry_w2v_<code>` cfg unset. The
-// consequence is no longer "the dependent test skips and reports
-// green" — with the cfg unset the test is `#[ignore]`d, so an
-// unreachable mirror surfaces as an *ignored* test naming the fixture
-// it wanted, and as a hard failure if anyone force-runs it with
-// `--ignored`. Never as a false pass.
+// A fresh fetch that 404s, or downloads bytes that fail their SHA,
+// does NOT fail the build: `fetch_align_fixture` returns `Err` and the
+// caller leaves both the `cargo:rustc-env` vars and the
+// `asry_w2v_<code>` cfg unset. The consequence is no longer "the
+// dependent test skips and reports green" — with the cfg unset the
+// test is `#[ignore]`d, so an unreachable mirror surfaces as an
+// *ignored* test naming the fixture it wanted, and as a hard failure
+// if anyone force-runs it with `--ignored`. Never as a false pass.
+//
+// A *cached* fixture whose bytes no longer match its pin is the one
+// case that DOES fail the build, loudly: those bytes would otherwise
+// validate the parity reference against un-advertised content. The pin
+// is re-hashed on every build that reaches the fixture (bound via
+// `cargo:rerun-if-changed`); see `obtain_pinned`.
 //
 // IMPORTANT: keep this block contiguous so a sibling Korean
 // branch's parallel additions merge mechanically.
@@ -566,8 +572,12 @@ fn fetch_wav2vec2_fixtures(models_dir: &std::path::Path) {
   // `return`ed on the first failure, so a transient English 5xx used
   // to silently skip Ja/Zh/Ko/… as well.)
   for fixture in selected {
-    if fetch_align_fixture(models_dir, fixture) {
-      println!("cargo:rustc-cfg=asry_w2v_{}", fixture.code);
+    match fetch_align_fixture(models_dir, fixture) {
+      Ok(()) => println!("cargo:rustc-cfg=asry_w2v_{}", fixture.code),
+      // Fixture absent or its mirror failed: leave the cfg unset so the
+      // language's tests stay honestly `#[ignore]`d. A *cached* pin
+      // mismatch never reaches here — `obtain_pinned` panics on it.
+      Err(_cause) => {}
     }
   }
 }
@@ -654,39 +664,51 @@ fn w2v_selection_error(raw: &str, offending: Option<&str>) -> String {
 /// into `models_dir`, then emit `<PREFIX>_MODEL` and
 /// `<PREFIX>_TOKENIZER` so `option_env!()` in the tests can find them.
 ///
-/// Returns `true` only when **both** files are on disk and match their
-/// pins. The caller keys `cargo:rustc-cfg=asry_w2v_<code>` off that
-/// return, so the cfg's meaning is exact: *this language's fixture is
+/// Returns `Ok(())` only when **both** files are on disk and match
+/// their pins. The caller keys `cargo:rustc-cfg=asry_w2v_<code>` off
+/// that, so the cfg's meaning is exact: *this language's fixture is
 /// complete and provenance-verified*. The env vars are emitted
-/// together at the end for the same reason — the previous version
-/// emitted `_MODEL` before even attempting the tokenizer, so a
-/// tokenizer 404 left a model path exported with no tokenizer to go
-/// with it, and the dependent test failed deep inside
-/// `Aligner::from_paths` instead of at the fixture check.
+/// together at the end — the previous version emitted `_MODEL` before
+/// even attempting the tokenizer, so a tokenizer 404 left a model path
+/// exported with no tokenizer to go with it, and the dependent test
+/// failed deep inside `Aligner::from_paths` instead of at the fixture
+/// check.
 ///
-/// A failed fetch logs and returns `false`; it does NOT fail the
-/// build, so one unreachable mirror doesn't block the other languages.
-/// It buys no test a free pass either: the language's tests stay
-/// `#[ignore]`d (cfg unset), and hard-fail on the absent env var if
-/// anyone forces them to run with `--ignored`.
-fn fetch_align_fixture(models_dir: &std::path::Path, fixture: &W2vFixture) -> bool {
+/// A fresh fetch that fails (404 / download error / freshly-downloaded
+/// bytes failing their checksum) returns `Err(cause)` and does NOT
+/// fail the build: one unreachable mirror doesn't block the other
+/// languages, and it buys no test a free pass — the language's tests
+/// stay `#[ignore]`d (cfg unset) and hard-fail on the absent env var
+/// if forced with `--ignored`. A **cached** file whose bytes no longer
+/// match its pin is the one fatal case; see [`obtain_pinned`].
+///
+/// Emits `cargo:rerun-if-changed` for both on-disk paths so a later
+/// mutation of a cached fixture re-runs this script — which re-hashes
+/// and, on mismatch, fails the build. Without it, cargo replays the
+/// cached cfg on subsequent builds and the pin is never re-checked.
+fn fetch_align_fixture(models_dir: &std::path::Path, fixture: &W2vFixture) -> Result<(), String> {
   eprintln!(
     "[asry build.rs] wav2vec2 alignment fixture `{}` (~{} MB)",
     fixture.code, fixture.approx_mb
   );
 
   let model_path = models_dir.join(fixture.model_filename);
-  if !fetch_with_sha(fixture.model_url, &model_path, fixture.model_sha256) {
-    return false;
-  }
   let tokenizer_path = models_dir.join(fixture.tokenizer_filename);
-  if !fetch_with_sha(
+
+  // Bind this build script's freshness to the fixture bytes. Emitted
+  // for every selected language regardless of fetch outcome, so a file
+  // that appears (or is mutated) later triggers a re-hash.
+  println!("cargo:rerun-if-changed={}", model_path.display());
+  println!("cargo:rerun-if-changed={}", tokenizer_path.display());
+
+  obtain_pinned(fixture.model_url, &model_path, fixture.model_sha256)
+    .map_err(|c| format!("model {}: {c}", fixture.model_filename))?;
+  obtain_pinned(
     fixture.tokenizer_url,
     &tokenizer_path,
     fixture.tokenizer_sha256,
-  ) {
-    return false;
-  }
+  )
+  .map_err(|c| format!("tokenizer {}: {c}", fixture.tokenizer_filename))?;
 
   println!(
     "cargo:rustc-env={}_MODEL={}",
@@ -698,7 +720,7 @@ fn fetch_align_fixture(models_dir: &std::path::Path, fixture: &W2vFixture) -> bo
     fixture.env_prefix,
     tokenizer_path.display()
   );
-  true
+  Ok(())
 }
 
 /// Idempotent fetch + SHA-256 verify. Returns true on success
@@ -739,6 +761,67 @@ fn fetch_with_sha(url: &str, dest: &std::path::Path, expected_sha: &str) -> bool
   }
 }
 
+/// Make one SHA-256-pinned wav2vec2 file present and verified in
+/// `models_dir`, re-hashing on every build that reaches it.
+///
+/// The policy differs deliberately from [`fetch_with_sha`] (used for
+/// the whisper checkpoint, which silently re-downloads a stale cache):
+/// a **cached** fixture whose bytes no longer match the pin is a HARD
+/// ERROR, not a re-download. These files live outside git and survive
+/// `cargo clean`; the parity reference must never be validated against
+/// un-advertised bytes, and silently replacing them would mask the
+/// tampering. A file that is merely *absent*, or whose fresh download
+/// fails its checksum, is non-fatal: the caller leaves the cfg unset
+/// and the language's tests stay honestly `#[ignore]`d.
+///
+/// `Ok(())` = present and verified. `Err(cause)` = unavailable
+/// (non-fatal). A cached pin mismatch never returns — it panics.
+fn obtain_pinned(url: &str, dest: &std::path::Path, expected_sha: &str) -> Result<(), String> {
+  if dest.exists() {
+    // Always re-hash a cached file; never trust mtime/size as a
+    // short-circuit. Cargo re-runs this script when the fixture's
+    // `rerun-if-changed` fingerprint moves (see `fetch_align_fixture`),
+    // and this is the check that then runs.
+    match verify_sha256(dest, expected_sha) {
+      Ok(true) => return Ok(()),
+      Ok(false) => {
+        let actual = sha256_hex(dest).unwrap_or_else(|e| format!("<unreadable: {e}>"));
+        panic!(
+          "asry build.rs: cached alignment fixture failed its SHA-256 pin.\n  \
+             file:     {}\n  \
+             expected: {expected_sha}\n  \
+             actual:   {actual}\n\n\
+           These are not the pinned, provenance-verified bytes the parity reference is\n\
+           validated against. Remove the file to force a fresh, verified re-download, or\n\
+           restore the correct bytes. Emitting its cfg anyway would let the alignment\n\
+           tests run against un-advertised content.",
+          dest.display()
+        );
+      }
+      Err(e) => return Err(format!("reading cached {}: {e}", dest.display())),
+    }
+  }
+  eprintln!(
+    "[asry build.rs] downloading {} ({url})",
+    dest.file_name().unwrap_or_default().to_string_lossy()
+  );
+  if let Err(e) = download(url, dest) {
+    let _ = fs::remove_file(dest);
+    return Err(format!("download failed: {e}"));
+  }
+  match verify_sha256(dest, expected_sha) {
+    Ok(true) => Ok(()),
+    Ok(false) => {
+      let actual = sha256_hex(dest).unwrap_or_else(|e| format!("<unreadable: {e}>"));
+      let _ = fs::remove_file(dest);
+      Err(format!(
+        "freshly downloaded bytes failed the SHA-256 pin (expected {expected_sha}, got {actual})"
+      ))
+    }
+    Err(e) => Err(format!("SHA-256 verify I/O error: {e}")),
+  }
+}
+
 fn find_target_dir() -> Option<PathBuf> {
   let out = std::env::var_os("OUT_DIR")?;
   let mut p = PathBuf::from(&out);
@@ -769,17 +852,10 @@ fn download(url: &str, dest: &std::path::Path) -> std::io::Result<()> {
   writer.flush()
 }
 
-fn verify_sha256(path: &std::path::Path, expected: &str) -> std::io::Result<bool> {
+/// SHA-256 of a file's contents as lowercase hex. Streamed in 64 KiB
+/// blocks so a 378 MB fixture never lands in memory whole.
+fn sha256_hex(path: &std::path::Path) -> std::io::Result<String> {
   use sha2::{Digest, Sha256};
-  // Fail closed on a malformed expected hash so a typo in the
-  // pinned constants can never accept a tampered file.
-  if expected.len() != 64
-    || !expected
-      .bytes()
-      .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-  {
-    return Ok(false);
-  }
   let mut f = fs::File::open(path)?;
   let mut hasher = Sha256::new();
   let mut buf = vec![0u8; 64 * 1024];
@@ -790,8 +866,20 @@ fn verify_sha256(path: &std::path::Path, expected: &str) -> std::io::Result<bool
     }
     hasher.update(&buf[..n]);
   }
-  let got = hex_encode(&hasher.finalize());
-  Ok(got == expected)
+  Ok(hex_encode(&hasher.finalize()))
+}
+
+fn verify_sha256(path: &std::path::Path, expected: &str) -> std::io::Result<bool> {
+  // Fail closed on a malformed expected hash so a typo in the
+  // pinned constants can never accept a tampered file.
+  if expected.len() != 64
+    || !expected
+      .bytes()
+      .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+  {
+    return Ok(false);
+  }
+  Ok(sha256_hex(path)? == expected)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
