@@ -562,16 +562,39 @@ fn fetch_wav2vec2_fixtures(models_dir: &std::path::Path) {
 
   // No longer nested inside the whisper fetch, so create the
   // directory ourselves rather than relying on that path having run.
+  //
+  // A hard error, not a soft `cargo:warning=` + `return`: the user
+  // explicitly asked to fetch (`ASRY_FETCH_W2V` is a valid, non-empty
+  // selector) and we cannot. A soft skip here would be *sticky*. The
+  // `rerun-if-changed` fixture bindings are emitted only inside
+  // `fetch_align_fixture` below, unreachable on this early return, so
+  // Cargo would cache this fixtureless "success" and NOT re-run even
+  // after the filesystem is repaired — the requested alignment gate
+  // would stay silently disabled until a manual `cargo clean` /
+  // `touch build.rs`, which is the campaign's whole bug class. A panic
+  // is never cached as success, so the next build after the repair
+  // retries automatically. (Emitting the `rerun-if-changed` deps before
+  // the early return was the other candidate, but Cargo's rerun
+  // fingerprint for a `models/<file>` path that can't even be stat'd
+  // while `models` is a plain file is far less certain than "a failed
+  // build script is never cached.") This matches the file's precedent
+  // that an explicit request which cannot legitimately proceed is fatal
+  // — `parse_w2v_selection` on a typo'd selector, `obtain_pinned` on a
+  // cached pin mismatch.
   if let Err(e) = fs::create_dir_all(models_dir) {
-    // `cargo:warning=`, not `eprintln!`: Cargo swallows build-script
-    // stderr unless `-vv`, so a captured error here would leave every
-    // selected language's alignment tests reporting `ignored` with the
-    // cause invisible.
-    println!(
-      "cargo:warning=ASRY_FETCH_W2V: cannot create {models_dir:?}: {e}; no alignment \
-       fixtures were fetched, so the alignment tests will report `ignored`, not run."
+    panic!(
+      "asry build.rs: ASRY_FETCH_W2V is set, but the models directory could not be \
+       created.\n  \
+       path:  {}\n  \
+       cause: {e}\n\n\
+       An explicitly requested alignment fixture fetch cannot proceed without it. This \
+       is a hard error, not a warning: a soft skip would cache a build with the \
+       alignment gate silently disabled, and repairing the filesystem would not re-run \
+       this script (Cargo caches the successful build). Remove whatever occupies that \
+       path (e.g. a regular file named `models` shadowing the directory) or fix its \
+       permissions, then re-build.",
+      models_dir.display()
     );
-    return;
   }
 
   // Independent per language: one dead mirror leaves the other
