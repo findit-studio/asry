@@ -406,6 +406,31 @@ fn main() {
   // redundant with "don't set FETCH" but existing scripts that rely
   // on `ASRY_OFFLINE=1` keep working.
   if std::env::var("ASRY_OFFLINE").is_ok() {
+    // Offline wins — nothing is fetched, and existing `ASRY_OFFLINE=1`
+    // scripts keep working. But an explicit `ASRY_FETCH_W2V` request must
+    // not vanish into that silence:
+    //
+    //   (a) An invalid selector stays a HARD ERROR even offline.
+    //       `parse_w2v_selection` panics on a typo (`ASRY_FETCH_W2V=eng`);
+    //       validating here, before the early return, keeps offline mode
+    //       from becoming a hole that smuggles a bad selector past the
+    //       very check built to catch it. (Online, the same call inside
+    //       `fetch_wav2vec2_fixtures` does the validating.)
+    //   (b) A valid, non-empty selection that offline suppresses is
+    //       announced via `cargo:warning=`, naming BOTH knobs. Cargo shows
+    //       `cargo:warning=` in ordinary output but swallows the
+    //       `eprintln!` below unless `-vv`, so without this
+    //       `ASRY_OFFLINE=1 ASRY_FETCH_W2V=en` would leave every alignment
+    //       test `ignored` with nothing naming offline mode as the cause.
+    if let Ok(raw) = std::env::var("ASRY_FETCH_W2V")
+      && !parse_w2v_selection(&raw).is_empty()
+    {
+      println!(
+        "cargo:warning=ASRY_OFFLINE is set, so ASRY_FETCH_W2V={raw:?} was ignored: no \
+         wav2vec2 alignment fixtures were fetched, and the alignment tests will report \
+         `ignored`, not run. Unset ASRY_OFFLINE to honor the fetch request."
+      );
+    }
     eprintln!("[asry build.rs] ASRY_OFFLINE set; skipping model fetch");
     return;
   }
