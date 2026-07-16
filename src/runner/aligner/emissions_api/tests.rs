@@ -420,10 +420,16 @@ fn emissions_rejects_a_frame_count_past_the_budget() {
 #[test]
 fn emissions_from_logits_applies_log_softmax_and_needs_no_value_scan() {
   // Raw logits, deliberately positive — which `from_log_probs` would
-  // (correctly) reject. `from_logits` is the CoreML path: it produces
-  // the log-probability domain itself.
+  // (correctly) reject. `from_logits` is the path for an encoder whose
+  // graph ends in a bare CTC head: it produces the log-probability
+  // domain itself.
+  //
+  // NOT "the CoreML path" — that label was wrong, and backwards for the
+  // actual CoreML consumer, whose `.mlmodelc` bakes the log-softmax into
+  // the graph and therefore needs `from_log_probs`. The criterion is the
+  // model's final op, never the runtime. See `Emissions::from_logits`.
   let em = Emissions::from_logits(2, nz(2), vec![1.0, 2.0, 3.0, 4.0])
-    .expect("raw logits are the CoreML path");
+    .expect("raw logits are the bare-CTC-head path");
   assert_eq!(em.frames(), 2);
   assert_eq!(em.vocab().get(), 2);
   // Output is finite and <= 0 by construction.
