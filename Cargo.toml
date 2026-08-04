@@ -70,7 +70,7 @@ bench-internals = ["alignment"]
 parity-dump-emission = ["alignment"]
 
 [dependencies]
-mediatime = "0.1"
+mediatime = "0.2"
 smol_str  = "0.3"
 thiserror = "2"
 smallvec  = "1"
