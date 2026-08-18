@@ -190,18 +190,18 @@ impl InconsistentTimebase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("timebase numerator must be non-zero (got {numerator})")]
 pub struct InvalidTimebase {
-  numerator: u32,
+  numerator: i32,
 }
 
 impl InvalidTimebase {
   /// Construct from the offending zero numerator.
   #[must_use]
-  pub const fn new(numerator: u32) -> Self {
+  pub const fn new(numerator: i32) -> Self {
     Self { numerator }
   }
   /// The offending zero numerator.
   #[must_use]
-  pub const fn numerator(&self) -> u32 {
+  pub const fn numerator(&self) -> i32 {
     self.numerator
   }
 }

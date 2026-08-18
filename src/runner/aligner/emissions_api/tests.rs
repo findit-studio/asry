@@ -6,7 +6,7 @@
 //! *unconstructible* or *rejected at one door*, rather than tolerated
 //! by a leaf somewhere down the call chain.
 
-use core::num::{NonZeroU32, NonZeroUsize};
+use core::num::{NonZeroI32, NonZeroUsize};
 
 use mediatime::{TimeRange, Timebase};
 
@@ -17,18 +17,21 @@ fn nz(v: usize) -> NonZeroUsize {
 }
 
 fn analysis_tb() -> Timebase {
-  Timebase::new(1, NonZeroU32::new(SAMPLE_RATE_HZ).expect("16000 != 0"))
+  Timebase::new(
+    1,
+    NonZeroI32::new(SAMPLE_RATE_HZ as i32).expect("16000 != 0"),
+  )
 }
 
 fn ms_tb() -> Timebase {
-  Timebase::new(1, NonZeroU32::new(1000).expect("1000 != 0"))
+  Timebase::new(1, NonZeroI32::new(1000).expect("1000 != 0"))
 }
 
 /// A degenerate `0/den` timebase. `Timebase::new` permits it — only the
-/// denominator is `NonZeroU32` — which is exactly why the seam has to
+/// denominator is `NonZeroI32` — which is exactly why the seam has to
 /// reject it explicitly.
 fn zero_numerator_tb() -> Timebase {
-  Timebase::new(0, NonZeroU32::new(16_000).expect("16000 != 0"))
+  Timebase::new(0, NonZeroI32::new(16_000).expect("16000 != 0"))
 }
 
 // ————————————————————— SpeechCoverage —————————————————————

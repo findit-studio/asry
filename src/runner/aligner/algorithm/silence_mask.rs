@@ -64,11 +64,11 @@ where
 #[cfg(test)]
 mod tests {
   use super::*;
-  use core::num::NonZeroU32;
+  use core::num::NonZeroI32;
   use mediatime::Timebase;
 
   fn tb_16k() -> Timebase {
-    Timebase::new(1, NonZeroU32::new(16_000).unwrap())
+    Timebase::new(1, NonZeroI32::new(16_000).unwrap())
   }
 
   fn ms_to_chunk_local(seg: TimeRange) -> (u64, u64) {

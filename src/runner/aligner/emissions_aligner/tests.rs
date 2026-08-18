@@ -1,7 +1,7 @@
 //! `EmissionsAligner` end-to-end tests — the seam an external-encoder
 //! consumer actually drives.
 
-use core::num::NonZeroU32;
+use core::num::{NonZeroI32, NonZeroU32};
 
 use mediatime::Timebase;
 
@@ -79,7 +79,7 @@ fn aligner() -> EmissionsAligner {
 }
 
 fn analysis_tb() -> Timebase {
-  Timebase::new(1, NonZeroU32::new(16_000).expect("16000 != 0"))
+  Timebase::new(1, NonZeroI32::new(16_000).expect("16000 != 0"))
 }
 
 /// Synthetic encoder: emits `T` frames of `V` logits, biased toward the
@@ -730,7 +730,7 @@ fn a_malformed_decision_wins_over_a_set_abort_flag() {
 #[test]
 fn rescaled_vad_spans_reach_prepare() {
   use mediatime::TimeRange;
-  let ms = Timebase::new(1, NonZeroU32::new(1000).expect("ok"));
+  let ms = Timebase::new(1, NonZeroI32::new(1000).expect("ok"));
   let err = SpeechSpans::from_time_ranges(&[TimeRange::new(0, 500, ms)])
     .expect_err("the strict bridge rejects a foreign timebase");
   assert!(matches!(err, SpanError::Timebase { .. }));

@@ -814,12 +814,12 @@ mod tests {
     },
     types::{AsrError, AsrFailure, Lang},
   };
-  use core::num::NonZeroU32;
+  use core::num::NonZeroI32;
   use mediatime::{Timebase, Timestamp};
   use smol_str::SmolStr;
 
   fn tb() -> Timebase {
-    Timebase::new(1, NonZeroU32::new(48_000).unwrap())
+    Timebase::new(1, NonZeroI32::new(48_000).unwrap())
   }
 
   fn make_buffer_with_samples(n_samples: usize) -> SampleBuffer {

@@ -1,6 +1,6 @@
 //! End-to-end black-box test for the core state machine.
 
-use core::{num::NonZeroU32, time::Duration};
+use core::{num::NonZeroI32, time::Duration};
 
 use asry::{
   AsrResult, Command, Event, Lang, LanguagePolicy, Transcriber, TranscriberOptions, VadSegment,
@@ -8,7 +8,7 @@ use asry::{
 use mediatime::{Timebase, Timestamp};
 
 fn tb_48k() -> Timebase {
-  Timebase::new(1, NonZeroU32::new(48_000).unwrap())
+  Timebase::new(1, NonZeroI32::new(48_000).unwrap())
 }
 
 fn ts(pts: i64) -> Timestamp {

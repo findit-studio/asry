@@ -674,7 +674,7 @@ impl Transcriber {
     }
     // Reject malformed timebases at the API boundary.
     // mediatime::Timebase::new(0, _) is constructible and would
-    // panic later in rescale_pts.
+    // panic later in `saturating_rescale`.
     let tb = starts_at.timebase();
     if tb.num() == 0 {
       return Err(TranscriberError::InvalidTimebase(InvalidTimebase::new(
@@ -1050,7 +1050,7 @@ impl Transcriber {
       return Err(TranscriberError::AfterEof);
     }
     // Reject malformed (zero-numerator) timebases at the API
-    // boundary; rescale_pts later would panic.
+    // boundary; `saturating_rescale` later would panic.
     let tb = starts_at.timebase();
     if tb.num() == 0 {
       return Err(TranscriberError::InvalidTimebase(InvalidTimebase::new(
@@ -1096,10 +1096,10 @@ impl Transcriber {
 mod tests {
   use super::*;
   use crate::types::VadSegment;
-  use core::num::NonZeroU32;
+  use core::num::NonZeroI32;
 
   fn tb_48k() -> Timebase {
-    Timebase::new(1, NonZeroU32::new(48_000).unwrap())
+    Timebase::new(1, NonZeroI32::new(48_000).unwrap())
   }
 
   fn ts(pts: i64) -> Timestamp {
@@ -1443,7 +1443,7 @@ mod tests {
     let mut t = fresh();
     t.handle_samples(ts(0), &[0.0; 1000]).unwrap();
     // Stream is now anchored at 1/48000. Try to restart at 1/1000.
-    let other_tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
+    let other_tb = Timebase::new(1, NonZeroI32::new(1000).unwrap());
     let r = t.handle_restart(Timestamp::new(0, other_tb));
     assert!(
       matches!(r, Err(TranscriberError::InconsistentTimebase(ref p)) if p.expected() == tb_48k() && p.got() == other_tb),
@@ -1507,14 +1507,14 @@ mod tests {
 
   /// `mediatime::Timebase::new(0, _)` is constructible (the type
   /// only enforces non-zero denominator). Using such a timebase
-  /// as the target of `Timebase::rescale_pts` panics. handle_samples
+  /// as the target of `Timebase::saturating_rescale` panics. handle_samples
   /// and handle_restart reject it explicitly with `InvalidTimebase`
   /// so a malformed caller timebase surfaces as `Err(_)` instead
   /// of an abort.
   #[test]
   fn handle_samples_rejects_zero_numerator_timebase() {
     let mut t = fresh();
-    let bad_tb = Timebase::new(0, NonZeroU32::new(48_000).unwrap());
+    let bad_tb = Timebase::new(0, NonZeroI32::new(48_000).unwrap());
     let r = t.handle_samples(Timestamp::new(0, bad_tb), &[0.0; 100]);
     assert!(
       matches!(r, Err(TranscriberError::InvalidTimebase(p)) if p.numerator() == 0),
@@ -1528,7 +1528,7 @@ mod tests {
   fn handle_restart_rejects_zero_numerator_timebase() {
     let mut t = fresh();
     t.handle_samples(ts(0), &[0.0; 100]).unwrap();
-    let bad_tb = Timebase::new(0, NonZeroU32::new(48_000).unwrap());
+    let bad_tb = Timebase::new(0, NonZeroI32::new(48_000).unwrap());
     let r = t.handle_restart(Timestamp::new(0, bad_tb));
     assert!(
       matches!(r, Err(TranscriberError::InvalidTimebase(p)) if p.numerator() == 0),

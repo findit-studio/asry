@@ -7,7 +7,7 @@
 //! emitted [`Word`]s, applying asry's silence-aware post-pass
 //! on top of WhisperX's bit-exact frame ranges.
 
-use core::{num::NonZeroU32, time::Duration};
+use core::{num::NonZeroI32, time::Duration};
 use std::borrow::Cow;
 
 use mediatime::{TimeRange, Timebase};
@@ -416,13 +416,22 @@ pub fn build_speech_frames(
 /// (`i64::try_from(x).unwrap_or(i64::MAX)`) or otherwise handle the
 /// high half of the range.
 ///
-/// `compose_words`'s own arithmetic is total over every argument:
-/// frame->sample products go through `f64 as u64` (saturating), the
-/// anchor adds are `saturating_add`, speech-mask reads are clamped to
-/// `speech_frames.len()`, and a zero `hop_samples` yields a
-/// zero-numerator [`Timebase`] whose `duration_to_pts` is defined
-/// (`0`). Pinned by
+/// `compose_words`'s own arithmetic is total over every argument
+/// **except a zero `hop_samples`**: frame->sample products go through
+/// `f64 as u64` (saturating), the anchor adds are `saturating_add`,
+/// speech-mask reads are clamped to `speech_frames.len()`, and a
+/// `hop_samples` above `i32::MAX` saturates into the frame timebase's
+/// numerator. Pinned by
 /// `compose_words_is_total_over_its_degenerate_argument_corners`.
+///
+/// # Panics
+///
+/// Panics if `hop_samples == 0`, which builds the zero-numerator frame
+/// [`Timebase`] that mediatime 0.3's `saturating_duration_to_pts`
+/// refuses; 0.1's bare `duration_to_pts` answered `0` there instead.
+/// Both callers hold a `NonZeroU32` hop (`AlignerCore::hop_samples`,
+/// `EmissionsAlignerBuilder::hop_samples`), so a zero cannot arrive
+/// from outside the crate.
 #[allow(
   clippy::too_many_arguments,
   reason = "10 args carry the per-chunk composition contract \
@@ -474,8 +483,20 @@ where
   // 16 kHz analysis sample → seconds per frame). Done once per
   // alignment so the per-word loop can compare directly against
   // frame indices.
-  let frame_tb = Timebase::new(hop_samples, NonZeroU32::new(SAMPLE_RATE_HZ).unwrap());
-  let max_silent_run_frames = frame_tb.duration_to_pts(max_intra_silent_run) as usize;
+  //
+  // A `Timebase` numerator is an `i32` (ffmpeg's `AVRational`) and a
+  // negative one panics in `Timebase::new`, so the `u32` hop saturates
+  // rather than wrapping through a bare `as i32`. Only a hop above
+  // `i32::MAX` moves, and there the frame interval is already long
+  // enough that either numerator floors the conversion at zero.
+  let frame_tb = Timebase::new(
+    i32::try_from(hop_samples).unwrap_or(i32::MAX),
+    NonZeroI32::new(SAMPLE_RATE_HZ as i32).unwrap(),
+  );
+  // The saturating rung keeps the old bare `duration_to_pts`'s
+  // `i64::MAX` clamp; it panics only on the zero-numerator timebase a
+  // zero `hop_samples` builds, which the `# Panics` note records.
+  let max_silent_run_frames = frame_tb.saturating_duration_to_pts(max_intra_silent_run) as usize;
 
   // Effective samples-per-frame from the actual encoder output
   // count, matching WhisperX's `ratio = duration / (T - 1)` in
@@ -598,11 +619,10 @@ mod tests {
   fn no_speech() -> SpeechSpans {
     SpeechSpans::new([])
   }
-  use core::num::NonZeroU32;
   use mediatime::Timebase;
 
   fn tb_ms() -> Timebase {
-    Timebase::new(1, NonZeroU32::new(1000).unwrap())
+    Timebase::new(1, NonZeroI32::new(1000).unwrap())
   }
 
   /// Stand-in for the caller's sample->PTS bridge.
@@ -679,8 +699,7 @@ mod tests {
   /// `emissions` surface, so the same "can any valid-typed input panic
   /// or silently misbehave?" question has to be answered for it too.
   ///
-  /// This sweeps the degenerate corners of every argument — a zero
-  /// hop (which makes `Timebase`'s numerator zero), zero/one
+  /// This sweeps the degenerate corners of every argument — zero/one
   /// `total_frames` (the `effective_samples_per_frame` fallback), a
   /// `u64::MAX` chunk anchor and `u64::MAX` sample extents, an empty
   /// speech mask against a segment that claims frames, a
@@ -692,13 +711,21 @@ mod tests {
   /// It found no hole (`compose_words` was already closed: the
   /// frame->sample conversions are `f64 as u64`, which saturates;
   /// the anchor adds are `saturating_add`; the speech-mask reads are
-  /// `.min(speech_frames.len())`-clamped; `Timebase::duration_to_pts`
-  /// returns 0 for a zero numerator and saturates at `i64::MAX`).
-  /// It stays as the executable evidence of that.
+  /// `.min(speech_frames.len())`-clamped; the duration→tick
+  /// conversion saturates at `i64::MAX`). It stays as the executable
+  /// evidence of that.
+  ///
+  /// **A zero hop left the sweep with mediatime 0.3.** It builds the
+  /// zero-numerator frame timebase, and `saturating_duration_to_pts`
+  /// panics there where 0.1's bare `duration_to_pts` answered `0`.
+  /// That corner is now `compose_words`'s documented panic rather
+  /// than a totality claim; both callers hold a `NonZeroU32` hop, so
+  /// nothing reachable lost coverage. `u32::MAX` stays, and pins the
+  /// saturating `u32 → i32` numerator bridge.
   #[test]
   fn compose_words_is_total_over_its_degenerate_argument_corners() {
     let anchors = [0_u64, 1, u64::MAX / 2, u64::MAX - 1, u64::MAX];
-    let hops = [0_u32, 1, 320, u32::MAX];
+    let hops = [1_u32, 320, u32::MAX];
     let extents = [0_u64, 1, 480_000, u64::MAX];
     let frame_counts = [0_usize, 1, 2, usize::MAX];
     let spans = [(0_usize, 0_usize), (0, 1), (0, usize::MAX), (usize::MAX, 0)];
@@ -1051,10 +1078,9 @@ mod tests {
 
   #[test]
   fn build_speech_frames_marks_overlapping_segments() {
-    use core::num::NonZeroU32;
     use mediatime::{TimeRange, Timebase};
 
-    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    let tb_16k = Timebase::new(1, NonZeroI32::new(16_000).unwrap());
     let segs = sp(vec![TimeRange::new(320, 960, tb_16k)]);
     let mask = build_speech_frames(
       /* n_frames: */ 5, /* samples_per_frame: */ 320.0, /* n_samples: */ 1600,
@@ -1107,10 +1133,9 @@ mod tests {
   /// `(0, -1)` bound and panicked identically.
   #[test]
   fn build_speech_frames_saturates_u64_max_extents_with_segments() {
-    use core::num::NonZeroU32;
     use mediatime::{TimeRange, Timebase};
 
-    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    let tb_16k = Timebase::new(1, NonZeroI32::new(16_000).unwrap());
     let n = u64::MAX;
     let spf = effective_samples_per_frame(n, 2, 320);
     let segs = sp(vec![TimeRange::new(0, 16_000, tb_16k)]);
@@ -1162,8 +1187,7 @@ mod tests {
   /// extent is 100 samples needs ~50 samples of speech overlap.
   #[test]
   fn build_speech_frames_short_padded_run_marks_real_speech() {
-    use core::num::NonZeroU32;
-    let tb_16k = mediatime::Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    let tb_16k = mediatime::Timebase::new(1, NonZeroI32::new(16_000).unwrap());
     // Encoder length 400 (padded), real audio length 100,
     // single 320-sample-per-frame frame, sub-segment covers
     // the entire real audio [0, 100).
@@ -1192,8 +1216,7 @@ mod tests {
   /// samples are PADDED ZEROS as speech.
   #[test]
   fn build_speech_frames_clamps_subsegments_to_real_audio_when_padded() {
-    use core::num::NonZeroU32;
-    let tb_16k = mediatime::Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    let tb_16k = mediatime::Timebase::new(1, NonZeroI32::new(16_000).unwrap());
     // Real audio length 100 (frame 0 real_width=100, frame 1
     // real_width=0, frame 2 real_width=0). Encoder length 960
     // → 3 frames of 320 each. Sub-segment overshoots into
@@ -1218,8 +1241,7 @@ mod tests {
   /// territory must contribute only the real-audio portion.
   #[test]
   fn build_speech_frames_partial_overshoot_clamps_to_real_audio() {
-    use core::num::NonZeroU32;
-    let tb_16k = mediatime::Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    let tb_16k = mediatime::Timebase::new(1, NonZeroI32::new(16_000).unwrap());
     // Real audio length 50, encoder length 640 (2 frames).
     // VAD [40, 320) starts inside real audio, ends in padding.
     // After clamp [40, 50): only 10 samples of real overlap
@@ -1246,8 +1268,7 @@ mod tests {
   /// branch.
   #[test]
   fn build_speech_frames_padding_only_frame_stays_silent() {
-    use core::num::NonZeroU32;
-    let tb_16k = mediatime::Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    let tb_16k = mediatime::Timebase::new(1, NonZeroI32::new(16_000).unwrap());
     // Encoder length 640 → 2 frames of 320 each. Real audio
     // length 100 (frame 0 has real_width=100, frame 1 has
     // real_width=0). Sub-segment covers only padded territory
@@ -1267,10 +1288,9 @@ mod tests {
 
   #[test]
   fn build_speech_frames_odd_hop_requires_strict_majority() {
-    use core::num::NonZeroU32;
     use mediatime::{TimeRange, Timebase};
 
-    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    let tb_16k = Timebase::new(1, NonZeroI32::new(16_000).unwrap());
     let segs = sp(vec![TimeRange::new(0, 1, tb_16k)]);
     let mask = build_speech_frames(4, 3.0, 12, 12, &segs);
     assert_eq!(mask, vec![false; 4]);
@@ -1282,10 +1302,9 @@ mod tests {
 
   #[test]
   fn build_speech_frames_threshold_is_inclusive() {
-    use core::num::NonZeroU32;
     use mediatime::{TimeRange, Timebase};
 
-    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    let tb_16k = Timebase::new(1, NonZeroI32::new(16_000).unwrap());
     let segs_at = sp(vec![TimeRange::new(0, 160, tb_16k)]);
     assert_eq!(
       build_speech_frames(2, 320.0, 640, 640, &segs_at),
@@ -1300,10 +1319,9 @@ mod tests {
 
   #[test]
   fn build_speech_frames_accumulates_overlap_across_adjacent_segments() {
-    use core::num::NonZeroU32;
     use mediatime::{TimeRange, Timebase};
 
-    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    let tb_16k = Timebase::new(1, NonZeroI32::new(16_000).unwrap());
     let segs = sp(vec![
       TimeRange::new(0, 80, tb_16k),
       TimeRange::new(160, 240, tb_16k),
@@ -1322,9 +1340,8 @@ mod tests {
     // marking the trailing frame as speech against audio that
     // doesn't exist. The clamp to `[0, n_samples]` (matching
     // `build_speech_mask`) eliminates this asymmetry.
-    use core::num::NonZeroU32;
     use mediatime::{TimeRange, Timebase};
-    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    let tb_16k = Timebase::new(1, NonZeroI32::new(16_000).unwrap());
 
     // n_samples=320, n_frames=2, spf=320 → frames cover
     // [0, 320) and [320, 640). Real audio only exists in the
@@ -1372,9 +1389,8 @@ mod tests {
     // - Seg B = `[50, 150]` → 100-sample overlap with frame 0.
     // - Sum = 200 ≥ 160 → would-classify-speech (wrong).
     // - Union = `[0, 150]` → 150 < 160 → correct: silent.
-    use core::num::NonZeroU32;
     use mediatime::{TimeRange, Timebase};
-    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    let tb_16k = Timebase::new(1, NonZeroI32::new(16_000).unwrap());
 
     let overlapping = sp(vec![
       TimeRange::new(0, 100, tb_16k),
@@ -1426,9 +1442,8 @@ mod tests {
     // The coalesce logic merges on `s <= last.1` so touching
     // segments are treated as one continuous range, matching the
     // existing per-sample boolean OR in `build_speech_mask`.
-    use core::num::NonZeroU32;
     use mediatime::{TimeRange, Timebase};
-    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    let tb_16k = Timebase::new(1, NonZeroI32::new(16_000).unwrap());
     let touching = sp(vec![
       TimeRange::new(0, 80, tb_16k),
       TimeRange::new(80, 160, tb_16k),
@@ -1476,10 +1491,9 @@ mod tests {
     // contract: both functions take an `f64
     // samples_per_frame` and the caller (`Aligner::align`)
     // computes it once via `effective_samples_per_frame`.
-    use core::num::NonZeroU32;
     use mediatime::{TimeRange, Timebase};
 
-    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    let tb_16k = Timebase::new(1, NonZeroI32::new(16_000).unwrap());
     let n_samples: u64 = 480_000;
     let total_frames: usize = 1499;
     let samples_per_frame =

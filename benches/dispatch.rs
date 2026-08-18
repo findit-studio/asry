@@ -14,7 +14,7 @@ fn bench_dispatch(c: &mut Criterion) {
                 .with_buffer_cap_samples(64_000_000)
                 .with_max_in_flight(32);
       let mut t = Transcriber::new(config);
-      let tb = mediatime::Timebase::new(1, core::num::NonZeroU32::new(48_000).unwrap());
+      let tb = mediatime::Timebase::new(1, core::num::NonZeroI32::new(48_000).unwrap());
       t.handle_samples(mediatime::Timestamp::new(0, tb), &vec![0.0_f32; 600_000])
         .unwrap();
       for i in 0..300u64 {

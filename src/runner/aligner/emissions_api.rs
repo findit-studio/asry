@@ -137,11 +137,11 @@ pub enum SpanError {
   )]
   Timebase {
     /// The required denominator (16000).
-    expected: u32,
+    expected: i32,
     /// The supplied timebase's numerator.
-    num: u32,
+    num: i32,
     /// The supplied timebase's denominator.
-    den: u32,
+    den: i32,
   },
 
   /// `start > end`.
@@ -169,7 +169,7 @@ pub enum SpanError {
   /// A timebase had a **zero numerator** (`0/den`).
   ///
   /// A `0/den` timebase carries no time, and `mediatime::Timebase::new`
-  /// permits it (only the denominator is `NonZeroU32`). Rescaling *to* it
+  /// permits it (only the denominator is `NonZeroI32`). Rescaling *to* it
   /// divides by zero — a successful non-empty [`OutputClock::range`] would
   /// PANIC; rescaling *from* it collapses every range to `0..0`, which
   /// silently masks ALL speech. asry already rejects a zero-numerator
@@ -183,7 +183,7 @@ pub enum SpanError {
   ZeroNumeratorTimebase {
     /// The timebase's denominator. The numerator is zero by definition
     /// of this variant.
-    den: u32,
+    den: i32,
   },
 }
 
@@ -246,9 +246,9 @@ impl SampleSpan {
   /// [`SpanError::Timebase`] if `range` is not in 1/16000.
   pub fn from_time_range(range: TimeRange) -> Result<Self, SpanError> {
     let tb = range.timebase();
-    if tb.num() != 1 || tb.den().get() != SAMPLE_RATE_HZ {
+    if tb.num() != 1 || tb.den().get() != SAMPLE_RATE_HZ as i32 {
       return Err(SpanError::Timebase {
-        expected: SAMPLE_RATE_HZ,
+        expected: SAMPLE_RATE_HZ as i32,
         num: tb.num(),
         den: tb.den().get(),
       });
@@ -283,8 +283,8 @@ impl SampleSpan {
         den: tb.den().get(),
       });
     }
-    let start = Timebase::rescale_pts(range.start_pts(), tb, ANALYSIS_TIMEBASE);
-    let end = Timebase::rescale_pts(range.end_pts(), tb, ANALYSIS_TIMEBASE);
+    let start = tb.saturating_rescale(range.start_pts(), ANALYSIS_TIMEBASE);
+    let end = tb.saturating_rescale(range.end_pts(), ANALYSIS_TIMEBASE);
     Self::from_analysis_pts(start, end)
   }
 
@@ -429,7 +429,7 @@ impl SpeechSpans {
 /// This is data. asry owns the `u64 → i64` saturation, so there is no
 /// caller code left to get it wrong. The arithmetic is exactly what
 /// `core::buffer` does:
-/// `base_pts + rescale_pts(sample, 1/16000, timebase)`.
+/// `base_pts + ANALYSIS_TIMEBASE.saturating_rescale(sample, timebase)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutputClock {
   chunk_first_sample_in_stream: u64,
@@ -479,16 +479,14 @@ impl OutputClock {
   /// pair can never invert.
   ///
   /// Panic-free by invariant: [`new`](Self::new) rejects a zero-numerator
-  /// `timebase`, so the `rescale_pts` *to* `self.timebase` below cannot
-  /// divide by zero.
+  /// `timebase`, so the `saturating_rescale` *to* `self.timebase` below
+  /// cannot divide by zero.
   pub(crate) fn range(&self, start_sample: u64, end_sample: u64) -> TimeRange {
     let to_pts = |sample: u64| -> i64 {
       let clamped = i64::try_from(sample).unwrap_or(i64::MAX);
-      self.base_pts.saturating_add(Timebase::rescale_pts(
-        clamped,
-        ANALYSIS_TIMEBASE,
-        self.timebase,
-      ))
+      self
+        .base_pts
+        .saturating_add(ANALYSIS_TIMEBASE.saturating_rescale(clamped, self.timebase))
     };
     let start = to_pts(start_sample);
     let end = to_pts(end_sample);

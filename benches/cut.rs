@@ -1,7 +1,7 @@
 //! Throughput bench: cut state machine driven through the public
 //! Transcriber surface.
 
-use core::{num::NonZeroU32, time::Duration};
+use core::{num::NonZeroI32, time::Duration};
 use std::hint::black_box;
 
 use asry::{Transcriber, TranscriberOptions, VadSegment};
@@ -15,7 +15,7 @@ fn bench_push_vad(c: &mut Criterion) {
         .with_chunk_size(Duration::from_secs(30))
         .with_buffer_cap_samples(100_000_000);
       let mut t = Transcriber::new(config);
-      let tb = Timebase::new(1, NonZeroU32::new(48_000).unwrap());
+      let tb = Timebase::new(1, NonZeroI32::new(48_000).unwrap());
       t.handle_samples(Timestamp::new(0, tb), &vec![0.0_f32; 1000])
         .unwrap();
       for i in 0..1000u64 {

@@ -1863,7 +1863,10 @@ mod tests {
   // substrings).
 
   fn analysis_tb() -> mediatime::Timebase {
-    mediatime::Timebase::new(1, core::num::NonZeroU32::new(SAMPLE_RATE_HZ).unwrap())
+    mediatime::Timebase::new(
+      1,
+      core::num::NonZeroI32::new(SAMPLE_RATE_HZ as i32).unwrap(),
+    )
   }
 
   /// Build the spans the mask consumes from chunk-local 1/16000 ranges,
