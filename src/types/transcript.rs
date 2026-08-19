@@ -205,10 +205,10 @@ pub(crate) mod for_test {
   //! tests concise.
 
   use super::*;
-  use core::num::NonZeroU32;
+  use core::num::NonZeroI32;
 
   pub(crate) fn ms_timebase() -> mediatime::Timebase {
-    mediatime::Timebase::new(1, NonZeroU32::new(1000).unwrap())
+    mediatime::Timebase::new(1, NonZeroI32::new(1000).unwrap())
   }
 
   pub(crate) fn transcript(chunk_id: u64, text: &str, words: Vec<Word>) -> Transcript {

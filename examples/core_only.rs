@@ -6,14 +6,14 @@
 //!
 //! Run with: `cargo run --example core_only`
 
-use core::{num::NonZeroU32, time::Duration};
+use core::{num::NonZeroI32, time::Duration};
 
 use asry::{AsrResult, Command, Event, Lang, Transcriber, TranscriberOptions, VadSegment};
 use mediatime::{Timebase, Timestamp};
 
 fn main() {
   // Output timebase: original media at 48 kHz.
-  let output_tb = Timebase::new(1, NonZeroU32::new(48_000).unwrap());
+  let output_tb = Timebase::new(1, NonZeroI32::new(48_000).unwrap());
 
   let config = TranscriberOptions::default().with_chunk_size(Duration::from_secs(2));
   let mut t = Transcriber::new(config);

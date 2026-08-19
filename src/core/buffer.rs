@@ -108,13 +108,9 @@ impl SampleBuffer {
     // delta against caller's starts_at. The regression check
     // stays in output-PTS space so contiguous pushes on
     // non-integer-ratio output timebases don't trip spurious
-    // regressions through round-trip truncation.
+    // regressions through round-trip rounding.
     let expected_pts_out = effective_anchor
-      + Timebase::rescale_pts(
-        self.absolute_sample_offset as i64,
-        ANALYSIS_TIMEBASE,
-        effective_tb,
-      );
+      + ANALYSIS_TIMEBASE.saturating_rescale(self.absolute_sample_offset as i64, effective_tb);
     let delta_pts_out = starts_at.pts() - expected_pts_out;
 
     let delta_samples: u64 = if delta_pts_out < 0 {
@@ -127,7 +123,7 @@ impl SampleBuffer {
     } else {
       // Convert the gap back to 16 kHz samples for the
       // zero-fill width / tolerance check.
-      let g = Timebase::rescale_pts(delta_pts_out, effective_tb, ANALYSIS_TIMEBASE);
+      let g = effective_tb.saturating_rescale(delta_pts_out, ANALYSIS_TIMEBASE);
       if (g as u64) > self.gap_tolerance_samples {
         return Err(TranscriberError::GapExceedsTolerance(
           GapExceedsTolerance::new(g as u64, self.gap_tolerance_samples),
@@ -245,7 +241,7 @@ impl SampleBuffer {
   pub(crate) fn next_expected_starts_at(&self) -> Option<Timestamp> {
     let tb = self.output_tb?;
     let pts = self.base_pts_out_anchor
-      + Timebase::rescale_pts(self.absolute_sample_offset as i64, ANALYSIS_TIMEBASE, tb);
+      + ANALYSIS_TIMEBASE.saturating_rescale(self.absolute_sample_offset as i64, tb);
     Some(Timestamp::new(pts, tb))
   }
 
@@ -271,9 +267,9 @@ impl SampleBuffer {
       .output_tb
       .expect("samples_to_output_range called before any push");
     let start_out =
-      self.base_pts_out_anchor + Timebase::rescale_pts(range.start as i64, ANALYSIS_TIMEBASE, tb);
+      self.base_pts_out_anchor + ANALYSIS_TIMEBASE.saturating_rescale(range.start as i64, tb);
     let end_out =
-      self.base_pts_out_anchor + Timebase::rescale_pts(range.end as i64, ANALYSIS_TIMEBASE, tb);
+      self.base_pts_out_anchor + ANALYSIS_TIMEBASE.saturating_rescale(range.end as i64, tb);
     mediatime::TimeRange::new(start_out, end_out, tb)
   }
 
@@ -288,7 +284,8 @@ impl SampleBuffer {
   ///
   /// Conversion math is identical to
   /// [`samples_to_output_range`](Self::samples_to_output_range)
-  /// (drift-free): `out_pts = base_pts_out_anchor + rescale(sample, ANALYSIS_TIMEBASE, tb)`.
+  /// (drift-free): `out_pts = base_pts_out_anchor +
+  /// ANALYSIS_TIMEBASE.saturating_rescale(sample, tb)`.
   #[cfg(feature = "alignment")]
   pub(crate) fn samples_to_output_range_fn_at(
     tb: Timebase,
@@ -297,9 +294,9 @@ impl SampleBuffer {
     std::sync::Arc::new(
       move |start_sample: u64, end_sample: u64| -> mediatime::TimeRange {
         let s_pts =
-          base_pts_out_anchor + Timebase::rescale_pts(start_sample as i64, ANALYSIS_TIMEBASE, tb);
+          base_pts_out_anchor + ANALYSIS_TIMEBASE.saturating_rescale(start_sample as i64, tb);
         let e_pts =
-          base_pts_out_anchor + Timebase::rescale_pts(end_sample as i64, ANALYSIS_TIMEBASE, tb);
+          base_pts_out_anchor + ANALYSIS_TIMEBASE.saturating_rescale(end_sample as i64, tb);
         mediatime::TimeRange::new(s_pts, e_pts, tb)
       },
     )
@@ -352,10 +349,10 @@ pub(crate) fn default_buffer() -> SampleBuffer {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use core::num::NonZeroU32;
+  use core::num::NonZeroI32;
 
   fn tb_48k() -> Timebase {
-    Timebase::new(1, NonZeroU32::new(48_000).unwrap())
+    Timebase::new(1, NonZeroI32::new(48_000).unwrap())
   }
 
   fn ts_at_48k(pts: i64) -> Timestamp {
@@ -484,7 +481,7 @@ mod tests {
   fn first_push_backpressure_allows_different_timebase_on_retry() {
     let mut b = SampleBuffer::new(150, 3200);
     let _ = b.append(ts_at_48k(0), &[0.0; 200], 0); // rejected
-    let other_tb = Timebase::new(1, NonZeroU32::new(96_000).unwrap());
+    let other_tb = Timebase::new(1, NonZeroI32::new(96_000).unwrap());
     // Different timebase + smaller packet must succeed.
     b.append(Timestamp::new(0, other_tb), &[0.0; 100], 0)
       .unwrap();
@@ -496,7 +493,7 @@ mod tests {
   fn inconsistent_timebase_errors() {
     let mut b = SampleBuffer::new(1_000_000, 3200);
     b.append(ts_at_48k(0), &[0.0; 100], 0).unwrap();
-    let other_tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
+    let other_tb = Timebase::new(1, NonZeroI32::new(1000).unwrap());
     let r = b.append(Timestamp::new(0, other_tb), &[0.0; 100], 0);
     assert!(matches!(r, Err(TranscriberError::InconsistentTimebase(_))));
   }

@@ -26,7 +26,7 @@
 //! build) so per-language script-dispatch `runs` are honoured:
 //!
 //! ```ignore
-//! use core::num::NonZeroU32;
+//! use core::num::NonZeroI32;
 //! use std::sync::{Arc, atomic::AtomicBool};
 //! use mediatime::{TimeRange, Timebase};
 //! use asry::{AlignWorkItem, run_one_alignment};

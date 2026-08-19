@@ -187,11 +187,11 @@ impl AlignWorkItem {
     // `TokenizationFailed`).
     oov_decisions: Vec<Vec<ResolvedOov>>,
   ) -> Option<Self> {
-    use core::num::NonZeroU32;
+    use core::num::NonZeroI32;
     let chunk_first = transcriber.chunk_first_sample(chunk_id)?;
     let raw_subs = transcriber.chunk_sub_segments_samples(chunk_id)?;
     let bridge = transcriber.chunk_samples_to_output_range_fn(chunk_id)?;
-    let tb_16k = mediatime::Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    let tb_16k = mediatime::Timebase::new(1, NonZeroI32::new(16_000).unwrap());
     let aligner_subs: Vec<TimeRange> = raw_subs
       .iter()
       .map(|(s, e)| {
@@ -1121,8 +1121,8 @@ fn clip_sub_segments(
   slice_hi: usize,
   language: &Lang,
 ) -> Result<Vec<TimeRange>, WorkFailure> {
-  use core::num::NonZeroU32;
-  let tb = mediatime::Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+  use core::num::NonZeroI32;
+  let tb = mediatime::Timebase::new(1, NonZeroI32::new(16_000).unwrap());
   let mut out = Vec::with_capacity(subs.len());
   let lo_i = slice_lo as i64;
   let hi_i = slice_hi as i64;

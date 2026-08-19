@@ -187,14 +187,14 @@ pub fn zero_mean_unit_var_normalize(samples: &[f32]) -> Vec<f32> {
     return scalar::zero_mean_unit_var_normalize(samples);
   }
   cfg_select! {
-  target_arch = "aarch64" => {
-  // SAFETY: NEON is part of the aarch64 base ISA; the kernel's
-  // `#[target_feature(enable = "neon")]` makes the compiler emit
-  // intrinsics in an explicitly-enabled context.
-  unsafe { neon::zero_mean_unit_var_normalize(samples) }
-  }
-  target_arch = "x86_64" => x86_dispatch(samples),
-  _ => scalar::zero_mean_unit_var_normalize(samples),
+    target_arch = "aarch64" => {
+      // SAFETY: NEON is part of the aarch64 base ISA; the kernel's
+      // `#[target_feature(enable = "neon")]` makes the compiler emit
+      // intrinsics in an explicitly-enabled context.
+      unsafe { neon::zero_mean_unit_var_normalize(samples) }
+    }
+    target_arch = "x86_64" => x86_dispatch(samples),
+    _ => scalar::zero_mean_unit_var_normalize(samples),
   }
 }
 

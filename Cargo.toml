@@ -1,6 +1,6 @@
 [package]
 name        = "asry"
-version     = "0.1.0"
+version     = "0.2.0"
 edition      = "2024"
 rust-version = "1.95"
 license     = "MIT OR Apache-2.0"
@@ -70,7 +70,18 @@ bench-internals = ["alignment"]
 parity-dump-emission = ["alignment"]
 
 [dependencies]
-mediatime = "0.1"
+# Public dependency: `TimeRange`, `Timebase` and `Timestamp` are
+# re-exported from the crate root and appear in every emitted
+# transcript range, so mediatime's breakage is asry's breakage.
+#
+# 0.2 signed `Timebase`'s numerator and denominator (`u32`/`NonZeroU32`
+# → `i32`/`NonZeroI32`) to match ffmpeg's `AVRational`, and made
+# `Timebase::new` panic on a negative one. 0.3 deleted the bare-name
+# arithmetic — `rescale_pts` and `duration_to_pts` are now the
+# `checked_`/`saturating_` rungs — and corrected the rounding to
+# nearest-with-ties-away-from-zero (`AV_ROUND_NEAR_INF`), which the
+# truncating docs had claimed all along.
+mediatime = "0.3"
 smol_str  = "0.3"
 thiserror = "2"
 smallvec  = "1"

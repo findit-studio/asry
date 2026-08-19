@@ -669,7 +669,7 @@ pub enum Command {
   /// ```ignore
   /// let chunk_first = transcriber.chunk_first_sample(chunk_id).unwrap();
   /// let raw_subs = transcriber.chunk_sub_segments_samples(chunk_id).unwrap();
-  /// let tb_16k = mediatime::Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+  /// let tb_16k = mediatime::Timebase::new(1, NonZeroI32::new(16_000).unwrap());
   /// let aligner_subs: Vec<TimeRange> = raw_subs.iter()
   /// .map(|(s, e)| TimeRange::new(
   /// (*s as i64) - (chunk_first as i64),

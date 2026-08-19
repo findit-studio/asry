@@ -704,7 +704,10 @@ mod tests {
   }
 
   fn analysis_tb() -> mediatime::Timebase {
-    mediatime::Timebase::new(1, core::num::NonZeroU32::new(SAMPLE_RATE_HZ).unwrap())
+    mediatime::Timebase::new(
+      1,
+      core::num::NonZeroI32::new(SAMPLE_RATE_HZ as i32).unwrap(),
+    )
   }
 
   /// The timebase check MOVED (into the span type) but did NOT change.
@@ -720,7 +723,7 @@ mod tests {
     // Release builds silently misinterpreted (e.g.) a
     // millisecond-timebase PTS as a 16 kHz sample index, masking the
     // wrong samples and producing plausible-but-wrong word alignments.
-    let ms_tb = mediatime::Timebase::new(1, core::num::NonZeroU32::new(1000).unwrap());
+    let ms_tb = mediatime::Timebase::new(1, core::num::NonZeroI32::new(1000).unwrap());
     let segs = [TimeRange::new(0, 100, ms_tb)];
     let err = spans_from_sub_segments(&segs, &Lang::En).expect_err("must error");
     match err {
@@ -746,7 +749,7 @@ mod tests {
     // caller passing the output-timebase ranges they were going to
     // emit, instead of converting back to chunk-local 1/16000. Same
     // fail-loud behaviour required.
-    let out_tb = mediatime::Timebase::new(1, core::num::NonZeroU32::new(48_000).unwrap());
+    let out_tb = mediatime::Timebase::new(1, core::num::NonZeroI32::new(48_000).unwrap());
     let segs = [TimeRange::new(0, 1000, out_tb)];
     let err = spans_from_sub_segments(&segs, &Lang::En).expect_err("must error");
     assert!(matches!(err, WorkFailure::Alignment(_)));
@@ -843,7 +846,7 @@ mod tests {
           TimeRange::new(
             start as i64,
             end as i64,
-            Timebase::new(1, core::num::NonZeroU32::new(16_000).unwrap()),
+            Timebase::new(1, core::num::NonZeroI32::new(16_000).unwrap()),
           )
         },
         &abort,
@@ -932,7 +935,7 @@ mod tests {
           TimeRange::new(
             start as i64,
             end as i64,
-            Timebase::new(1, core::num::NonZeroU32::new(16_000).unwrap()),
+            Timebase::new(1, core::num::NonZeroI32::new(16_000).unwrap()),
           )
         },
         &abort,
@@ -1035,7 +1038,7 @@ mod tests {
           TimeRange::new(
             start as i64,
             end as i64,
-            Timebase::new(1, core::num::NonZeroU32::new(16_000).unwrap()),
+            Timebase::new(1, core::num::NonZeroI32::new(16_000).unwrap()),
           )
         },
         &abort,
@@ -1092,7 +1095,7 @@ mod tests {
           TimeRange::new(
             start as i64,
             end as i64,
-            Timebase::new(1, core::num::NonZeroU32::new(16_000).unwrap()),
+            Timebase::new(1, core::num::NonZeroI32::new(16_000).unwrap()),
           )
         },
         &abort,
@@ -1156,7 +1159,7 @@ mod tests {
           TimeRange::new(
             start as i64,
             end as i64,
-            Timebase::new(1, core::num::NonZeroU32::new(16_000).unwrap()),
+            Timebase::new(1, core::num::NonZeroI32::new(16_000).unwrap()),
           )
         },
         &abort,
@@ -1220,7 +1223,7 @@ mod tests {
           TimeRange::new(
             start as i64,
             end as i64,
-            Timebase::new(1, core::num::NonZeroU32::new(16_000).unwrap()),
+            Timebase::new(1, core::num::NonZeroI32::new(16_000).unwrap()),
           )
         },
         &abort,

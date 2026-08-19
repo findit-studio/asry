@@ -9,26 +9,30 @@
 //!   [`mediatime::TimeRange`] asry emits is in the timebase of
 //!   the caller's first `handle_samples` call.
 
-use core::num::NonZeroU32;
+use core::num::NonZeroI32;
 use mediatime::Timebase;
 
 /// Internal analysis sample rate. All audio fed to asry must
 /// already be resampled to this rate (caller's responsibility).
 pub const SAMPLE_RATE_HZ: u32 = 16_000;
 
-/// `const fn` helper for `NonZeroU32` conversion. Panics on zero
+/// `const fn` helper for `NonZeroI32` conversion. Panics on zero
 /// input — only used at compile time on statically-nonzero values,
 /// so the panic is unreachable in practice. Avoids depending on
 /// `Option::unwrap` const stability.
+///
+/// Signed because a [`Timebase`] denominator is: ffmpeg's `AVRational`
+/// is a pair of C `int`s, so mediatime spells both halves `i32`. The
+/// sample rate itself stays `u32` — it counts, it does not divide.
 #[cfg_attr(not(tarpaulin), inline(always))]
-const fn nz(n: u32) -> NonZeroU32 {
-  match NonZeroU32::new(n) {
+const fn nz(n: i32) -> NonZeroI32 {
+  match NonZeroI32::new(n) {
     Some(n) => n,
-    None => panic!("expected nonzero u32"),
+    None => panic!("expected nonzero i32"),
   }
 }
 
-const SAMPLE_RATE_NZ: NonZeroU32 = nz(SAMPLE_RATE_HZ);
+const SAMPLE_RATE_NZ: NonZeroI32 = nz(SAMPLE_RATE_HZ as i32);
 
 /// Internal analysis timebase (`1 / 16_000`). Used by the cut state
 /// machine, the sample buffer, and the alignment pipeline. Not part
@@ -48,6 +52,6 @@ mod tests {
 
   #[test]
   fn sample_rate_constant_matches_timebase() {
-    assert_eq!(SAMPLE_RATE_HZ, ANALYSIS_TIMEBASE.den().get());
+    assert_eq!(SAMPLE_RATE_HZ as i32, ANALYSIS_TIMEBASE.den().get());
   }
 }

@@ -71,7 +71,7 @@ fn data_dependent_failures_are_recoverable() {
   ignore = "needs the English wav2vec2 fixture: ASRY_FETCH_W2V=en cargo test --features alignment"
 )]
 fn too_short_chunk_recovers_to_empty_result() {
-  use core::num::NonZeroU32;
+  use core::num::NonZeroI32;
 
   use mediatime::Timebase;
 
@@ -119,7 +119,7 @@ fn too_short_chunk_recovers_to_empty_result() {
       TimeRange::new(
         start as i64,
         end as i64,
-        Timebase::new(1, NonZeroU32::new(16_000).unwrap()),
+        Timebase::new(1, NonZeroI32::new(16_000).unwrap()),
       )
     }),
     oov_decisions: Vec::new(),
@@ -370,8 +370,8 @@ fn run_audio_slice_ignores_chunk_first_sample_in_stream() {
 /// the run's slice.
 #[test]
 fn clip_sub_segments_offsets_into_run_local_space() {
-  use core::num::NonZeroU32;
-  let tb = mediatime::Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+  use core::num::NonZeroI32;
+  let tb = mediatime::Timebase::new(1, NonZeroI32::new(16_000).unwrap());
   let subs = vec![
     // Fully inside the run window.
     TimeRange::new(2_000, 3_000, tb),
@@ -402,9 +402,9 @@ fn clip_sub_segments_offsets_into_run_local_space() {
 /// see monotone PTS — that's the public contract.
 #[test]
 fn sort_words_by_pts_orders_overlapping_runs() {
-  use core::num::NonZeroU32;
+  use core::num::NonZeroI32;
   use mediatime::Timebase;
-  let tb = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+  let tb = Timebase::new(1, NonZeroI32::new(16_000).unwrap());
   let mk = |start: i64, end: i64, text: &str| {
     crate::types::Word::new(SmolStr::new(text), TimeRange::new(start, end, tb), 1.0)
   };
@@ -435,9 +435,9 @@ fn sort_words_by_pts_orders_overlapping_runs() {
 /// but keeps the output deterministic for debug/log readers.
 #[test]
 fn sort_words_by_pts_breaks_ties_by_end_pts() {
-  use core::num::NonZeroU32;
+  use core::num::NonZeroI32;
   use mediatime::Timebase;
-  let tb = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+  let tb = Timebase::new(1, NonZeroI32::new(16_000).unwrap());
   let mk = |start: i64, end: i64, text: &str| {
     crate::types::Word::new(SmolStr::new(text), TimeRange::new(start, end, tb), 1.0)
   };
@@ -703,8 +703,8 @@ fn validate_oov_decision_languages_empty_passes() {
 
 #[test]
 fn clip_sub_segments_rejects_non_16000_timebase() {
-  use core::num::NonZeroU32;
-  let tb_48k = mediatime::Timebase::new(1, NonZeroU32::new(48_000).unwrap());
+  use core::num::NonZeroI32;
+  let tb_48k = mediatime::Timebase::new(1, NonZeroI32::new(48_000).unwrap());
   let subs = vec![TimeRange::new(2_000, 3_000, tb_48k)];
   let result = clip_sub_segments(&subs, 1_600, 4_800, &Lang::En);
   match result {
