@@ -5,7 +5,7 @@ edition      = "2024"
 rust-version = "1.95"
 license     = "MIT OR Apache-2.0"
 description = "Sans-I/O cut/batch/whisper/align state machine for speech-to-text indexing pipelines"
-repository  = "https://github.com/Findit-AI/asry"
+repository  = "https://github.com/findit-studio/asry"
 readme      = "README.md"
 keywords    = ["whisper", "asr", "speech-to-text", "indexing", "alignment"]
 categories  = ["multimedia::audio", "science"]
@@ -96,7 +96,7 @@ unicode-script = { version = "0.5", default-features = false }
 # `--no-default-features` without these.
 #
 # The whisper.cpp wrapper is the standalone `whispercpp` crate
-# at https://github.com/Findit-AI/whispercpp (workspace also
+# at https://github.com/findit-studio/whispercpp (workspace also
 # contains the `whispercpp-sys` low-level FFI). It replaced
 # `whisper-rs 0.16` after we reproduced two soundness bugs in
 # that crate's safe API (`set_abort_callback_safe` UB → `failed

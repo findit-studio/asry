@@ -11,7 +11,7 @@
 #     reference.rttm     <- from references/<name>.rttm
 #
 # Source repo:
-#   https://github.com/Findit-AI/audio-fixtures
+#   https://github.com/findit-studio/audio-fixtures
 #
 # Override the source via ASRY_FIXTURES_REPO_URL /
 # ASRY_FIXTURES_REPO_REF (defaults below). Set
@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-REPO_URL="${ASRY_FIXTURES_REPO_URL:-https://github.com/Findit-AI/audio-fixtures.git}"
+REPO_URL="${ASRY_FIXTURES_REPO_URL:-https://github.com/findit-studio/audio-fixtures.git}"
 REPO_REF="${ASRY_FIXTURES_REPO_REF:-main}"
 DEST="tests/parity/fixtures"
 CLONE_DIR="target/audio-fixtures"
