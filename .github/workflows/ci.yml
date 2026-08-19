@@ -201,7 +201,7 @@ jobs:
       # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
       run: rustup update stable --no-self-update && rustup default stable
     # Audio parity fixtures (~283 MB of WAV + RTTM) live in the
-    # sibling repo `Findit-AI/audio-fixtures`, NOT in asry's
+    # sibling repo `findit-studio/audio-fixtures`, NOT in asry's
     # git history. The fetch is opt-in via
     # `ASRY_FETCH_FIXTURES=1` so the default `cargo test`
     # path stays network-free and fast. Tests that need the
