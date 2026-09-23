@@ -223,8 +223,12 @@ impl EmissionsAligner {
   /// # Errors
   ///
   /// [`EmissionsError::Normalization`] if the normalizer rejects the
-  /// text; [`EmissionsError::Tokenization`] on a tokenizer-engine
-  /// failure. Punctuation-only input yields an empty vec, not an error.
+  /// text; [`EmissionsError::Tokenization`] if the normalizer's output
+  /// disagrees with itself (its whitespace-word count against its
+  /// boundary map). A character the vocabulary cannot spell is an event,
+  /// never an error: detection looks each character up in the vocabulary
+  /// and never runs the tokenizer's `encode`. Punctuation-only input
+  /// yields an empty vec, not an error.
   pub fn detect_oov(&self, text: &str) -> Result<Vec<OovEvent>, EmissionsError> {
     self
       .core

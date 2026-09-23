@@ -144,9 +144,10 @@ impl AlignmentSet {
   /// the whole-chunk path.
   ///
   /// Returns `Err` immediately on the first per-run detection
-  /// failure (tokenizer-engine / normalisation error), so the
-  /// caller can surface the failure to the chunk before
-  /// alignment.
+  /// failure (a normalisation error), so the caller can
+  /// surface the failure to the chunk before alignment. A
+  /// character a run's vocabulary cannot spell is an event,
+  /// not a failure.
   ///
   /// introduced
   /// to thread caller policy through the per-run path —

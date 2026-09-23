@@ -74,6 +74,33 @@ CHANGED
     than a wrapping `as` cast that would build a negative numerator and
     panic in `Timebase::new`.
 
+FIXED
+
+- **A character the aligner's vocabulary cannot spell is an OOV event,
+  never a tokenization failure.** OOV detection (`detect_oov` on
+  `Aligner`, `AlignmentSet` and `EmissionsAligner`) and tokenization
+  (`Aligner::align_chunk`, `EmissionsAligner::prepare`) classified each
+  character by running it alone through `Tokenizer::encode`, and read an
+  encode error as a hard `Tokenization` failure. A `WordLevel` model whose
+  declared `unk_token` is absent from its vocabulary (a CTC alphabet with
+  no unknown-token entry) fails `encode` with `MissingUnkToken` on every
+  character outside the alphabet, so the whole chunk failed before any OOV
+  policy could decide the character. Both now ask the vocabulary instead
+  (`Tokenizer::token_to_id` on the uppercase-projected character) and never
+  call `encode`: a character is in the alphabet exactly when it has an
+  entry other than the unknown token, and any other character is an
+  `OovKind::Symbol` event at its char and word index, for the caller's
+  policy to decide.
+  - **Unchanged for a vocabulary that holds its unknown token** as `<unk>`
+    or `[UNK]`, when its tokenizer passes a lone character through
+    unchanged, as wav2vec2 tokenizers (the bundled wav2vec2-base-960h one
+    included) do: same events, same token stream. The lookup reads the
+    vocabulary as it is, without the tokenizer's normalizer or
+    pre-tokenizer.
+  - **A vocabulary whose unknown token has another name** used to have
+    such a character tokenized silently as that token; it is now an event
+    too.
+
 # 0.1.2 (January 6th, 2022)
 
 FEATURES
