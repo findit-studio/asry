@@ -94,7 +94,8 @@ impl TokenizedText {
 /// Japanese) where whitespace is an indexing artefact only and must
 /// not introduce CTC-graph delimiters that were never spoken.
 ///
-/// `uppercase_input` projects ASCII to uppercase before encoding;
+/// `uppercase_input` projects ASCII to uppercase before the vocabulary
+/// lookup;
 /// set when the vocab covers `A`-`Z` only (the case for
 /// `wav2vec2-base-960h`). Without this projection a lowercase
 /// normaliser would feed every English letter through `<unk>`,
@@ -134,6 +135,25 @@ impl TokenizedText {
 /// `U.S.A.`, `D.C.`, `etc.` are pronounced as their letters.
 fn is_skippable_internal_punct(c: char) -> bool {
   c == '.'
+}
+
+/// The vocabulary id of the one-character `token`, or `None` when the
+/// vocabulary cannot spell it.
+///
+/// A lookup ([`Tokenizer::token_to_id`]: added tokens, then the model's own
+/// entries), never `Tokenizer::encode`. A `WordLevel` model whose declared
+/// unknown token is absent from its vocabulary answers `encode` of an
+/// unknown character with an error; the lookup answers `None`. The
+/// `unk_token_id`, when there is one, is no member of the alphabet: a
+/// character that looks up to it is unspellable as well.
+///
+/// The one classification [`detect_oov_events`] and
+/// [`tokenize_with_word_map`] share, so tokenization meets exactly the OOV
+/// positions detection reported.
+fn vocab_id(tokenizer: &Tokenizer, token: &str, unk_token_id: Option<u32>) -> Option<u32> {
+  tokenizer
+    .token_to_id(token)
+    .filter(|&id| Some(id) != unk_token_id)
 }
 
 /// Consume the next caller decision for a wildcard-generating
@@ -197,9 +217,8 @@ fn boundary_fail_closed(position: &str) -> EmissionsError {
 )]
 /// Sans-I/O OOV detection — runs the same per-character
 /// iteration as [`tokenize_with_word_map`] but emits an
-/// [`OovEvent`] for each char that would otherwise hit the
-/// "is unknown or empty" branch, instead of making a policy
-/// decision.
+/// [`OovEvent`] for each char that call will need a decision
+/// for, instead of making a policy decision.
 ///
 /// **Order invariant.** Events are emitted in the order
 /// `tokenize_with_word_map` encounters them. Callers that
@@ -216,27 +235,36 @@ fn boundary_fail_closed(position: &str) -> EmissionsError {
 /// surfaced"; `U.S.A` emits two `InternalPunct` events, as
 /// `detect_oov_events_surfaces_internal_punct` pins.)
 ///
-/// Every char the tokenizer maps to `<unk>` — or to nothing at all —
-/// is surfaced as [`OovKind::Symbol`](crate::core::OovKind::Symbol)
-/// rather than silently dropped. That includes **alphanumerics**, not
-/// just pronounced symbols like `&` / `@` / `%` / `,`: a digit against
-/// the English wav2vec2 vocab, which has none, is a `Symbol` event too
+/// **Membership is a vocabulary lookup; this function never encodes.** A
+/// character, after the `uppercase_input` projection, is in the alphabet
+/// exactly when the vocabulary has an entry for it
+/// ([`Tokenizer::token_to_id`]) that is not `unk_token_id`. Every other
+/// character is surfaced as
+/// [`OovKind::Symbol`](crate::core::OovKind::Symbol) at its char and word
+/// index. `Tokenizer::encode` is never called: a `WordLevel` model whose
+/// declared unknown token is absent from its vocabulary (a CTC alphabet
+/// with no unknown-token entry) fails `encode` on every character outside
+/// the alphabet, which would turn the very character this function reports
+/// into a failed chunk. The lookup reads the vocabulary as it is, without
+/// the tokenizer's normalizer or pre-tokenizer: WhisperX's
+/// `model_dictionary.get(c, -1)`. For a vocabulary that holds its unknown
+/// token and whose tokenizer passes a lone character through unchanged
+/// (wav2vec2's do), these are the events an `encode` probe produced.
+///
+/// That includes **alphanumerics**, not just pronounced symbols like
+/// `&` / `@` / `%` / `,`: a digit against the English wav2vec2 vocab,
+/// which has none, is a `Symbol` event too
 /// (`tokenize_with_word_map_rejects_stale_same_length_decisions` leans
 /// on `"4"` producing exactly one).
 ///
 /// # Errors
 ///
-/// [`EmissionsError::Tokenization`] on a tokenizer-engine failure
-/// (`encode(..)` itself errored), on a `word_count` that disagrees with
+/// [`EmissionsError::Tokenization`] on a `word_count` that disagrees with
 /// the whitespace-word count of `normalized`, and on a
 /// `wildcard_boundary_per_word` that is neither empty nor exactly
-/// `word_count` long. (This doc used to claim errors were engine-only;
-/// the two length checks below return `Tokenization` too, and a
-/// caller that mis-sizes either argument would otherwise get an
-/// index-skew between detect and tokenize.)
-///
-/// OOV *detection* itself never fails — every detected char becomes an
-/// event.
+/// `word_count` long: a caller that mis-sizes either argument would
+/// otherwise skew indices between detect and tokenize. Nothing else fails;
+/// a character the vocabulary cannot spell is an event.
 pub fn detect_oov_events(
   tokenizer: &Tokenizer,
   normalized: &str,
@@ -316,21 +344,7 @@ pub fn detect_oov_events(
       };
       tmp_buf.clear();
       tmp_buf.push(projected);
-      let encoding = tokenizer
-        .encode(tmp_buf.as_str(), /* add_special_tokens = */ false)
-        .map_err(|e| {
-          EmissionsError::Tokenization(EmissionsFailure::new(format_smolstr!(
-            "encode({:?}) failed: {e:?}",
-            projected
-          )))
-        })?;
-      let ids = encoding.get_ids();
-      let is_unk_or_empty = ids.is_empty()
-        || match unk_token_id {
-          Some(unk) => ids.contains(&unk),
-          None => false,
-        };
-      if is_unk_or_empty {
+      if vocab_id(tokenizer, &tmp_buf, unk_token_id).is_none() {
         events.push(OovEvent::new(
           crate::core::OovKind::Symbol(ch),
           char_index,
@@ -453,7 +467,7 @@ pub fn tokenize_with_word_map(
   // `ResolvedOov.event` to match the recomputed event by
   // identity (kind, char_index, word_index, language).
   //
-  // Cost: one duplicate per-char tokenizer.encode pass.
+  // Cost: one duplicate per-char vocabulary-lookup pass.
   // Tokenize is microsecond-scale, correctness trumps perf.
   let pre_events = detect_oov_events(
     tokenizer,
@@ -531,10 +545,9 @@ pub fn tokenize_with_word_map(
     )));
   }
 
-  // Per-char tokenisation. We can't encode the whole word at
-  // once and inspect after-the-fact: we need to know which
-  // *char* produced an `<unk>` so we can decide between
-  // wildcard-and-keep vs drop-the-chunk.
+  // Per-char tokenisation: each character is looked up on its
+  // own, so an unspellable one is known by position and gets
+  // its own decision (wildcard-and-keep vs drop-the-chunk).
   let mut per_word_tokens: Vec<Vec<i32>> = Vec::with_capacity(words.len());
   let mut tmp_buf = String::with_capacity(8);
   for (wi, word) in words.iter().enumerate() {
@@ -600,28 +613,7 @@ pub fn tokenize_with_word_map(
       };
       tmp_buf.clear();
       tmp_buf.push(projected);
-      let encoding = tokenizer
-        .encode(tmp_buf.as_str(), /* add_special_tokens = */ false)
-        .map_err(|e| {
-          EmissionsError::Tokenization(EmissionsFailure::new(format_smolstr!(
-            "encode({:?}) failed: {e:?}",
-            projected
-          )))
-        })?;
-      let ids = encoding.get_ids();
-      // Single-char encode usually yields exactly one token.
-      // If for some reason it doesn't (a tokenizer with
-      // multi-char merges, or a model that decomposes
-      // characters), treat the whole encoded sequence as a
-      // unit — but that's unusual for wav2vec2 vocabs. An
-      // empty result means the tokenizer dropped the char
-      // entirely; we treat that as if it produced an `<unk>`.
-      let is_unk_or_empty = ids.is_empty()
-        || match unk_token_id {
-          Some(unk) => ids.contains(&unk),
-          None => false,
-        };
-      if is_unk_or_empty {
+      let Some(id) = vocab_id(tokenizer, &tmp_buf, unk_token_id) else {
         let decision = consume_oov_decision(oov_decisions, &mut oov_consumed, "Symbol")?;
         match decision {
           crate::core::OovDecision::Wildcard => {
@@ -642,37 +634,35 @@ pub fn tokenize_with_word_map(
             )));
           }
         }
-      } else {
-        // validate every model
-        // id fits an `i32` AND is non-negative before storing
-        // alongside the `WILDCARD_TOKEN_ID = -1` sentinel.
-        // `id as i32` aliased `u32::MAX` to `-1`, which
-        // the trellis would then treat as a wildcard instead of
-        // a real model token — silent misalignment for sparse
-        // / malformed tokenizers. `i32::try_from` returns the
-        // out-of-range case as a `TokenizationFailed` so the
-        // caller learns about the tokenizer/model mismatch.
-        for &id in ids {
-          let signed_id = i32::try_from(id).map_err(|_| {
-            EmissionsError::Tokenization(EmissionsFailure::new(format_smolstr!(
-              "tokenizer returned id {} which exceeds i32::MAX or aliases the wildcard \
+        continue;
+      };
+      // Validate that the model id fits an `i32` AND is
+      // non-negative before storing it alongside the
+      // `WILDCARD_TOKEN_ID = -1` sentinel. `id as i32` would
+      // alias `u32::MAX` to `-1`, which the trellis would then
+      // treat as a wildcard instead of a real model token —
+      // silent misalignment for sparse / malformed tokenizers.
+      // `i32::try_from` returns the out-of-range case as a
+      // `TokenizationFailed` so the caller learns about the
+      // tokenizer/model mismatch.
+      let signed_id = i32::try_from(id).map_err(|_| {
+        EmissionsError::Tokenization(EmissionsFailure::new(format_smolstr!(
+          "tokenizer returned id {} which exceeds i32::MAX or aliases the wildcard \
  sentinel; tokenizer / model mismatch?",
-              id
-            )))
-          })?;
-          if signed_id < 0 {
-            return Err(EmissionsError::Tokenization(EmissionsFailure::new(
-              format_smolstr!(
-                "tokenizer returned negative-after-cast id {} (raw {}); refusing to alias \
+          id
+        )))
+      })?;
+      if signed_id < 0 {
+        return Err(EmissionsError::Tokenization(EmissionsFailure::new(
+          format_smolstr!(
+            "tokenizer returned negative-after-cast id {} (raw {}); refusing to alias \
  wildcard sentinel",
-                signed_id,
-                id
-              ),
-            )));
-          }
-          word_tokens.push(signed_id);
-        }
+            signed_id,
+            id
+          ),
+        )));
       }
+      word_tokens.push(signed_id);
     }
     // Append SUFFIX wildcards from the normaliser's trailing-
     // punct strip count. Internal-punct wildcards are emitted
@@ -777,7 +767,14 @@ pub fn tokenize_with_word_map(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::types::Lang;
+  use crate::{
+    core::{OovEvent, OovKind},
+    runner::aligner::{
+      core::{detect_unk_token_id, load_tokenizer_bytes_with_compat},
+      normalizer::WildcardBoundary,
+    },
+    types::Lang,
+  };
 
   /// Inline WordLevel tokenizer matching the wav2vec2-base-960h
   /// shape (uppercase-only ASCII alphabet plus `<unk>`, `<pad>`,
@@ -1550,5 +1547,284 @@ mod tests {
     )
     .expect_err("length mismatch must surface TokenizationFailed");
     assert!(matches!(err, EmissionsError::Tokenization(_)));
+  }
+
+  // -- the vocabulary decides membership ----------------------
+
+  /// `A`-`Z`: a letters-only CTC alphabet.
+  const LETTERS: [&str; 26] = [
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S",
+    "T", "U", "V", "W", "X", "Y", "Z",
+  ];
+
+  /// A `WordLevel` tokenizer whose vocabulary is `alphabet` (ids in
+  /// order) and whose declared unknown token is `<unk>`. With `unk_entry`
+  /// the vocabulary also holds `<unk>`; without it the declared token is
+  /// absent, the shape of a CTC alphabet with no unknown-token concept,
+  /// and `Tokenizer::encode` fails on every character outside the
+  /// alphabet.
+  fn word_level_tokenizer(alphabet: &[&str], unk_entry: bool) -> Tokenizer {
+    let mut vocab: Vec<String> = alphabet
+      .iter()
+      .enumerate()
+      .map(|(id, token)| format!("{token:?}: {id}"))
+      .collect();
+    if unk_entry {
+      vocab.push(format!("\"<unk>\": {}", alphabet.len()));
+    }
+    let json = format!(
+      r#"{{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+ "normalizer": null, "pre_tokenizer": null, "post_processor": null, "decoder": null,
+ "model": {{"type": "WordLevel", "vocab": {{{}}}, "unk_token": "<unk>"}}}}"#,
+      vocab.join(", ")
+    );
+    Tokenizer::from_bytes(json.as_bytes()).expect("a WordLevel tokenizer must parse")
+  }
+
+  /// On a vocabulary without an unknown-token entry an encode probe
+  /// cannot classify a character outside the alphabet at all: `encode`
+  /// fails. Detection reports that character as one `Symbol` event at its
+  /// position instead, so the caller's policy decides it.
+  #[test]
+  fn detect_oov_events_reports_what_a_vocabulary_without_unk_cannot_spell() {
+    let tok = word_level_tokenizer(&LETTERS, false);
+    assert!(
+      tok.encode("4", false).is_err(),
+      "precondition: this vocabulary cannot encode a character outside it"
+    );
+    let unk = detect_unk_token_id(&tok);
+    assert_eq!(unk, None);
+
+    let events = detect_oov_events(&tok, "b4d", 1, true, unk, &Lang::En, &[])
+      .expect("an unspellable character is an event, never an error");
+    assert_eq!(
+      events,
+      vec![OovEvent::new(OovKind::Symbol('4'), 1, 0, Lang::En)]
+    );
+  }
+
+  /// Tokenization classifies characters the same way, so on a vocabulary
+  /// without an unknown-token entry it applies the caller's decision for
+  /// the unspellable character: a wildcard at its position, or the
+  /// policy's refusal. Neither is a tokenization failure.
+  #[test]
+  fn tokenize_with_word_map_applies_the_decision_on_a_vocabulary_without_unk() {
+    let tok = word_level_tokenizer(&LETTERS, false);
+    let events = detect_oov_events(&tok, "b4d", 1, true, None, &Lang::En, &[]).expect("detect");
+
+    let wildcard = crate::core::wildcard_all_decisions(&events);
+    let tokenized =
+      tokenize_with_word_map(&tok, "b4d", 1, false, true, None, &[], &Lang::En, &wildcard)
+        .expect("a character the caller decided tokenizes");
+    let id_of = |token: &str| tok.token_to_id(token).expect("in the alphabet") as i32;
+    assert_eq!(
+      tokenized.token_ids(),
+      [id_of("B"), WILDCARD_TOKEN_ID, id_of("D")]
+    );
+
+    let refused = crate::core::fail_closed_all_decisions(&events);
+    let err = tokenize_with_word_map(&tok, "b4d", 1, false, true, None, &[], &Lang::En, &refused)
+      .expect_err("a refused character refuses the chunk");
+    assert!(
+      matches!(err, EmissionsError::SemanticOutOfVocab(_)),
+      "the policy's refusal, not a tokenization failure; got {err:?}"
+    );
+  }
+
+  /// Mixed text against a letters-only alphabet: the two characters the
+  /// alphabet cannot spell are events, at their positions, and nothing
+  /// else is, whether or not the vocabulary holds an unknown-token entry.
+  #[test]
+  fn detect_oov_events_reports_only_what_a_letters_only_alphabet_cannot_spell() {
+    for unk_entry in [false, true] {
+      let tok = word_level_tokenizer(&LETTERS, unk_entry);
+      let unk = detect_unk_token_id(&tok);
+      let events = detect_oov_events(&tok, "Good <morning>", 2, true, unk, &Lang::En, &[])
+        .expect("an unspellable character is an event, never an error");
+      assert_eq!(
+        events,
+        vec![
+          OovEvent::new(OovKind::Symbol('<'), 5, 1, Lang::En),
+          OovEvent::new(OovKind::Symbol('>'), 13, 1, Lang::En),
+        ],
+        "unk_entry = {unk_entry}"
+      );
+    }
+  }
+
+  /// How a character was classified before the vocabulary was asked:
+  /// `encode` the projected character alone; nothing, or the unknown
+  /// token, meant unspellable (`None`), anything else was the ids
+  /// tokenization pushed.
+  fn encode_probe(tok: &Tokenizer, projected: char, unk: Option<u32>) -> Option<Vec<u32>> {
+    let encoding = tok
+      .encode(projected.to_string().as_str(), false)
+      .expect("a vocabulary that holds its unknown token encodes every character");
+    let ids = encoding.get_ids();
+    let unspellable = ids.is_empty() || unk.is_some_and(|unk| ids.contains(&unk));
+    (!unspellable).then(|| ids.to_vec())
+  }
+
+  /// `detect_oov_events` as it was before it asked the vocabulary: the
+  /// same walk, each character classified by [`encode_probe`].
+  fn events_before(
+    tok: &Tokenizer,
+    normalized: &str,
+    uppercase_input: bool,
+    unk: Option<u32>,
+    boundaries: &[WildcardBoundary],
+  ) -> Vec<OovEvent> {
+    let words: Vec<&str> = normalized.split_whitespace().collect();
+    let mut events = Vec::new();
+    let mut char_index = 0;
+    for (word_index, word) in words.iter().enumerate() {
+      let boundary = boundaries
+        .get(word_index)
+        .copied()
+        .unwrap_or(WildcardBoundary::NONE);
+      for _ in 0..boundary.prefix() {
+        events.push(OovEvent::new(
+          OovKind::BoundaryPunct,
+          char_index,
+          word_index,
+          Lang::En,
+        ));
+      }
+      for ch in word.chars() {
+        let projected = if uppercase_input {
+          ch.to_ascii_uppercase()
+        } else {
+          ch
+        };
+        let kind = if is_skippable_internal_punct(ch) {
+          Some(OovKind::InternalPunct(ch))
+        } else if encode_probe(tok, projected, unk).is_none() {
+          Some(OovKind::Symbol(ch))
+        } else {
+          None
+        };
+        if let Some(kind) = kind {
+          events.push(OovEvent::new(kind, char_index, word_index, Lang::En));
+        }
+        char_index += 1;
+      }
+      for _ in 0..boundary.suffix() {
+        events.push(OovEvent::new(
+          OovKind::BoundaryPunct,
+          char_index,
+          word_index,
+          Lang::En,
+        ));
+      }
+      if word_index + 1 < words.len() {
+        char_index += 1;
+      }
+    }
+    events
+  }
+
+  /// For a vocabulary that holds its unknown token, asking the vocabulary
+  /// changes nothing. Every character a whitespace-split word can hold is
+  /// classified as the encode probe classified it and tokenizes to the
+  /// same id, and whole-text events are identical. Checked against the
+  /// bundled wav2vec2-base-960h tokenizer (added tokens, a `Replace`
+  /// normalizer, a per-character `Split`) and two plain `WordLevel`
+  /// alphabets.
+  #[test]
+  fn events_and_tokens_are_unchanged_when_the_vocabulary_holds_its_unk_token() {
+    let bundled = load_tokenizer_bytes_with_compat(
+      include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/wav2vec2_base_960h_tokenizer.json"
+      )),
+      "bundled wav2vec2-base-960h",
+    )
+    .expect("the bundled tokenizer loads");
+    let vocabularies = [
+      ("bundled wav2vec2-base-960h", bundled),
+      ("uppercase", uppercase_tokenizer()),
+      ("letters", word_level_tokenizer(&LETTERS, true)),
+    ];
+    let chars: Vec<char> = ('\u{21}'..='\u{17f}')
+      .chain("|'.-ßẞΣςıİﬁ東京서울ひらがなアイ\u{301}\u{200b}\u{feff}\u{0}🎉".chars())
+      .filter(|c| !c.is_whitespace())
+      .collect();
+    let texts = [
+      "hello world",
+      "AT&T cost 43",
+      "U.S.A",
+      "café naïve",
+      "don't stop",
+      "Good <morning>",
+      "B2B 1000 ok",
+      "東京 서울 ひらがな",
+      "emoji 🎉 time",
+      "tab|pipe e\u{301}clair",
+    ];
+    for (name, tok) in &vocabularies {
+      let unk = detect_unk_token_id(tok);
+      assert!(unk.is_some(), "{name}: holds its unknown token");
+      for uppercase_input in [false, true] {
+        for &ch in &chars {
+          let text = ch.to_string();
+          let events =
+            detect_oov_events(tok, &text, 1, uppercase_input, unk, &Lang::En, &[]).expect("detect");
+          assert_eq!(
+            events,
+            events_before(tok, &text, uppercase_input, unk, &[]),
+            "{name}: {ch:?}, uppercase_input = {uppercase_input}"
+          );
+          let decisions = crate::core::wildcard_all_decisions(&events);
+          let tokenized = tokenize_with_word_map(
+            tok,
+            &text,
+            1,
+            false,
+            uppercase_input,
+            unk,
+            &[],
+            &Lang::En,
+            &decisions,
+          )
+          .expect("tokenize");
+          let projected = if uppercase_input {
+            ch.to_ascii_uppercase()
+          } else {
+            ch
+          };
+          let before: Vec<i32> = match encode_probe(tok, projected, unk) {
+            Some(ids) if !is_skippable_internal_punct(ch) => {
+              ids.iter().map(|&id| id as i32).collect()
+            }
+            _ => vec![WILDCARD_TOKEN_ID],
+          };
+          assert_eq!(
+            tokenized.token_ids(),
+            before,
+            "{name}: {ch:?}, uppercase_input = {uppercase_input}"
+          );
+        }
+        for text in texts {
+          let word_count = text.split_whitespace().count();
+          for boundaries in [Vec::new(), vec![WildcardBoundary::new(1, 2); word_count]] {
+            let events = detect_oov_events(
+              tok,
+              text,
+              word_count,
+              uppercase_input,
+              unk,
+              &Lang::En,
+              &boundaries,
+            )
+            .expect("detect");
+            assert_eq!(
+              events,
+              events_before(tok, text, uppercase_input, unk, &boundaries),
+              "{name}: {text:?}, uppercase_input = {uppercase_input}"
+            );
+          }
+        }
+      }
+    }
   }
 }

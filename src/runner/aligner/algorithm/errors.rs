@@ -168,9 +168,10 @@ pub enum EmissionsError {
 
   /// The tokenised input is malformed for the supplied emissions: a
   /// token id outside `[0, v)` (or a non-wildcard negative id), a
-  /// `token_ids`/`word_idx_per_token` length disagreement, an OOV
+  /// `token_ids`/`word_idx_per_token` length disagreement, or an OOV
   /// decisions vec that ran out or did not match the freshly-detected
-  /// events, or the tokenizer engine itself errored.
+  /// events. A character the vocabulary cannot spell is never one: it
+  /// is an OOV event.
   #[error("tokenization failed: {0}")]
   Tokenization(EmissionsFailure),
 

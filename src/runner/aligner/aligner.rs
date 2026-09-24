@@ -232,8 +232,12 @@ impl Aligner {
   /// the decisions back as data. No callbacks, no traits the
   /// library holds.
   ///
-  /// Returns an empty vec for in-vocab text. Returns an error
-  /// only on tokenizer-engine failures or normalizer rejection
+  /// Returns an empty vec for in-vocab text. A character the
+  /// vocabulary cannot spell is an event, never an error:
+  /// detection looks each character up in the vocabulary and
+  /// never runs the tokenizer's `encode`. Returns an error only
+  /// on normalizer rejection, or on normalizer output whose
+  /// word count disagrees with its boundary map
   /// (`NormalizationError::EmptyText` for punctuation-only
   /// input is converted to an empty event vec — there's
   /// nothing to align, so nothing to decide).

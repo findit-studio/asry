@@ -748,3 +748,81 @@ fn rescaled_vad_spans_reach_prepare() {
   assert!(buf[..8_000].iter().all(|&s| s == 0.2), "speech survives");
   assert!(buf[8_000..].iter().all(|&s| s == 0.0), "the rest is masked");
 }
+
+// ————————————————— A vocabulary with no unknown token —————————————————
+
+/// A CTC alphabet with no unknown-token concept, in the shape of the
+/// chordai base960h vocabulary: `-` is the blank, `|` the word delimiter,
+/// then `A`-`Z` and the apostrophe. The `WordLevel` schema requires an
+/// `unk_token`, so one is declared, but the vocabulary does not hold it:
+/// `Tokenizer::encode` fails on every character outside the alphabet.
+const NO_UNK_TOKENIZER_JSON: &str = r#"{
+ "version": "1.0",
+ "truncation": null,
+ "padding": null,
+ "added_tokens": [],
+ "normalizer": null,
+ "pre_tokenizer": null,
+ "post_processor": null,
+ "decoder": null,
+ "model": {
+ "type": "WordLevel",
+ "vocab": {
+ "-": 0, "|": 1, "E": 2, "T": 3, "A": 4, "O": 5, "N": 6, "I": 7, "H": 8,
+ "S": 9, "R": 10, "D": 11, "L": 12, "U": 13, "M": 14, "W": 15, "C": 16,
+ "F": 17, "G": 18, "Y": 19, "P": 20, "B": 21, "V": 22, "K": 23, "'": 24,
+ "X": 25, "J": 26, "Q": 27, "Z": 28
+ },
+ "unk_token": "<unk>"
+ }
+ }"#;
+
+/// On that vocabulary a digit is one OOV event, the caller's policy
+/// decides it, and `prepare` follows the decision: a wildcard tokenizes,
+/// a refusal refuses. Nothing on the road fails because the vocabulary
+/// has no unknown token.
+#[test]
+fn a_character_the_vocabulary_cannot_spell_is_an_oov_event() {
+  use crate::core::{OovEvent, OovKind, fail_closed_all_decisions};
+
+  let a = EmissionsAligner::builder(Lang::En, NO_UNK_TOKENIZER_JSON.as_bytes())
+    .blank_token_id(0)
+    .build()
+    .expect("a CTC alphabet with no unknown token builds");
+  let text = "take 4 cats";
+  let events = a
+    .detect_oov(text)
+    .expect("an unspellable character is an event, never an error");
+  assert_eq!(
+    events,
+    vec![OovEvent::new(OovKind::Symbol('4'), 5, 1, Lang::En)]
+  );
+
+  let samples = vec![0.2_f32; 16_000];
+  let speech = SpeechSpans::all_speech();
+  let abort = AtomicBool::new(false);
+  let prepared = a
+    .prepare(
+      &samples,
+      &speech,
+      text,
+      &default_oov_decisions(&events),
+      &abort,
+    )
+    .expect("the default policy wildcards a digit");
+  assert!(!prepared.is_trivial());
+
+  let Err(err) = a.prepare(
+    &samples,
+    &speech,
+    text,
+    &fail_closed_all_decisions(&events),
+    &abort,
+  ) else {
+    panic!("a refused character refuses the chunk");
+  };
+  assert!(
+    matches!(err, EmissionsError::SemanticOutOfVocab(_)),
+    "the policy's refusal, not a tokenization failure; got {err:?}"
+  );
+}
