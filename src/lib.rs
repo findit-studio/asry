@@ -144,7 +144,8 @@ pub use ort;
 /// and asry takes them as declared: that the vocabulary is the model's
 /// own, and the blank id, the word delimiter, the letter case, the hop and
 /// the receptive field are the model's, and that the tokenizer JSON
-/// declares the model's special tokens special. It checks what a
+/// declares the model's unknown token (its model's `unk_token`) and its
+/// special tokens special. It checks what a
 /// declaration makes checkable (a delimiter the vocabulary does not spell,
 /// a head width that disagrees with the vocabulary), and does not defend
 /// against a model, vocabulary or configuration declared wrongly. No
