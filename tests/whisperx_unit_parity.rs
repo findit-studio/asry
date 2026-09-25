@@ -206,7 +206,8 @@ fn run_align_with_policy(
   policy: fn(&asry::core::OovEvent) -> asry::core::OovDecision,
 ) -> Vec<AlignedWord> {
   let tokenizer = load_tokenizer();
-  let unk = tokenizer.token_to_id("<unk>");
+  let reserved =
+    asry::__bench::ReservedIds::new(&tokenizer, BLANK_ID, "|", tokenizer.token_to_id("<unk>"));
   let words: Vec<&str> = text.split_whitespace().collect();
   let word_count = words.len();
 
@@ -215,7 +216,7 @@ fn run_align_with_policy(
     text,
     word_count,
     /* uppercase_input: */ true,
-    unk,
+    &reserved,
     &Lang::En,
     /* wildcard_boundary_per_word: */ &[],
   )
@@ -228,7 +229,7 @@ fn run_align_with_policy(
     word_count,
     /* word_delimiter: */ Some("|"),
     /* uppercase_input: */ true,
-    /* unk_token_id: */ unk,
+    &reserved,
     /* wildcard_boundary_per_word: */ &[],
     &Lang::En,
     &oov_decisions,

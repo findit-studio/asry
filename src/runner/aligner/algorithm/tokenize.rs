@@ -73,13 +73,64 @@ impl TokenizedText {
   }
 }
 
+/// The vocabulary ids no transcript character is looked up to: the CTC
+/// blank, the word delimiter, the unknown token, and every token the
+/// tokenizer declares special (`added_tokens[].special`).
+///
+/// Each names a column of the model's output that stands for no letter: the
+/// blank for "no symbol", the delimiter for the boundary between two words,
+/// a special for whatever the tokenizer reserved it for. A vocabulary may
+/// spell one of them with a single character (the chordai wav2vec2-base-960h
+/// table spells its blank `-`, and every English wav2vec2 table its
+/// delimiter `|`), so a transcript character can look up to it. Such a
+/// character is not spelled: the mark rules decide it as any character the
+/// vocabulary cannot spell (a mark nobody reads aloud is dropped, anything
+/// else is an OOV event for the caller's policy). The delimiter's column
+/// takes only the separators tokenization itself puts between normalized
+/// words.
+///
+/// The specials are the tokenizer's own statement, read from its
+/// `added_tokens`; nothing is inferred from a token's spelling.
+#[derive(Clone, Debug)]
+pub struct ReservedIds(Vec<u32>);
+
+impl ReservedIds {
+  /// The reserved ids of `tokenizer`, whose CTC blank is `blank`, whose
+  /// word delimiter is `word_delimiter` (reserved when the vocabulary
+  /// spells it) and whose unknown token is `unk`, with every token the
+  /// tokenizer declares special.
+  #[must_use]
+  pub fn new(tokenizer: &Tokenizer, blank: u32, word_delimiter: &str, unk: Option<u32>) -> Self {
+    let mut ids: Vec<u32> = tokenizer
+      .get_added_vocabulary()
+      .get_added_tokens_decoder()
+      .iter()
+      .filter(|(_, token)| token.special)
+      .map(|(&id, _)| id)
+      .chain([blank])
+      .chain(tokenizer.token_to_id(word_delimiter))
+      .chain(unk)
+      .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    Self(ids)
+  }
+
+  /// Whether `id` is reserved.
+  #[must_use]
+  pub fn contains(&self, id: u32) -> bool {
+    self.0.binary_search(&id).is_ok()
+  }
+}
+
 /// How tokenization treats one character of a normalized word.
 ///
 /// [`classify`] is the one classification [`detect_oov_events`] and
 /// [`tokenize_with_word_map`] share, so tokenization meets exactly the OOV
 /// positions detection reported.
 enum CharClass {
-  /// The vocabulary spells the character: this id.
+  /// The vocabulary spells the character: this id, never a
+  /// [reserved](ReservedIds) one.
   Spelled(u32),
   /// A punctuation mark nobody reads aloud, which the vocabulary does not
   /// spell. It has no acoustic realization, so it is dropped under every
@@ -96,12 +147,15 @@ enum CharClass {
 ///
 /// The vocabulary is asked first: a mark it spells (the apostrophe of
 /// wav2vec2-base-960h) is a token like any letter, and only a mark it
-/// cannot spell is silent.
+/// cannot spell is silent. A character that looks up to a
+/// [reserved](ReservedIds) id is not spelled, so the mark rules decide it:
+/// the `-` a table spells as its blank is a silent mark and dropped, and a
+/// `|` the table spells as its delimiter is a symbol, an OOV event.
 fn classify(
   tokenizer: &Tokenizer,
   ch: char,
   uppercase_input: bool,
-  unk_token_id: Option<u32>,
+  reserved: &ReservedIds,
 ) -> CharClass {
   let projected = if uppercase_input {
     ch.to_ascii_uppercase()
@@ -109,7 +163,7 @@ fn classify(
     ch
   };
   let mut utf8 = [0; 4];
-  match vocab_id(tokenizer, projected.encode_utf8(&mut utf8), unk_token_id) {
+  match vocab_id(tokenizer, projected.encode_utf8(&mut utf8), reserved) {
     Some(id) => CharClass::Spelled(id),
     None if is_silent_mark(ch) => CharClass::Silent,
     None => CharClass::Unspelled,
@@ -122,13 +176,14 @@ fn classify(
 /// A lookup ([`Tokenizer::token_to_id`]: added tokens, then the model's own
 /// entries), never `Tokenizer::encode`. A `WordLevel` model whose declared
 /// unknown token is absent from its vocabulary answers `encode` of an
-/// unknown character with an error; the lookup answers `None`. The
-/// `unk_token_id`, when there is one, is no member of the alphabet: a
-/// character that looks up to it is unspellable as well.
-fn vocab_id(tokenizer: &Tokenizer, token: &str, unk_token_id: Option<u32>) -> Option<u32> {
+/// unknown character with an error; the lookup answers `None`. A
+/// [reserved](ReservedIds) id (the blank, the delimiter, the unknown token,
+/// a declared special) is no member of the alphabet: a character that
+/// looks up to one is unspellable as well.
+fn vocab_id(tokenizer: &Tokenizer, token: &str, reserved: &ReservedIds) -> Option<u32> {
   tokenizer
     .token_to_id(token)
-    .filter(|&id| Some(id) != unk_token_id)
+    .filter(|&id| !reserved.contains(id))
 }
 
 /// Consume the next caller decision for a wildcard-generating
@@ -213,7 +268,9 @@ fn boundary_fail_closed(position: &str) -> EmissionsError {
 /// **Membership is a vocabulary lookup; this function never encodes.** A
 /// character, after the `uppercase_input` projection, is in the alphabet
 /// exactly when the vocabulary has an entry for it
-/// (`Tokenizer::token_to_id`) that is not `unk_token_id`. Every other
+/// (`Tokenizer::token_to_id`) that is not [reserved](ReservedIds): not the
+/// blank, the word delimiter, the unknown token or a declared special.
+/// Every other
 /// spoken character is surfaced as
 /// [`OovKind::Symbol`](crate::core::OovKind::Symbol) at its char and word
 /// index. `Tokenizer::encode` is never called: a `WordLevel` model whose
@@ -246,7 +303,7 @@ pub fn detect_oov_events(
   normalized: &str,
   word_count: usize,
   uppercase_input: bool,
-  unk_token_id: Option<u32>,
+  reserved: &ReservedIds,
   language: &Lang,
   // Per-word boundary wildcard counts as supplied to
   // `tokenize_with_word_map`. Must be either empty (=
@@ -302,7 +359,7 @@ pub fn detect_oov_events(
     }
     for ch in word.chars() {
       if matches!(
-        classify(tokenizer, ch, uppercase_input, unk_token_id),
+        classify(tokenizer, ch, uppercase_input, reserved),
         CharClass::Unspelled
       ) {
         events.push(OovEvent::new(
@@ -353,7 +410,9 @@ pub fn detect_oov_events(
 ///
 /// Each character is classified as [`detect_oov_events`] classifies
 /// it:
-/// * one the vocabulary spells is its id;
+/// * one the vocabulary spells is its id, never a [reserved](ReservedIds)
+///   one (a character that looks up to the blank, the delimiter, the
+///   unknown token or a declared special is not spelled);
 /// * a punctuation mark nobody reads aloud that the vocabulary does
 ///   not spell is dropped, under every policy: no token, no wildcard,
 ///   no decision consumed;
@@ -408,7 +467,7 @@ pub fn tokenize_with_word_map(
   // `None` when it is not.
   word_delimiter: Option<&str>,
   uppercase_input: bool,
-  unk_token_id: Option<u32>,
+  reserved: &ReservedIds,
   // Per-word `(prefix, suffix)` count of wildcard tokens to
   // inject around the word's encoded chars. Prefix wildcards
   // are pushed BEFORE the encoded chars and suffix wildcards
@@ -457,7 +516,7 @@ pub fn tokenize_with_word_map(
     normalized,
     word_count,
     uppercase_input,
-    unk_token_id,
+    reserved,
     language,
     wildcard_boundary_per_word,
   )?;
@@ -557,7 +616,7 @@ pub fn tokenize_with_word_map(
       }
     }
     for ch in word.chars() {
-      let id = match classify(tokenizer, ch, uppercase_input, unk_token_id) {
+      let id = match classify(tokenizer, ch, uppercase_input, reserved) {
         CharClass::Spelled(id) => id,
         CharClass::Silent => continue,
         CharClass::Unspelled => {
@@ -630,9 +689,11 @@ pub fn tokenize_with_word_map(
 
   // Pass 2: flatten into the final token stream, inserting the
   // delimiter only between adjacent NON-EMPTY groups when the
-  // normaliser opted in. The orphan-delimiter rule still applies — an
-  // empty group (a word of dropped marks) leaves no stray delimiter for
-  // the trellis to attribute frames to.
+  // normaliser opted in. These inserted separators are the only tokens
+  // that reach the delimiter's column: a transcript character that looks
+  // up to it is reserved, so no group holds it. The orphan-delimiter rule
+  // still applies — an empty group (a word of dropped marks) leaves no
+  // stray delimiter for the trellis to attribute frames to.
   let delim_id = word_delimiter.and_then(|token| tokenizer.token_to_id(token));
   let mut last_emitted_word: Option<usize> = None;
   for (word_idx, group) in per_word_tokens.iter().enumerate() {
@@ -755,6 +816,18 @@ mod tests {
       .expect("inline WordLevel tokenizer must parse")
   }
 
+  /// `tok`'s reserved ids, as a front end builds them: its detected blank
+  /// (an id no vocabulary holds when it has none), the `|` delimiter, its
+  /// unknown token and its declared specials.
+  fn reserved(tok: &Tokenizer) -> ReservedIds {
+    ReservedIds::new(
+      tok,
+      crate::runner::aligner::core::detect_blank_token_id(tok).unwrap_or(u32::MAX),
+      "|",
+      detect_unk_token_id(tok),
+    )
+  }
+
   /// Convenience wrapper that mirrors the historical default
   /// policy (alphanumeric / apostrophe → wildcard, pronounced
   /// → fail-closed) for tests written against
@@ -767,7 +840,7 @@ mod tests {
     word_count: usize,
     use_word_delimiter: bool,
     uppercase_input: bool,
-    unk_token_id: Option<u32>,
+    reserved: &ReservedIds,
     wildcard_boundary_per_word: &[crate::runner::aligner::normalizer::WildcardBoundary],
     language: &Lang,
   ) -> Result<TokenizedText, EmissionsError> {
@@ -776,7 +849,7 @@ mod tests {
       normalized,
       word_count,
       uppercase_input,
-      unk_token_id,
+      reserved,
       language,
       wildcard_boundary_per_word,
     )?;
@@ -787,7 +860,7 @@ mod tests {
       word_count,
       use_word_delimiter.then_some("|"),
       uppercase_input,
-      unk_token_id,
+      reserved,
       wildcard_boundary_per_word,
       language,
       &decisions,
@@ -801,7 +874,7 @@ mod tests {
   #[test]
   fn detect_oov_events_empty_for_in_vocab_text() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     let events = detect_oov_events(
       &tok,
       "hello",
@@ -823,7 +896,7 @@ mod tests {
   #[test]
   fn detect_oov_events_collects_in_source_order() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     let events = detect_oov_events(&tok, "AT&T", 1, true, unk, &Lang::En, &[]).expect("ok");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].kind(), &crate::core::OovKind::Symbol('&'));
@@ -842,7 +915,7 @@ mod tests {
   #[test]
   fn tokenize_with_word_map_rejects_too_long_oov_decisions() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     // "AT&T" has exactly one OOV (`&`); supply two ResolvedOov.
     // The first matches the real event so length mismatch (not
     // identity mismatch) is the failing predicate; the second
@@ -893,7 +966,7 @@ mod tests {
   #[test]
   fn tokenize_with_word_map_rejects_too_long_decisions_even_when_first_is_fail_closed() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     let real_event = detect_oov_events(&tok, "AT&T", 1, true, unk, &Lang::En, &[])
       .expect("ok")
       .pop()
@@ -945,7 +1018,7 @@ mod tests {
   #[test]
   fn tokenize_with_word_map_rejects_stale_same_length_decisions() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     // Decisions produced for `"4"` (digit OOV at char_index=0).
     let stale_for_digit = detect_oov_events(&tok, "4", 1, true, unk, &Lang::En, &[]).expect("ok");
     assert_eq!(stale_for_digit.len(), 1);
@@ -997,7 +1070,7 @@ mod tests {
   #[test]
   fn tokenize_with_word_map_accepts_mismatched_language_under_any_fallback() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     // The fallback aligner detects against its own language
     // (En), producing `Symbol('&')` at char_index=2, word_idx=0.
     let pre = detect_oov_events(&tok, "AT&T", 1, true, unk, &Lang::En, &[])
@@ -1041,7 +1114,7 @@ mod tests {
   #[test]
   fn detect_oov_events_tracks_word_index() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     let events = detect_oov_events(&tok, "AT&T cost 43", 3, true, unk, &Lang::En, &[]).expect("ok");
     let chars: Vec<Option<char>> = events.iter().map(|e| e.char()).collect();
     let words: Vec<usize> = events.iter().map(|e| e.word_index()).collect();
@@ -1054,7 +1127,7 @@ mod tests {
   #[test]
   fn detect_oov_events_reports_no_internal_stop() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     let events = detect_oov_events(&tok, "U.S.A", 1, true, unk, &Lang::En, &[]).expect("ok");
     assert!(events.is_empty(), "got {events:?}");
   }
@@ -1064,7 +1137,7 @@ mod tests {
   #[test]
   fn detect_oov_events_word_count_mismatch_errors() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     let result = detect_oov_events(&tok, "hello world", 1, true, unk, &Lang::En, &[]);
     assert!(matches!(result, Err(EmissionsError::Tokenization(_))));
   }
@@ -1074,7 +1147,7 @@ mod tests {
   #[test]
   fn english_lowercase_word_uppercases_for_uppercase_only_vocab() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let result = tokenize_with_word_map(
       &tok,
@@ -1082,7 +1155,7 @@ mod tests {
       /* word_count: */ 1,
       /* word_delimiter: */ Some("|"),
       /* uppercase_input: */ true,
-      /* unk_token_id: */ unk,
+      /* reserved: */ unk,
       /* wildcard_boundary_per_word: */ &[],
       &Lang::En,
       &[],
@@ -1090,7 +1163,7 @@ mod tests {
     .expect("tokenisation must succeed with uppercase projection");
 
     assert_eq!(result.token_ids.len(), 5);
-    let unk_i32 = unk.unwrap() as i32;
+    let unk_i32 = detect_unk_token_id(&tok).expect("<unk>") as i32;
     assert!(
       result.token_ids.iter().all(|&id| id != unk_i32),
       "no <unk> ids; got {:?}",
@@ -1114,7 +1187,7 @@ mod tests {
   #[test]
   fn a_word_of_silent_marks_tokenizes_to_nothing() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     let pipe = tok.token_to_id("|").expect("|") as i32;
 
     let alone =
@@ -1148,7 +1221,7 @@ mod tests {
   #[test]
   fn internal_periods_in_abbreviation_strip_to_letters() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let result = tokenize_with_default_oov(
       &tok,
@@ -1156,7 +1229,7 @@ mod tests {
       /* word_count: */ 1,
       /* use_word_delimiter: */ true,
       /* uppercase_input: */ true,
-      /* unk_token_id: */ unk,
+      /* reserved: */ unk,
       /* wildcard_boundary_per_word: */ &[],
       &Lang::En,
     )
@@ -1181,7 +1254,7 @@ mod tests {
   #[test]
   fn partial_oov_alphanumeric_word_uses_wildcard() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let result =
       tokenize_with_default_oov(&tok, "B2B", 1, true, true, unk, &[], &Lang::En).expect("ok");
@@ -1199,7 +1272,7 @@ mod tests {
   #[test]
   fn all_digit_word_against_uppercase_vocab_uses_wildcards() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let result =
       tokenize_with_default_oov(&tok, "1000", 1, true, true, unk, &[], &Lang::En).expect("ok");
@@ -1238,7 +1311,7 @@ mod tests {
   #[test]
   fn ampersand_oov_drops_chunk() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let outcome = tokenize_with_default_oov(&tok, "AT&T", 1, true, true, unk, &[], &Lang::En);
     match outcome {
@@ -1276,7 +1349,7 @@ mod tests {
   #[test]
   fn accented_letter_uses_wildcard() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let result =
       tokenize_with_default_oov(&tok, "café", 1, true, true, unk, &[], &Lang::En).expect("ok");
@@ -1297,7 +1370,7 @@ mod tests {
   #[test]
   fn middle_digit_word_no_longer_drops_chunk() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let result =
       tokenize_with_default_oov(&tok, "hi 1000 world", 3, true, true, unk, &[], &Lang::En)
@@ -1316,7 +1389,7 @@ mod tests {
   #[test]
   fn separator_token_id_is_returned() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     let pipe = tok.token_to_id("|").expect("|");
 
     let result = tokenize_with_word_map(
@@ -1337,7 +1410,7 @@ mod tests {
   #[test]
   fn separator_token_id_none_when_normaliser_opts_out() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let result = tokenize_with_word_map(
       &tok,
@@ -1364,7 +1437,7 @@ mod tests {
   #[test]
   fn trailing_wildcards_land_after_encoded_chars() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     // "hello" with 1 SUFFIX wildcard reported → 5 letters + 1 wildcard.
     // Trailing punctuation case: `hello"` → letters then wildcard.
@@ -1407,7 +1480,7 @@ mod tests {
   #[test]
   fn leading_wildcards_land_before_encoded_chars() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let result = tokenize_with_default_oov(
       &tok,
@@ -1444,7 +1517,7 @@ mod tests {
   #[test]
   fn paired_wildcards_bracket_encoded_chars() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let result = tokenize_with_default_oov(
       &tok,
@@ -1478,7 +1551,7 @@ mod tests {
   #[test]
   fn wildcard_boundary_per_word_length_mismatch_errors() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let err = tokenize_with_word_map(
       &tok,
@@ -1542,8 +1615,8 @@ mod tests {
       tok.encode("4", false).is_err(),
       "precondition: this vocabulary cannot encode a character outside it"
     );
-    let unk = detect_unk_token_id(&tok);
-    assert_eq!(unk, None);
+    assert_eq!(detect_unk_token_id(&tok), None);
+    let unk = &reserved(&tok);
 
     let events = detect_oov_events(&tok, "b4d", 1, true, unk, &Lang::En, &[])
       .expect("an unspellable character is an event, never an error");
@@ -1560,11 +1633,12 @@ mod tests {
   #[test]
   fn tokenize_with_word_map_applies_the_decision_on_a_vocabulary_without_unk() {
     let tok = word_level_tokenizer(&LETTERS, false);
-    let events = detect_oov_events(&tok, "b4d", 1, true, None, &Lang::En, &[]).expect("detect");
+    let unk = &reserved(&tok);
+    let events = detect_oov_events(&tok, "b4d", 1, true, unk, &Lang::En, &[]).expect("detect");
 
     let wildcard = crate::core::oov::resolve_events(&events, crate::core::wildcard_all_policy);
     let tokenized =
-      tokenize_with_word_map(&tok, "b4d", 1, None, true, None, &[], &Lang::En, &wildcard)
+      tokenize_with_word_map(&tok, "b4d", 1, None, true, unk, &[], &Lang::En, &wildcard)
         .expect("a character the caller decided tokenizes");
     let id_of = |token: &str| tok.token_to_id(token).expect("in the alphabet") as i32;
     assert_eq!(
@@ -1573,7 +1647,7 @@ mod tests {
     );
 
     let refused = crate::core::oov::resolve_events(&events, crate::core::fail_closed_all_policy);
-    let err = tokenize_with_word_map(&tok, "b4d", 1, None, true, None, &[], &Lang::En, &refused)
+    let err = tokenize_with_word_map(&tok, "b4d", 1, None, true, unk, &[], &Lang::En, &refused)
       .expect_err("a refused character refuses the chunk");
     assert!(
       matches!(err, EmissionsError::SemanticOutOfVocab(_)),
@@ -1588,7 +1662,7 @@ mod tests {
   fn detect_oov_events_reports_only_what_a_letters_only_alphabet_cannot_spell() {
     for unk_entry in [false, true] {
       let tok = word_level_tokenizer(&LETTERS, unk_entry);
-      let unk = detect_unk_token_id(&tok);
+      let unk = &reserved(&tok);
       let events = detect_oov_events(&tok, "Good <morning>", 2, true, unk, &Lang::En, &[])
         .expect("an unspellable character is an event, never an error");
       assert_eq!(
@@ -1603,15 +1677,15 @@ mod tests {
   }
 
   /// How a character was classified before the vocabulary was asked:
-  /// `encode` the projected character alone; nothing, or the unknown
-  /// token, meant unspellable (`None`), anything else was the ids
-  /// tokenization pushed.
-  fn encode_probe(tok: &Tokenizer, projected: char, unk: Option<u32>) -> Option<Vec<u32>> {
+  /// `encode` the projected character alone; nothing, or a reserved id
+  /// (the unknown token among them), meant unspellable (`None`), anything
+  /// else was the ids tokenization pushed.
+  fn encode_probe(tok: &Tokenizer, projected: char, reserved: &ReservedIds) -> Option<Vec<u32>> {
     let encoding = tok
       .encode(projected.to_string().as_str(), false)
       .expect("a vocabulary that holds its unknown token encodes every character");
     let ids = encoding.get_ids();
-    let unspellable = ids.is_empty() || unk.is_some_and(|unk| ids.contains(&unk));
+    let unspellable = ids.is_empty() || ids.iter().any(|&id| reserved.contains(id));
     (!unspellable).then(|| ids.to_vec())
   }
 
@@ -1623,7 +1697,7 @@ mod tests {
     tok: &Tokenizer,
     normalized: &str,
     uppercase_input: bool,
-    unk: Option<u32>,
+    unk: &ReservedIds,
     boundaries: &[WildcardBoundary],
   ) -> Vec<OovEvent> {
     let words: Vec<&str> = normalized.split_whitespace().collect();
@@ -1705,8 +1779,11 @@ mod tests {
       "tab|pipe e\u{301}clair",
     ];
     for (name, tok) in &vocabularies {
-      let unk = detect_unk_token_id(tok);
-      assert!(unk.is_some(), "{name}: holds its unknown token");
+      assert!(
+        detect_unk_token_id(tok).is_some(),
+        "{name}: holds its unknown token"
+      );
+      let unk = &reserved(tok);
       for uppercase_input in [false, true] {
         for &ch in &chars {
           let text = ch.to_string();
@@ -1807,7 +1884,7 @@ mod tests {
     let normalized = normalizer.normalize(text).expect("the text normalizes");
     let words = normalized.original_words().len();
     let uppercase_input = detect_vocab_uppercase_only(tok);
-    let unk = detect_unk_token_id(tok);
+    let unk = &reserved(tok);
     let events = detect_oov_events(
       tok,
       normalized.normalized(),
@@ -1897,7 +1974,7 @@ mod tests {
   #[test]
   fn fail_closed_refuses_an_unspellable_spoken_character_by_name() {
     let tok = bundled_tokenizer();
-    let unk = detect_unk_token_id(&tok);
+    let unk = &reserved(&tok);
     let spoken = READ_ALOUD
       .into_iter()
       .chain(['$', '+', '<', '=', '^', '`', '~', '\u{A9}', '\u{20AC}', '4']);

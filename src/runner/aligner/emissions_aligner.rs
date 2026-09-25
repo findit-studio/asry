@@ -494,6 +494,17 @@ pub enum LetterCase {
 /// samples), and a model that differs states its own. asry aligns
 /// correctly for correctly declared inputs; declaring the model's
 /// properties is the caller's part.
+///
+/// # Reserved ids
+///
+/// No transcript character is looked up to the CTC blank, the word
+/// delimiter, the unknown token, or a token the tokenizer JSON declares
+/// special (`added_tokens[].special`): a character whose lookup lands on
+/// one is one the vocabulary does not spell, so a mark nobody reads aloud
+/// is dropped and anything else is an OOV event for the caller's policy.
+/// Only the separators tokenization puts between words reach the
+/// delimiter's column. A model with special tokens declares them in its
+/// tokenizer JSON as special added tokens.
 pub struct EmissionsAlignerBuilder {
   language: Lang,
   tokenizer_json: Vec<u8>,

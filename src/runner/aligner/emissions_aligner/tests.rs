@@ -887,6 +887,219 @@ fn a_character_the_vocabulary_cannot_spell_is_an_oov_event() {
   );
 }
 
+// ———————————— A reserved id is never a transcript character's ————————————
+
+/// The chordai base960h table, as [`NO_UNK_TOKENIZER_JSON`], with `#`
+/// added at id 29, declared special when `special` is true.
+fn base960h_with_hash(special: bool) -> String {
+  NO_UNK_TOKENIZER_JSON.replacen(
+    "\"added_tokens\": []",
+    &format!(
+      "\"added_tokens\": [{{\"id\": 29, \"content\": \"#\", \"single_word\": false, \
+       \"lstrip\": false, \"rstrip\": false, \"normalized\": false, \"special\": {special}}}]"
+    ),
+    1,
+  )
+}
+
+/// An aligner over the chordai base960h table: `-` the blank at 0, `|` the
+/// delimiter at 1.
+fn base960h(json: &str, normalizer: Option<DynTextNormalizer>) -> EmissionsAligner {
+  let builder = EmissionsAligner::builder(Lang::En, json.as_bytes()).blank_token_id(0);
+  match normalizer {
+    Some(normalizer) => builder.normalizer(normalizer),
+    None => builder,
+  }
+  .build()
+  .expect("the base960h table builds")
+}
+
+/// `text`'s one outcome on `a`, through `prepare` and `finish`, from
+/// uniform emissions over 16 000 samples.
+fn align_uniformly(a: &EmissionsAligner, text: &str, resolution: OovResolution) -> UnitOutcome {
+  let prepared = a
+    .prepare(
+      &vec![0.2_f32; 16_000],
+      &SpeechSpans::all_speech(),
+      text,
+      resolution,
+      &AtomicBool::new(false),
+    )
+    .expect("prepare");
+  let v = a.vocab_size();
+  let emissions = Emissions::from_logits(49, v, vec![0.0_f32; 49 * v.get()]).expect("logits");
+  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
+  a.finish(prepared, &emissions, clock, &AtomicBool::new(false))
+    .expect("finish")
+}
+
+/// The texts of `outcome`'s words.
+fn word_texts(outcome: &UnitOutcome) -> Vec<&str> {
+  outcome
+    .words()
+    .iter()
+    .map(crate::types::Word::text)
+    .collect()
+}
+
+/// **A `|` in the text is a character, never a separator.** On the base960h
+/// table `|` is the word delimiter's spelling, so `A|B` used to tokenize as
+/// `A | B`: one word split into two segments under one word index. The
+/// delimiter is reserved, so the `|` is a character the table cannot spell,
+/// a symbol: one OOV event for the caller's policy. The wildcard policy
+/// aligns `A|B` as one word with a wildcard where the `|` stood, and the
+/// default policy refuses it by name.
+#[test]
+fn a_pipe_in_the_text_is_an_oov_event_not_a_separator() {
+  use crate::{core::OovKind, runner::aligner::algorithm::trellis_beam::WILDCARD_TOKEN_ID};
+
+  let a = base960h(NO_UNK_TOKENIZER_JSON, None);
+  let events = a.detect_oov("A|B").expect("detect_oov").events().to_vec();
+  assert_eq!(
+    events,
+    vec![OovEvent::new(OovKind::Symbol('|'), 1, 0, Lang::En)]
+  );
+
+  let prepared = a
+    .prepare(
+      &vec![0.2_f32; 16_000],
+      &SpeechSpans::all_speech(),
+      "A|B",
+      a.detect_oov("A|B")
+        .expect("detect_oov")
+        .decide(wildcard_all_policy),
+      &AtomicBool::new(false),
+    )
+    .expect("the wildcard policy prepares it");
+  assert_eq!(prepared.token_ids(), [4, WILDCARD_TOKEN_ID, 21]);
+  let outcome = align_uniformly(
+    &a,
+    "A|B",
+    a.detect_oov("A|B")
+      .expect("detect_oov")
+      .decide(wildcard_all_policy),
+  );
+  assert_eq!(word_texts(&outcome), ["A|B"], "one word, not two segments");
+
+  let Err(EmissionsError::SemanticOutOfVocab(failure)) = a.prepare(
+    &vec![0.2_f32; 16_000],
+    &SpeechSpans::all_speech(),
+    "A|B",
+    a.detect_oov("A|B")
+      .expect("detect_oov")
+      .decide(default_oov_policy),
+    &AtomicBool::new(false),
+  ) else {
+    panic!("the default policy refuses the `|`");
+  };
+  assert!(
+    failure.message().contains("'|'"),
+    "the refusal names it: {}",
+    failure.message()
+  );
+}
+
+/// **A `-` in a word is a dropped mark, never the blank.** On the base960h
+/// table `-` spells the CTC blank. A normalizer that keeps `well-known` as
+/// one word (the Latin ones split it at the hyphen) used to hand the blank's
+/// column to the hyphen as a target. The blank is reserved, so the `-` is a
+/// dash the table cannot spell, a mark nobody reads aloud: dropped, with no
+/// event, and `well-known` aligns as one word from its letters.
+#[test]
+fn a_hyphen_in_a_word_is_dropped_not_the_blank() {
+  let a = base960h(NO_UNK_TOKENIZER_JSON, Some(Box::new(WhitespaceNormalizer)));
+  assert!(
+    a.detect_oov("well-known")
+      .expect("detect_oov")
+      .events()
+      .is_empty()
+  );
+  let prepared = a
+    .prepare(
+      &vec![0.2_f32; 16_000],
+      &SpeechSpans::all_speech(),
+      "well-known",
+      resolution(&a, "well-known"),
+      &AtomicBool::new(false),
+    )
+    .expect("prepare");
+  assert_eq!(prepared.token_ids(), [15, 2, 12, 12, 23, 6, 5, 15, 6]);
+  let outcome = align_uniformly(&a, "well-known", resolution(&a, "well-known"));
+  assert_eq!(word_texts(&outcome), ["well-known"]);
+}
+
+/// **A one-character special the tokenizer declares is never a target.**
+/// With `#` added to the base960h table and declared special, a `#` in the
+/// text is not the special's token: it is a mark read aloud the table cannot
+/// spell, one OOV event, a wildcard under the wildcard policy. Added without
+/// the declaration, the same `#` is an ordinary token: the rule is the
+/// tokenizer's own statement, not the token's spelling.
+#[test]
+fn a_declared_special_is_never_a_target() {
+  use crate::{core::OovKind, runner::aligner::algorithm::trellis_beam::WILDCARD_TOKEN_ID};
+
+  let text = "a # b";
+  let tokens = |a: &EmissionsAligner| {
+    a.prepare(
+      &vec![0.2_f32; 16_000],
+      &SpeechSpans::all_speech(),
+      text,
+      a.detect_oov(text)
+        .expect("detect_oov")
+        .decide(wildcard_all_policy),
+      &AtomicBool::new(false),
+    )
+    .expect("prepare")
+    .token_ids()
+    .to_vec()
+  };
+
+  let special = base960h(&base960h_with_hash(true), None);
+  assert_eq!(special.vocab_size().get(), 30);
+  assert_eq!(
+    special
+      .detect_oov(text)
+      .expect("detect_oov")
+      .events()
+      .to_vec(),
+    vec![OovEvent::new(OovKind::Symbol('#'), 2, 1, Lang::En)]
+  );
+  assert_eq!(tokens(&special), [4, 1, WILDCARD_TOKEN_ID, 1, 21]);
+
+  let ordinary = base960h(&base960h_with_hash(false), None);
+  assert!(
+    ordinary
+      .detect_oov(text)
+      .expect("detect_oov")
+      .events()
+      .is_empty()
+  );
+  assert_eq!(tokens(&ordinary), [4, 1, 29, 1, 21]);
+}
+
+/// **The separators tokenization inserts are unchanged.** Between two
+/// normalized words the delimiter's token still goes in, and it is the
+/// only way the delimiter's column is reached.
+#[test]
+fn inserted_separators_are_unchanged() {
+  let a = base960h(NO_UNK_TOKENIZER_JSON, None);
+  let prepared = a
+    .prepare(
+      &vec![0.2_f32; 16_000],
+      &SpeechSpans::all_speech(),
+      "hello world",
+      resolution(&a, "hello world"),
+      &AtomicBool::new(false),
+    )
+    .expect("prepare");
+  assert_eq!(
+    prepared.token_ids(),
+    [8, 2, 12, 12, 5, 1, 15, 5, 10, 12, 11]
+  );
+  let outcome = align_uniformly(&a, "hello world", resolution(&a, "hello world"));
+  assert_eq!(word_texts(&outcome), ["hello", "world"]);
+}
+
 // ——————————————— Punctuation is never an alignment target ———————————————
 
 /// A sentence as a recogniser writes it carries no event for its marks, so

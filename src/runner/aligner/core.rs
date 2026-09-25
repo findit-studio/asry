@@ -43,7 +43,7 @@ use crate::{
     algorithm::{
       compose::{build_speech_frames, compose_words, effective_samples_per_frame},
       encode::{LogProbsTV, validate_stride_extent, validate_vocab_dim},
-      tokenize::{TokenizedText, detect_oov_events, tokenize_with_word_map},
+      tokenize::{ReservedIds, TokenizedText, detect_oov_events, tokenize_with_word_map},
       trellis_beam::align_to_word_segments,
     },
     emissions_api::{SpeechCoverage, SpeechSpans},
@@ -637,7 +637,9 @@ pub(crate) struct AlignerCore {
   /// front end's receptive field, 400 samples for wav2vec2.
   receptive_field_samples: NonZeroU32,
   blank_token_id: u32,
-  unk_token_id: Option<u32>,
+  /// The ids no transcript character is looked up to: the blank, the word
+  /// delimiter, the unknown token and every declared special.
+  reserved: ReservedIds,
   /// Look ASCII letters up in upper case.
   vocab_uppercase_only: bool,
   /// Tokenizer vocab size, captured at construction. The encoder's
@@ -769,6 +771,7 @@ impl AlignerCore {
     min_speech_coverage: SpeechCoverage,
     max_intra_silent_run: Duration,
   ) -> Self {
+    let reserved = ReservedIds::new(&tokenizer, blank_token_id, &word_delimiter, unk_token_id);
     Self {
       id: AlignerId::next(),
       tokenizer,
@@ -778,7 +781,7 @@ impl AlignerCore {
       word_delimiter,
       receptive_field_samples,
       blank_token_id,
-      unk_token_id,
+      reserved,
       vocab_uppercase_only,
       tokenizer_vocab_size,
       min_speech_coverage,
@@ -882,7 +885,7 @@ impl AlignerCore {
       normalized.normalized(),
       n_words,
       self.vocab_uppercase_only,
-      self.unk_token_id,
+      &self.reserved,
       &self.language,
       normalized.wildcard_boundary_per_word(),
     )
@@ -1020,8 +1023,9 @@ impl AlignerCore {
     // Chinese/Japanese where whitespace is an indexing artefact).
     // `vocab_uppercase_only` triggers ASCII case projection so a
     // lowercase normaliser doesn't feed <unk>s into a vocab like
-    // wav2vec2-base-960h's. `unk_token_id` is the per-character
-    // skip target.
+    // wav2vec2-base-960h's. `reserved` holds the ids no character is
+    // looked up to (the blank, the delimiter, the unknown token, the
+    // declared specials).
     let tokenized = tokenize_with_word_map(
       &self.tokenizer,
       normalized.normalized(),
@@ -1031,7 +1035,7 @@ impl AlignerCore {
         .use_word_delimiter()
         .then_some(self.word_delimiter.as_str()),
       self.vocab_uppercase_only,
-      self.unk_token_id,
+      &self.reserved,
       normalized.wildcard_boundary_per_word(),
       &self.language,
       oov_decisions,

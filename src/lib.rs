@@ -142,10 +142,13 @@ pub use ort;
 /// text, any audio. The model's properties are the caller's to declare,
 /// and asry takes them as declared: that the vocabulary is the model's
 /// own, and the blank id, the word delimiter, the letter case, the hop and
-/// the receptive field are the model's. It checks what a declaration makes
-/// checkable (a delimiter the vocabulary does not spell, a head width that
-/// disagrees with the vocabulary), and does not defend against a model,
-/// vocabulary or configuration declared wrongly.
+/// the receptive field are the model's, and that the tokenizer JSON
+/// declares the model's special tokens special. It checks what a
+/// declaration makes checkable (a delimiter the vocabulary does not spell,
+/// a head width that disagrees with the vocabulary), and does not defend
+/// against a model, vocabulary or configuration declared wrongly. No
+/// transcript character is ever aligned to the blank, the word delimiter,
+/// the unknown token or a declared special.
 #[cfg(feature = "emissions")]
 #[cfg_attr(docsrs, doc(cfg(feature = "emissions")))]
 pub mod emissions {
@@ -190,7 +193,7 @@ pub mod __bench {
     runner::aligner::algorithm::{
       encode::LogProbsTV,
       normalize::{scalar, zero_mean_unit_var_normalize},
-      tokenize::{TokenizedText, detect_oov_events, tokenize_with_word_map},
+      tokenize::{ReservedIds, TokenizedText, detect_oov_events, tokenize_with_word_map},
       trellis_beam::{
         ALIGN_BEAM_WIDTH, PathPointPublic, WILDCARD_TOKEN_ID, WordSegment, align_to_word_segments,
         backtrack_beam, get_trellis,

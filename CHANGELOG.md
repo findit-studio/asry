@@ -165,6 +165,26 @@ BREAKING
 
 FIXED
 
+- **No transcript character is aligned to a reserved column.** Each
+  character is looked up in the vocabulary on its own, and a character
+  that looked up to the CTC blank, the word delimiter or a special token
+  became an ordinary target. On a table that spells the blank `-` and the
+  delimiter `|` (the chordai wav2vec2-base-960h table), `well-known` under
+  a normalizer that keeps the hyphen aligned the hyphen to the blank's
+  column, and `A|B` put the delimiter's token inside the word, which split
+  one word into two segments under one word index. Now the reserved ids
+  are defined once: the blank (stated or detected), the word delimiter,
+  the unknown token (already excluded) and every token the tokenizer JSON
+  declares special (`added_tokens[].special`), read from the tokenizer's
+  own statement, never inferred from a spelling. A character whose lookup
+  lands on one is not spelled, so the mark rules decide it: a mark nobody
+  reads aloud (the `-`) is dropped, anything else (the `|`, a declared
+  one-character special such as `#`) is an `OovKind::Symbol` event for
+  the caller's policy. The separators tokenization inserts between
+  normalized words are unchanged, and they are now the only tokens that
+  reach the delimiter's column. Both front ends and `AlignmentSet`
+  detection follow the rule. A model with special tokens declares them in
+  its tokenizer JSON as special added tokens.
 - **The frame-count check reads the declared receptive field and hop.**
   `finish` (both front ends) accepted `T` frames only when `T · hop` lay
   within two hops of the chunk's real length. That window fits wav2vec2's
