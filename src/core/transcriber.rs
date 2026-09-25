@@ -978,17 +978,24 @@ impl Transcriber {
 
   /// Inject the result of a `Command::Alignment`.
   ///
-  /// The result must give each of the chunk's alignment units exactly
-  /// one outcome: [`AlignmentResult::whole`] when the command carried no
-  /// runs, [`AlignmentResult::runs`] with one outcome per run, in order,
-  /// when it did. The transcript then carries every aligned word, in
-  /// time order.
+  /// The result must be built with the [`AlignmentTicket`](crate::core::AlignmentTicket)
+  /// that chunk's command carried, and must give each of the chunk's
+  /// alignment units exactly one outcome: [`AlignmentResult::whole`] when
+  /// the command carried no runs, [`AlignmentResult::runs`] with one
+  /// outcome per run, in order, when it did. The transcript then carries
+  /// every aligned word, in time order.
+  ///
+  /// The result is consumed, so it is delivered once.
   ///
   /// Errors:
   /// - `UnknownChunk(chunk_id)` if `chunk_id` is not awaiting alignment.
+  /// - `ForeignAlignment` if the result was built with another command's
+  ///   ticket: it answers another chunk, or a command of another
+  ///   transcriber. Checked before any outcome is read.
   /// - `UnaccountedAlignment` if the result's units are not the chunk's.
-  ///   Nothing is consumed: the chunk stays awaiting alignment, for a
-  ///   result that accounts for its units or a `handle_failure`.
+  ///
+  /// A refused result is dropped with its ticket, and the chunk stays
+  /// awaiting alignment until `handle_failure` resolves it.
   pub fn handle_alignment(
     &mut self,
     chunk_id: ChunkId,

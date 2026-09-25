@@ -43,7 +43,7 @@ pub use align::dispatch;
 pub use mediatime::{TimeRange, Timebase, Timestamp};
 
 pub use types::{
-  AlignmentError, AlignmentFailure, AsrError, AsrFailure, Backpressure, ChunkId,
+  AlignmentError, AlignmentFailure, AsrError, AsrFailure, Backpressure, ChunkId, ForeignAlignment,
   GapExceedsTolerance, InconsistentTimebase, InvalidTimebase, Lang,
   LanguageUnsupportedForAlignment, PtsRegression, PushKind, TranscriberError, Transcript,
   UnaccountedAlignment, VadAheadOfAudio, VadSegment, Word, WorkFailure, WorkerHangTimeout,
@@ -51,9 +51,9 @@ pub use types::{
 };
 
 pub use core::{
-  AlignedWords, AlignmentResult, AlignmentUnit, AsrParams, AsrParamsOverride, AsrResult, Command,
-  Event, LanguagePolicy, SamplingStrategy, Transcriber, TranscriberOptions, UnalignedCause,
-  UnitOutcome,
+  AlignedWords, AlignmentResult, AlignmentTicket, AlignmentUnit, AsrParams, AsrParamsOverride,
+  AsrResult, Command, Event, LanguagePolicy, SamplingStrategy, Transcriber, TranscriberOptions,
+  UnalignedCause, UnitOutcome,
 };
 
 // Reachable under `runner` (whisper.cpp ASR) OR `emissions` (the

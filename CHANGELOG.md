@@ -41,7 +41,7 @@ BREAKING
   - Pool: build the work item first, then detect and decide it.
     `AlignWorkItem::from_run_alignment` no longer takes `oov_decisions`;
     `AlignmentSet::detect_oov(&job)` replaces `detect_oov(text, language)`
-    and `detect_oov_per_run(runs)`; `run_one_alignment(&set, &job,
+    and `detect_oov_per_run(runs)`; `run_one_alignment(&set, job,
     resolution, &run_options)` takes the resolution.
     `AlignWorkItem::oov_decisions` is gone.
   - Direct: `aligner.detect_oov(text)?.decide(policy)`, then pass the
@@ -55,12 +55,14 @@ BREAKING
   - New: `AlignmentUnit` (`Whole`, or `Run(index)` of
     `Command::Alignment::runs`) names the unit a detection or resolution is
     for.
-- **An alignment result is exactly one outcome per unit, and the transcriber
-  checks it.** `AlignmentResult` was a word list anyone could build empty
-  (`AlignmentResult::new(Vec::new())`), and `Transcriber::handle_alignment`
-  consumed only its words: a chunk awaiting alignment could be resolved
-  with no outcome at all, and zero words told a caller nothing about why.
-  Now:
+- **An alignment result is exactly one outcome per unit, answers only the
+  command it was built for, and the transcriber checks both.**
+  `AlignmentResult` was a word list anyone could build empty
+  (`AlignmentResult::new(Vec::new())`) and clone, and
+  `Transcriber::handle_alignment` consumed only its words: a chunk awaiting
+  alignment could be resolved with no outcome at all, zero words told a
+  caller nothing about why, and two chunks with the same unit layout
+  accepted each other's results (or one result, cloned, for both). Now:
   - **`UnitOutcome`** is one unit's outcome: `Aligned(AlignedWords)`, whose
     words are never empty (`AlignedWords::new` returns `None` for none), or
     `Unaligned(UnalignedCause)`, with the reason: `Skipped`, `Refused`,
@@ -68,34 +70,54 @@ BREAKING
     reads aloud), `NoSurvivingWords` (the speech gates dropped every word)
     or `Failed` (a recoverable alignment failure, such as a policy refusing
     a spoken character).
-  - **`AlignmentResult`** is built only as `AlignmentResult::whole(outcome)`
-    or `AlignmentResult::runs(outcomes)` (run `i`'s outcome at `i`), so no
-    unit is missing from it or answered twice. `units()` yields each unit
+  - **`AlignmentResult`** is built only as
+    `AlignmentResult::whole(ticket, outcome)` or
+    `AlignmentResult::runs(ticket, outcomes)` (run `i`'s outcome at `i`), so
+    no unit is missing from it or answered twice. `units()` yields each unit
     with its outcome, `unaligned()` the units without words and their
     reasons, `words()` every word in unit order, and `into_words()` every
     word in time order.
+  - **A result answers only the command whose ticket built it.**
+    `Command::Alignment` carries an `AlignmentTicket`, minted with the
+    command; its identity is unique within the process and the chunk's
+    in-flight record keeps it. Building the result consumes the ticket.
+    `handle_alignment` refuses a result built with another command's ticket
+    (another chunk's, or another transcriber's) as the new
+    `TranscriberError::ForeignAlignment` (with `ForeignAlignment`: the chunk
+    it was handed to and the chunk it answers), before reading any
+    outcome. Neither a ticket nor a result can be cloned, and
+    `handle_alignment` consumes the result, so a command is answered at most
+    once.
   - **`Transcriber::handle_alignment` refuses a result whose units are not
     the chunk's**, as the new `TranscriberError::UnaccountedAlignment` (with
     `UnaccountedAlignment`: the chunk, the units it expected and the units
-    the result gave), before consuming anything: the chunk stays awaiting
-    alignment. A chunk aligned whole takes `whole`, one aligned run by run
-    takes `runs` with one outcome per run.
+    the result gave). A chunk aligned whole takes `whole`, one aligned run by
+    run takes `runs` with one outcome per run. A refused result is dropped
+    with its ticket; the chunk stays awaiting alignment until
+    `handle_failure` resolves it.
   - `run_one_alignment` builds one outcome per unit on both roads, and
     `Aligner::align_chunk`, `Aligner::align_chunk_with_abort` and
     `EmissionsAligner::finish` return the aligned text's `UnitOutcome`.
 
   Migration:
+  - Take the `ticket` from `Command::Alignment` along with its other fields.
+    `AlignWorkItem::from_run_alignment` takes it in place of the chunk id
+    (the ticket names the chunk), and `run_one_alignment(&set, job,
+    resolution, &run_options)` takes the work item by value and builds the
+    result with its ticket.
   - A driver that feeds `handle_alignment` from its own aligner wraps its
-    words: `AlignmentResult::whole(AlignedWords::new(words).map_or(
+    words with the command's ticket:
+    `AlignmentResult::whole(ticket, AlignedWords::new(words).map_or(
     UnitOutcome::Unaligned(cause), UnitOutcome::Aligned))` for a whole-text
-    chunk, `AlignmentResult::runs(..)` with one outcome per run otherwise.
+    chunk, `AlignmentResult::runs(ticket, ..)` with one outcome per run
+    otherwise.
   - `result.words()` is an iterator now; `into_words()` still returns every
     word, in time order.
   - The direct front ends return a `UnitOutcome`: read its words with
-    `outcome.words()`, or wrap it in `AlignmentResult::whole` for a
-    `Transcriber`.
-  - `TranscriberError` has the new variant `UnaccountedAlignment`; an
-    exhaustive `match` needs an arm for it.
+    `outcome.words()`, or wrap it in `AlignmentResult::whole(ticket, ..)` for
+    a `Transcriber`.
+  - `TranscriberError` has the new variants `UnaccountedAlignment` and
+    `ForeignAlignment`; an exhaustive `match` needs an arm for each.
 - **`EmissionsAlignerBuilder` states the word delimiter, the letter case and
   the receptive field instead of taking them from English wav2vec2 or the
   vocabulary.** The builder always used `|` as the word delimiter and

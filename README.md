@@ -158,9 +158,11 @@ while let Some(cmd) = transcriber.poll_command() {
       ))?;
       transcriber.handle_asr(chunk_id, result)?;
     }
-    Command::Alignment { chunk_id, samples, sub_segments: _, text, language, runs } => {
+    Command::Alignment { chunk_id, samples, sub_segments: _, text, language, runs, ticket } => {
+      // The job carries the command's ticket: the result is built with
+      // it, and the transcriber accepts no result built with another.
       let job = AlignWorkItem::from_run_alignment(
-        &transcriber, chunk_id, samples, text, language,
+        &transcriber, ticket, samples, text, language,
         runs, abort_flag.clone(),
       ).expect("chunk in flight");
       // Sans-I/O OOV resolution: detect every unit of THIS job (its
@@ -176,7 +178,7 @@ while let Some(cmd) = transcriber.poll_command() {
       // Fresh `RunOptions` per chunk so a watchdog's
       // `terminate()` for chunk N does not poison chunk N+1.
       let run_options = RunOptions::new()?;
-      let aligned = run_one_alignment(&alignment_set, &job, resolution, &run_options)?;
+      let aligned = run_one_alignment(&alignment_set, job, resolution, &run_options)?;
       transcriber.handle_alignment(chunk_id, aligned)?;
     }
   }

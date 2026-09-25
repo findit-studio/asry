@@ -102,7 +102,7 @@ fn too_short_chunk_recovers_to_empty_result() {
 
   let job = AlignWorkItem {
     id: JobId::next(),
-    chunk_id: ChunkId::from_raw(0),
+    ticket: crate::core::AlignmentTicket::mint(ChunkId::from_raw(0)),
     // 200 samples = 12.5 ms. The aligner pads it to 400 ⇒ T=1 frame,
     // against 11 chars ⇒ no CTC path. Byte-for-byte the input
     // `sub_400_sample_chunk_surfaces_no_alignment_path` hands to
@@ -130,7 +130,19 @@ fn too_short_chunk_recovers_to_empty_result() {
     .expect("detect_oov")
     .decide(crate::core::default_oov_policy);
 
-  let result = run_one_alignment(&set, &job, resolution, &run_options).expect(
+  // Input sanity, NOT a preservation proof: this confirms only that the
+  // work item carries the text the dispatcher will later read. It says
+  // nothing about what gets emitted. The emission-side preservation (that
+  // `handle_alignment` keeps `asr.text()` and reports the unit's outcome
+  // instead of routing an `Err` to `Event::Error`) is pinned separately by
+  // `core::dispatch::tests::empty_alignment_result_preserves_asr_text_and_emits_no_error`.
+  assert_eq!(
+    job.text().as_str(),
+    ASR_TEXT,
+    "the input work item carries the ASR text (input sanity, not the preservation proof)"
+  );
+
+  let result = run_one_alignment(&set, job, resolution, &run_options).expect(
     "`NoAlignmentPath` is classified recoverable, so the pool must absorb it into an Ok result \
      with no words and a record naming the failure. \
      An Err here would reach `handle_failure` upstream and turn a chunk carrying a perfectly \
@@ -147,20 +159,6 @@ fn too_short_chunk_recovers_to_empty_result() {
     ),
     "the whole text's one outcome names the recovered failure, never a bare empty list; got \
      {result:?}"
-  );
-
-  // Input sanity, NOT a preservation proof: `run_one_alignment` borrows
-  // `&job` and never mutates it, so this can only confirm the work item
-  // still carries the text the dispatcher will later read — it says
-  // nothing about what gets emitted. The emission-side preservation
-  // (that `handle_alignment` rebuilds `Transcript::new(.., asr.text(),
-  // result.into_words(), ..)` — text kept, `words: []` — instead of
-  // routing an `Err` to `Event::Error`) is pinned separately by
-  // `core::dispatch::tests::empty_alignment_result_preserves_asr_text_and_emits_no_error`.
-  assert_eq!(
-    job.text().as_str(),
-    ASR_TEXT,
-    "the input work item still carries the ASR text (input sanity, not the preservation proof)"
   );
 }
 
@@ -578,7 +576,7 @@ fn per_run_job(chunk: u64, runs: Vec<Run>) -> AlignWorkItem {
   let text: String = runs.iter().map(Run::text).collect();
   AlignWorkItem {
     id: JobId::next(),
-    chunk_id: ChunkId::from_raw(chunk),
+    ticket: crate::core::AlignmentTicket::mint(ChunkId::from_raw(chunk)),
     samples: Arc::from(vec![0.0_f32; 1_600]),
     sub_segments: Vec::new(),
     text: SmolStr::new(text),

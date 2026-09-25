@@ -51,6 +51,12 @@ pub enum TranscriberError {
   /// Caller `inject_*`-ed a chunk_id that does not match in-flight.
   #[error("unknown or already-resolved chunk_id {0}")]
   UnknownChunk(ChunkId),
+  /// `handle_alignment` got a result built with another alignment
+  /// command's ticket: it answers another chunk, or a command of another
+  /// transcriber. Refused before any outcome is read; the chunk stays
+  /// awaiting alignment.
+  #[error("{0}")]
+  ForeignAlignment(ForeignAlignment),
   /// `handle_alignment` got a result that does not give each of the
   /// chunk's alignment units exactly one outcome. The chunk stays
   /// awaiting alignment.
@@ -59,6 +65,43 @@ pub enum TranscriberError {
   /// Caller called `handle_eof` and then attempted to push.
   #[error("operation rejected after handle_eof")]
   AfterEof,
+}
+
+/// An alignment result handed to a chunk whose outstanding
+/// `Command::Alignment` it does not answer: it was built with the
+/// [`AlignmentTicket`](crate::core::AlignmentTicket) of another command,
+/// issued for another chunk or by another transcriber.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "alignment result handed to chunk {chunk_id} answers another alignment command (one issued \
+   for chunk {answers}); a chunk accepts only the result built with its own command's ticket"
+)]
+pub struct ForeignAlignment {
+  chunk_id: ChunkId,
+  answers: ChunkId,
+}
+
+impl ForeignAlignment {
+  /// Construct from the chunk the result was handed to and the chunk its
+  /// ticket answers.
+  #[must_use]
+  pub const fn new(chunk_id: ChunkId, answers: ChunkId) -> Self {
+    Self { chunk_id, answers }
+  }
+
+  /// The chunk the result was handed to.
+  #[must_use]
+  pub const fn chunk_id(&self) -> ChunkId {
+    self.chunk_id
+  }
+
+  /// The chunk whose alignment command the result's ticket answers. It
+  /// can equal [`chunk_id`](Self::chunk_id) for a result built by another
+  /// transcriber.
+  #[must_use]
+  pub const fn answers(&self) -> ChunkId {
+    self.answers
+  }
 }
 
 /// An alignment result that does not account for the chunk's alignment

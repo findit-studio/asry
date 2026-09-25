@@ -11,7 +11,7 @@ use crate::{
   align::script_dispatch::runs_reproduce_text,
   core::{
     buffer::SampleBuffer,
-    command::{AsrParams, AsrResult, Command},
+    command::{AlignmentTicket, AsrParams, AsrResult, Command},
     cut::{MergedChunk, SampleRange, SubOrigin},
     event::Event,
     transcriber::LanguagePolicy,
@@ -93,6 +93,9 @@ pub(crate) struct ChunkRecord {
   /// How many runs the chunk's `Command::Alignment` carried (0: the whole
   /// text): which alignment units its result must account for.
   pub alignment_runs: usize,
+  /// The identity of the ticket the chunk's `Command::Alignment` carried:
+  /// the only result the chunk accepts is one built with it.
+  pub alignment_ticket: Option<core::num::NonZeroU64>,
 }
 
 /// A chunk whose audio has been extracted from the live buffer and
@@ -449,6 +452,7 @@ impl Dispatch {
       phase: ChunkPhase::AwaitingAsr,
       asr_result: None,
       alignment_runs: 0,
+      alignment_ticket: None,
     };
     self.in_flight.insert(chunk_id, record);
 
@@ -625,6 +629,8 @@ impl Dispatch {
         Vec::new()
       };
       record.alignment_runs = runs.len();
+      let ticket = AlignmentTicket::mint(chunk_id);
+      record.alignment_ticket = Some(ticket.id());
       self.pending_commands.push_back(Command::Alignment {
         chunk_id,
         samples: record.samples.clone(),
@@ -632,6 +638,7 @@ impl Dispatch {
         text: result.text().clone(),
         language: result.language().clone(),
         runs,
+        ticket,
       });
     } else {
       // Build the Transcript with empty words.
@@ -659,11 +666,18 @@ impl Dispatch {
   /// alignment result. Calling on a chunk in any other phase
   /// returns `UnknownChunk`.
   ///
+  /// Binding contract: the result must have been built with the ticket
+  /// the chunk's `Command::Alignment` carried. A result built with any
+  /// other ticket (another chunk's, or another transcriber's) is refused
+  /// with `ForeignAlignment` before any outcome is read.
+  ///
   /// Accounting contract: the result must give each of the chunk's
   /// alignment units exactly one outcome (the whole text when its
   /// command carried no runs, else each run, in order). Otherwise it is
-  /// refused with `UnaccountedAlignment` before anything is consumed, and
-  /// the chunk stays awaiting alignment.
+  /// refused with `UnaccountedAlignment`.
+  ///
+  /// A refused result is dropped with its ticket, and the chunk stays
+  /// awaiting alignment until `handle_failure` resolves it.
   pub(crate) fn handle_alignment(
     &mut self,
     chunk_id: ChunkId,
@@ -675,6 +689,11 @@ impl Dispatch {
       .ok_or(TranscriberError::UnknownChunk(chunk_id))?;
     if !matches!(record.phase, ChunkPhase::AwaitingAlignment) {
       return Err(TranscriberError::UnknownChunk(chunk_id));
+    }
+    if record.alignment_ticket != Some(result.ticket_id()) {
+      return Err(TranscriberError::ForeignAlignment(
+        crate::types::ForeignAlignment::new(chunk_id, result.chunk_id()),
+      ));
     }
     if !result.accounts_for(record.alignment_runs) {
       return Err(TranscriberError::UnaccountedAlignment(
@@ -885,6 +904,47 @@ mod tests {
 
   fn fake_asr_result(text: &str) -> AsrResult {
     AsrResult::new(SmolStr::new(text), Lang::En, -0.5, 0.05, 0.0)
+  }
+
+  /// A word-aligning dispatch.
+  fn aligning_dispatch() -> Dispatch {
+    Dispatch::new(
+      AsrParams::default(),
+      /* word_alignment = */ true,
+      /* max_in_flight = */ 4,
+      LanguagePolicy::Auto,
+    )
+  }
+
+  /// Bring chunk `chunk` of `d` to awaiting alignment with `text` and
+  /// `runs`, and return the ticket its `Command::Alignment` carried.
+  fn await_alignment(
+    d: &mut Dispatch,
+    b: &SampleBuffer,
+    chunk: u64,
+    text: &str,
+    runs: Vec<crate::align::Run>,
+  ) -> AlignmentTicket {
+    d.on_emit(
+      fake_chunk(chunk * 2_000, chunk * 2_000 + 2_000),
+      ChunkId::from_raw(chunk),
+      b,
+    );
+    d.handle_asr(
+      ChunkId::from_raw(chunk),
+      AsrResult::new(SmolStr::new(text), Lang::En, -0.5, 0.05, 0.0).with_runs(runs),
+    )
+    .expect("a non-empty ASR result under word_alignment asks for alignment");
+    match d.pending_commands.pop_back() {
+      Some(Command::Alignment {
+        chunk_id, ticket, ..
+      }) => {
+        assert_eq!(chunk_id, ChunkId::from_raw(chunk));
+        assert_eq!(ticket.chunk_id(), chunk_id, "the ticket names its chunk");
+        ticket
+      }
+      other => panic!("the ASR result queues an alignment command; got {other:?}"),
+    }
   }
 
   #[test]
@@ -1232,9 +1292,10 @@ mod tests {
     // Phase is AwaitingAsr.
     let r = d.handle_alignment(
       ChunkId::from_raw(0),
-      crate::core::command::AlignmentResult::whole(crate::core::UnitOutcome::Unaligned(
-        crate::core::UnalignedCause::NoSurvivingWords,
-      )),
+      crate::core::command::AlignmentResult::whole(
+        AlignmentTicket::mint(ChunkId::from_raw(0)),
+        crate::core::UnitOutcome::Unaligned(crate::core::UnalignedCause::NoSurvivingWords),
+      ),
     );
     assert!(matches!(r, Err(TranscriberError::UnknownChunk(_))));
   }
@@ -1264,28 +1325,18 @@ mod tests {
     // chunk in `AwaitingAlignment` (caching the ASR text) rather than
     // emitting a Transcript straight from ASR — that parking is the
     // precondition for `handle_alignment` to run at all.
-    let mut d = Dispatch::new(
-      AsrParams::default(),
-      /* word_alignment = */ true,
-      /* max_in_flight = */ 4,
-      LanguagePolicy::Auto,
-    );
+    let mut d = aligning_dispatch();
     let mut b = make_buffer_with_samples(10_000);
-
-    d.on_emit(fake_chunk(0, 2_000), ChunkId::from_raw(0), &b);
-    d.handle_asr(
-      ChunkId::from_raw(0),
-      AsrResult::new(SmolStr::new(ASR_TEXT), Lang::En, -0.5, 0.05, 0.0),
-    )
-    .expect("a non-empty ASR result under word_alignment parks the chunk in AwaitingAlignment");
+    let ticket = await_alignment(&mut d, &b, 0, ASR_TEXT, Vec::new());
 
     // The result a dropped alignment recovers to: the chunk's one unit,
     // unaligned, with its reason.
     d.handle_alignment(
       ChunkId::from_raw(0),
-      crate::core::command::AlignmentResult::whole(crate::core::UnitOutcome::Unaligned(
-        crate::core::UnalignedCause::NoSurvivingWords,
-      )),
+      crate::core::command::AlignmentResult::whole(
+        ticket,
+        crate::core::UnitOutcome::Unaligned(crate::core::UnalignedCause::NoSurvivingWords),
+      ),
     )
     .expect("a result naming why the unit has no words must resolve the chunk to Ready");
 
@@ -1383,15 +1434,15 @@ mod tests {
   /// one outcome, for its whole text; a chunk aligned run by run takes
   /// exactly one per run, in order. A result with no unit (no words and no
   /// reason), a missing or an extra run, or the other road's shape is
-  /// refused as `UnaccountedAlignment`, naming both unit lists, and consumes
-  /// nothing: the chunk stays awaiting alignment, and the result that
-  /// accounts for its units then resolves it, words in time order.
+  /// refused as `UnaccountedAlignment`, naming both unit lists: the chunk
+  /// stays awaiting alignment, and `handle_failure` still resolves it. The
+  /// result that accounts for its units resolves it, words in time order.
   #[test]
   fn an_alignment_result_must_account_for_every_unit_of_the_chunk() {
     use crate::{
       align::{BoundsSource, Run},
       core::{AlignedWords, AlignmentResult, AlignmentUnit, UnalignedCause, UnitOutcome},
-      types::Word,
+      types::{AlignmentError, AlignmentFailure, Word},
     };
 
     let run = |text: &str| {
@@ -1421,33 +1472,22 @@ mod tests {
       } else {
         vec![AlignmentUnit::Run(0), AlignmentUnit::Run(1)]
       };
-      let mut d = Dispatch::new(
-        AsrParams::default(),
-        /* word_alignment = */ true,
-        /* max_in_flight = */ 4,
-        LanguagePolicy::Auto,
-      );
-      let mut b = make_buffer_with_samples(10_000);
-      d.on_emit(fake_chunk(0, 2_000), ChunkId::from_raw(0), &b);
-      d.handle_asr(
-        ChunkId::from_raw(0),
-        AsrResult::new(SmolStr::new("hello world"), Lang::En, -0.5, 0.05, 0.0)
-          .with_runs(runs.clone()),
-      )
-      .expect("the chunk awaits alignment");
-
-      let wrong = [
-        AlignmentResult::runs(Vec::new()),
-        AlignmentResult::runs(vec![skipped()]),
-        AlignmentResult::runs(vec![skipped(), skipped(), skipped()]),
-        if runs.is_empty() {
-          AlignmentResult::runs(vec![skipped()])
-        } else {
-          AlignmentResult::whole(skipped())
-        },
+      type Build = fn(AlignmentTicket, fn() -> UnitOutcome) -> AlignmentResult;
+      let wrong: [Build; 4] = [
+        |ticket, _| AlignmentResult::runs(ticket, Vec::new()),
+        |ticket, unit| AlignmentResult::runs(ticket, vec![unit()]),
+        |ticket, unit| AlignmentResult::runs(ticket, vec![unit(), unit(), unit()]),
+        |ticket, unit| AlignmentResult::whole(ticket, unit()),
       ];
-      for result in wrong {
+      for build in wrong {
+        let mut d = aligning_dispatch();
+        let b = make_buffer_with_samples(10_000);
+        let ticket = await_alignment(&mut d, &b, 0, "hello world", runs.clone());
+        let result = build(ticket, skipped);
         let received = result.unit_list();
+        if received == expected {
+          continue;
+        }
         match d.handle_alignment(ChunkId::from_raw(0), result) {
           Err(TranscriberError::UnaccountedAlignment(unaccounted)) => {
             assert_eq!(unaccounted.chunk_id(), ChunkId::from_raw(0));
@@ -1461,17 +1501,31 @@ mod tests {
             d.in_flight.get(&ChunkId::from_raw(0)).map(|r| &r.phase),
             Some(ChunkPhase::AwaitingAlignment)
           ),
-          "a refused result consumes nothing"
+          "a refused result resolves nothing"
         );
+        d.handle_failure(
+          ChunkId::from_raw(0),
+          WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(
+            SmolStr::new("refused"),
+            Lang::En,
+          ))),
+        )
+        .expect("the chunk still awaits alignment, so a failure resolves it");
       }
 
+      let mut d = aligning_dispatch();
+      let mut b = make_buffer_with_samples(10_000);
+      let ticket = await_alignment(&mut d, &b, 0, "hello world", runs.clone());
       let right = if runs.is_empty() {
-        AlignmentResult::whole(aligned(vec![word("hello", 0), word("world", 20)]))
+        AlignmentResult::whole(ticket, aligned(vec![word("hello", 0), word("world", 20)]))
       } else {
-        AlignmentResult::runs(vec![
-          aligned(vec![word("world", 20)]),
-          aligned(vec![word("hello", 0)]),
-        ])
+        AlignmentResult::runs(
+          ticket,
+          vec![
+            aligned(vec![word("world", 20)]),
+            aligned(vec![word("hello", 0)]),
+          ],
+        )
       };
       d.handle_alignment(ChunkId::from_raw(0), right)
         .expect("a result that accounts for every unit resolves the chunk");
@@ -1483,6 +1537,100 @@ mod tests {
         }
         other => panic!("expected the transcript; got {other:?}"),
       }
+    }
+  }
+
+  /// **A result answers only the command whose ticket built it.** Two
+  /// chunks awaiting alignment with one unit layout, whole or run by run,
+  /// cannot take each other's results: each swapped result is refused by
+  /// name, before any outcome is read, and both chunks stay awaiting
+  /// alignment. A result built by another transcriber for a chunk with the
+  /// same id and layout is refused the same way. Each chunk's own result
+  /// resolves it. A result or a ticket cannot be cloned (the
+  /// `compile_fail` doctests on `AlignmentResult` and `AlignmentTicket`),
+  /// and `handle_alignment` consumes the result, so none is delivered
+  /// twice.
+  #[test]
+  fn an_alignment_result_answers_only_its_own_command() {
+    use crate::{
+      align::{BoundsSource, Run},
+      core::{AlignmentResult, UnalignedCause, UnitOutcome},
+    };
+
+    let run = |text: &str| {
+      Run::new(
+        Lang::En,
+        SmolStr::new(text),
+        0,
+        1_000,
+        0,
+        BoundsSource::Segment,
+      )
+    };
+    let result = |ticket: AlignmentTicket, runs: usize| {
+      let outcome = || UnitOutcome::Unaligned(UnalignedCause::NoSurvivingWords);
+      if runs == 0 {
+        AlignmentResult::whole(ticket, outcome())
+      } else {
+        AlignmentResult::runs(ticket, (0..runs).map(|_| outcome()).collect())
+      }
+    };
+    let foreign = |outcome: Result<(), TranscriberError>, chunk: u64, answers: u64| match outcome {
+      Err(TranscriberError::ForeignAlignment(foreign)) => {
+        assert_eq!(foreign.chunk_id(), ChunkId::from_raw(chunk));
+        assert_eq!(foreign.answers(), ChunkId::from_raw(answers));
+      }
+      other => panic!("chunk {chunk} must refuse a result for chunk {answers}; got {other:?}"),
+    };
+    let awaiting = |d: &Dispatch, chunk: u64| {
+      matches!(
+        d.in_flight.get(&ChunkId::from_raw(chunk)).map(|r| &r.phase),
+        Some(ChunkPhase::AwaitingAlignment)
+      )
+    };
+
+    for runs in [Vec::new(), vec![run("hello"), run(" world")]] {
+      let n = runs.len();
+      let mut d = aligning_dispatch();
+      let mut b = make_buffer_with_samples(10_000);
+      let first = await_alignment(&mut d, &b, 0, "hello world", runs.clone());
+      let second = await_alignment(&mut d, &b, 1, "hello world", runs.clone());
+      foreign(
+        d.handle_alignment(ChunkId::from_raw(0), result(second, n)),
+        0,
+        1,
+      );
+      foreign(
+        d.handle_alignment(ChunkId::from_raw(1), result(first, n)),
+        1,
+        0,
+      );
+      assert!(
+        awaiting(&d, 0) && awaiting(&d, 1),
+        "a swap resolves nothing"
+      );
+
+      let mut other = aligning_dispatch();
+      let elsewhere = await_alignment(&mut other, &b, 0, "hello world", runs.clone());
+      let mut d = aligning_dispatch();
+      let own = await_alignment(&mut d, &b, 0, "hello world", runs.clone());
+      foreign(
+        d.handle_alignment(ChunkId::from_raw(0), result(elsewhere, n)),
+        0,
+        0,
+      );
+      assert!(
+        awaiting(&d, 0),
+        "another transcriber's result resolves nothing"
+      );
+      d.handle_alignment(ChunkId::from_raw(0), result(own, n))
+        .expect("the chunk's own result resolves it");
+      d.after_inject(&mut b, None, u64::MAX);
+      assert!(
+        matches!(d.pending_events.front(), Some(Event::Transcript(t)) if t.chunk_id() == ChunkId::from_raw(0)),
+        "got {:?}",
+        d.pending_events
+      );
     }
   }
 

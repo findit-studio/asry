@@ -31,7 +31,10 @@ use ort::session::RunOptions;
 
 use crate::{
   align::{Run, script_dispatch::runs_reproduce_text},
-  core::{AlignmentResult, OovDecision, OovResolution, ResolvedOov, UnalignedCause, UnitOutcome},
+  core::{
+    AlignmentResult, AlignmentTicket, OovDecision, OovResolution, ResolvedOov, UnalignedCause,
+    UnitOutcome,
+  },
   runner::aligner::{Aligner, AlignmentFallback, AlignmentLookup, AlignmentSet},
   types::{
     AlignmentError, AlignmentFailure, ChunkId, Lang, LanguageUnsupportedForAlignment, WorkFailure,
@@ -86,8 +89,9 @@ pub struct AlignWorkItem {
   /// This work item's own identity, minted when it is built: what the
   /// job's OOV detection is bound to.
   id: JobId,
-  /// Identity of the chunk this alignment fulfils.
-  chunk_id: ChunkId,
+  /// The capability of the `Command::Alignment` this job answers, which
+  /// names its chunk: the job's result is built with it.
+  ticket: AlignmentTicket,
   /// Chunk audio (16 kHz f32 mono); shared via `Arc` with the
   /// core.
   samples: Arc<[f32]>,
@@ -139,7 +143,8 @@ impl AlignWorkItem {
   /// `Backpressure` from the caller's pump if needed.
   ///
   /// Inputs map 1:1 to the `Alignment` variant's fields plus
-  /// the caller-owned `abort_flag`.
+  /// the caller-owned `abort_flag`. `ticket` is the command's own: the
+  /// job's [`AlignmentResult`] is built with it, and it names the chunk.
   ///
   /// Each work item has an identity of its own. Detect its OOV
   /// characters with [`AlignmentSet::detect_oov(&job)`](AlignmentSet::detect_oov),
@@ -153,7 +158,7 @@ impl AlignWorkItem {
   )]
   pub fn from_run_alignment(
     transcriber: &crate::core::Transcriber,
-    chunk_id: ChunkId,
+    ticket: AlignmentTicket,
     samples: Arc<[f32]>,
     text: SmolStr,
     language: Lang,
@@ -161,6 +166,7 @@ impl AlignWorkItem {
     abort_flag: Arc<AtomicBool>,
   ) -> Option<Self> {
     use core::num::NonZeroI32;
+    let chunk_id = ticket.chunk_id();
     let chunk_first = transcriber.chunk_first_sample(chunk_id)?;
     let raw_subs = transcriber.chunk_sub_segments_samples(chunk_id)?;
     let bridge = transcriber.chunk_samples_to_output_range_fn(chunk_id)?;
@@ -177,7 +183,7 @@ impl AlignWorkItem {
       .collect();
     Some(Self {
       id: JobId::next(),
-      chunk_id,
+      ticket,
       samples,
       sub_segments: aligner_subs,
       text,
@@ -197,7 +203,7 @@ impl AlignWorkItem {
   /// Identity of the chunk this alignment fulfils.
   #[must_use]
   pub const fn chunk_id(&self) -> ChunkId {
-    self.chunk_id
+    self.ticket.chunk_id()
   }
 
   /// Chunk audio (16 kHz f32 mono).
@@ -303,12 +309,36 @@ impl AlignWorkItem {
 /// tokenization unless it was detected for this very work item (its
 /// `ChunkId` with it) through this very set, and it is consumed, so it
 /// applies once.
+///
+/// `job` is consumed too: the result is built with the ticket of the
+/// command the job answers, so a job yields at most one result.
 pub fn run_one_alignment(
+  set: &AlignmentSet,
+  job: AlignWorkItem,
+  resolution: JobResolution,
+  run_options: &RunOptions,
+) -> Result<AlignmentResult, WorkFailure> {
+  let outcomes = align_job(set, &job, resolution, run_options)?;
+  Ok(match outcomes {
+    JobOutcomes::Whole(outcome) => AlignmentResult::whole(job.ticket, outcome),
+    JobOutcomes::Runs(outcomes) => AlignmentResult::runs(job.ticket, outcomes),
+  })
+}
+
+/// The outcomes of one job's alignment units: its whole text's, or each
+/// run's, in run order.
+enum JobOutcomes {
+  Whole(UnitOutcome),
+  Runs(Vec<UnitOutcome>),
+}
+
+/// [`run_one_alignment`]'s work, up to the result it builds.
+fn align_job(
   set: &AlignmentSet,
   job: &AlignWorkItem,
   resolution: JobResolution,
   run_options: &RunOptions,
-) -> Result<AlignmentResult, WorkFailure> {
+) -> Result<JobOutcomes, WorkFailure> {
   let started_at = Instant::now();
 
   // pre-entry abort gate. The
@@ -374,12 +404,12 @@ pub fn run_one_alignment(
     })
     .map(|outcome| {
       if let UnitOutcome::Unaligned(cause) = &outcome {
-        log_unaligned(job.chunk_id, None, &job.language, cause);
+        log_unaligned(job.chunk_id(), None, &job.language, cause);
       }
-      AlignmentResult::whole(outcome)
+      JobOutcomes::Whole(outcome)
     })
   } else {
-    dispatch_runs(set, job, units, run_options)
+    dispatch_runs(set, job, units, run_options).map(JobOutcomes::Runs)
   };
 
   match outcome {
@@ -686,8 +716,8 @@ impl BoundsSourceCounters {
 
 /// Per-run dispatch path: for each [`Run`] in
 /// `job.runs`, look up the matching [`crate::Aligner`] and run
-/// `align_chunk` over the run's audio slice. Results are stitched
-/// into a single [`AlignmentResult`].
+/// `align_chunk` over the run's audio slice: one outcome per run, in
+/// run order.
 ///
 /// **Audio slicing.** The dispatcher inherits each run's bounds
 /// from the parent whisper segment (per the design spec — finer
@@ -736,7 +766,7 @@ fn dispatch_runs(
   job: &AlignWorkItem,
   resolutions: Vec<OovResolution>,
   run_options: &RunOptions,
-) -> Result<AlignmentResult, WorkFailure> {
+) -> Result<Vec<UnitOutcome>, WorkFailure> {
   let mut counters = BoundsSourceCounters::default();
   let mut outcomes: Vec<UnitOutcome> = Vec::with_capacity(job.runs.len());
   let dispatch_started_at = Instant::now();
@@ -754,7 +784,7 @@ fn dispatch_runs(
     // run propagates immediately, matching the
     // `Aligner::align` post-call abort semantics.
     if let Err(failure) = check_abort_between_runs(&job.abort_flag, dispatch_started_at) {
-      emit_telemetry(job.chunk_id, &counters);
+      emit_telemetry(job.chunk_id(), &counters);
       return Err(failure);
     }
 
@@ -796,7 +826,7 @@ fn dispatch_runs(
         decisions,
       )
     })
-    .inspect_err(|_| emit_telemetry(job.chunk_id, &counters))?;
+    .inspect_err(|_| emit_telemetry(job.chunk_id(), &counters))?;
 
     let outcome = match outcome {
       // tag every dispatched word with its run's language so
@@ -809,7 +839,7 @@ fn dispatch_runs(
       }
       UnitOutcome::Unaligned(cause) => {
         counters.observe_unaligned();
-        log_unaligned(job.chunk_id, Some(run_idx), run.language(), &cause);
+        log_unaligned(job.chunk_id(), Some(run_idx), run.language(), &cause);
         UnitOutcome::Unaligned(cause)
       }
     };
@@ -821,8 +851,8 @@ fn dispatch_runs(
     // `Transcript::words()` time order across multi-run output.
   }
 
-  emit_telemetry(job.chunk_id, &counters);
-  Ok(AlignmentResult::runs(outcomes))
+  emit_telemetry(job.chunk_id(), &counters);
+  Ok(outcomes)
 }
 
 /// Translate a run's `(audio_t0_ms, audio_t1_ms)` into chunk-local

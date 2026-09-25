@@ -340,8 +340,8 @@ impl EmissionsAligner {
   /// Returns the text's one [`UnitOutcome`]: its aligned words, or
   /// `Unaligned` with the reason it has none (`NoAlignableText` for a
   /// trivial chunk, `NoSurvivingWords` when the speech gates kept no
-  /// word). Wrap it in `AlignmentResult::whole` to hand it to a
-  /// `Transcriber`.
+  /// word). To hand it to a `Transcriber`, wrap it with the ticket its
+  /// `Command::Alignment` carried: `AlignmentResult::whole(ticket, outcome)`.
   ///
   /// Runs the stride-extent and vocab-width checks — neither
   /// of which the emissions seam has ever run — then the pinned

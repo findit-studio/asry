@@ -6,6 +6,10 @@
 //! `FullParams`; a future swap to candle-whisper or a CTranslate2
 //! binding would change only the runner.
 
+use core::{
+  num::NonZeroU64,
+  sync::atomic::{AtomicU64, Ordering},
+};
 use std::sync::Arc;
 
 use mediatime::TimeRange;
@@ -672,8 +676,57 @@ impl UnitOutcome {
   }
 }
 
+/// The capability to answer one `Command::Alignment`.
+///
+/// The transcriber mints one with each alignment command and keeps its
+/// identity with the chunk. Building the command's [`AlignmentResult`]
+/// ([`AlignmentResult::whole`], [`AlignmentResult::runs`]) consumes it,
+/// and [`Transcriber::handle_alignment`](crate::core::Transcriber::handle_alignment)
+/// accepts a result only when it carries the ticket of the chunk's
+/// outstanding command. A result built for another chunk, or for a command
+/// of another transcriber, is refused by name, whatever its unit layout.
+///
+/// Its identity is never reused within a process, it cannot be cloned or
+/// built outside asry, and a result carries it, so one command is answered
+/// by at most one result.
+///
+/// ```compile_fail
+/// fn replay(ticket: asry::AlignmentTicket) {
+///   let _twice = ticket.clone();
+/// }
+/// ```
+#[derive(Debug)]
+pub struct AlignmentTicket {
+  id: NonZeroU64,
+  chunk_id: ChunkId,
+}
+
+impl AlignmentTicket {
+  /// Mint the ticket of a new alignment command for `chunk_id`.
+  pub(crate) fn mint(chunk_id: ChunkId) -> Self {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let raw = COUNTER.fetch_add(1, Ordering::Relaxed);
+    Self {
+      // Unreachable: exhausting this needs 2^64 alignment commands.
+      id: NonZeroU64::new(raw).expect("AlignmentTicket counter overflowed u64"),
+      chunk_id,
+    }
+  }
+
+  /// The chunk whose alignment command this ticket answers.
+  #[must_use]
+  pub const fn chunk_id(&self) -> ChunkId {
+    self.chunk_id
+  }
+
+  /// This ticket's identity: what the chunk's in-flight record keeps.
+  pub(crate) const fn id(&self) -> NonZeroU64 {
+    self.id
+  }
+}
+
 /// The result of one chunk's word-level alignment: exactly one outcome
-/// for each of its alignment units.
+/// for each of its alignment units, bound to the command it answers.
 ///
 /// A chunk whose `Command::Alignment` carried no runs has one unit, its
 /// whole text ([`AlignmentResult::whole`]); one whose command carried
@@ -683,12 +736,26 @@ impl UnitOutcome {
 /// [`Transcriber::handle_alignment`](crate::core::Transcriber::handle_alignment)
 /// refuses a result whose units are not the chunk's.
 ///
+/// Each is built from the [`AlignmentTicket`] its command carried, and
+/// `handle_alignment` refuses a result carrying any other ticket before it
+/// reads an outcome, so a result cannot be delivered to another chunk,
+/// even one with the same unit layout. It cannot be cloned, and
+/// `handle_alignment` consumes it, so it is delivered once.
+///
+/// ```compile_fail
+/// fn replay(result: asry::AlignmentResult) {
+///   let _twice = result.clone();
+/// }
+/// ```
+///
 /// Each unit contributes words or names why it has none: nothing could
 /// read it, a policy refused it, it held nothing alignable, the speech
 /// gates kept none of its words, or its alignment failed recoverably. An
 /// empty word list never stands in for a reason.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct AlignmentResult {
+  /// The capability of the command this result answers.
+  ticket: AlignmentTicket,
   /// A whole-text result; `outcomes` then holds exactly one.
   whole: bool,
   outcomes: Vec<UnitOutcome>,
@@ -696,23 +763,37 @@ pub struct AlignmentResult {
 
 impl AlignmentResult {
   /// The result of aligning a chunk's whole text: its one unit's
-  /// outcome.
+  /// outcome, answering the command `ticket` came with.
   #[must_use]
-  pub fn whole(outcome: UnitOutcome) -> Self {
+  pub fn whole(ticket: AlignmentTicket, outcome: UnitOutcome) -> Self {
     Self {
+      ticket,
       whole: true,
       outcomes: vec![outcome],
     }
   }
 
-  /// The result of aligning a chunk run by run: `outcomes[i]` is the
-  /// outcome of run `i` of `Command::Alignment::runs`.
+  /// The result of aligning a chunk run by run, answering the command
+  /// `ticket` came with: `outcomes[i]` is the outcome of run `i` of
+  /// `Command::Alignment::runs`.
   #[must_use]
-  pub fn runs(outcomes: Vec<UnitOutcome>) -> Self {
+  pub fn runs(ticket: AlignmentTicket, outcomes: Vec<UnitOutcome>) -> Self {
     Self {
+      ticket,
       whole: false,
       outcomes,
     }
+  }
+
+  /// The chunk whose alignment command this result answers.
+  #[must_use]
+  pub const fn chunk_id(&self) -> ChunkId {
+    self.ticket.chunk_id()
+  }
+
+  /// The identity of the ticket this result was built with.
+  pub(crate) const fn ticket_id(&self) -> NonZeroU64 {
+    self.ticket.id()
   }
 
   /// Each alignment unit with its outcome, in unit order.
@@ -907,6 +988,10 @@ pub enum Command {
     /// the text; the alignment worker then falls back to
     /// whole-chunk alignment keyed on `language`.
     runs: Vec<crate::align::Run>,
+    /// The capability to answer this command: its [`AlignmentResult`]
+    /// is built with it, and the transcriber accepts no result built
+    /// with another.
+    ticket: AlignmentTicket,
   },
 }
 
@@ -1134,15 +1219,19 @@ mod tests {
 
     let failed =
       AlignmentError::NoAlignmentPath(AlignmentFailure::new(SmolStr::new("too short"), Lang::En));
-    let result = AlignmentResult::runs(vec![
-      UnitOutcome::from_words(vec![word("b", 20)]),
-      UnitOutcome::Unaligned(UnalignedCause::Skipped),
-      UnitOutcome::Unaligned(UnalignedCause::Refused),
-      UnitOutcome::Unaligned(UnalignedCause::NoAlignableText),
-      UnitOutcome::Unaligned(UnalignedCause::NoSurvivingWords),
-      UnitOutcome::Unaligned(UnalignedCause::Failed(failed)),
-      UnitOutcome::from_words(vec![word("a", 0)]),
-    ]);
+    let result = AlignmentResult::runs(
+      AlignmentTicket::mint(ChunkId::from_raw(3)),
+      vec![
+        UnitOutcome::from_words(vec![word("b", 20)]),
+        UnitOutcome::Unaligned(UnalignedCause::Skipped),
+        UnitOutcome::Unaligned(UnalignedCause::Refused),
+        UnitOutcome::Unaligned(UnalignedCause::NoAlignableText),
+        UnitOutcome::Unaligned(UnalignedCause::NoSurvivingWords),
+        UnitOutcome::Unaligned(UnalignedCause::Failed(failed)),
+        UnitOutcome::from_words(vec![word("a", 0)]),
+      ],
+    );
+    assert_eq!(result.chunk_id(), ChunkId::from_raw(3));
     assert_eq!(
       result.unit_list(),
       (0..7).map(AlignmentUnit::Run).collect::<Vec<_>>()
@@ -1176,10 +1265,16 @@ mod tests {
       "time order"
     );
 
-    let whole = AlignmentResult::whole(UnitOutcome::Unaligned(UnalignedCause::Refused));
+    let whole = AlignmentResult::whole(
+      AlignmentTicket::mint(ChunkId::from_raw(3)),
+      UnitOutcome::Unaligned(UnalignedCause::Refused),
+    );
     assert_eq!(whole.unit_list(), [AlignmentUnit::Whole]);
     assert!(whole.accounts_for(0) && !whole.accounts_for(1));
-    assert!(!AlignmentResult::runs(Vec::new()).accounts_for(0));
+    assert!(
+      !AlignmentResult::runs(AlignmentTicket::mint(ChunkId::from_raw(3)), Vec::new())
+        .accounts_for(0)
+    );
   }
 
   #[test]
