@@ -81,7 +81,7 @@ parity-dump-emission = ["alignment"]
 # `checked_`/`saturating_` rungs — and corrected the rounding to
 # nearest-with-ties-away-from-zero (`AV_ROUND_NEAR_INF`), which the
 # truncating docs had claimed all along.
-mediatime = "0.3"
+mediatime = "0.4"
 smol_str  = "0.3"
 thiserror = "2"
 smallvec  = "1"
