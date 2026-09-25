@@ -25,8 +25,8 @@ pub(crate) fn is_silent_mark(c: char) -> bool {
 /// A mark read aloud only in context stays silent: the `.` of `3.5`, the `,` of the German `4,9`,
 /// the `/` of `km/h`. That is sound at asry's output granularity, the word, because a normalizer
 /// never splits a word at a mark inside it: the Latin normalizers keep `km/h` and `well-known` one
-/// word each, their surfaces as written, and their one segmentation rule is the French and
-/// Italian clitic apostrophe (`l'eau`), which splits no spoken mark. So a mark inside a word is
+/// word each, their surfaces as written, and their one segmentation rule splits a recognised
+/// French or Italian clitic off the word it begins (`l'eau`), which splits no spoken mark. So a mark inside a word is
 /// spoken, when it is, inside that word's span: the "per" of `km/h` lies between the `m` and the
 /// `h`, whose tokens bound the word, and dropping the mark cannot move a word boundary. Surfacing
 /// it as an OOV event instead would make a fail-closed policy refuse words it can align, such as
