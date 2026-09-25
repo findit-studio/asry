@@ -512,6 +512,76 @@ impl Aligner {
     )
   }
 
+  /// Align one unit of an alignment request: the job's own text against the
+  /// job's own audio, answering the unit with what came of it.
+  ///
+  /// `job` is one of the command's `AlignmentRequest::take_units()`, and
+  /// `resolution` is this aligner's [`detect_oov(job.text())`](Self::detect_oov),
+  /// decided. The job carries its unit's text, audio (the chunk's, or the
+  /// run's slice of it), sub-VAD-segments and place in the stream, so the
+  /// outcome answers the unit it was computed from, and
+  /// `AlignmentRequest::aligned` accepts it for that unit only.
+  ///
+  /// A data-dependent failure (no alignment path, a character the policy
+  /// refused, an empty text) is the unit's outcome,
+  /// `Unaligned(Failed(..))`, as on the pool.
+  ///
+  /// # Errors
+  ///
+  /// Any other failure: a resolution this aligner did not detect in the
+  /// job's text ([`AlignmentError::Tokenization`](crate::types::AlignmentError::Tokenization)),
+  /// a backend or configuration fault, or an abort. The job is consumed;
+  /// answer the command with `request.failed(failure)`.
+  pub fn align_unit(
+    &mut self,
+    job: crate::core::UnitJob,
+    resolution: crate::core::OovResolution,
+    abort_flag: &core::sync::atomic::AtomicBool,
+    run_options: &RunOptions,
+  ) -> Result<crate::core::UnitOutcome, WorkFailure> {
+    // The resolution must be this aligner's detection of this very text,
+    // checked before anything is tokenized.
+    let decisions = self.core.accept(&resolution, job.text())?;
+    // A direct detection stamps this aligner's own language on its events.
+    let expected = self.core.language().clone();
+    let alignment = match self.align_job(&job, decisions, &expected, abort_flag, run_options) {
+      Ok(alignment) => alignment,
+      Err(WorkFailure::Alignment(err))
+        if crate::runner::alignment_pool::alignment_error_is_recoverable(&err) =>
+      {
+        UnitAlignment::Unaligned(UnalignedCause::Failed(err))
+      }
+      Err(failure) => return Err(failure),
+    };
+    Ok(job.answer(alignment))
+  }
+
+  /// Align `job`'s own text against its own audio, with `decisions`
+  /// resolved against `expected_decision_language`: what the unit came to,
+  /// for the caller to answer that same job with.
+  pub(crate) fn align_job(
+    &mut self,
+    job: &crate::core::UnitJob,
+    decisions: &[crate::core::ResolvedOov],
+    expected_decision_language: &Lang,
+    abort_flag: &core::sync::atomic::AtomicBool,
+    run_options: &RunOptions,
+  ) -> Result<UnitAlignment, WorkFailure> {
+    let place = job.place();
+    let bridge = job.samples_to_output_range();
+    self.align(
+      job.samples(),
+      &place.sub_segments,
+      job.text(),
+      place.first_sample_in_stream,
+      move |start, end| (bridge)(start, end),
+      abort_flag,
+      run_options,
+      decisions,
+      expected_decision_language,
+    )
+  }
+
   /// Crate-private alignment entrypoint.
   ///
   /// Inputs:

@@ -56,7 +56,7 @@
 //!     }
 //!     Command::Alignment(request) => {
 //!       // The job is built from the request alone: its payload,
-//!       // its ticket and unit slots, and the chunk's place in the
+//!       // its ticket and unit jobs, and the chunk's place in the
 //!       // stream. `AlignWorkItem::new` flips the sub-segments
 //!       // into chunk-local 1/16000 (the form `Aligner::align`
 //!       // requires) and builds the output-time bridge.

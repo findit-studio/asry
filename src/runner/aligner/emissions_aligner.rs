@@ -35,7 +35,7 @@ use core::{
 use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
-  core::{OovDetection, OovResolution, UnalignedCause, UnitAlignment},
+  core::{OovDetection, OovResolution, UnalignedCause, UnitAlignment, UnitJob, UnitOutcome},
   runner::aligner::{
     algorithm::{
       compose::DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -47,7 +47,7 @@ use crate::{
       WAV2VEC2_WORD_DELIMITER, capture_vocab_size, declared_unk_token_id, detect_blank_token_id,
       load_tokenizer_bytes_with_compat, validate_word_delimiter_present,
     },
-    emissions_api::{Emissions, OutputClock, SpeechCoverage, SpeechSpans},
+    emissions_api::{Emissions, EncoderOutput, OutputClock, SpeechCoverage, SpeechSpans},
     normalizer::DynTextNormalizer,
     normalizers::default_normalizer_for,
   },
@@ -345,10 +345,9 @@ impl EmissionsAligner {
   /// Returns the text's one [`UnitAlignment`]: its aligned words, or
   /// `Unaligned` with the reason it has none (`NoAlignableText` for a
   /// trivial chunk, `NoSurvivingWords` when the speech gates kept no
-  /// word). To hand it to a `Transcriber`, answer the unit's slot with it
-  /// (`slot.answer(alignment)`, the slot taken from the command's
-  /// `AlignmentRequest`), then complete the request with its outcomes
-  /// (`request.aligned(outcomes)`, then `Transcriber::complete`).
+  /// word). It answers no alignment command: a unit of a `Transcriber`'s
+  /// command is aligned with [`align_unit`](Self::align_unit), which
+  /// consumes the unit's job.
   ///
   /// Runs the stride-extent and vocab-width checks — neither
   /// of which the emissions seam has ever run — then the pinned
@@ -470,6 +469,80 @@ impl EmissionsAligner {
       )
       .map_err(|e| to_emissions_error(e, Stage::Finish))
   }
+}
+
+impl EmissionsAligner {
+  /// Align one unit of an alignment request end to end, answering the unit
+  /// with what came of it: [`prepare`](Self::prepare) the job's own audio
+  /// and text, run `encoder` on the prepared input (as
+  /// [`PreparedChunk::encode_with`] does), and [`finish`](Self::finish).
+  ///
+  /// `job` is one of the command's `AlignmentRequest::take_units()`, and
+  /// `resolution` is this aligner's
+  /// [`detect_oov(job.text())`](Self::detect_oov), decided. The job carries
+  /// its unit's text, audio (the chunk's, or the run's slice of it),
+  /// sub-VAD-segments and place in the stream (the output clock), so the
+  /// outcome answers the unit it was computed from, and
+  /// `AlignmentRequest::aligned` accepts it for that unit only. A trivial
+  /// unit's encoder is not called.
+  ///
+  /// A data-dependent failure (no alignment path, a character the policy
+  /// refused) is the unit's outcome, `Unaligned(Failed(..))`, as on the
+  /// pool.
+  ///
+  /// # Errors
+  ///
+  /// What `encoder` returns, and every other [`EmissionsError`] of
+  /// `prepare`, `encode_with` and `finish`, converted into `E`. The job is
+  /// consumed; answer the command with `request.failed(failure)`.
+  pub fn align_unit<E: From<EmissionsError>>(
+    &self,
+    job: UnitJob,
+    resolution: OovResolution,
+    encoder: impl FnOnce(&[f32]) -> Result<EncoderOutput, E>,
+    abort_flag: &AtomicBool,
+  ) -> Result<UnitOutcome, E> {
+    let place = job.place();
+    let invalid = |error: crate::runner::aligner::emissions_api::SpanError| {
+      EmissionsError::Config(EmissionsFailure::new(format_smolstr!(
+        "the unit's place in the stream is invalid: {error}"
+      )))
+    };
+    let speech = SpeechSpans::from_time_ranges(&place.sub_segments).map_err(invalid)?;
+    let clock = OutputClock::new(
+      place.first_sample_in_stream,
+      place.output_tb,
+      place.base_pts_out_anchor,
+    )
+    .map_err(invalid)?;
+    let prepared = match self.prepare(job.samples(), &speech, job.text(), resolution, abort_flag) {
+      Ok(prepared) => prepared,
+      Err(error) => return unit_failure(job, error),
+    };
+    let emissions = prepared.encode_with(encoder)?;
+    match self.finish(prepared, emissions, clock, abort_flag) {
+      Ok(alignment) => Ok(job.answer(alignment)),
+      Err(error) => unit_failure(job, error),
+    }
+  }
+}
+
+/// `error` for the unit `job`: its outcome when it is data-dependent (no
+/// alignment path, a character the policy refused), as on the pool, else
+/// the error.
+fn unit_failure<E: From<EmissionsError>>(
+  job: UnitJob,
+  error: EmissionsError,
+) -> Result<UnitOutcome, E> {
+  let language = job.language().clone();
+  let failure =
+    |f: &EmissionsFailure| crate::types::AlignmentFailure::new(f.message().clone(), language);
+  let cause = match &error {
+    EmissionsError::NoAlignmentPath(f) => AlignmentError::NoAlignmentPath(failure(f)),
+    EmissionsError::SemanticOutOfVocab(f) => AlignmentError::SemanticOutOfVocab(failure(f)),
+    _ => return Err(error.into()),
+  };
+  Ok(job.answer(UnitAlignment::Unaligned(UnalignedCause::Failed(cause))))
 }
 
 /// Pull the diagnostic out of a `WorkFailure` the validators produced.

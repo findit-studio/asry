@@ -126,7 +126,7 @@ impl ForeignAlignment {
 #[error(
   "alignment outcomes for chunk {chunk_id} answer units {received:?} ({foreign} of them another \
    request's), but the request's units are {expected:?}; each unit is answered once, in order, by \
-   the outcome made from its own slot"
+   the outcome made by consuming its own job"
 )]
 pub struct UnaccountedAlignment {
   chunk_id: ChunkId,

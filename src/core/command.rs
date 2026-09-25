@@ -746,63 +746,126 @@ impl AlignmentTicket {
   }
 }
 
-/// The capability to answer one alignment unit of one [`AlignmentRequest`].
+/// One alignment unit of one [`AlignmentRequest`], with that unit's own
+/// text, language and audio: the one capability to answer the unit.
 ///
-/// The transcriber mints one per unit with the request (the whole text, or
-/// each run, in order), tagged with the request's ticket and the unit. An
-/// outcome is made only by consuming a slot ([`aligned`](Self::aligned),
-/// [`unaligned`](Self::unaligned), [`answer`](Self::answer)), and a slot
-/// cannot be cloned or built outside asry, so each unit is answered at most
-/// once, and only by an outcome that names it.
+/// [`AlignmentRequest::take_units`] hands out one per unit (the whole text,
+/// or each run, in order), tagged with the request's ticket and the unit.
+/// The unit's outcome is made only by an aligner that consumes the job and
+/// aligns the job's own text against the job's own audio
+/// (`Aligner::align_unit`, `EmissionsAligner::align_unit`), or by
+/// [`skip`](Self::skip) when the driver aligns none of it. No public
+/// operation joins an alignment made elsewhere to a unit, and a job cannot
+/// be cloned or built outside asry, so each unit is answered at most once,
+/// by what was computed from it.
 ///
 /// ```compile_fail
-/// fn replay(slot: asry::UnitSlot) {
-///   let _twice = slot.clone();
+/// fn replay(job: asry::UnitJob) {
+///   let _twice = job.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn relabel(job: asry::UnitJob, alignment: asry::UnitAlignment) -> asry::UnitOutcome {
+///   job.answer(alignment)
 /// }
 /// ```
 #[derive(Debug)]
-#[must_use = "a unit is answered only by an outcome made from its slot"]
-pub struct UnitSlot {
+#[must_use = "a unit is answered only by an aligner consuming its job, or by skipping it"]
+pub struct UnitJob {
   ticket: NonZeroU64,
   unit: AlignmentUnit,
+  text: SmolStr,
+  language: Lang,
+  samples: Arc<[f32]>,
+  /// The unit's audio: this range of `samples`, chunk-local.
+  window: core::ops::Range<usize>,
+  #[cfg(any(feature = "alignment", feature = "emissions"))]
+  place: UnitPlace,
 }
 
-impl UnitSlot {
-  /// The unit this slot answers.
+/// Where a unit's audio sits in the stream and how its samples map to
+/// output time: what an aligner reads besides the unit's text and audio.
+#[cfg(any(feature = "alignment", feature = "emissions"))]
+#[derive(Debug)]
+pub(crate) struct UnitPlace {
+  /// The unit's first 16 kHz sample, in stream coordinates.
+  pub(crate) first_sample_in_stream: u64,
+  /// The chunk's sub-VAD-segments over the unit's audio, unit-local, in
+  /// the 1/16000 timebase.
+  pub(crate) sub_segments: Vec<TimeRange>,
+  /// The output timebase captured at extract time.
+  pub(crate) output_tb: mediatime::Timebase,
+  /// The PTS anchor at stream zero captured at extract time.
+  pub(crate) base_pts_out_anchor: i64,
+}
+
+impl UnitJob {
+  /// The unit this job answers.
   #[must_use]
   pub const fn unit(&self) -> AlignmentUnit {
     self.unit
   }
 
-  /// The unit aligned `words`.
+  /// The unit's text: the request's whole text, or the run's.
   #[must_use]
-  pub fn aligned(self, words: AlignedWords) -> UnitOutcome {
-    self.answer(UnitAlignment::Aligned(words))
+  pub fn text(&self) -> &str {
+    &self.text
   }
 
-  /// The unit contributed no words, for `cause`.
+  /// The unit's language: the request's, or the run's.
   #[must_use]
-  pub fn unaligned(self, cause: UnalignedCause) -> UnitOutcome {
-    self.answer(UnitAlignment::Unaligned(cause))
+  pub const fn language(&self) -> &Lang {
+    &self.language
   }
 
-  /// The unit came to `alignment`: what an aligner made of it
-  /// (`Aligner::align_chunk`, `EmissionsAligner::finish`).
+  /// The unit's audio (16 kHz f32 mono): the chunk's whole audio for the
+  /// whole text, the run's slice of it for a run.
   #[must_use]
-  pub fn answer(self, alignment: UnitAlignment) -> UnitOutcome {
+  pub fn samples(&self) -> &[f32] {
+    &self.samples[self.window.clone()]
+  }
+
+  /// Answer the unit as skipped: the driver aligns none of it (no aligner
+  /// of its reads the unit's language). Its outcome is
+  /// `Unaligned(Skipped)`.
+  pub fn skip(self) -> UnitOutcome {
+    self.answer(UnitAlignment::Unaligned(UnalignedCause::Skipped))
+  }
+
+  /// Answer the unit with `alignment`, which the caller computed from this
+  /// very job.
+  pub(crate) fn answer(self, alignment: UnitAlignment) -> UnitOutcome {
     UnitOutcome {
       ticket: self.ticket,
       unit: self.unit,
       alignment,
     }
   }
+
+  /// Where the unit's audio sits in the stream.
+  #[cfg(any(feature = "alignment", feature = "emissions"))]
+  pub(crate) const fn place(&self) -> &UnitPlace {
+    &self.place
+  }
+
+  /// The bridge from stream sample indices to the unit's output-timebase
+  /// `TimeRange`s, in the epoch its chunk was extracted in.
+  #[cfg(feature = "alignment")]
+  pub(crate) fn samples_to_output_range(&self) -> Arc<dyn Fn(u64, u64) -> TimeRange + Send + Sync> {
+    crate::core::buffer::SampleBuffer::samples_to_output_range_fn_at(
+      self.place.output_tb,
+      self.place.base_pts_out_anchor,
+    )
+  }
 }
 
-/// What one alignment unit came to, made from that unit's [`UnitSlot`]:
-/// its [`UnitAlignment`], tagged with the request and the unit it answers.
+/// What one alignment unit came to, made by consuming that unit's
+/// [`UnitJob`]: its [`UnitAlignment`], tagged with the request and the unit
+/// it answers.
 ///
 /// It cannot be cloned or built any other way, so an outcome answers one
-/// unit of one request, once. [`AlignmentRequest::aligned`] accepts only its
+/// unit of one request, once, with what was computed from that unit. [`AlignmentRequest::aligned`] accepts only its
 /// own units' outcomes, each once, in order.
 ///
 /// ```compile_fail
@@ -833,8 +896,8 @@ impl UnitOutcome {
 
 /// Where a chunk sits in the stream and how its samples map to output
 /// time, as the transcriber recorded them when it extracted the chunk: what
-/// a pool work item needs besides the command's payload.
-#[cfg(feature = "alignment")]
+/// a unit's aligner needs besides the command's payload.
+#[cfg(any(feature = "alignment", feature = "emissions"))]
 #[derive(Debug)]
 pub(crate) struct ChunkContext {
   /// The chunk's first 16 kHz sample, in stream coordinates.
@@ -855,9 +918,10 @@ pub(crate) struct ChunkContext {
 /// [`Command::Alignment`] by value is the only way to hold one. It owns the
 /// payload (the chunk's audio, sub-VAD-segments, text, language and script
 /// runs), the chunk's identity, the ticket the transcriber keeps for the
-/// chunk, the identity of the transcriber that issued it, and one
-/// [`UnitSlot`] per alignment unit: the whole text when it carries no runs,
-/// else each run, in order.
+/// chunk, the identity of the transcriber that issued it, and the chunk's
+/// place in the stream. It hands out one [`UnitJob`] per alignment unit
+/// ([`take_units`](Self::take_units)): the whole text when it carries no
+/// runs, else each run, in order.
 ///
 /// It answers once, by value: [`aligned`](Self::aligned) with each unit's
 /// outcome, or [`failed`](Self::failed). Either builds the
@@ -881,15 +945,14 @@ pub struct AlignmentRequest {
   text: SmolStr,
   language: Lang,
   runs: Vec<crate::align::Run>,
-  /// The unit slots not yet taken.
-  slots: Vec<UnitSlot>,
-  #[cfg(feature = "alignment")]
+  /// Whether the unit jobs were handed out.
+  units_taken: bool,
+  #[cfg(any(feature = "alignment", feature = "emissions"))]
   context: ChunkContext,
 }
 
 impl AlignmentRequest {
-  /// The request of the command `ticket` was minted for, with one slot per
-  /// unit.
+  /// The request of the command `ticket` was minted for.
   pub(crate) fn new(
     ticket: AlignmentTicket,
     samples: Arc<[f32]>,
@@ -897,15 +960,8 @@ impl AlignmentRequest {
     text: SmolStr,
     language: Lang,
     runs: Vec<crate::align::Run>,
-    #[cfg(feature = "alignment")] context: ChunkContext,
+    #[cfg(any(feature = "alignment", feature = "emissions"))] context: ChunkContext,
   ) -> Self {
-    let slots = alignment_units(runs.len())
-      .into_iter()
-      .map(|unit| UnitSlot {
-        ticket: ticket.id(),
-        unit,
-      })
-      .collect();
     Self {
       ticket,
       samples,
@@ -913,8 +969,8 @@ impl AlignmentRequest {
       text,
       language,
       runs,
-      slots,
-      #[cfg(feature = "alignment")]
+      units_taken: false,
+      #[cfg(any(feature = "alignment", feature = "emissions"))]
       context,
     }
   }
@@ -967,21 +1023,76 @@ impl AlignmentRequest {
     alignment_units(self.runs.len())
   }
 
-  /// Take the unit slots, one per unit, in unit order: the only way to
-  /// make the outcomes [`aligned`](Self::aligned) accepts. They are taken
-  /// once; a second call returns none.
-  pub fn take_slots(&mut self) -> Vec<UnitSlot> {
-    core::mem::take(&mut self.slots)
+  /// Take the unit jobs, one per unit, in unit order, each with its unit's
+  /// own text, language and audio: the only way to make the outcomes
+  /// [`aligned`](Self::aligned) accepts. They are taken once; a second call
+  /// returns none.
+  pub fn take_units(&mut self) -> Vec<UnitJob> {
+    if core::mem::replace(&mut self.units_taken, true) {
+      return Vec::new();
+    }
+    alignment_units(self.runs.len())
+      .into_iter()
+      .map(|unit| self.unit_job(unit))
+      .collect()
+  }
+
+  /// The job of `unit`: the whole text over the chunk's whole audio, or a
+  /// run's text over the run's slice of it.
+  fn unit_job(&self, unit: AlignmentUnit) -> UnitJob {
+    let (text, language, window) = match unit {
+      AlignmentUnit::Whole => (
+        self.text.clone(),
+        self.language.clone(),
+        0..self.samples.len(),
+      ),
+      AlignmentUnit::Run(index) => {
+        let run = &self.runs[index];
+        let (lo, hi) = run_audio_slice(run, self.samples.len(), 0);
+        (SmolStr::new(run.text()), run.language().clone(), lo..hi)
+      }
+    };
+    #[cfg(any(feature = "alignment", feature = "emissions"))]
+    let place = {
+      let chunk_local = self.chunk_local_sub_segments();
+      let sub_segments = match unit {
+        AlignmentUnit::Whole => chunk_local,
+        // Chunk-local sub-segments are in 1/16000 by construction, so the
+        // clip cannot refuse their timebase.
+        AlignmentUnit::Run(_) => {
+          clip_sub_segments(&chunk_local, window.start, window.end, &language).unwrap_or_default()
+        }
+      };
+      UnitPlace {
+        first_sample_in_stream: self
+          .context
+          .first_sample
+          .saturating_add(window.start as u64),
+        sub_segments,
+        output_tb: self.context.output_tb,
+        base_pts_out_anchor: self.context.base_pts_out_anchor,
+      }
+    };
+    UnitJob {
+      ticket: self.ticket.id(),
+      unit,
+      text,
+      language,
+      samples: self.samples.clone(),
+      window,
+      #[cfg(any(feature = "alignment", feature = "emissions"))]
+      place,
+    }
   }
 
   /// Answer the command with each unit's outcome: exactly one per unit,
-  /// each made from this request's own slot for it, in unit order.
+  /// each made by consuming this request's own job for it, in unit order.
   ///
   /// # Errors
   ///
   /// [`UnaccountedOutcomes`], naming the units expected and received, when
   /// an outcome is missing, repeated, out of order, or made from another
-  /// request's slot. It hands the request and the outcomes back, so the
+  /// request's job. It hands the request and the outcomes back, so the
   /// command can still be answered.
   pub fn aligned(
     self,
@@ -1037,7 +1148,7 @@ impl AlignmentRequest {
 
   /// The chunk's sub-VAD-segments in chunk-local 16 kHz sample indices,
   /// as `TimeRange`s in the 1/16000 timebase: the form the aligner reads.
-  #[cfg(feature = "alignment")]
+  #[cfg(any(feature = "alignment", feature = "emissions"))]
   pub(crate) fn chunk_local_sub_segments(&self) -> Vec<TimeRange> {
     let first = self.context.first_sample as i64;
     let tb_16k =
@@ -1078,7 +1189,7 @@ impl AlignmentRequest {
       text,
       language,
       runs,
-      #[cfg(feature = "alignment")]
+      #[cfg(any(feature = "alignment", feature = "emissions"))]
       ChunkContext {
         first_sample: 0,
         sub_segments_samples: Vec::new(),
@@ -1090,6 +1201,136 @@ impl AlignmentRequest {
       },
     )
   }
+}
+
+/// Translate a run's `(audio_t0_ms, audio_t1_ms)` into chunk-local
+/// sample indices. The whole-clip sentinel
+/// ([`crate::align::BoundsSource::Wholeclip`]) maps to the full
+/// chunk (`0..samples_len`). Out-of-range or inverted bounds
+/// degrade to the full chunk as well — the dispatcher should never
+/// emit those, but we tolerate them defensively rather than panic
+/// inside the alignment worker.
+///
+/// **Coordinate contract.** `Run::audio_t0_ms`
+/// / `audio_t1_ms` MUST be **chunk-local** (origin at the
+/// start of the chunk's audio, not stream-absolute), in
+/// milliseconds, at the chunk's 16 kHz mono sample rate.
+/// `chunk_first_sample_in_stream` is the chunk's anchor in
+/// stream coordinates and is **NOT** used to translate run
+/// bounds — it would be in samples-of-stream while
+/// `audio_t0_ms` is ms-of-chunk; mixing the two would
+/// silently double-shift output timing.
+///
+/// a pluggable
+/// `AsrSource` that erroneously populates
+/// [`crate::types::AsrResult::runs`] with stream-absolute
+/// times will fail this contract; `(t0_ms * 16) >=
+/// samples_len` is the visible symptom (bounds saturate to
+/// `samples_len`, the run aligns against zero audio, output
+/// silently drops words). Surface that case as a stderr
+/// warning so operators see the contract violation instead
+/// of silent zero-word per-run alignment.
+pub(crate) fn run_audio_slice(
+  run: &crate::align::Run,
+  samples_len: usize,
+  _chunk_first_sample_in_stream: u64,
+) -> (usize, usize) {
+  use crate::align::BoundsSource;
+  if matches!(run.bounds_source(), BoundsSource::Wholeclip) {
+    return (0, samples_len);
+  }
+  let t0 = run.audio_t0_ms();
+  let t1 = run.audio_t1_ms();
+  // previously any degenerate
+  // non-Wholeclip bounds (`t0 < 0`, `t1 <= t0`) re-expanded to
+  // `(0, samples_len)`, conflating "explicit Wholeclip" with
+  // "interpolation collapsed to a zero-width span" and aligning
+  // tiny code-switch runs against the entire chunk. Now we
+  // surface degenerate inputs as an empty slice `(0, 0)` so the
+  // aligner gracefully produces no words for the run instead of
+  // duplicating unrelated audio. The dispatcher's
+  // `compute_run_bounds` widens collapsed interpolation by 1cs
+  // (10ms) so this branch is only hit for genuinely
+  // pathological inputs (negative t0, NaN-shaped saturation).
+  if t0 < 0 || t1 <= t0 {
+    return (0, 0);
+  }
+  // 16 kHz sample rate: 1 ms = 16 samples.
+  let lo_u64 = (t0 as u64).saturating_mul(16);
+  let hi_u64 = (t1 as u64).saturating_mul(16);
+  // contract violation:
+  // an out-of-window non-Wholeclip run is the visible symptom
+  // of stream-absolute coordinates leaking into the
+  // chunk-local API. Fail loud (stderr) so operators see the
+  // bug rather than silent empty alignment. We still return
+  // an empty slice so the worker doesn't crash; the per-run
+  // dispatch logger then counts it as unaligned.
+  if lo_u64 >= samples_len as u64 {
+    eprintln!(
+      "asry alignment Run bounds appear out-of-chunk: \
+ audio_t0_ms={t0} audio_t1_ms={t1} chunk_samples_len={samples_len}; \
+ check your AsrSource — Run::audio_t*_ms must be chunk-local ms, not stream-absolute"
+    );
+    return (samples_len, samples_len);
+  }
+  let lo = lo_u64.min(samples_len as u64) as usize;
+  let hi = hi_u64.min(samples_len as u64) as usize;
+  if hi <= lo {
+    // Same defence as above: collapsed slice → empty, not
+    // whole-chunk fallback.
+    return (lo, lo);
+  }
+  (lo, hi)
+}
+
+/// Clip and offset chunk-local sub-segments into a run's
+/// audio window. Inputs **must** be in chunk-local 1/16000
+/// timebase (start/end PTS == sample indices); outputs are in
+/// the run's local 1/16000 timebase (start/end PTS == sample
+/// indices relative to `slice_lo`).
+///
+/// this silently
+/// re-labelled inputs of any timebase as 1/16000 — an
+/// integration that accidentally passed output-timebase
+/// `sub_segments` from `Alignment` would have its
+/// caller-timebase PTS values reinterpreted as sample indices,
+/// silently zero-masking the wrong audio. Now we hard-error
+/// on any non-1/16000 timebase before clipping.
+#[cfg(any(feature = "alignment", feature = "emissions"))]
+pub(crate) fn clip_sub_segments(
+  subs: &[TimeRange],
+  slice_lo: usize,
+  slice_hi: usize,
+  language: &Lang,
+) -> Result<Vec<TimeRange>, WorkFailure> {
+  use core::num::NonZeroI32;
+  let tb = mediatime::Timebase::new(1, NonZeroI32::new(16_000).unwrap());
+  let mut out = Vec::with_capacity(subs.len());
+  let lo_i = slice_lo as i64;
+  let hi_i = slice_hi as i64;
+  for sub in subs {
+    let actual_tb = sub.timebase();
+    if actual_tb.num() != 1 || actual_tb.den().get() != 16_000 {
+      return Err(WorkFailure::Alignment(
+        crate::types::AlignmentError::ModelInference(crate::types::AlignmentFailure::new(
+          smol_str::format_smolstr!(
+            "sub_segments must be in 1/16000 (chunk-local sample-index) timebase; got \
+ {}/{}. Convert via `Transcriber::chunk_first_sample` + a 1/16000 timebase \
+ before passing to the aligner.",
+            actual_tb.num(),
+            actual_tb.den().get(),
+          ),
+          language.clone(),
+        )),
+      ));
+    }
+    let s = sub.start_pts().max(lo_i);
+    let e = sub.end_pts().min(hi_i);
+    if e > s {
+      out.push(TimeRange::new(s - lo_i, e - lo_i, tb));
+    }
+  }
+  Ok(out)
 }
 
 /// Outcomes [`AlignmentRequest::aligned`] refused: they are not exactly the
@@ -1762,20 +2003,24 @@ mod tests {
     );
   }
 
-  /// **A request's slots are its units, and its completion carries its
-  /// answer.** A request carrying no runs has one slot, for its whole text;
-  /// one carrying runs has one per run, in order. Its own outcomes, in
-  /// order, build the completion, whose report is the whole text's one
-  /// outcome or each run's; a failure builds a completion carrying it.
+  /// **A request hands out one job per unit, with the unit's own text and
+  /// audio, and its completion carries its answer.** A request carrying no
+  /// runs has one job, for its whole text over the chunk's whole audio; one
+  /// carrying runs has one per run, in order, each with the run's own text,
+  /// language and slice of the audio. Its own outcomes, in order, build the
+  /// completion, whose report is the whole text's one outcome or each
+  /// run's; a failure builds a completion carrying it.
   #[test]
-  fn a_request_mints_one_slot_per_unit_and_answers_once() {
+  fn a_request_hands_out_one_job_per_unit_and_answers_once() {
     let transcriber = NonZeroU64::new(1).expect("1 != 0");
-    let run = |text: &str| {
+    // 100 ms of audio, each sample its own index; the runs split it in two.
+    let audio: Arc<[f32]> = (0..1_600).map(|i| i as f32).collect();
+    let run = |language: Lang, text: &str, t0_ms: i64, t1_ms: i64| {
       crate::align::Run::new(
-        Lang::En,
+        language,
         SmolStr::new(text),
-        0,
-        1_000,
+        t0_ms,
+        t1_ms,
         0,
         crate::align::BoundsSource::Segment,
       )
@@ -1784,28 +2029,52 @@ mod tests {
       AlignmentRequest::for_test(
         ChunkId::from_raw(3),
         transcriber,
-        Arc::from(vec![0.0_f32; 16]),
-        SmolStr::new("hello world"),
+        audio.clone(),
+        SmolStr::new("hello 세계"),
         Lang::En,
         runs,
       )
     };
 
-    for (runs, units) in [
-      (Vec::new(), vec![AlignmentUnit::Whole]),
+    for (runs, units, texts, languages, windows) in [
       (
-        vec![run("hello"), run(" world")],
+        Vec::new(),
+        vec![AlignmentUnit::Whole],
+        vec!["hello 세계"],
+        vec![Lang::En],
+        vec![(0, 1_600)],
+      ),
+      (
+        vec![
+          run(Lang::En, "hello", 0, 50),
+          run(Lang::Ko, " 세계", 50, 100),
+        ],
         vec![AlignmentUnit::Run(0), AlignmentUnit::Run(1)],
+        vec!["hello", " 세계"],
+        vec![Lang::En, Lang::Ko],
+        vec![(0, 800), (800, 1_600)],
       ),
     ] {
       let mut request = request(runs);
       assert_eq!(request.chunk_id(), ChunkId::from_raw(3));
       assert_eq!(request.units(), units);
-      let slots = request.take_slots();
-      assert_eq!(slots.iter().map(UnitSlot::unit).collect::<Vec<_>>(), units);
-      let outcomes: Vec<UnitOutcome> = slots
+      let jobs = request.take_units();
+      assert!(request.take_units().is_empty(), "the jobs are taken once");
+      assert_eq!(jobs.iter().map(UnitJob::unit).collect::<Vec<_>>(), units);
+      assert_eq!(jobs.iter().map(UnitJob::text).collect::<Vec<_>>(), texts);
+      assert_eq!(
+        jobs
+          .iter()
+          .map(|job| job.language().clone())
+          .collect::<Vec<_>>(),
+        languages
+      );
+      for (job, (lo, hi)) in jobs.iter().zip(windows) {
+        assert_eq!(job.samples(), &audio[lo..hi], "{:?}", job.unit());
+      }
+      let outcomes: Vec<UnitOutcome> = jobs
         .into_iter()
-        .map(|slot| slot.unaligned(UnalignedCause::NoSurvivingWords))
+        .map(|job| job.answer(UnitAlignment::Unaligned(UnalignedCause::NoSurvivingWords)))
         .collect();
       assert_eq!(
         outcomes.iter().map(UnitOutcome::unit).collect::<Vec<_>>(),

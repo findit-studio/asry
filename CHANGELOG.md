@@ -129,10 +129,16 @@ BREAKING
     `run_one_alignment` returns an `AlignmentCompletion` (it returned
     `Result<AlignmentResult, WorkFailure>`): hand it to
     `transcriber.complete(completion)` whether the job succeeded or failed.
-  - A driver with its own aligner: take the slots
-    (`request.take_slots()`), answer each with what the aligner made of its
-    unit (`slot.answer(alignment)`), then `request.aligned(outcomes)` and
-    `transcriber.complete(..)`; for a failure that is not one unit's own,
+  - A driver with its own aligner: take the unit jobs
+    (`request.take_units()`), each with its unit's own text, language and
+    audio, and have the aligner consume each one:
+    `aligner.align_unit(job, resolution, &abort, &run_options)` (ORT) or
+    `emissions_aligner.align_unit(job, resolution, |input| model(input),
+    &abort)` (your encoder), with `resolution` that aligner's
+    `detect_oov(job.text())`, decided. Each returns the unit's
+    `UnitOutcome`; then `request.aligned(outcomes)` and
+    `transcriber.complete(..)`. A unit the driver does not align is
+    `job.skip()`. For a failure that is not one unit's own,
     `request.failed(failure)` and `complete`.
   - `Transcriber::handle_alignment` is gone: use `complete`, which returns
     `Result<(), RefusedCompletion>`. `handle_failure` takes ASR failures
@@ -156,6 +162,38 @@ BREAKING
     `AlignmentError` and `AlignmentFailure` serialize too.
   - `TranscriberError` has the new variants `ForeignAlignment` and
     `AwaitsCompletion`; an exhaustive `match` needs an arm for each.
+- **A unit's outcome is made by the aligner that consumes its job, from the
+  job's own text and audio.** A driver with its own aligner took a unit
+  slot and answered it with any `UnitAlignment` (`UnitSlot::answer`,
+  `aligned(words)`, `unaligned(cause)`), a public, cloneable value with no
+  record of the text or audio it was computed from: two runs' alignments
+  could be swapped, one cloned into several units, or chunk A's attached
+  to chunk B's unit, and the request accepted them because each outcome
+  named the right unit. Now the request hands out a `UnitJob` per unit
+  (`AlignmentRequest::take_units`), which carries the unit's text,
+  language and audio (the chunk's, or the run's slice of it, with its
+  sub-VAD-segments and place in the stream). The unit's outcome is made
+  only by an aligner consuming the job: `Aligner::align_unit` or
+  `EmissionsAligner::align_unit` (which runs your encoder on the unit's
+  prepared input, as `encode_with` does), or by `UnitJob::skip`. A
+  data-dependent failure (no alignment path, a character the policy
+  refused) is the unit's `Unaligned(Failed(..))` outcome, as on the pool.
+  No public operation joins a `UnitAlignment` to a unit any more; the pool
+  consumes the same jobs through the same aligner call.
+
+  Migration:
+  - `request.take_slots()` becomes `request.take_units()`, and
+    `slot.answer(aligner.align_chunk_with_abort(..)?)` becomes
+    `aligner.align_unit(job, resolution, &abort, &run_options)?`, and
+    `slot.answer(emissions_aligner.finish(..)?)` becomes
+    `emissions_aligner.align_unit(job, resolution, |input| model(input),
+    &abort)?`: the job supplies the samples, sub-segments, text and output
+    clock.
+  - `slot.unaligned(UnalignedCause::Skipped)` becomes `job.skip()`.
+  - Removed: `UnitSlot` and its `answer`, `aligned` and `unaligned`.
+    `Aligner::align_chunk*` and `EmissionsAligner::finish` still return a
+    `UnitAlignment` for a caller without a `Transcriber`; it answers no
+    command.
 - **No error path destroys the completion that answers an alignment
   command.** A pool job whose OOV detection failed (a normalisation error)
   held the only request its command could be answered with and offered no

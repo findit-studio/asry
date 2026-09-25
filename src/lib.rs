@@ -54,7 +54,7 @@ pub use core::{
   AlignedWords, AlignmentCompletion, AlignmentReport, AlignmentRequest, AlignmentUnit, AsrParams,
   AsrParamsOverride, AsrResult, Command, Event, LanguagePolicy, RefusedCompletion,
   SamplingStrategy, Transcriber, TranscriberOptions, UnaccountedOutcomes, UnalignedCause,
-  UnitAlignment, UnitOutcome, UnitSlot,
+  UnitAlignment, UnitJob, UnitOutcome,
 };
 
 // Reachable under `runner` (whisper.cpp ASR) OR `emissions` (the
@@ -135,6 +135,7 @@ pub use ort;
 /// | supply a non-total sample→time closure (which panicked in your own code) | [`OutputClock`](emissions::OutputClock) is data; asry owns the saturation |
 /// | supply `V = 0`, a `T` that OOMs, or a non-log-probability | a chunk's [`Emissions`](emissions::Emissions) are made through its [`PreparedChunk`](emissions::PreparedChunk)'s `encode_with`, the one door, and it checks all three |
 /// | stamp another chunk's encoder output as this chunk's emissions | `encode_with` hands your encoder this chunk's prepared input and builds the emissions from what it returns; no emissions are made from a free tensor |
+/// | answer a unit of a `Transcriber`'s command with an alignment computed for another unit | a unit is answered only by [`EmissionsAligner::align_unit`](emissions::EmissionsAligner::align_unit) consuming its [`UnitJob`], from the job's own text and audio |
 /// | finish a chunk with another chunk's emissions of the same shape | emissions carry the identity of the preparation they were made through, and `finish` refuses any other by name |
 /// | disagree with asry about the sample count, frame count, or stride | asry derives all three from slices that physically exist |
 /// | run a CTC head whose width disagrees with the tokenizer | `finish` validates it — the check this seam has NEVER run |

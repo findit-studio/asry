@@ -801,6 +801,132 @@ fn the_encoder_runs_on_its_own_chunk_input() {
   ));
 }
 
+/// A transcriber holding one second of audio whose chunk awaits alignment
+/// of `text`, and the command's request.
+fn transcriber_awaiting_alignment(
+  text: &str,
+  runs: Vec<crate::align::Run>,
+) -> (crate::core::Transcriber, crate::core::AlignmentRequest) {
+  use crate::{
+    core::{AsrResult, Command, Transcriber, TranscriberOptions},
+    types::VadSegment,
+  };
+
+  let mut t = Transcriber::new(TranscriberOptions::default().with_word_alignment(true));
+  let tb = Timebase::new(1, NonZeroI32::new(16_000).expect("16000 != 0"));
+  let audio: Vec<f32> = (0..16_000).map(|i| (i as f32 * 0.01).sin() * 0.2).collect();
+  t.handle_samples(mediatime::Timestamp::new(0, tb), &audio)
+    .expect("samples");
+  t.handle_vad_segment(VadSegment::new(0, 16_000))
+    .expect("a VAD segment over the audio");
+  t.handle_eof().expect("eof");
+  let Some(Command::Asr { chunk_id, .. }) = t.poll_command() else {
+    panic!("the chunk asks for ASR");
+  };
+  t.handle_asr(
+    chunk_id,
+    AsrResult::new(smol_str::SmolStr::new(text), Lang::En, -0.5, 0.05, 0.0).with_runs(runs),
+  )
+  .expect("a non-empty ASR result under word alignment");
+  let Some(Command::Alignment(request)) = t.poll_command() else {
+    panic!("the chunk asks for alignment");
+  };
+  (t, request)
+}
+
+/// **A unit is answered by an aligner consuming its job, from the job's own
+/// text and audio.** A transcriber's alignment command hands out its units
+/// as jobs. `align_unit` consumes one: it runs the encoder on the unit's own
+/// prepared audio and answers that unit with what came of it, and the
+/// request takes the outcome for that unit, so the chunk's transcript
+/// carries the words. Run by run, each run's job carries the run's text,
+/// and its outcome answers that run. A unit the policy refuses is its
+/// outcome, not a failure.
+#[test]
+fn a_unit_is_answered_by_an_aligner_consuming_its_job() {
+  use crate::core::{AlignmentUnit, Event};
+
+  let a = aligner();
+  let encoder = |input: &[f32]| {
+    let t = input.len() / 320;
+    let mut raw = vec![0.0_f32; t * VOCAB_SIZE];
+    for frame in 0..t {
+      raw[frame * VOCAB_SIZE] = 1.0;
+      raw[frame * VOCAB_SIZE + 5 + (frame % (VOCAB_SIZE - 5))] = 2.0;
+    }
+    Ok::<_, EmissionsError>(EncoderOutput::Logits {
+      frames: t,
+      vocab: a.vocab_size(),
+      data: raw,
+    })
+  };
+
+  let (mut t, mut request) = transcriber_awaiting_alignment("hello", Vec::new());
+  let job = request.take_units().pop().expect("the whole text's job");
+  assert_eq!((job.unit(), job.text()), (AlignmentUnit::Whole, "hello"));
+  assert_eq!(job.samples(), &request.samples()[..]);
+  let resolution = a
+    .detect_oov(job.text())
+    .expect("detect")
+    .decide(default_oov_policy);
+  let outcome = a
+    .align_unit(job, resolution, encoder, &AtomicBool::new(false))
+    .expect("aligned");
+  assert_eq!(outcome.unit(), AlignmentUnit::Whole);
+  assert!(matches!(outcome.alignment(), UnitAlignment::Aligned(_)));
+  t.complete(request.aligned(vec![outcome]).expect("its own unit"))
+    .expect("its own command");
+  match t.poll_event() {
+    Some(Event::Transcript(transcript)) => assert!(transcript.words().count() > 0),
+    other => panic!("expected the transcript; got {other:?}"),
+  }
+
+  // Run by run: each job is its run's, and a refusal is the run's outcome.
+  let run = |text: &str, t0_ms: i64, t1_ms: i64| {
+    crate::align::Run::new(
+      Lang::En,
+      smol_str::SmolStr::new(text),
+      t0_ms,
+      t1_ms,
+      0,
+      crate::align::BoundsSource::Segment,
+    )
+  };
+  let (mut t, mut request) = transcriber_awaiting_alignment(
+    "hello w9rld",
+    vec![run("hello", 0, 500), run(" w9rld", 500, 1_000)],
+  );
+  let mut outcomes = Vec::new();
+  for (job, text) in request.take_units().into_iter().zip(["hello", " w9rld"]) {
+    assert_eq!(job.text(), text);
+    assert_eq!(job.samples().len(), 8_000);
+    let resolution = a
+      .detect_oov(job.text())
+      .expect("detect")
+      .decide(fail_closed_all_policy);
+    outcomes.push(
+      a.align_unit(job, resolution, encoder, &AtomicBool::new(false))
+        .expect("answered"),
+    );
+  }
+  assert_eq!(
+    outcomes.iter().map(|o| o.unit()).collect::<Vec<_>>(),
+    [AlignmentUnit::Run(0), AlignmentUnit::Run(1)]
+  );
+  assert!(matches!(outcomes[0].alignment(), UnitAlignment::Aligned(_)));
+  assert!(
+    matches!(
+      outcomes[1].alignment(),
+      UnitAlignment::Unaligned(UnalignedCause::Failed(_))
+    ),
+    "{:?}",
+    outcomes[1].alignment()
+  );
+  t.complete(request.aligned(outcomes).expect("its own units, in order"))
+    .expect("its own command");
+  assert!(matches!(t.poll_event(), Some(Event::Transcript(_))));
+}
+
 /// `finish` CONSUMES `prepared`, so a chunk cannot be finished twice.
 /// (Compile-time; this test documents it — uncommenting the second call
 /// below is a borrow-check error.)

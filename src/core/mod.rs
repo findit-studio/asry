@@ -13,8 +13,10 @@ pub(crate) use command::sort_words_by_pts;
 pub use command::{
   AlignedWords, AlignmentCompletion, AlignmentReport, AlignmentRequest, AlignmentUnit, AsrParams,
   AsrParamsOverride, AsrResult, Command, RefusedCompletion, SamplingStrategy, UnaccountedOutcomes,
-  UnalignedCause, UnitAlignment, UnitOutcome, UnitSlot,
+  UnalignedCause, UnitAlignment, UnitJob, UnitOutcome,
 };
+#[cfg(all(test, feature = "alignment"))]
+pub(crate) use command::{clip_sub_segments, run_audio_slice};
 pub use event::Event;
 pub use oov::{
   OovDecision, OovDetection, OovEvent, OovKind, OovResolution, ResolvedOov, default_oov_policy,

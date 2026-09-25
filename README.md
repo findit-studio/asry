@@ -160,7 +160,7 @@ while let Some(cmd) = transcriber.poll_command() {
     }
     Command::Alignment(request) => {
       // The job is built from the request alone: its payload, its ticket
-      // and unit slots, and the chunk's place in the stream.
+      // and unit jobs, and the chunk's place in the stream.
       let job = AlignWorkItem::new(request, abort_flag.clone());
       // Sans-I/O OOV resolution: detect every unit of THIS job (its
       // whole text, or each run), then decide. The resolution is

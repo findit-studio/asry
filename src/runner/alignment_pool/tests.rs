@@ -809,13 +809,14 @@ fn a_pool_completion_answers_only_its_own_command() {
       .detect_oov(&job)
       .expect("detect_oov")
       .decide(default_oov_policy);
-    answer_job(job, |job, slots| {
-      let units = resolution.into_units_for(job, set.id())?;
-      units
+    answer_job(job, |job, units| {
+      let resolutions = resolution.into_units_for(job, set.id())?;
+      resolutions
         .iter()
-        .zip(slots)
-        .map(|(unit, slot)| {
-          resolve_not_inspected(unit, fallback, job.language()).map(|cause| slot.unaligned(cause))
+        .zip(units)
+        .map(|(resolution, unit)| {
+          resolve_not_inspected(resolution, fallback, job.language())
+            .map(|cause| unit.answer(UnitAlignment::Unaligned(cause)))
         })
         .collect()
     })

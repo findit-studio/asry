@@ -70,7 +70,7 @@ pub(crate) struct ChunkRecord {
   /// preserved alongside the output-timebase form so the alignment
   /// worker can build the silence mask in chunk-local space.
   /// Each `(start, end)` is half-open in 16 kHz stream samples.
-  #[cfg(feature = "alignment")]
+  #[cfg(any(feature = "alignment", feature = "emissions"))]
   #[allow(dead_code)] // exposed via Dispatch::chunk_sub_segments_samples
   pub sub_segments_samples: Vec<(u64, u64)>,
   /// Output timebase snapshot, captured at chunk-extract time.
@@ -82,12 +82,12 @@ pub(crate) struct ChunkRecord {
   /// so a fresh closure built post-restart would map this
   /// chunk's pre-restart sample indices through the wrong PTS
   /// origin.
-  #[cfg(feature = "alignment")]
+  #[cfg(any(feature = "alignment", feature = "emissions"))]
   pub output_tb: mediatime::Timebase,
   /// PTS-anchor snapshot at stream-zero in `output_tb`,
   /// captured at chunk-extract time. See
   /// [`Self::output_tb`] for the rationale.
-  #[cfg(feature = "alignment")]
+  #[cfg(any(feature = "alignment", feature = "emissions"))]
   pub base_pts_out_anchor: i64,
   #[allow(dead_code)] // used by alignment feature
   pub sub_origins: Vec<SubOrigin>,
@@ -117,18 +117,18 @@ pub(crate) struct ExtractedChunk {
   /// Preserved alongside the output-timebase `sub_segments` so the
   /// runner's alignment dispatch can rebuild chunk-local sample
   /// indices for the aligner's silence mask.
-  #[cfg(feature = "alignment")]
+  #[cfg(any(feature = "alignment", feature = "emissions"))]
   pub sub_segments_samples: Vec<(u64, u64)>,
   /// Output timebase snapshot captured at extract time. Promoted
   /// onto [`ChunkRecord::output_tb`] so the runner's alignment
   /// dispatch can rebuild a per-chunk
   /// `samples_to_output_range` closure that survives a later
   /// `handle_restart`.
-  #[cfg(feature = "alignment")]
+  #[cfg(any(feature = "alignment", feature = "emissions"))]
   pub output_tb: mediatime::Timebase,
   /// PTS anchor at stream-zero, captured at extract time. See
   /// [`Self::output_tb`] for the rationale.
-  #[cfg(feature = "alignment")]
+  #[cfg(any(feature = "alignment", feature = "emissions"))]
   pub base_pts_out_anchor: i64,
   pub sub_origins: Vec<SubOrigin>,
   /// Per-packet `AsrParamsOverride` snapshot captured at the
@@ -164,7 +164,7 @@ impl ExtractedChunk {
       .iter()
       .map(|s| buffer.samples_to_output_range(s.range))
       .collect();
-    #[cfg(feature = "alignment")]
+    #[cfg(any(feature = "alignment", feature = "emissions"))]
     let sub_segments_samples: Vec<(u64, u64)> = chunk
       .subs
       .iter()
@@ -175,11 +175,11 @@ impl ExtractedChunk {
     // any later `handle_restart` shifts the buffer onto a new
     // epoch. Promoted to `ChunkRecord` at promote-time and
     // consulted at alignment-dispatch time.
-    #[cfg(feature = "alignment")]
+    #[cfg(any(feature = "alignment", feature = "emissions"))]
     let output_tb = buffer
       .output_timebase()
       .expect("output timebase established by first push (extract_from runs after push)");
-    #[cfg(feature = "alignment")]
+    #[cfg(any(feature = "alignment", feature = "emissions"))]
     let base_pts_out_anchor = buffer.base_pts_out_anchor();
     Self {
       chunk_id,
@@ -187,11 +187,11 @@ impl ExtractedChunk {
       sample_range: chunk.range,
       range,
       sub_segments,
-      #[cfg(feature = "alignment")]
+      #[cfg(any(feature = "alignment", feature = "emissions"))]
       sub_segments_samples,
-      #[cfg(feature = "alignment")]
+      #[cfg(any(feature = "alignment", feature = "emissions"))]
       output_tb,
-      #[cfg(feature = "alignment")]
+      #[cfg(any(feature = "alignment", feature = "emissions"))]
       base_pts_out_anchor,
       sub_origins,
       override_at_creation: asr_params_override,
@@ -450,11 +450,11 @@ impl Dispatch {
       samples: samples.clone(),
       sample_range: ext.sample_range,
       sub_segments: ext.sub_segments,
-      #[cfg(feature = "alignment")]
+      #[cfg(any(feature = "alignment", feature = "emissions"))]
       sub_segments_samples: ext.sub_segments_samples,
-      #[cfg(feature = "alignment")]
+      #[cfg(any(feature = "alignment", feature = "emissions"))]
       output_tb: ext.output_tb,
-      #[cfg(feature = "alignment")]
+      #[cfg(any(feature = "alignment", feature = "emissions"))]
       base_pts_out_anchor: ext.base_pts_out_anchor,
       sub_origins: ext.sub_origins,
       phase: ChunkPhase::AwaitingAsr,
@@ -647,7 +647,7 @@ impl Dispatch {
           result.text().clone(),
           result.language().clone(),
           runs,
-          #[cfg(feature = "alignment")]
+          #[cfg(any(feature = "alignment", feature = "emissions"))]
           crate::core::command::ChunkContext {
             first_sample: record.sample_range.start,
             sub_segments_samples: record.sub_segments_samples.clone(),
@@ -980,22 +980,22 @@ mod tests {
   }
 
   /// Answer every unit of `request` with `alignment(unit)`, each from its
-  /// own slot, in order.
+  /// own job, in order.
   fn answer(
     mut request: AlignmentRequest,
     mut alignment: impl FnMut(crate::core::AlignmentUnit) -> crate::core::UnitAlignment,
   ) -> AlignmentCompletion {
     let outcomes = request
-      .take_slots()
+      .take_units()
       .into_iter()
-      .map(|slot| {
-        let unit = slot.unit();
-        slot.answer(alignment(unit))
+      .map(|job| {
+        let unit = job.unit();
+        job.answer(alignment(unit))
       })
       .collect();
     request
       .aligned(outcomes)
-      .expect("each unit answered from its own slot, in order")
+      .expect("each unit answered by consuming its own job, in order")
   }
 
   /// A run of `text`, in English.
@@ -1526,13 +1526,13 @@ mod tests {
   }
 
   /// **A request is answered only with its own units, each once, in
-  /// order.** Each unit's outcome is made from that unit's slot, and the
-  /// slots are taken once, so no unit can be answered twice (`[o0, o0]` has
-  /// no second slot 0 to make it from, and neither a slot nor an outcome can
-  /// be cloned: the `compile_fail` doctests on `UnitSlot` and
+  /// order.** Each unit's outcome is made by consuming that unit's job, and
+  /// the jobs are taken once, so no unit can be answered twice (`[o0, o0]`
+  /// has no second job 0 to make it from, and neither a job nor an outcome
+  /// can be cloned: the `compile_fail` doctests on `UnitJob` and
   /// `UnitOutcome`). `aligned` refuses, by name, outcomes out of order
   /// (`[o1, o0]`), a missing unit, and an outcome made from another
-  /// request's slot, naming the units expected and received, and hands the
+  /// request's job, naming the units expected and received, and hands the
   /// request and the outcomes back unanswered. Its own outcomes in order
   /// then complete the chunk, words in time order.
   #[test]
@@ -1570,16 +1570,16 @@ mod tests {
       request.units(),
       [AlignmentUnit::Run(0), AlignmentUnit::Run(1)]
     );
-    let mut slots = request.take_slots();
-    assert!(request.take_slots().is_empty(), "the slots are taken once");
-    let second = slots.pop().expect("run 1's slot");
-    let first = slots.pop().expect("run 0's slot");
+    let mut jobs = request.take_units();
+    assert!(request.take_units().is_empty(), "the jobs are taken once");
+    let second = jobs.pop().expect("run 1's job");
+    let first = jobs.pop().expect("run 0's job");
     assert_eq!(
       (first.unit(), second.unit()),
       (AlignmentUnit::Run(0), AlignmentUnit::Run(1))
     );
-    let o1 = second.aligned(words(AlignmentUnit::Run(1)));
-    let o0 = first.aligned(words(AlignmentUnit::Run(0)));
+    let o1 = second.answer(UnitAlignment::Aligned(words(AlignmentUnit::Run(1))));
+    let o0 = first.answer(UnitAlignment::Aligned(words(AlignmentUnit::Run(0))));
     let refused = request
       .aligned(vec![o1, o0])
       .expect_err("[o1, o0] is out of order");
@@ -1630,10 +1630,10 @@ mod tests {
     let mut other = aligning_dispatch();
     let mut elsewhere = await_alignment(&mut other, &b, 0, "hello world", Vec::new());
     let theirs = elsewhere
-      .take_slots()
+      .take_units()
       .pop()
-      .expect("the whole text's slot")
-      .unaligned(UnalignedCause::NoSurvivingWords);
+      .expect("the whole text's job")
+      .skip();
     let refused = request
       .aligned(vec![theirs])
       .expect_err("another request's outcome answers no unit of this one");
