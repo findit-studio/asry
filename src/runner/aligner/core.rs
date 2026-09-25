@@ -1362,12 +1362,16 @@ impl AlignerCore {
     // before — the DP checks `abort_flag` periodically so a
     // hallucinated long token sequence can't run past the deadline and
     // starve every chunk queued behind it.
+    // A wildcard scores the best column that could be a character: never
+    // the blank, the delimiter, the unknown token or a declared special.
+    let wildcard_columns = self.reserved.wildcard_columns(log_probs.v());
     let word_segments = align_to_word_segments(
       log_probs,
       tokenized.token_ids(),
       tokenized.word_idx_per_token(),
       tokenized.separator_token_id(),
       self.blank_token_id,
+      &wildcard_columns,
       abort_flag,
       &self.language,
     )?;
@@ -1388,6 +1392,7 @@ impl AlignerCore {
           log_probs,
           tokenized.token_ids(),
           self.blank_token_id,
+          &wildcard_columns,
           abort_flag,
           &self.language,
         );

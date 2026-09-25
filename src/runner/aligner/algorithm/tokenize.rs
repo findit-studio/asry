@@ -122,6 +122,18 @@ impl ReservedIds {
   pub fn contains(&self, id: u32) -> bool {
     self.0.binary_search(&id).is_ok()
   }
+
+  /// The columns of a `vocab`-wide emission row a wildcard may take:
+  /// `true` for every column but a reserved one. A wildcard stands for a
+  /// transcript character the vocabulary cannot spell, so it scores the
+  /// best column that could be a character, never the blank, the word
+  /// delimiter, the unknown token or a declared special.
+  #[must_use]
+  pub fn wildcard_columns(&self, vocab: usize) -> Vec<bool> {
+    (0..vocab)
+      .map(|column| u32::try_from(column).map_or(true, |id| !self.contains(id)))
+      .collect()
+  }
 }
 
 /// How tokenization treats one character of a normalized word.

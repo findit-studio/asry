@@ -259,6 +259,7 @@ fn run_align_with_policy(
     tokenized.word_idx_per_token(),
     tokenized.separator_token_id(),
     BLANK_ID,
+    &reserved.wildcard_columns(log_probs.v()),
     &abort,
     &Lang::En,
   )
