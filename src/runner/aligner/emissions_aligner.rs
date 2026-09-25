@@ -334,8 +334,14 @@ impl EmissionsAligner {
       .map_err(|e| to_emissions_error(e, Stage::Prepare))
   }
 
-  /// Steps 3-9. **Consumes `prepared`**, so a chunk cannot be finished
-  /// twice.
+  /// Steps 3-9. **Consumes `prepared` and `emissions`**, so a chunk cannot
+  /// be finished twice and emissions cannot be reused.
+  ///
+  /// `emissions` must be the ones made through `prepared`
+  /// ([`PreparedChunk::emissions_from_log_probs`],
+  /// [`PreparedChunk::emissions_from_logits`]): emissions made through
+  /// another chunk are refused by name before a frame is read, whatever
+  /// their shape.
   ///
   /// Returns the text's one [`UnitOutcome`]: its aligned words, or
   /// `Unaligned` with the reason it has none (`NoAlignableText` for a
@@ -364,11 +370,13 @@ impl EmissionsAligner {
   /// [`EmissionsError::NoAlignmentPath`] if the lattice admits no finite
   /// path; [`EmissionsError::Aborted`] if `abort_flag` is observed set;
   /// [`EmissionsError::AlignerMismatch`] if `prepared` came from a
-  /// *different* `EmissionsAligner`.
+  /// *different* `EmissionsAligner`;
+  /// [`EmissionsError::PreparationMismatch`] if `emissions` were made
+  /// through another chunk than `prepared`.
   pub fn finish(
     &self,
     prepared: PreparedChunk<'_>,
-    emissions: &Emissions,
+    emissions: Emissions,
     clock: OutputClock,
     abort_flag: &AtomicBool,
   ) -> Result<UnitOutcome, EmissionsError> {
@@ -392,6 +400,25 @@ impl EmissionsAligner {
  token ids, a word map, and OOV decisions resolved against that aligner's tokenizer, \
  blank id, and language — none of which need match this one's, even when the vocab \
  sizes and hops are identical. Call `finish` on the same aligner that called `prepare`."
+        ),
+      )));
+    }
+
+    // ——— The emissions must answer THIS chunk ———
+    //
+    // Emissions are made through the chunk whose encoder output they are,
+    // and carry that preparation's identity. Checked before a frame is
+    // read, and before the trivial short-circuit, for the reason the
+    // aligner check above is: two chunks of one aligner, with the same
+    // shape, would otherwise trade tensors and align each one's tokens to
+    // the other's audio.
+    if emissions.preparation() != prepared.preparation() {
+      return Err(EmissionsError::PreparationMismatch(EmissionsFailure::new(
+        SmolStr::new_static(
+          "these Emissions were made through another PreparedChunk. Emissions answer the one \
+ chunk they were made through, whatever their shape: make them with \
+ `prepared.emissions_from_log_probs` / `prepared.emissions_from_logits` on the chunk you \
+ finish.",
         ),
       )));
     }

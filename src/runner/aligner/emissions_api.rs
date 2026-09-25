@@ -28,7 +28,7 @@ use crate::{
       errors::{EmissionsError, EmissionsFailure},
       trellis_beam::SEAM_PATH_FRAME_BUDGET,
     },
-    core::coerce_speech_coverage,
+    core::{PreparationId, PreparedChunk, coerce_speech_coverage},
   },
   time::{ANALYSIS_TIMEBASE, SAMPLE_RATE_HZ},
 };
@@ -498,7 +498,22 @@ impl OutputClock {
 
 // ————————————————————— Emissions —————————————————————
 
-/// The **only** way log-probabilities enter asry.
+/// The **only** way log-probabilities enter asry, made through the
+/// [`PreparedChunk`] they answer.
+///
+/// A chunk's encoder output enters through that chunk's own door,
+/// [`PreparedChunk::emissions_from_log_probs`] or
+/// [`PreparedChunk::emissions_from_logits`], and the emissions carry the
+/// identity of that one preparation. `EmissionsAligner::finish` consumes
+/// them and refuses, by name and before it reads a frame, to pair them
+/// with any other chunk: two chunks of one aligner, with the same shape,
+/// cannot trade emissions, and no free-standing, reusable emissions exist.
+///
+/// ```compile_fail
+/// fn replay(emissions: asry::emissions::Emissions) {
+///   let _twice = emissions.clone();
+/// }
+/// ```
 ///
 /// Wraps the (unchanged, now crate-internal) row-major `(T, V)` lattice
 /// input. Every invariant the DP relies on is established here, at
@@ -539,6 +554,8 @@ impl OutputClock {
 pub struct Emissions {
   inner: LogProbsTV,
   vocab: NonZeroUsize,
+  /// The preparation these emissions answer.
+  preparation: PreparationId,
 }
 
 impl Emissions {
@@ -548,134 +565,49 @@ impl Emissions {
   /// case into a fast typed error instead of an OOM.
   pub const FRAME_BUDGET: usize = SEAM_PATH_FRAME_BUDGET;
 
-  /// Your encoder's graph **already ends in log-softmax** — its final
-  /// op is a `log_softmax`, or a `softmax` followed by a `log`. Runs the
-  /// shape, budget, **and value-domain** checks.
-  ///
-  /// Pick between this and [`from_logits`](Self::from_logits) by what
-  /// your model's **final op** is, not by which runtime you execute it
-  /// on. See [`from_logits`](Self::from_logits) for why the runtime tells
-  /// you nothing.
-  ///
-  /// # The `O(T·V)` scan is a domain check, not a provenance check
-  ///
-  /// The value-domain scan verifies exactly one property: every element
-  /// is finite and `<= 0` — the domain of a log-probability. It is worth
-  /// stating precisely what that does and does not buy you, because it is
-  /// tempting to overread it as a "contract check on the model artifact",
-  /// which it is not.
-  ///
-  /// It **often** catches a raw-logit head fed here by mistake: an
-  /// unnormalised CTC head usually emits at least one positive score per
-  /// frame, and a single `> 0` element trips [`EmissionsError::Value`]
-  /// naming the first offending `(frame, vocab)`. But *usual* is not
-  /// *guaranteed*. A bare linear head can emit all-negative logits —
-  /// `[-10.0, -11.0]`, or any row after a large negative bias shift —
-  /// which are finite and `<= 0`, so this constructor **accepts them**
-  /// even though `exp(-10) + exp(-11) ≪ 1`: wildly unnormalised, yet in
-  /// domain. The elementwise `(-∞, 0]` scan is NOT the row-normalisation
-  /// invariant `logsumexp(row) ≈ 0`; it cannot see a row that fails to
-  /// sum to one in probability space, and it cannot prove the producing
-  /// graph's final op was a `log_softmax`. It is a **domain check, not an
-  /// artifact-provenance check.**
-  ///
-  /// So this scan does not, on its own, protect you from a model swap
-  /// that quietly ships a raw-logit head. Establishing the graph's final
-  /// op is the **caller's** responsibility, done externally — e.g.
-  /// alignkit pins its model's graph contract in its own `model_io`
-  /// tests, checks per-frame `logsumexp ≈ 0` empirically on real
-  /// emissions, and parses the shipped MIL to confirm the terminal op.
-  /// Choose this constructor vs [`from_logits`](Self::from_logits) by
-  /// that externally-verified final op, not by the presence of this scan.
-  ///
-  /// Note what the hazard of the *opposite* mistake is **not**.
-  /// Re-applying log-softmax to true log-probs is a mathematical no-op —
-  /// log-softmax is exactly idempotent, since `lse(x − lse(x)) = ln 1 =
-  /// 0`. Passing log-probs to `from_logits` does not corrupt them by
-  /// "double normalisation"; it returns the same values. What you forgo
-  /// by routing log-probs through `from_logits` is merely this domain
-  /// check — not a normalisation guarantee it never provided.
-  ///
-  /// # Errors
-  ///
-  /// [`EmissionsError::PathBudget`] when `t > FRAME_BUDGET`;
-  /// [`EmissionsError::Shape`] when `t * v != data.len()` or the product
-  /// overflows; [`EmissionsError::Value`] when any element is non-finite
-  /// or `> 0.0`, reporting the first offending `(frame, vocab)`.
-  pub fn from_log_probs(t: usize, v: NonZeroUsize, data: Vec<f32>) -> Result<Self, EmissionsError> {
+  /// Log-probabilities for the preparation `preparation`, checked: see
+  /// [`PreparedChunk::emissions_from_log_probs`].
+  pub(crate) fn from_log_probs(
+    preparation: PreparationId,
+    t: usize,
+    v: NonZeroUsize,
+    data: Vec<f32>,
+  ) -> Result<Self, EmissionsError> {
     Self::check_budget(t)?;
     let inner = LogProbsTV::new(t, v.get(), data)?;
-    Ok(Self { inner, vocab: v })
+    Ok(Self {
+      inner,
+      vocab: v,
+      preparation,
+    })
   }
 
-  /// Your encoder's graph **ends in a bare CTC head** — a final `linear`
-  /// / `matmul` with no normalisation after it — so it emits **raw
-  /// logits**: unbounded scores whose per-frame max is typically
-  /// positive. asry applies the log-softmax for you.
-  ///
-  /// # Choose by the model's final op, never by the runtime
-  ///
-  /// The question is *"what is the last op in the graph?"*, which is a
-  /// property of the **model**, not of the engine executing it. This doc
-  /// used to call `from_logits` "the CoreML path", which is both wrong
-  /// and dangerous — it is exactly backwards for the actual CoreML
-  /// consumer:
-  ///
-  /// * asry's own **ONNX** wav2vec2 ends in a bare `linear` CTC head →
-  ///   raw logits → `from_logits` is correct.
-  /// * A **CoreML** export may **bake the log-softmax into the graph**
-  ///   (`softmax` → `log` ops living inside the `.mlmodelc`) → that model
-  ///   emits log-probs → [`from_log_probs`](Self::from_log_probs) is
-  ///   correct, and `from_logits` is wrong.
-  ///
-  /// So "I'm on CoreML" tells you nothing. Inspect the `.mlmodelc`'s
-  /// actual output ops: some CoreML callers need this constructor, some
-  /// need [`from_log_probs`](Self::from_log_probs).
-  ///
-  /// Getting it wrong in the log-probs → `from_logits` direction is
-  /// **silent**: log-softmax is idempotent, so the values survive intact
-  /// and nothing errors. What you forfeit is the value-domain scan —
-  /// which *often* (not always) flags a raw-logit head sent the other
-  /// way; see [`from_log_probs`](Self::from_log_probs)'s note on why that
-  /// scan is a domain check, not a provenance check. When your model
-  /// already emits log-probs, prefer that constructor.
-  ///
-  /// # Domain by construction
-  ///
-  /// Shape + budget + finite-input checks, then asry's own
-  /// finiteness-guarded log-softmax. The output is finite and `<= 0` BY
-  /// CONSTRUCTION (`lp = (x − max) − ln Σ exp(x − max)`; the `max`
-  /// element contributes `exp(0) = 1` to the sum, so `ln Σ >= 0` and
-  /// every output is `(<= 0) − (>= 0)`), so this path never pays the
-  /// value-domain scan.
-  ///
-  /// # Errors
-  ///
-  /// [`EmissionsError::PathBudget`] when `t > FRAME_BUDGET`;
-  /// [`EmissionsError::Shape`] on a shape/product mismatch;
-  /// [`EmissionsError::Numeric`] when a supplied logit is non-finite or
-  /// the softmax normaliser blows up.
-  pub fn from_logits(t: usize, v: NonZeroUsize, raw: Vec<f32>) -> Result<Self, EmissionsError> {
-    Self::from_logits_slice(t, v, &raw)
-  }
-
-  /// [`from_logits`](Self::from_logits) without taking ownership — for a
-  /// caller whose encoder hands back a borrowed buffer it wants to
-  /// reuse.
-  ///
-  /// # Errors
-  ///
-  /// Same as [`from_logits`](Self::from_logits).
-  pub fn from_logits_slice(t: usize, v: NonZeroUsize, raw: &[f32]) -> Result<Self, EmissionsError> {
+  /// Logits for the preparation `preparation`, log-softmaxed: see
+  /// [`PreparedChunk::emissions_from_logits`].
+  pub(crate) fn from_logits_slice(
+    preparation: PreparationId,
+    t: usize,
+    v: NonZeroUsize,
+    raw: &[f32],
+  ) -> Result<Self, EmissionsError> {
     Self::check_budget(t)?;
     // Does its own `v != 0` + `t * v == raw.len()` shape checks, then
     // the per-row finite-input guard.
     let data = log_softmax_with_finite_guard(raw, t, v.get())?;
-    // Finite and <= 0 by construction — see the doc above. Skipping the
-    // scan here is not a shortcut; re-running it would be re-deriving a
-    // fact the log-softmax identity already guarantees.
+    // Finite and <= 0 by construction — see `emissions_from_logits`.
+    // Skipping the scan here is not a shortcut; re-running it would be
+    // re-deriving a fact the log-softmax identity already guarantees.
     let inner = LogProbsTV::from_parts_unchecked(t, v.get(), data);
-    Ok(Self { inner, vocab: v })
+    Ok(Self {
+      inner,
+      vocab: v,
+      preparation,
+    })
+  }
+
+  /// The preparation these emissions answer.
+  pub(crate) const fn preparation(&self) -> PreparationId {
+    self.preparation
   }
 
   /// Frame count `T`.
@@ -712,6 +644,151 @@ impl Emissions {
       )));
     }
     Ok(())
+  }
+}
+
+impl PreparedChunk<'_> {
+  /// This chunk's emissions, from log-probabilities: the encoder's output
+  /// for [`encoder_input`](Self::encoder_input). They answer this chunk
+  /// alone, and `EmissionsAligner::finish` refuses them for any other.
+  ///
+  /// Your encoder's graph **already ends in log-softmax** — its final
+  /// op is a `log_softmax`, or a `softmax` followed by a `log`. Runs the
+  /// shape, budget, **and value-domain** checks.
+  ///
+  /// Pick between this and [`emissions_from_logits`](Self::emissions_from_logits) by what
+  /// your model's **final op** is, not by which runtime you execute it
+  /// on. See [`emissions_from_logits`](Self::emissions_from_logits) for why the runtime tells
+  /// you nothing.
+  ///
+  /// # The `O(T·V)` scan is a domain check, not a provenance check
+  ///
+  /// The value-domain scan verifies exactly one property: every element
+  /// is finite and `<= 0` — the domain of a log-probability. It is worth
+  /// stating precisely what that does and does not buy you, because it is
+  /// tempting to overread it as a "contract check on the model artifact",
+  /// which it is not.
+  ///
+  /// It **often** catches a raw-logit head fed here by mistake: an
+  /// unnormalised CTC head usually emits at least one positive score per
+  /// frame, and a single `> 0` element trips [`EmissionsError::Value`]
+  /// naming the first offending `(frame, vocab)`. But *usual* is not
+  /// *guaranteed*. A bare linear head can emit all-negative logits —
+  /// `[-10.0, -11.0]`, or any row after a large negative bias shift —
+  /// which are finite and `<= 0`, so this constructor **accepts them**
+  /// even though `exp(-10) + exp(-11) ≪ 1`: wildly unnormalised, yet in
+  /// domain. The elementwise `(-∞, 0]` scan is NOT the row-normalisation
+  /// invariant `logsumexp(row) ≈ 0`; it cannot see a row that fails to
+  /// sum to one in probability space, and it cannot prove the producing
+  /// graph's final op was a `log_softmax`. It is a **domain check, not an
+  /// artifact-provenance check.**
+  ///
+  /// So this scan does not, on its own, protect you from a model swap
+  /// that quietly ships a raw-logit head. Establishing the graph's final
+  /// op is the **caller's** responsibility, done externally — e.g.
+  /// alignkit pins its model's graph contract in its own `model_io`
+  /// tests, checks per-frame `logsumexp ≈ 0` empirically on real
+  /// emissions, and parses the shipped MIL to confirm the terminal op.
+  /// Choose this constructor vs [`emissions_from_logits`](Self::emissions_from_logits) by
+  /// that externally-verified final op, not by the presence of this scan.
+  ///
+  /// Note what the hazard of the *opposite* mistake is **not**.
+  /// Re-applying log-softmax to true log-probs is a mathematical no-op —
+  /// log-softmax is exactly idempotent, since `lse(x − lse(x)) = ln 1 =
+  /// 0`. Passing log-probs to `emissions_from_logits` does not corrupt them by
+  /// "double normalisation"; it returns the same values. What you forgo
+  /// by routing log-probs through `emissions_from_logits` is merely this domain
+  /// check — not a normalisation guarantee it never provided.
+  ///
+  /// # Errors
+  ///
+  /// [`EmissionsError::PathBudget`] when `t > Emissions::FRAME_BUDGET`;
+  /// [`EmissionsError::Shape`] when `t * v != data.len()` or the product
+  /// overflows; [`EmissionsError::Value`] when any element is non-finite
+  /// or `> 0.0`, reporting the first offending `(frame, vocab)`.
+  pub fn emissions_from_log_probs(
+    &self,
+    t: usize,
+    v: NonZeroUsize,
+    data: Vec<f32>,
+  ) -> Result<Emissions, EmissionsError> {
+    Emissions::from_log_probs(self.preparation(), t, v, data)
+  }
+
+  /// This chunk's emissions, from raw logits: the encoder's output for
+  /// [`encoder_input`](Self::encoder_input). They answer this chunk alone,
+  /// and `EmissionsAligner::finish` refuses them for any other.
+  ///
+  /// Your encoder's graph **ends in a bare CTC head** — a final `linear`
+  /// / `matmul` with no normalisation after it — so it emits **raw
+  /// logits**: unbounded scores whose per-frame max is typically
+  /// positive. asry applies the log-softmax for you.
+  ///
+  /// # Choose by the model's final op, never by the runtime
+  ///
+  /// The question is *"what is the last op in the graph?"*, which is a
+  /// property of the **model**, not of the engine executing it. This doc
+  /// used to call `emissions_from_logits` "the CoreML path", which is both wrong
+  /// and dangerous — it is exactly backwards for the actual CoreML
+  /// consumer:
+  ///
+  /// * asry's own **ONNX** wav2vec2 ends in a bare `linear` CTC head →
+  ///   raw logits → `emissions_from_logits` is correct.
+  /// * A **CoreML** export may **bake the log-softmax into the graph**
+  ///   (`softmax` → `log` ops living inside the `.mlmodelc`) → that model
+  ///   emits log-probs → [`emissions_from_log_probs`](Self::emissions_from_log_probs) is
+  ///   correct, and `emissions_from_logits` is wrong.
+  ///
+  /// So "I'm on CoreML" tells you nothing. Inspect the `.mlmodelc`'s
+  /// actual output ops: some CoreML callers need this constructor, some
+  /// need [`emissions_from_log_probs`](Self::emissions_from_log_probs).
+  ///
+  /// Getting it wrong in the log-probs → `emissions_from_logits` direction is
+  /// **silent**: log-softmax is idempotent, so the values survive intact
+  /// and nothing errors. What you forfeit is the value-domain scan —
+  /// which *often* (not always) flags a raw-logit head sent the other
+  /// way; see [`emissions_from_log_probs`](Self::emissions_from_log_probs)'s note on why that
+  /// scan is a domain check, not a provenance check. When your model
+  /// already emits log-probs, prefer that constructor.
+  ///
+  /// # Domain by construction
+  ///
+  /// Shape + budget + finite-input checks, then asry's own
+  /// finiteness-guarded log-softmax. The output is finite and `<= 0` BY
+  /// CONSTRUCTION (`lp = (x − max) − ln Σ exp(x − max)`; the `max`
+  /// element contributes `exp(0) = 1` to the sum, so `ln Σ >= 0` and
+  /// every output is `(<= 0) − (>= 0)`), so this path never pays the
+  /// value-domain scan.
+  ///
+  /// # Errors
+  ///
+  /// [`EmissionsError::PathBudget`] when `t > Emissions::FRAME_BUDGET`;
+  /// [`EmissionsError::Shape`] on a shape/product mismatch;
+  /// [`EmissionsError::Numeric`] when a supplied logit is non-finite or
+  /// the softmax normaliser blows up.
+  pub fn emissions_from_logits(
+    &self,
+    t: usize,
+    v: NonZeroUsize,
+    raw: Vec<f32>,
+  ) -> Result<Emissions, EmissionsError> {
+    Emissions::from_logits_slice(self.preparation(), t, v, &raw)
+  }
+
+  /// [`emissions_from_logits`](Self::emissions_from_logits) without taking ownership — for a
+  /// caller whose encoder hands back a borrowed buffer it wants to
+  /// reuse.
+  ///
+  /// # Errors
+  ///
+  /// Same as [`emissions_from_logits`](Self::emissions_from_logits).
+  pub fn emissions_from_logits_slice(
+    &self,
+    t: usize,
+    v: NonZeroUsize,
+    raw: &[f32],
+  ) -> Result<Emissions, EmissionsError> {
+    Emissions::from_logits_slice(self.preparation(), t, v, raw)
   }
 }
 

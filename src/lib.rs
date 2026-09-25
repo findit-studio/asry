@@ -132,7 +132,8 @@ pub use ort;
 /// | pass VAD in the wrong timebase (which was silently ignored) | [`SampleSpan`](emissions::SampleSpan) has no timebase; the bridge from `TimeRange` is strict |
 /// | mean "no VAD" and get "all silence" (which dropped every word) | [`SpeechSpans::all_speech()`](emissions::SpeechSpans::all_speech) says it out loud |
 /// | supply a non-total sample→time closure (which panicked in your own code) | [`OutputClock`](emissions::OutputClock) is data; asry owns the saturation |
-/// | supply `V = 0`, a `T` that OOMs, or a non-log-probability | [`Emissions`](emissions::Emissions) is the one door, and it checks all three |
+/// | supply `V = 0`, a `T` that OOMs, or a non-log-probability | a chunk's [`Emissions`](emissions::Emissions) are made through its [`PreparedChunk`](emissions::PreparedChunk), the one door, and it checks all three |
+/// | finish a chunk with another chunk's emissions of the same shape | emissions carry the identity of the preparation they were made through, and `finish` refuses any other by name |
 /// | disagree with asry about the sample count, frame count, or stride | asry derives all three from slices that physically exist |
 /// | run a CTC head whose width disagrees with the tokenizer | `finish` validates it — the check this seam has NEVER run |
 ///

@@ -156,6 +156,18 @@ pub enum EmissionsError {
   #[error("prepared chunk belongs to a different aligner: {0}")]
   AlignerMismatch(EmissionsFailure),
 
+  /// The `Emissions` handed to `finish` were made through a **different**
+  /// `PreparedChunk`.
+  ///
+  /// Emissions are made only through the chunk whose encoder output they
+  /// are (`PreparedChunk::emissions_from_log_probs`,
+  /// `PreparedChunk::emissions_from_logits`) and carry its identity. Two
+  /// chunks of one aligner with the same shape pass every dimension check,
+  /// so pairing one chunk with the other's emissions would align its
+  /// tokens to the other chunk's audio. Refused before a frame is read.
+  #[error("emissions answer a different prepared chunk: {0}")]
+  PreparationMismatch(EmissionsFailure),
+
   /// The audio contains a non-finite (`NaN` / `±inf`) sample.
   ///
   /// Rejected against the RAW samples, before the speech mask zeroes
@@ -256,6 +268,7 @@ impl EmissionsError {
       | Self::StrideMismatch(f)
       | Self::VocabMismatch(f)
       | Self::AlignerMismatch(f)
+      | Self::PreparationMismatch(f)
       | Self::NonFiniteAudio(f) => AlignmentError::ModelInference(failure(f.message)),
       Self::Tokenization(f) => AlignmentError::Tokenization(failure(f.message)),
       Self::Normalization(f) => AlignmentError::Normalization(failure(f.message)),

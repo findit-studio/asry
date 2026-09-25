@@ -632,6 +632,28 @@ impl AlignerId {
   }
 }
 
+/// The identity of one [`AlignerCore::prepare`] call: what its
+/// [`PreparedChunk`] carries, what every
+/// [`Emissions`](crate::runner::aligner::emissions_api::Emissions) made
+/// through that chunk carries, and what `EmissionsAligner::finish`
+/// compares before it reads a frame.
+///
+/// Never reused within a process, and minted only here, so emissions
+/// answer exactly one preparation: two chunks of the same aligner, with
+/// the same shape, cannot trade emissions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct PreparationId(NonZeroU64);
+
+impl PreparationId {
+  /// Mint the next process-unique id.
+  pub(crate) fn next() -> Self {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let raw = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Unreachable: exhausting this needs 2^64 preparations.
+    Self(NonZeroU64::new(raw).expect("PreparationId counter overflowed u64"))
+  }
+}
+
 /// Everything an aligner owns **except** the encoder.
 ///
 /// This is the sealed middle of the sandwich: `Aligner` is
@@ -708,12 +730,22 @@ pub(crate) struct AlignerCore {
 /// `finish` checks. A chunk prepared by one
 /// aligner and finished by another is rejected rather than aligned
 /// against the wrong vocabulary.
+///
+/// And it carries the identity of its own preparation. Its encoder output
+/// enters asry only through it
+/// ([`emissions_from_log_probs`](Self::emissions_from_log_probs),
+/// [`emissions_from_logits`](Self::emissions_from_logits)), and those
+/// emissions answer this chunk alone: `finish` refuses to pair a chunk with
+/// emissions made through another, by name, before it reads a frame.
 pub struct PreparedChunk<'a> {
   /// The aligner that produced this chunk. Sits OUTSIDE `inner` on
   /// purpose: a trivial chunk carries no encoder buffer, but it is
   /// still bound to its originating aligner, so the ownership check
   /// runs before the trivial short-circuit rather than after it.
   owner: AlignerId,
+  /// This preparation's identity: what the emissions made through this
+  /// chunk carry. Outside `inner` for the reason `owner` is.
+  preparation: PreparationId,
   /// `None` for the two short-circuits `Aligner::align` has always
   /// had: normalisation produced empty text, or tokenisation produced
   /// zero alignable tokens. The encoder should be skipped entirely and
@@ -774,6 +806,12 @@ impl PreparedChunk<'_> {
   #[must_use]
   pub fn real_samples(&self) -> usize {
     self.inner.as_ref().map_or(0, |i| i.real_samples)
+  }
+
+  /// This preparation's identity: what the emissions made through this
+  /// chunk carry.
+  pub(crate) const fn preparation(&self) -> PreparationId {
+    self.preparation
   }
 
   /// The token stream tokenization produced: empty when trivial.
@@ -991,6 +1029,7 @@ impl AlignerCore {
     if abort_flag.load(Ordering::Relaxed) {
       return Err(timed_out());
     }
+    let preparation = PreparationId::next();
 
     // Step 0: silence-aware preprocessing.
     //
@@ -1041,6 +1080,7 @@ impl AlignerCore {
       Err(NormalizationError::EmptyText) => {
         return Ok(PreparedChunk {
           owner: self.id,
+          preparation,
           inner: None,
         });
       }
@@ -1095,6 +1135,7 @@ impl AlignerCore {
     if tokenized.token_ids().is_empty() {
       return Ok(PreparedChunk {
         owner: self.id,
+        preparation,
         inner: None,
       });
     }
@@ -1153,6 +1194,7 @@ impl AlignerCore {
 
     Ok(PreparedChunk {
       owner: self.id,
+      preparation,
       inner: Some(PreparedInner {
         encoder_input,
         real_samples: samples.len(),
