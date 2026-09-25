@@ -1181,9 +1181,60 @@ impl AlignmentCompletion {
     }
   }
 
-  /// The ticket and the answer, for the transcriber that checks them.
+  /// The ticket, for the transcriber that checks it.
+  pub(crate) const fn ticket(&self) -> &AlignmentTicket {
+    &self.ticket
+  }
+
+  /// The ticket and the answer, for the transcriber that accepted them.
   pub(crate) fn into_parts(self) -> (AlignmentTicket, Answer) {
     (self.ticket, self.answer)
+  }
+}
+
+/// A completion [`Transcriber::complete`](crate::core::Transcriber::complete)
+/// refused, handed back with the refusal, so the command it answers can
+/// still be completed: a completion delivered to a transcriber that did not
+/// issue its command can be delivered to the one that did.
+///
+/// It converts into its [`TranscriberError`](crate::types::TranscriberError)
+/// (dropping the completion), so `?` works where a `TranscriberError` is
+/// expected.
+#[derive(Debug, thiserror::Error)]
+#[error("{}", .0.error)]
+pub struct RefusedCompletion(Box<Refusal>);
+
+/// What [`RefusedCompletion`] hands back.
+#[derive(Debug)]
+struct Refusal {
+  error: crate::types::TranscriberError,
+  completion: AlignmentCompletion,
+}
+
+impl RefusedCompletion {
+  /// `completion`, refused for `error`.
+  pub(crate) fn new(
+    error: crate::types::TranscriberError,
+    completion: AlignmentCompletion,
+  ) -> Self {
+    Self(Box::new(Refusal { error, completion }))
+  }
+
+  /// Why the completion was refused.
+  #[must_use]
+  pub fn error(&self) -> &crate::types::TranscriberError {
+    &self.0.error
+  }
+
+  /// The refused completion, still unanswered.
+  pub fn into_completion(self) -> AlignmentCompletion {
+    self.0.completion
+  }
+}
+
+impl From<RefusedCompletion> for crate::types::TranscriberError {
+  fn from(refused: RefusedCompletion) -> Self {
+    refused.0.error
   }
 }
 

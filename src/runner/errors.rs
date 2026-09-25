@@ -83,3 +83,10 @@ pub enum RunnerError {
   #[error("transcriber: {0}")]
   Transcriber(#[from] TranscriberError),
 }
+
+impl From<crate::core::RefusedCompletion> for RunnerError {
+  /// The refusal, as the state machine's error; the completion is dropped.
+  fn from(refused: crate::core::RefusedCompletion) -> Self {
+    Self::Transcriber(refused.into())
+  }
+}

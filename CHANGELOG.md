@@ -98,11 +98,15 @@ BREAKING
     the chunk awaits, as the new `TranscriberError::ForeignAlignment` (with
     `ForeignAlignment`: the chunk, and whether another transcriber issued
     the command), and a chunk not awaiting alignment as `UnknownChunk`. A
-    failure completion becomes the chunk's `Event::Error`. `complete`
-    consumes the completion, so a command is answered once.
+    refused completion is handed back (`RefusedCompletion`), so one
+    delivered to the wrong transcriber can still reach the one that issued
+    its command. A failure completion becomes the chunk's `Event::Error`.
+    `complete` consumes an accepted completion, so a command is answered
+    once.
   - **Pool.** `AlignWorkItem::new(request, abort_flag)` builds a job from
     the request alone, and `run_one_alignment` answers the job's request on
-    success and on failure, returning its `AlignmentCompletion`.
+    success and on failure, a panic in the job included, returning its
+    `AlignmentCompletion`.
   - **The `Transcript` keeps the report.** `Transcript::alignment()`
     returns the chunk's `AlignmentReport`: `NotAttempted` when no alignment
     was asked for (word alignment is off, or the text was empty),
@@ -130,9 +134,11 @@ BREAKING
     unit (`slot.answer(alignment)`), then `request.aligned(outcomes)` and
     `transcriber.complete(..)`; for a failure that is not one unit's own,
     `request.failed(failure)` and `complete`.
-  - `Transcriber::handle_alignment` is gone: use `complete`.
-    `handle_failure` takes ASR failures only, and refuses a chunk awaiting
-    alignment as the new `TranscriberError::AwaitsCompletion`.
+  - `Transcriber::handle_alignment` is gone: use `complete`, which returns
+    `Result<(), RefusedCompletion>`; `?` converts a refusal into its
+    `TranscriberError` or a `RunnerError`. `handle_failure` takes ASR
+    failures only, and refuses a chunk awaiting alignment as the new
+    `TranscriberError::AwaitsCompletion`.
   - Removed: `AlignmentResult`, `AlignmentTicket`,
     `AlignWorkItem::from_run_alignment` and
     `TranscriberError::UnaccountedAlignment` (the request refuses

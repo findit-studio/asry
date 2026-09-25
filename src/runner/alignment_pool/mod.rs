@@ -211,14 +211,31 @@ pub fn run_one_alignment(
 }
 
 /// Answer `job`'s request with what `align` makes of its unit slots: the
-/// outcomes, each made from its unit's slot, or a failure. Either way the
-/// completion is built by the job's own request.
+/// outcomes, each made from its unit's slot, or a failure, a panic in
+/// `align` included. Either way the completion is built by the job's own
+/// request.
 fn answer_job(
   mut job: AlignWorkItem,
   align: impl FnOnce(&AlignWorkItem, Vec<UnitSlot>) -> Result<Vec<UnitOutcome>, WorkFailure>,
 ) -> AlignmentCompletion {
   let slots = job.request.take_slots();
-  let answered = align(&job, slots);
+  // A job that panics (an aligner fault) still answers its request: as a
+  // failure, so the chunk resolves to its `Event::Error` instead of
+  // waiting for a completion no one can build any more.
+  let answered = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| align(&job, slots)))
+    .unwrap_or_else(|panic| {
+      let message = panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a panic with no message");
+      Err(WorkFailure::Alignment(AlignmentError::ModelInference(
+        AlignmentFailure::new(
+          format_smolstr!("the alignment job panicked: {message}"),
+          job.language().clone(),
+        ),
+      )))
+    });
   let AlignWorkItem { request, .. } = job;
   match answered {
     Ok(outcomes) => request.aligned(outcomes).unwrap_or_else(|refused| {

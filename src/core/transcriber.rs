@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
   core::{
     buffer::SampleBuffer,
-    command::{AlignmentCompletion, AsrParams, AsrParamsOverride, AsrResult, Command},
+    command::{
+      AlignmentCompletion, AsrParams, AsrParamsOverride, AsrResult, Command, RefusedCompletion,
+    },
     cut::Cut,
     dispatch::Dispatch,
     event::Event,
@@ -987,15 +989,14 @@ impl Transcriber {
   /// in time order; a failure becomes the chunk's `Event::Error`. The
   /// completion is consumed, so it is delivered once.
   ///
-  /// Errors, each checked before any state changes:
+  /// Errors, each checked before any state changes, and each handing the
+  /// completion back ([`RefusedCompletion`]) so its command can still be
+  /// completed, by the transcriber that issued it:
   /// - `ForeignAlignment` if the completion answers a command another
   ///   transcriber issued, or another command than the one its chunk
   ///   awaits.
   /// - `UnknownChunk(chunk_id)` if its chunk is not awaiting alignment.
-  ///
-  /// A refused completion is dropped: it answers no command of this
-  /// transcriber's awaited chunks, which are unchanged.
-  pub fn complete(&mut self, completion: AlignmentCompletion) -> Result<(), TranscriberError> {
+  pub fn complete(&mut self, completion: AlignmentCompletion) -> Result<(), RefusedCompletion> {
     self.dispatch.complete(completion)?;
     self.dispatch.after_inject(
       &mut self.buffer,

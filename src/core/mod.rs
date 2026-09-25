@@ -12,8 +12,8 @@ mod transcriber;
 pub(crate) use command::sort_words_by_pts;
 pub use command::{
   AlignedWords, AlignmentCompletion, AlignmentReport, AlignmentRequest, AlignmentUnit, AsrParams,
-  AsrParamsOverride, AsrResult, Command, SamplingStrategy, UnaccountedOutcomes, UnalignedCause,
-  UnitAlignment, UnitOutcome, UnitSlot,
+  AsrParamsOverride, AsrResult, Command, RefusedCompletion, SamplingStrategy, UnaccountedOutcomes,
+  UnalignedCause, UnitAlignment, UnitOutcome, UnitSlot,
 };
 pub use event::Event;
 pub use oov::{

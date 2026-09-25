@@ -13,7 +13,7 @@ use crate::{
     buffer::SampleBuffer,
     command::{
       AlignmentCompletion, AlignmentReport, AlignmentRequest, AlignmentTicket, Answer, AsrParams,
-      AsrResult, Command,
+      AsrResult, Command, RefusedCompletion,
     },
     cut::{MergedChunk, SampleRange, SubOrigin},
     event::Event,
@@ -679,22 +679,61 @@ impl Dispatch {
   /// `Transcript`, keeping each unit's outcome as its alignment report, or
   /// resolves it to its `Event::Error`.
   ///
-  /// Binding contract, checked before any state changes: the completion
-  /// must answer the command its chunk awaits. A chunk's recorded ticket is
-  /// process-unique, so it names both the command and this transcriber,
-  /// and a completion built from any other request is refused as
-  /// `ForeignAlignment`, naming whether another transcriber issued it. A
-  /// chunk not awaiting alignment answers `UnknownChunk` (or
-  /// `ForeignAlignment`, when another transcriber issued the command).
+  /// Binding contract, checked before any state changes (see
+  /// [`Self::accepts`]): the completion must answer the command its chunk
+  /// awaits. A refused completion is handed back with the refusal.
   ///
-  /// The completion is consumed, so it is delivered once; its outcomes were
-  /// proven to be the request's own units, each once, in order, when the
-  /// request built it.
+  /// The completion is consumed when accepted, so it is delivered once; its
+  /// outcomes were proven to be the request's own units, each once, in
+  /// order, when the request built it.
   pub(crate) fn complete(
     &mut self,
     completion: AlignmentCompletion,
-  ) -> Result<(), TranscriberError> {
+  ) -> Result<(), RefusedCompletion> {
+    if let Err(error) = self.accepts(&completion) {
+      return Err(RefusedCompletion::new(error, completion));
+    }
     let (ticket, answer) = completion.into_parts();
+    let chunk_id = ticket.chunk_id();
+    let record = self
+      .in_flight
+      .get_mut(&chunk_id)
+      .expect("accepted above: the chunk awaits alignment");
+    let asr = record
+      .asr_result
+      .take()
+      .expect("accepted above: a chunk awaiting alignment caches its ASR result");
+    match answer {
+      Answer::Aligned(report) => {
+        let transcript = Transcript::new(
+          record.range,
+          asr.language().clone(),
+          asr.text().clone(),
+          report,
+          asr.avg_logprob(),
+          asr.no_speech_prob(),
+          asr.temperature(),
+          record.sub_segments.clone(),
+          chunk_id,
+        );
+        record.phase = ChunkPhase::Ready { transcript };
+      }
+      // An alignment-stage failure had its language observed at ASR-result
+      // time, so the auto-lock cursor is not touched.
+      Answer::Failed(failure) => record.phase = ChunkPhase::FailedReady { failure },
+    }
+    Ok(())
+  }
+
+  /// Whether `completion` answers the command its chunk awaits.
+  ///
+  /// A chunk's recorded ticket is process-unique, so it names both the
+  /// command and this transcriber: a completion built from any other
+  /// request is `ForeignAlignment`, naming whether another transcriber
+  /// issued its command. A chunk not awaiting alignment is `UnknownChunk`
+  /// (or `ForeignAlignment`, when another transcriber issued the command).
+  fn accepts(&self, completion: &AlignmentCompletion) -> Result<(), TranscriberError> {
+    let ticket = completion.ticket();
     let chunk_id = ticket.chunk_id();
     let another_transcriber = ticket.transcriber() != self.id;
     let foreign = || {
@@ -703,11 +742,9 @@ impl Dispatch {
         another_transcriber,
       ))
     };
-    let Some(record) = self
-      .in_flight
-      .get_mut(&chunk_id)
-      .filter(|record| matches!(record.phase, ChunkPhase::AwaitingAlignment))
-    else {
+    let Some(record) = self.in_flight.get(&chunk_id).filter(|record| {
+      matches!(record.phase, ChunkPhase::AwaitingAlignment) && record.asr_result.is_some()
+    }) else {
       return Err(if another_transcriber {
         foreign()
       } else {
@@ -717,32 +754,6 @@ impl Dispatch {
     if record.alignment_ticket != Some(ticket.id()) {
       return Err(foreign());
     }
-    let report = match answer {
-      Answer::Aligned(report) => report,
-      Answer::Failed(failure) => {
-        // An alignment-stage failure had its language observed at ASR-result
-        // time, so the auto-lock cursor is not touched.
-        record.asr_result = None;
-        record.phase = ChunkPhase::FailedReady { failure };
-        return Ok(());
-      }
-    };
-    let asr = record
-      .asr_result
-      .take()
-      .ok_or(TranscriberError::UnknownChunk(chunk_id))?;
-    let transcript = Transcript::new(
-      record.range,
-      asr.language().clone(),
-      asr.text().clone(),
-      report,
-      asr.avg_logprob(),
-      asr.no_speech_prob(),
-      asr.temperature(),
-      record.sub_segments.clone(),
-      chunk_id,
-    );
-    record.phase = ChunkPhase::Ready { transcript };
     Ok(())
   }
 
@@ -1371,10 +1382,17 @@ mod tests {
     let mut d = aligning_dispatch();
     let b = make_buffer_with_samples(10_000);
     d.on_emit(fake_chunk(0, 1_000), ChunkId::from_raw(0), &b);
-    let r = d.complete(answer(stale(&d, 0), unaligned));
+    let refused = d
+      .complete(answer(stale(&d, 0), unaligned))
+      .expect_err("chunk 0 awaits ASR");
     assert!(
-      matches!(r, Err(TranscriberError::UnknownChunk(c)) if c == ChunkId::from_raw(0)),
-      "got {r:?}"
+      matches!(refused.error(), TranscriberError::UnknownChunk(c) if *c == ChunkId::from_raw(0)),
+      "got {refused:?}"
+    );
+    assert_eq!(
+      refused.into_completion().chunk_id(),
+      ChunkId::from_raw(0),
+      "the refused completion is handed back"
     );
     assert!(matches!(
       d.in_flight.get(&ChunkId::from_raw(0)).map(|r| &r.phase),
@@ -1385,11 +1403,14 @@ mod tests {
     let mut d = aligning_dispatch();
     let own = await_alignment(&mut d, &b, 0, "hello world", Vec::new());
     match d.complete(answer(stale(&d, 0), unaligned)) {
-      Err(TranscriberError::ForeignAlignment(foreign)) => {
-        assert_eq!(foreign.chunk_id(), ChunkId::from_raw(0));
-        assert!(!foreign.another_transcriber());
-      }
-      other => panic!("another command's completion must be refused; got {other:?}"),
+      Err(refused) => match refused.error() {
+        TranscriberError::ForeignAlignment(foreign) => {
+          assert_eq!(foreign.chunk_id(), ChunkId::from_raw(0));
+          assert!(!foreign.another_transcriber());
+        }
+        other => panic!("another command's completion must be refused by name; got {other:?}"),
+      },
+      Ok(()) => panic!("another command's completion must be refused"),
     }
     assert!(awaiting_alignment(&d, 0), "a refusal changes nothing");
     d.complete(answer(own, unaligned))
@@ -1629,15 +1650,15 @@ mod tests {
   /// success or failure.** Two transcribers each hold chunk 0 awaiting
   /// alignment, with one text and one unit layout, whole or run by run.
   /// Swapped, each refuses the other's completion as `ForeignAlignment`
-  /// naming another transcriber, before any state changes, and a failure
-  /// from one job is refused by the other the same way. A completion names
-  /// its own chunk, so within one transcriber a completion cannot reach
-  /// another chunk at all. An alignment failure travels only through its
-  /// request: `handle_failure` refuses a chunk awaiting alignment
-  /// (`AwaitsCompletion`). Each chunk's own completion resolves it; a
-  /// completion cannot be cloned (the `compile_fail` doctest on
-  /// `AlignmentCompletion`), and `complete` consumes it, so none is
-  /// delivered twice.
+  /// naming another transcriber, before any state changes, and hands it
+  /// back; delivered to the transcriber that issued its command, it
+  /// resolves that chunk. A failure from one job is refused by the other
+  /// the same way. A completion names its own chunk, so within one
+  /// transcriber a completion cannot reach another chunk at all. An
+  /// alignment failure travels only through its request: `handle_failure`
+  /// refuses a chunk awaiting alignment (`AwaitsCompletion`). A completion
+  /// cannot be cloned (the `compile_fail` doctest on `AlignmentCompletion`),
+  /// and `complete` consumes an accepted one, so none is delivered twice.
   #[test]
   fn a_completion_answers_only_its_own_command() {
     use crate::{
@@ -1652,12 +1673,28 @@ mod tests {
         Lang::En,
       )))
     };
-    let foreign = |outcome: Result<(), TranscriberError>| match outcome {
-      Err(TranscriberError::ForeignAlignment(foreign)) => {
-        assert_eq!(foreign.chunk_id(), ChunkId::from_raw(0));
-        assert!(foreign.another_transcriber());
+    let foreign = |outcome: Result<(), RefusedCompletion>| match outcome {
+      Err(refused) => {
+        match refused.error() {
+          TranscriberError::ForeignAlignment(foreign) => {
+            assert_eq!(foreign.chunk_id(), ChunkId::from_raw(0));
+            assert!(foreign.another_transcriber());
+          }
+          other => panic!("another transcriber's completion is refused by name; got {other:?}"),
+        }
+        refused.into_completion()
       }
-      other => panic!("another transcriber's completion must be refused; got {other:?}"),
+      Ok(()) => panic!("another transcriber's completion must be refused"),
+    };
+    let resolved = |d: &mut Dispatch, transcript: bool| {
+      flush(d);
+      match d.pending_events.front() {
+        Some(Event::Transcript(t)) if transcript => assert_eq!(t.chunk_id(), ChunkId::from_raw(0)),
+        Some(Event::Error { chunk_id, .. }) if !transcript => {
+          assert_eq!(*chunk_id, ChunkId::from_raw(0))
+        }
+        other => panic!("expected chunk 0's terminal event; got {other:?}"),
+      }
     };
 
     for runs in [Vec::new(), vec![en_run("hello"), en_run(" world")]] {
@@ -1667,16 +1704,22 @@ mod tests {
       let from_a = await_alignment(&mut a, &b, 0, "hello world", runs.clone());
       let from_z = await_alignment(&mut z, &b, 0, "hello world", runs.clone());
       assert_ne!(a.id, z.id);
-      foreign(a.complete(answer(from_z, unaligned)));
-      foreign(z.complete(answer(from_a, unaligned)));
+      let back_to_z = foreign(a.complete(answer(from_z, unaligned)));
+      let back_to_a = foreign(z.complete(answer(from_a, unaligned)));
       assert!(awaiting_alignment(&a, 0) && awaiting_alignment(&z, 0));
+      a.complete(back_to_a)
+        .expect("handed back, its issuer takes it");
+      z.complete(back_to_z)
+        .expect("handed back, its issuer takes it");
+      resolved(&mut a, true);
+      resolved(&mut z, true);
 
       // A failure from job A offered to job Z.
       let mut a = aligning_dispatch();
       let mut z = aligning_dispatch();
       let from_a = await_alignment(&mut a, &b, 0, "hello world", runs.clone());
       let own = await_alignment(&mut z, &b, 0, "hello world", runs.clone());
-      foreign(z.complete(from_a.failed(failure())));
+      let back_to_a = foreign(z.complete(from_a.failed(failure())));
       assert!(
         awaiting_alignment(&z, 0),
         "a refused failure resolves nothing"
@@ -1691,12 +1734,10 @@ mod tests {
       );
       z.complete(answer(own, unaligned))
         .expect("the chunk's own completion resolves it");
-      flush(&mut z);
-      assert!(
-        matches!(z.pending_events.front(), Some(Event::Transcript(t)) if t.chunk_id() == ChunkId::from_raw(0)),
-        "got {:?}",
-        z.pending_events
-      );
+      resolved(&mut z, true);
+      a.complete(back_to_a)
+        .expect("the failure answers the command it was built for");
+      resolved(&mut a, false);
 
       // Within one transcriber a failure resolves only the chunk it names.
       let mut d = aligning_dispatch();
@@ -1709,12 +1750,7 @@ mod tests {
         Some(ChunkPhase::FailedReady { .. })
       ));
       assert!(awaiting_alignment(&d, 1), "chunk 1 is untouched");
-      flush(&mut d);
-      assert!(
-        matches!(d.pending_events.front(), Some(Event::Error { chunk_id, .. }) if *chunk_id == ChunkId::from_raw(0)),
-        "got {:?}",
-        d.pending_events
-      );
+      resolved(&mut d, false);
     }
   }
 

@@ -52,8 +52,9 @@ pub use types::{
 
 pub use core::{
   AlignedWords, AlignmentCompletion, AlignmentReport, AlignmentRequest, AlignmentUnit, AsrParams,
-  AsrParamsOverride, AsrResult, Command, Event, LanguagePolicy, SamplingStrategy, Transcriber,
-  TranscriberOptions, UnaccountedOutcomes, UnalignedCause, UnitAlignment, UnitOutcome, UnitSlot,
+  AsrParamsOverride, AsrResult, Command, Event, LanguagePolicy, RefusedCompletion,
+  SamplingStrategy, Transcriber, TranscriberOptions, UnaccountedOutcomes, UnalignedCause,
+  UnitAlignment, UnitOutcome, UnitSlot,
 };
 
 // Reachable under `runner` (whisper.cpp ASR) OR `emissions` (the

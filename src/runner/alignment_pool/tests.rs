@@ -772,11 +772,12 @@ fn transcriber_awaiting_alignment(
 /// decide it, and the pool answers it through the request: here no aligner
 /// reads Korean, so under `SkipChunk` every unit is skipped. Swapped, each
 /// transcriber refuses the other's completion as `ForeignAlignment` naming
-/// another transcriber, and its chunk still awaits alignment; its own
-/// completion resolves it. Under the `Error` fallback the job fails, and
-/// that failure answers its own request too: offered to the other
-/// transcriber it is refused the same way, and delivered home it is the
-/// chunk's `Event::Error`.
+/// another transcriber and hands it back, and its chunk still awaits
+/// alignment; delivered home, each completion resolves its own chunk.
+/// Under the `Error` fallback the job fails, and that failure answers its
+/// own request too: offered to the other transcriber it is refused the
+/// same way, and delivered home it is the chunk's `Event::Error`. A job
+/// that panics answers its request as a failure too.
 ///
 /// The jobs run the pool's own answering step (`answer_job`) over the units'
 /// real detection and resolution, as `run_one_alignment` does for units no
@@ -785,16 +786,22 @@ fn transcriber_awaiting_alignment(
 #[test]
 fn a_pool_completion_answers_only_its_own_command() {
   use crate::{
-    core::{Event, UnitAlignment, default_oov_policy},
+    core::{Event, RefusedCompletion, UnitAlignment, default_oov_policy},
     types::TranscriberError,
   };
 
-  let foreign = |outcome: Result<(), TranscriberError>| match outcome {
-    Err(TranscriberError::ForeignAlignment(foreign)) => {
-      assert_eq!(foreign.chunk_id(), ChunkId::from_raw(0));
-      assert!(foreign.another_transcriber());
+  let foreign = |outcome: Result<(), RefusedCompletion>| match outcome {
+    Err(refused) => {
+      match refused.error() {
+        TranscriberError::ForeignAlignment(foreign) => {
+          assert_eq!(foreign.chunk_id(), ChunkId::from_raw(0));
+          assert!(foreign.another_transcriber());
+        }
+        other => panic!("another transcriber's completion is refused by name; got {other:?}"),
+      }
+      refused.into_completion()
     }
-    other => panic!("another transcriber's completion must be refused; got {other:?}"),
+    Ok(()) => panic!("another transcriber's completion must be refused"),
   };
   let run_job = |set: &AlignmentSet, fallback: AlignmentFallback, request: AlignmentRequest| {
     let job = AlignWorkItem::new(request, Arc::new(AtomicBool::new(false)));
@@ -827,44 +834,45 @@ fn a_pool_completion_answers_only_its_own_command() {
       run_job(&registry, skip, from_z),
     );
     assert!(done_a.report().is_some() && done_z.report().is_some());
-    foreign(a.complete(done_z));
-    foreign(z.complete(done_a));
+    let back_to_z = foreign(a.complete(done_z));
+    let back_to_a = foreign(z.complete(done_a));
     assert_eq!(
       (a.in_flight_chunk_count(), z.in_flight_chunk_count()),
       (1, 1),
       "the swap resolves nothing"
     );
-
-    let (mut own, request) = transcriber_awaiting_alignment("hello world", runs.clone());
-    own
-      .complete(run_job(&registry, skip, request))
-      .expect("the job of its own request resolves the chunk");
-    match own.poll_event() {
-      Some(Event::Transcript(t)) => {
-        assert_eq!(t.alignment().units().len(), runs.len().max(1));
-        assert!(
-          t.alignment().units().all(|(_, alignment)| matches!(
-            alignment,
-            UnitAlignment::Unaligned(UnalignedCause::Skipped)
-          )),
-          "{:?}",
-          t.alignment()
-        );
+    a.complete(back_to_a)
+      .expect("handed back, the transcriber that issued its command takes it");
+    z.complete(back_to_z)
+      .expect("handed back, the transcriber that issued its command takes it");
+    for transcriber in [&mut a, &mut z] {
+      match transcriber.poll_event() {
+        Some(Event::Transcript(t)) => {
+          assert_eq!(t.alignment().units().len(), runs.len().max(1));
+          assert!(
+            t.alignment().units().all(|(_, alignment)| matches!(
+              alignment,
+              UnitAlignment::Unaligned(UnalignedCause::Skipped)
+            )),
+            "{:?}",
+            t.alignment()
+          );
+        }
+        other => panic!("expected the transcript; got {other:?}"),
       }
-      other => panic!("expected the transcript; got {other:?}"),
     }
 
     // A failure from job A offered to job Z.
     let error = AlignmentFallback::Error;
     let registry = empty_registry(error);
-    let (_a, from_a) = transcriber_awaiting_alignment("hello world", runs.clone());
+    let (mut a, from_a) = transcriber_awaiting_alignment("hello world", runs.clone());
     let (mut z, from_z) = transcriber_awaiting_alignment("hello world", runs.clone());
     let failed_a = run_job(&registry, error, from_a);
     assert!(matches!(
       failed_a.failure(),
       Some(WorkFailure::LanguageUnsupported(_))
     ));
-    foreign(z.complete(failed_a));
+    let back_to_a = foreign(z.complete(failed_a));
     assert_eq!(
       z.in_flight_chunk_count(),
       1,
@@ -873,6 +881,25 @@ fn a_pool_completion_answers_only_its_own_command() {
     z.complete(run_job(&registry, error, from_z))
       .expect("z's own failure resolves its chunk");
     assert!(matches!(z.poll_event(), Some(Event::Error { .. })));
+    a.complete(back_to_a)
+      .expect("a's failure answers a's command");
+    assert!(matches!(a.poll_event(), Some(Event::Error { .. })));
+
+    // A job that panics still answers its request, as a failure.
+    let (mut a, from_a) = transcriber_awaiting_alignment("hello world", runs.clone());
+    let job = AlignWorkItem::new(from_a, Arc::new(AtomicBool::new(false)));
+    let panicked = answer_job(job, |_, _| panic!("an aligner fault"));
+    match panicked.failure() {
+      Some(WorkFailure::Alignment(AlignmentError::ModelInference(failure))) => assert!(
+        failure.message().contains("an aligner fault"),
+        "{}",
+        failure.message()
+      ),
+      other => panic!("a panicking job answers as a failure; got {other:?}"),
+    }
+    a.complete(panicked)
+      .expect("the panicked job's failure answers its command");
+    assert!(matches!(a.poll_event(), Some(Event::Error { .. })));
   }
 }
 
