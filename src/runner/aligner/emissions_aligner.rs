@@ -338,8 +338,7 @@ impl EmissionsAligner {
   /// be finished twice and emissions cannot be reused.
   ///
   /// `emissions` must be the ones made through `prepared`
-  /// ([`PreparedChunk::emissions_from_log_probs`],
-  /// [`PreparedChunk::emissions_from_logits`]): emissions made through
+  /// ([`PreparedChunk::encode_with`]): emissions made through
   /// another chunk are refused by name before a frame is read, whatever
   /// their shape.
   ///
@@ -419,7 +418,7 @@ impl EmissionsAligner {
         SmolStr::new_static(
           "these Emissions were made through another PreparedChunk. Emissions answer the one \
  chunk they were made through, whatever their shape: make them with \
- `prepared.emissions_from_log_probs` / `prepared.emissions_from_logits` on the chunk you \
+ `prepared.encode_with` on the chunk you \
  finish.",
         ),
       )));

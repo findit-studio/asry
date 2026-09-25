@@ -731,11 +731,10 @@ pub(crate) struct AlignerCore {
 /// aligner and finished by another is rejected rather than aligned
 /// against the wrong vocabulary.
 ///
-/// And it carries the identity of its own preparation. Its encoder output
-/// enters asry only through it
-/// ([`emissions_from_log_probs`](Self::emissions_from_log_probs),
-/// [`emissions_from_logits`](Self::emissions_from_logits)), and those
-/// emissions answer this chunk alone: `finish` refuses to pair a chunk with
+/// And it carries the identity of its own preparation. Its encoder runs
+/// only through it ([`encode_with`](Self::encode_with), which hands the
+/// encoder this chunk's input and builds the emissions from its output),
+/// and those emissions answer this chunk alone: `finish` refuses to pair a chunk with
 /// emissions made through another, by name, before it reads a frame.
 pub struct PreparedChunk<'a> {
   /// The aligner that produced this chunk. Sits OUTSIDE `inner` on

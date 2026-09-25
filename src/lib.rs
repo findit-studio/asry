@@ -133,7 +133,8 @@ pub use ort;
 /// | pass VAD in the wrong timebase (which was silently ignored) | [`SampleSpan`](emissions::SampleSpan) has no timebase; the bridge from `TimeRange` is strict |
 /// | mean "no VAD" and get "all silence" (which dropped every word) | [`SpeechSpans::all_speech()`](emissions::SpeechSpans::all_speech) says it out loud |
 /// | supply a non-total sample→time closure (which panicked in your own code) | [`OutputClock`](emissions::OutputClock) is data; asry owns the saturation |
-/// | supply `V = 0`, a `T` that OOMs, or a non-log-probability | a chunk's [`Emissions`](emissions::Emissions) are made through its [`PreparedChunk`](emissions::PreparedChunk), the one door, and it checks all three |
+/// | supply `V = 0`, a `T` that OOMs, or a non-log-probability | a chunk's [`Emissions`](emissions::Emissions) are made through its [`PreparedChunk`](emissions::PreparedChunk)'s `encode_with`, the one door, and it checks all three |
+/// | stamp another chunk's encoder output as this chunk's emissions | `encode_with` hands your encoder this chunk's prepared input and builds the emissions from what it returns; no emissions are made from a free tensor |
 /// | finish a chunk with another chunk's emissions of the same shape | emissions carry the identity of the preparation they were made through, and `finish` refuses any other by name |
 /// | disagree with asry about the sample count, frame count, or stride | asry derives all three from slices that physically exist |
 /// | run a CTC head whose width disagrees with the tokenizer | `finish` validates it — the check this seam has NEVER run |
@@ -175,7 +176,9 @@ pub mod emissions {
       core::PreparedChunk,
       default_normalizer_for,
       emissions_aligner::{EmissionsAligner, EmissionsAlignerBuilder, LetterCase},
-      emissions_api::{Emissions, OutputClock, SampleSpan, SpanError, SpeechCoverage, SpeechSpans},
+      emissions_api::{
+        Emissions, EncoderOutput, OutputClock, SampleSpan, SpanError, SpeechCoverage, SpeechSpans,
+      },
     },
   };
 }

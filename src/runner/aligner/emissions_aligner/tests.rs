@@ -12,10 +12,59 @@ use crate::{
     oov::{default_oov_policy, fail_closed_all_policy, wildcard_all_policy},
   },
   runner::aligner::{
-    emissions_api::{SampleSpan, SpanError},
+    emissions_api::{EncoderOutput, SampleSpan, SpanError},
     normalizer::{NormalizationError, NormalizedText, TextNormalizer},
   },
 };
+
+/// A chunk's emissions from an encoder that returned this tensor for the
+/// chunk's input, as [`PreparedChunk::encode_with`] makes them.
+trait EncodedAs {
+  fn encoded_logits(
+    &self,
+    frames: usize,
+    vocab: NonZeroUsize,
+    data: Vec<f32>,
+  ) -> Result<Emissions, EmissionsError>;
+  fn encoded_log_probs(
+    &self,
+    frames: usize,
+    vocab: NonZeroUsize,
+    data: Vec<f32>,
+  ) -> Result<Emissions, EmissionsError>;
+}
+
+impl EncodedAs for PreparedChunk<'_> {
+  fn encoded_logits(
+    &self,
+    frames: usize,
+    vocab: NonZeroUsize,
+    data: Vec<f32>,
+  ) -> Result<Emissions, EmissionsError> {
+    self.encode_with(|_| {
+      Ok::<_, EmissionsError>(EncoderOutput::Logits {
+        frames,
+        vocab,
+        data,
+      })
+    })
+  }
+
+  fn encoded_log_probs(
+    &self,
+    frames: usize,
+    vocab: NonZeroUsize,
+    data: Vec<f32>,
+  ) -> Result<Emissions, EmissionsError> {
+    self.encode_with(|_| {
+      Ok::<_, EmissionsError>(EncoderOutput::LogProbs {
+        frames,
+        vocab,
+        data,
+      })
+    })
+  }
+}
 
 /// A wav2vec2-base-960h-shape tokenizer: uppercase-only vocab, `<pad>`
 /// as the CTC blank at id 0, a `|` word delimiter. Small enough to reason
@@ -254,7 +303,7 @@ fn trivial_chunks_skip_the_encoder() {
   assert!(prepared.encoder_input().is_empty());
 
   let emissions = prepared
-    .emissions_from_log_probs(
+    .encoded_log_probs(
       1,
       NonZeroUsize::new(VOCAB_SIZE).unwrap(),
       vec![-1.0; VOCAB_SIZE],
@@ -295,7 +344,7 @@ fn finish_rejects_a_vocab_dim_that_disagrees_with_the_tokenizer() {
   // mispaired export.
   let wrong_v = NonZeroUsize::new(29).expect("29 != 0");
   let emissions = prepared
-    .emissions_from_logits(t, wrong_v, vec![0.5_f32; t * 29])
+    .encoded_logits(t, wrong_v, vec![0.5_f32; t * 29])
     .expect("well-formed 29-wide logits");
 
   let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
@@ -333,7 +382,7 @@ fn finish_rejects_a_frame_count_that_cannot_match_the_audio() {
   let t = 1500;
   let v = NonZeroUsize::new(VOCAB_SIZE).expect("ok");
   let emissions = prepared
-    .emissions_from_logits(t, v, vec![0.5_f32; t * VOCAB_SIZE])
+    .encoded_logits(t, v, vec![0.5_f32; t * VOCAB_SIZE])
     .expect("well-formed logits");
 
   let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
@@ -463,7 +512,7 @@ fn finish_rejects_a_prepared_chunk_from_a_different_aligner() {
   // Emissions from B's encoder: correct width, correct T for this audio.
   let (t, logits) = fake_encoder(&prepared_from_a, 320);
   let emissions_from_b = prepared_from_a
-    .emissions_from_logits(t, b.vocab_size(), logits)
+    .encoded_logits(t, b.vocab_size(), logits)
     .expect("well-formed");
 
   let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
@@ -506,7 +555,7 @@ fn finish_rejects_a_foreign_trivial_chunk_too() {
   assert!(prepared_from_a.is_trivial());
 
   let emissions = prepared_from_a
-    .emissions_from_log_probs(
+    .encoded_log_probs(
       1,
       NonZeroUsize::new(VOCAB_SIZE).expect("32 != 0"),
       vec![-1.0; VOCAB_SIZE],
@@ -536,7 +585,7 @@ fn finish_accepts_the_chunk_its_own_prepare_minted() {
     .expect("prepare");
   let (t, logits) = fake_encoder(&prepared, 320);
   let emissions = prepared
-    .emissions_from_logits(t, a.vocab_size(), logits)
+    .encoded_logits(t, a.vocab_size(), logits)
     .expect("ok");
   let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   a.finish(prepared, emissions, clock, &AtomicBool::new(false))
@@ -596,7 +645,7 @@ fn alignkit_call_site_aligns_end_to_end() {
   let (t, logits) = fake_encoder(&prepared, 320);
 
   let emissions = prepared
-    .emissions_from_logits(t, vocab, logits)
+    .encoded_logits(t, vocab, logits)
     .expect("one door, all the guards");
 
   // —— timed words out ————————————————————————————————————————
@@ -644,7 +693,7 @@ fn finish_refuses_emissions_made_through_another_chunk() {
   let (first, second) = (prepare("hello"), prepare("hello"));
   let (t, logits) = fake_encoder(&first, 320);
   let from_first = first
-    .emissions_from_logits(t, a.vocab_size(), logits.clone())
+    .encoded_logits(t, a.vocab_size(), logits.clone())
     .expect("well-formed");
   let Err(EmissionsError::PreparationMismatch(failure)) =
     a.finish(second, from_first, clock(), &AtomicBool::new(true))
@@ -660,7 +709,7 @@ fn finish_refuses_emissions_made_through_another_chunk() {
   let (trivial, other) = (prepare("!!!"), prepare("..."));
   assert!(trivial.is_trivial() && other.is_trivial());
   let from_other = other
-    .emissions_from_log_probs(1, a.vocab_size(), vec![-1.0; VOCAB_SIZE])
+    .encoded_log_probs(1, a.vocab_size(), vec![-1.0; VOCAB_SIZE])
     .expect("well-formed");
   assert!(matches!(
     a.finish(trivial, from_other, clock(), &AtomicBool::new(false)),
@@ -668,11 +717,87 @@ fn finish_refuses_emissions_made_through_another_chunk() {
   ));
 
   let own = first
-    .emissions_from_logits(t, a.vocab_size(), logits)
+    .encoded_logits(t, a.vocab_size(), logits)
     .expect("well-formed");
   assert!(matches!(
     a.finish(first, own, clock(), &AtomicBool::new(false)),
     Ok(UnitAlignment::Aligned(_))
+  ));
+}
+
+/// **The encoder runs on its chunk's own input, and its output answers that
+/// chunk alone.** `encode_with` hands the encoder exactly the chunk's
+/// prepared input (two chunks of one shape and different audio each see
+/// their own) and builds the emissions from what it returns; `finish`
+/// refuses them for the other chunk and aligns its own with them. A trivial
+/// chunk's encoder is not called.
+#[test]
+fn the_encoder_runs_on_its_own_chunk_input() {
+  let a = aligner();
+  let rising: Vec<f32> = (0..16_000).map(|i| (i as f32 * 0.01).sin() * 0.2).collect();
+  let falling: Vec<f32> = (0..16_000).map(|i| (i as f32 * 0.03).cos() * 0.1).collect();
+  let prepare = |samples: &[f32], text: &'static str| {
+    a.prepare(
+      samples,
+      &SpeechSpans::all_speech(),
+      text,
+      resolution(&a, text),
+      &AtomicBool::new(false),
+    )
+    .expect("prepare")
+  };
+  let clock = || OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
+  let encode = |prepared: &PreparedChunk<'_>| {
+    let (t, logits) = fake_encoder(prepared, 320);
+    let mut seen = Vec::new();
+    let emissions = prepared
+      .encode_with(|input| {
+        seen = input.to_vec();
+        Ok::<_, EmissionsError>(EncoderOutput::Logits {
+          frames: t,
+          vocab: a.vocab_size(),
+          data: logits,
+        })
+      })
+      .expect("well-formed");
+    (seen, emissions)
+  };
+
+  let (first, second) = (prepare(&rising, "hello"), prepare(&falling, "hello"));
+  assert_eq!(first.encoder_input().len(), second.encoder_input().len());
+  assert_ne!(first.encoder_input(), second.encoder_input());
+  let (seen_first, from_first) = encode(&first);
+  let (seen_second, _) = encode(&second);
+  assert_eq!(
+    seen_first,
+    first.encoder_input(),
+    "the encoder sees its chunk's input"
+  );
+  assert_eq!(
+    seen_second,
+    second.encoder_input(),
+    "the encoder sees its chunk's input"
+  );
+  assert!(matches!(
+    a.finish(second, from_first, clock(), &AtomicBool::new(false)),
+    Err(EmissionsError::PreparationMismatch(_))
+  ));
+  let (_, own) = encode(&first);
+  assert!(matches!(
+    a.finish(first, own, clock(), &AtomicBool::new(false)),
+    Ok(UnitAlignment::Aligned(_))
+  ));
+
+  let trivial = prepare(&rising, "!!!");
+  assert!(trivial.is_trivial());
+  let emissions = trivial
+    .encode_with(|_| -> Result<EncoderOutput, EmissionsError> {
+      panic!("a trivial chunk's encoder is not called")
+    })
+    .expect("a trivial chunk needs no encoder");
+  assert!(matches!(
+    a.finish(trivial, emissions, clock(), &AtomicBool::new(false)),
+    Ok(UnitAlignment::Unaligned(UnalignedCause::NoAlignableText))
   ));
 }
 
@@ -694,7 +819,7 @@ fn prepared_chunk_is_consumed_by_finish() {
     .expect("prepare");
   let (t, logits) = fake_encoder(&prepared, 320);
   let emissions = prepared
-    .emissions_from_logits(t, a.vocab_size(), logits)
+    .encoded_logits(t, a.vocab_size(), logits)
     .expect("ok");
   let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
 
@@ -719,7 +844,7 @@ fn finish_honours_the_abort_flag() {
     .expect("prepare");
   let (t, logits) = fake_encoder(&prepared, 320);
   let emissions = prepared
-    .emissions_from_logits(t, a.vocab_size(), logits)
+    .encoded_logits(t, a.vocab_size(), logits)
     .expect("ok");
   let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
 
@@ -999,7 +1124,7 @@ fn align_uniformly(a: &EmissionsAligner, text: &str, resolution: OovResolution) 
     .expect("prepare");
   let v = a.vocab_size();
   let emissions = prepared
-    .emissions_from_logits(49, v, vec![0.0_f32; 49 * v.get()])
+    .encoded_logits(49, v, vec![0.0_f32; 49 * v.get()])
     .expect("logits");
   let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   a.finish(prepared, emissions, clock, &AtomicBool::new(false))
@@ -1525,7 +1650,7 @@ fn a_punctuation_only_text_is_named_no_alignable_text() {
       .expect("prepare");
     assert!(prepared.is_trivial(), "{text:?}");
     let emissions = prepared
-      .emissions_from_log_probs(
+      .encoded_log_probs(
         1,
         NonZeroUsize::new(VOCAB_SIZE).expect("32 != 0"),
         vec![-1.0; VOCAB_SIZE],
@@ -1567,7 +1692,7 @@ fn a_fully_masked_text_is_named_no_surviving_words() {
   assert!(!prepared.is_trivial());
   let (t, logits) = fake_encoder(&prepared, 320);
   let emissions = prepared
-    .emissions_from_logits(t, a.vocab_size(), logits)
+    .encoded_logits(t, a.vocab_size(), logits)
     .expect("ok");
   let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   let result = a
@@ -1626,7 +1751,7 @@ fn a_space_delimited_vocabulary_aligns_under_its_stated_delimiter() {
 
   let (t, logits) = fake_encoder(&prepared, 320);
   let emissions = prepared
-    .emissions_from_logits(t, a.vocab_size(), logits)
+    .encoded_logits(t, a.vocab_size(), logits)
     .expect("ok");
   let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   let outcome = a
@@ -1756,7 +1881,7 @@ fn the_frame_count_is_checked_against_the_declared_front_end() {
   let clock = || OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   let emissions = |prepared: &PreparedChunk<'_>, t: usize| {
     prepared
-      .emissions_from_logits(
+      .encoded_logits(
         t,
         NonZeroUsize::new(VOCAB_SIZE).expect("32 != 0"),
         vec![0.0_f32; t * VOCAB_SIZE],

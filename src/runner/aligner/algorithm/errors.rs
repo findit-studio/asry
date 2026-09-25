@@ -160,8 +160,7 @@ pub enum EmissionsError {
   /// `PreparedChunk`.
   ///
   /// Emissions are made only through the chunk whose encoder output they
-  /// are (`PreparedChunk::emissions_from_log_probs`,
-  /// `PreparedChunk::emissions_from_logits`) and carry its identity. Two
+  /// are (`PreparedChunk::encode_with`) and carry its identity. Two
   /// chunks of one aligner with the same shape pass every dimension check,
   /// so pairing one chunk with the other's emissions would align its
   /// tokens to the other chunk's audio. Refused before a frame is read.

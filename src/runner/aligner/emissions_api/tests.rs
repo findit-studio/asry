@@ -13,17 +13,18 @@ use mediatime::{TimeRange, Timebase};
 use super::*;
 
 /// Emissions for a preparation of their own, through the crate's
-/// constructor: what `PreparedChunk::emissions_from_log_probs` runs.
+/// constructor: what `PreparedChunk::encode_with` runs for
+/// `EncoderOutput::LogProbs`.
 fn log_probs(t: usize, v: NonZeroUsize, data: Vec<f32>) -> Result<Emissions, EmissionsError> {
   Emissions::from_log_probs(PreparationId::next(), t, v, data)
 }
 
-/// As [`log_probs`], for `PreparedChunk::emissions_from_logits`.
+/// As [`log_probs`], for `EncoderOutput::Logits`.
 fn logits(t: usize, v: NonZeroUsize, raw: Vec<f32>) -> Result<Emissions, EmissionsError> {
   Emissions::from_logits_slice(PreparationId::next(), t, v, &raw)
 }
 
-/// As [`log_probs`], for `PreparedChunk::emissions_from_logits_slice`.
+/// As [`log_probs`], from a borrowed buffer.
 fn logits_slice(t: usize, v: NonZeroUsize, raw: &[f32]) -> Result<Emissions, EmissionsError> {
   Emissions::from_logits_slice(PreparationId::next(), t, v, raw)
 }
@@ -446,7 +447,7 @@ fn emissions_from_logits_applies_log_softmax_and_needs_no_value_scan() {
   // NOT "the CoreML path" — that label was wrong, and backwards for the
   // actual CoreML consumer, whose `.mlmodelc` bakes the log-softmax into
   // the graph and therefore needs `from_log_probs`. The criterion is the
-  // model's final op, never the runtime. See `PreparedChunk::emissions_from_logits`.
+  // model's final op, never the runtime. See `EncoderOutput`.
   let em =
     logits(2, nz(2), vec![1.0, 2.0, 3.0, 4.0]).expect("raw logits are the bare-CTC-head path");
   assert_eq!(em.frames(), 2);
