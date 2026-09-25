@@ -93,7 +93,7 @@ pub use runner::{
 // Re-export ort types that appear on the alignment public API.
 //
 // SemVer note: re-exporting pins asry's public API to ort's
-// semver. Cargo.toml pins ort to =2.0.0-rc.12; bumping it requires
+// semver. Cargo.toml pins ort to =2.0.0-rc.13; bumping it requires
 // a matching asry-major bump.
 #[cfg(feature = "alignment")]
 #[cfg_attr(docsrs, doc(cfg(feature = "alignment")))]

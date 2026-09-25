@@ -125,9 +125,10 @@ miniz_oxide = { version = "0.9", optional = true, default-features = false, feat
 # algorithm — trellis/beam/tokenize/normalize/compose) and so is
 # also present whenever `alignment` is, since `alignment` depends
 # on `emissions`. All optional — Plan A/B compile without either.
-# ort: ONNX runtime bindings. Pinned to =2.0.0-rc.12 because rc.13+
-# changed Session API in incompatible ways and rc.x versions don't
-# follow semver across rc bumps.
+# ort: ONNX runtime bindings, pinned exactly because rc.x versions do
+# not follow semver across rc bumps. rc.13 was verified on 2026-09-25:
+# the crate builds with every feature and the English wav2vec2 fixture's
+# ONNX session runs its aligner tests (ONNX Runtime 1.27.1, api-24).
 ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["std", "ndarray", "load-dynamic", "api-24"] }
 # tokenizers: HuggingFace WordPiece/BPE/Unigram tokenizer used to
 # read wav2vec2's tokenizer.json.
