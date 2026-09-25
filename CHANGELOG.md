@@ -1,5 +1,61 @@
 # UNRELEASED
 
+These changes ship as 0.3.0. Several are breaking, and each breaking change
+below names its migration. `Cargo.toml` still says 0.2.0: the version is
+bumped when the release is cut.
+
+BREAKING
+
+- **An OOV decision is made through the detection that found its event, and
+  nowhere else.** A decision was a `ResolvedOov` anyone could build
+  (`OovEvent::new`, `ResolvedOov::new`) and pass as a slice or a
+  `Vec<Vec<ResolvedOov>>`, and nothing tied it to the job or the text it was
+  made for: two jobs with the same text and run layout accepted each other's
+  decisions, and an event built by hand was accepted wherever its position
+  matched. Detection now returns a capability, and its decided form is the
+  only way decisions reach alignment:
+  - **`OovDetection` → `decide(policy)` → `OovResolution`** for one text
+    (`Aligner::detect_oov`, `EmissionsAligner::detect_oov`), bound to that
+    text and to the aligner that read it. `Aligner::align_chunk_with_abort`
+    and `EmissionsAligner::prepare` take the resolution by value and refuse,
+    before tokenizing, one detected in another text or by another aligner.
+  - **`JobDetection` → `decide(policy)` → `JobResolution`** for a pool job
+    (`AlignmentSet::detect_oov(&job)`), bound to that one `AlignWorkItem`
+    (its `ChunkId` with it) and to the set that read it. `run_one_alignment`
+    takes the resolution by value and refuses, before any aligner lookup or
+    tokenization, one detected for another job (even one with the same chunk
+    id, text and run layout) or through another set.
+  - None of these types can be cloned or built by hand, and deciding or
+    applying one consumes it, so a decision applies once, to the unit it was
+    made for.
+  - A direct detection holds its text once and a pool job's holds none (it
+    is bound by identity); no event carries a copy of the text, so
+    detection's memory grows linearly with the text.
+
+  Migration:
+  - `default_oov_decisions(&events)`, `wildcard_all_decisions(&events)` and
+    `fail_closed_all_decisions(&events)` become
+    `detection.decide(default_oov_policy)`, `decide(wildcard_all_policy)`
+    and `decide(fail_closed_all_policy)`. A policy is any
+    `FnMut(&OovEvent) -> OovDecision`, so a custom one is a closure.
+  - Pool: build the work item first, then detect and decide it.
+    `AlignWorkItem::from_run_alignment` no longer takes `oov_decisions`;
+    `AlignmentSet::detect_oov(&job)` replaces `detect_oov(text, language)`
+    and `detect_oov_per_run(runs)`; `run_one_alignment(&set, &job,
+    resolution, &run_options)` takes the resolution.
+    `AlignWorkItem::oov_decisions` is gone.
+  - Direct: `aligner.detect_oov(text)?.decide(policy)`, then pass the
+    resolution by value, with the same text, to `align_chunk_with_abort` or
+    `prepare`.
+  - Removed: `OovEvent::new`, `OovEvent::set_language`, `ResolvedOov::new`,
+    the three `*_decisions` helpers, `AlignmentSet::detect_oov_per_run`, and
+    the decision slices and `Vec<Vec<ResolvedOov>>` parameters. `OovEvent`
+    and `ResolvedOov` stay as read-only views (`OovDetection::events`,
+    `OovResolution::resolved`).
+  - New: `AlignmentUnit` (`Whole`, or `Run(index)` of
+    `Command::Alignment::runs`) names the unit a detection or resolution is
+    for.
+
 FIXED
 
 - **A punctuation mark nobody reads aloud is dropped: never a wildcard,
@@ -10,7 +66,7 @@ FIXED
   `OovKind::BoundaryPunct` event each; a `.` inside a word was an
   `OovKind::InternalPunct` event; and any other mark the vocabulary cannot
   spell (a guillemet, an ellipsis, the comma of `4,9`, a Chinese `《`) was an
-  `OovKind::Symbol` event, which `default_oov_decisions` refuses.
+  `OovKind::Symbol` event, which `default_oov_decisions` refused.
   `fail_closed_all_decisions` therefore refused every punctuated sentence,
   and the default policy refused every chunk carrying such a mark. Now a
   character of Unicode general category P* (Unicode 16.0) that is not read
@@ -20,8 +76,8 @@ FIXED
   - **Spoken characters stay the policy's.** A letter, a digit, a symbol
     (`$`, `<`, `©`) or a mark read aloud (`#`, `%`, `&`, `@`, `§`, `¶`, `٪`,
     `‰`, `‱` and the fullwidth `＃`, `％`, `＆`, `＠`) that the vocabulary
-    cannot spell is still an `OovKind::Symbol` event, and
-    `fail_closed_all_decisions` still refuses it by name. A mark read aloud
+    cannot spell is still an `OovKind::Symbol` event, and the fail-closed
+    policy still refuses it by name. A mark read aloud
     only in context stays silent: the `.` of `3.5`, the `,` of `4,9`.
   - **A mark the vocabulary spells is a token**, as the apostrophe of
     `don't` is against wav2vec2-base-960h. That now includes a `.`, which
@@ -75,16 +131,16 @@ FIXED
   - **Detection reports it as exactly one `OovKind::NotInspected` event** in
     its language (a new variant of the non-exhaustive `OovKind`), and the
     caller's policy decides it like any other event, before any fallback.
-    `fail_closed_all_decisions` refuses the text whatever the registry's
+    `fail_closed_all_policy` refuses the unit whatever the registry's
     fallback (under `AlignmentFallback::Error` too, where it used to fail
-    the chunk with `LanguageUnsupported`); `default_oov_decisions` and
-    `wildcard_all_decisions` decide `Wildcard`, which hands it to the
+    the chunk with `LanguageUnsupported`); `default_oov_policy` and
+    `wildcard_all_policy` decide `Wildcard`, which hands it to the
     fallback: `SkipChunk` skips it, `Error` fails the chunk as before. A
     custom policy decides it in its catch-all arm.
-  - **A unit no aligner can read needs exactly that one decision.**
-    Dispatching it with no decision (an empty batch, or no decisions at
-    all) is refused as `AlignmentError::Tokenization`, never read as a
-    skip.
+  - **A unit no aligner can read always carries that decision.** Deciding
+    a detection decides every event, so its resolution cannot leave the
+    `NotInspected` event out: no empty or missing decision can stand in for
+    a skip.
 - **Every alignment unit ends with exactly one named outcome.**
   `AlignmentResult::unaligned` (new, with `Unaligned` and `UnalignedCause`)
   names every unit that contributed no words, the whole chunk or a run by
@@ -96,21 +152,6 @@ FIXED
   `Aligner::align_chunk`, `Aligner::align_chunk_with_abort` and
   `EmissionsAligner::finish` name an empty result's reason the same way.
   An empty word list no longer stands in for a reason.
-- **A decision applies only to the unit it was detected for.** Positional
-  identity compared kinds and indices only, so two units with the same
-  event layout could swap or replay each other's decisions, and a decision
-  detected through one registry passed wherever its layout matched another.
-  Detection now stamps every event with the exact text it read, the aligner
-  that read it, and, through an `AlignmentSet`, the registry and run. The
-  stamp is private, so only detection writes it, and equality ignores it.
-  `run_one_alignment` refuses a decision stamped for another registry, run
-  or text before any lookup, and `prepare` (on `Aligner` and
-  `EmissionsAligner`) refuses one stamped for another text or aligner
-  before tokenizing. An event built with `OovEvent::new` carries no stamp,
-  so a decision made for it is refused: decisions come from detection.
-  Decide a whole-chunk job with `AlignmentSet::detect_oov`'s events and a
-  job with runs with `detect_oov_per_run`'s, both on the set that
-  dispatches it.
 
 ## 0.2.0
 

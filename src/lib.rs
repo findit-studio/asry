@@ -50,8 +50,8 @@ pub use types::{
 };
 
 pub use core::{
-  AlignmentResult, AsrParams, AsrParamsOverride, AsrResult, Command, Event, LanguagePolicy,
-  SamplingStrategy, Transcriber, TranscriberOptions, Unaligned, UnalignedCause,
+  AlignmentResult, AlignmentUnit, AsrParams, AsrParamsOverride, AsrResult, Command, Event,
+  LanguagePolicy, SamplingStrategy, Transcriber, TranscriberOptions, Unaligned, UnalignedCause,
 };
 
 // Reachable under `runner` (whisper.cpp ASR) OR `emissions` (the
@@ -86,8 +86,8 @@ pub use runner::{
   AlignWorkItem, Aligner, AlignerKey, AlignmentFallback, AlignmentLookup, AlignmentSet,
   AlignmentSetBuilder, ChineseNormalizer, DEFAULT_MAX_INTRA_SILENT_RUN,
   DEFAULT_MIN_SPEECH_COVERAGE, DynTextNormalizer, EnglishNormalizer, JapaneseNormalizer,
-  KoreanNormalizer, LatinNormalizer, NormalizationError, NormalizedText, TextNormalizer, bundled,
-  default_normalizer_for, run_one_alignment,
+  JobDetection, JobResolution, KoreanNormalizer, LatinNormalizer, NormalizationError,
+  NormalizedText, TextNormalizer, bundled, default_normalizer_for, run_one_alignment,
 };
 
 // Re-export ort types that appear on the alignment public API.
@@ -137,9 +137,12 @@ pub use ort;
 #[cfg_attr(docsrs, doc(cfg(feature = "emissions")))]
 pub mod emissions {
   pub use crate::{
-    core::oov::{
-      OovDecision, OovEvent, OovKind, ResolvedOov, default_oov_decisions,
-      fail_closed_all_decisions, wildcard_all_decisions,
+    core::{
+      AlignmentUnit,
+      oov::{
+        OovDecision, OovDetection, OovEvent, OovKind, OovResolution, ResolvedOov,
+        default_oov_policy, fail_closed_all_policy, wildcard_all_policy,
+      },
     },
     runner::aligner::{
       ChineseNormalizer, DynTextNormalizer, EnglishNormalizer, JapaneseNormalizer,
@@ -169,13 +172,16 @@ pub mod emissions {
 #[cfg(all(feature = "bench-internals", feature = "alignment"))]
 #[doc(hidden)]
 pub mod __bench {
-  pub use crate::runner::aligner::algorithm::{
-    encode::LogProbsTV,
-    normalize::{scalar, zero_mean_unit_var_normalize},
-    tokenize::{TokenizedText, detect_oov_events, tokenize_with_word_map},
-    trellis_beam::{
-      ALIGN_BEAM_WIDTH, PathPointPublic, WILDCARD_TOKEN_ID, WordSegment, align_to_word_segments,
-      backtrack_beam, get_trellis,
+  pub use crate::{
+    core::oov::resolve_events,
+    runner::aligner::algorithm::{
+      encode::LogProbsTV,
+      normalize::{scalar, zero_mean_unit_var_normalize},
+      tokenize::{TokenizedText, detect_oov_events, tokenize_with_word_map},
+      trellis_beam::{
+        ALIGN_BEAM_WIDTH, PathPointPublic, WILDCARD_TOKEN_ID, WordSegment, align_to_word_segments,
+        backtrack_beam, get_trellis,
+      },
     },
   };
 

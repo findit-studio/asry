@@ -85,10 +85,10 @@ fn too_short_chunk_recovers_to_empty_result() {
   let set = AlignmentSetBuilder::new()
     // `Error`, deliberately, rather than the `SkipChunk` default, so a
     // registry MISS can never pass for the recovery under test: a miss
-    // with no decision is refused, and one with a `Wildcard` decision
-    // surfaces `LanguageUnsupported`, so either fails the `expect`
-    // below. The `Ok` this test accepts can only have come from a real
-    // alignment attempt, and its record names what that attempt met.
+    // with the default policy's `Wildcard` decision surfaces
+    // `LanguageUnsupported` and fails the `expect` below. The `Ok` this
+    // test accepts can only have come from a real alignment attempt, and
+    // its record names what that attempt met.
     .with_fallback(AlignmentFallback::Error)
     .register(
       AlignerKey::Lang(Lang::En),
@@ -101,6 +101,7 @@ fn too_short_chunk_recovers_to_empty_result() {
   );
 
   let job = AlignWorkItem {
+    id: JobId::next(),
     chunk_id: ChunkId::from_raw(0),
     // 200 samples = 12.5 ms. The aligner pads it to 400 ⇒ T=1 frame,
     // against 11 chars ⇒ no CTC path. Byte-for-byte the input
@@ -122,11 +123,14 @@ fn too_short_chunk_recovers_to_empty_result() {
         Timebase::new(1, NonZeroI32::new(16_000).unwrap()),
       )
     }),
-    oov_decisions: Vec::new(),
   };
   let run_options = RunOptions::new().expect("RunOptions::new");
+  let resolution = set
+    .detect_oov(&job)
+    .expect("detect_oov")
+    .decide(crate::core::default_oov_policy);
 
-  let result = run_one_alignment(&set, &job, &run_options).expect(
+  let result = run_one_alignment(&set, &job, resolution, &run_options).expect(
     "`NoAlignmentPath` is classified recoverable, so the pool must absorb it into an Ok result \
      with no words and a record naming the failure. \
      An Err here would reach `handle_failure` upstream and turn a chunk carrying a perfectly \
@@ -521,185 +525,6 @@ fn check_abort_between_runs_passes_through_when_flag_clear() {
 
 /// replicates
 /// the outer-shape check that `run_one_alignment` performs.
-/// The dispatch validation can't easily be exercised
-/// end-to-end without a real Aligner / ORT, so this test
-/// pins the predicate that decides "is the
-/// `Vec<Vec<OovDecision>>` shape valid for this chunk
-/// shape?". A regression that reverts to silent acceptance
-/// of stale shapes will trip these expectations.
-#[test]
-fn outer_oov_decisions_shape_predicate() {
-  fn shape_ok(outer: usize, runs_len: usize) -> bool {
-    let expected = if runs_len == 0 { 1 } else { runs_len };
-    outer == 0 || outer == expected
-  }
-  // Whole-chunk job: 0 (no OOV) or 1 (one whole-chunk vec).
-  assert!(shape_ok(0, 0));
-  assert!(shape_ok(1, 0));
-  assert!(!shape_ok(2, 0)); // stale per-run payload — REJECT
-  assert!(!shape_ok(3, 0));
-  // Per-run job with 2 runs: 0 (no OOV) or exactly 2.
-  assert!(shape_ok(0, 2));
-  assert!(shape_ok(2, 2));
-  assert!(!shape_ok(1, 2)); // shorter-than-runs.len() — REJECT
-  assert!(!shape_ok(3, 2));
-}
-
-/// per-run
-/// dispatch must thread the caller's per-run OOV decisions
-/// from `AlignWorkItem::oov_decisions[run_idx]` into
-/// `run_one_per_run`, NOT hard-code `default_oov_decisions`.
-/// This pins the indexing slice so a future refactor that
-/// drops the `enumerate()`+index lookup can't silently
-/// substitute the default policy.
-///
-/// Structural test: builds a `Vec<Vec<OovDecision>>` with
-/// distinct per-run policies and asserts the dispatcher's
-/// slice-extraction matches each run's expected policy.
-/// No real `Aligner` needed — exercises only the index
-/// math.
-#[test]
-fn per_run_oov_decisions_are_indexed_by_run_idx() {
-  use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
-  fn synth(decision: OovDecision, char_idx: usize) -> ResolvedOov {
-    ResolvedOov::new(
-      OovEvent::new(OovKind::Symbol('?'), char_idx, 0, Lang::En),
-      decision,
-    )
-  }
-  let oov_decisions: Vec<Vec<ResolvedOov>> = vec![
-    // Run 0: caller chose `wildcard_all_decisions` — three Wildcards.
-    vec![
-      synth(OovDecision::Wildcard, 0),
-      synth(OovDecision::Wildcard, 1),
-      synth(OovDecision::Wildcard, 2),
-    ],
-    // Run 1: caller chose `default_oov_decisions` — mixed.
-    vec![
-      synth(OovDecision::Wildcard, 0),
-      synth(OovDecision::FailClosed, 1),
-    ],
-    // Run 2: empty = no OOV expected.
-    vec![],
-  ];
-  // Mirror `dispatch_runs`'s per-run extraction.
-  for run_idx in 0..3 {
-    let slice = oov_decisions
-      .get(run_idx)
-      .map(|v| v.as_slice())
-      .unwrap_or(&[]);
-    match run_idx {
-      0 => {
-        assert_eq!(slice.len(), 3);
-        assert!(slice.iter().all(|r| r.decision() == OovDecision::Wildcard));
-      }
-      1 => {
-        assert_eq!(slice.len(), 2);
-        assert_eq!(slice[0].decision(), OovDecision::Wildcard);
-        assert_eq!(slice[1].decision(), OovDecision::FailClosed);
-      }
-      2 => assert!(slice.is_empty()),
-      _ => unreachable!(),
-    }
-  }
-  // Out-of-range run idx (hypothetical: caller pre-sized
-  // shorter than `runs`) falls back to `&[]`. The aligner
-  // then surfaces `TokenizationFailed` if it hits any OOV
-  // — loud diagnostic, not silent default-policy.
-  let oob = oov_decisions.get(99).map(|v| v.as_slice()).unwrap_or(&[]);
-  assert!(oob.is_empty());
-}
-
-/// at the
-/// dispatch boundary, every supplied `ResolvedOov.event.language`
-/// must match the chunk/run's requested language. Round 10
-/// loosened the in-tokenizer identity check to ignore
-/// `language` (so Any-fallback works); this test pins the
-/// dispatch-boundary precheck that catches what the
-/// in-tokenizer check now lets through.
-#[test]
-fn validate_oov_decision_languages_whole_chunk_match_passes() {
-  use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
-  let resolved = vec![vec![ResolvedOov::new(
-    OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::En),
-    OovDecision::Wildcard,
-  )]];
-  assert!(validate_oov_decision_languages(&[], &Lang::En, &resolved).is_ok());
-}
-
-#[test]
-fn validate_oov_decision_languages_whole_chunk_mismatch_rejects() {
-  use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
-  // Job language is Korean; supplied decision was made for
-  // English — language-conditional policy would run against
-  // the wrong key.
-  let resolved = vec![vec![ResolvedOov::new(
-    OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::En),
-    OovDecision::Wildcard,
-  )]];
-  let result = validate_oov_decision_languages(&[], &Lang::Ko, &resolved);
-  match result {
-    Err(WorkFailure::Alignment(AlignmentError::Tokenization(payload))) => assert!(
-      payload
-        .message()
-        .contains("oov_decisions[0][0].event.language")
-        && payload.message().contains("job.language"),
-      "diagnostic should cite the whole-chunk mismatch; got {message}",
-      message = payload.message(),
-    ),
-    other => panic!("expected TokenizationFailed; got {other:?}"),
-  }
-}
-
-#[test]
-fn validate_oov_decision_languages_per_run_mismatch_rejects() {
-  use crate::{
-    align::{BoundsSource, Run},
-    core::{OovDecision, OovEvent, OovKind, ResolvedOov},
-  };
-  use smol_str::SmolStr;
-  let runs = vec![
-    Run::new(
-      Lang::En,
-      SmolStr::from("AT&T"),
-      0,
-      1_000,
-      0,
-      BoundsSource::Segment,
-    ),
-    Run::new(
-      Lang::Ko,
-      SmolStr::from("4번"),
-      1_000,
-      2_000,
-      1,
-      BoundsSource::Segment,
-    ),
-  ];
-  // Run 1 (Korean) is wired with a stale English-stamped decision.
-  let resolved = vec![
-    vec![ResolvedOov::new(
-      OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::En),
-      OovDecision::Wildcard,
-    )],
-    // BUG: event language Lang::En but run language Lang::Ko.
-    vec![ResolvedOov::new(
-      OovEvent::new(OovKind::Symbol('4'), 0, 0, Lang::En),
-      OovDecision::Wildcard,
-    )],
-  ];
-  let result = validate_oov_decision_languages(&runs, &Lang::En, &resolved);
-  match result {
-    Err(WorkFailure::Alignment(AlignmentError::Tokenization(payload))) => assert!(
-      payload.message().contains("oov_decisions[1][0]")
-        && payload.message().contains("runs[1].language()"),
-      "diagnostic should cite the run index of the mismatch; got {message}",
-      message = payload.message(),
-    ),
-    other => panic!("expected TokenizationFailed; got {other:?}"),
-  }
-}
-
 /// The per-run road aligns the runs' texts only, so a per-run job whose
 /// runs do not reproduce its text is refused loudly: a character left
 /// out would reach no OOV detection, and a run that differs would align
@@ -743,15 +568,16 @@ fn a_per_run_job_whose_runs_do_not_reproduce_its_text_is_refused() {
   }
 }
 
-/// A per-run job over `runs`, with `oov_decisions`, for the validators.
-fn per_run_job(runs: Vec<Run>, oov_decisions: Vec<Vec<ResolvedOov>>) -> AlignWorkItem {
+/// A per-run job over `runs` for `chunk`, for the validators.
+fn per_run_job(chunk: u64, runs: Vec<Run>) -> AlignWorkItem {
   use core::num::NonZeroI32;
 
   use mediatime::Timebase;
 
   let text: String = runs.iter().map(Run::text).collect();
   AlignWorkItem {
-    chunk_id: ChunkId::from_raw(0),
+    id: JobId::next(),
+    chunk_id: ChunkId::from_raw(chunk),
     samples: Arc::from(vec![0.0_f32; 1_600]),
     sub_segments: Vec::new(),
     text: SmolStr::new(text),
@@ -766,7 +592,6 @@ fn per_run_job(runs: Vec<Run>, oov_decisions: Vec<Vec<ResolvedOov>>) -> AlignWor
         Timebase::new(1, NonZeroI32::new(16_000).unwrap()),
       )
     }),
-    oov_decisions,
   }
 }
 
@@ -789,22 +614,40 @@ fn empty_registry(fallback: AlignmentFallback) -> AlignmentSet {
     .build()
 }
 
-/// **A unit no aligner can read is resolved policy first.** Its one
-/// `NotInspected` decision decides it before the registry's fallback:
-/// `FailClosed` refuses it under `SkipChunk` and `Error` alike, and only
-/// `Wildcard` reaches the fallback (`SkipChunk` skips, `Error` fails the
-/// job with `LanguageUnsupported`). No decision at all is refused, never
-/// read as a skip, and so is a decision made for a text an aligner read.
+/// **A unit no aligner can read is resolved policy first.** Detection
+/// reports it as one `NotInspected` event, so its resolution holds exactly
+/// the policy's decision for it: a resolution cannot be empty or skip that
+/// event. `FailClosed` refuses the unit under `SkipChunk` and `Error`
+/// alike, and only `Wildcard` reaches the fallback (`SkipChunk` skips,
+/// `Error` fails the job with `LanguageUnsupported`). A unit an aligner
+/// read at detection is refused if the registry misses it at dispatch.
 #[test]
 fn a_unit_no_aligner_can_read_is_resolved_policy_first() {
-  use crate::core::{default_oov_decisions, fail_closed_all_decisions};
+  use crate::core::{
+    AlignmentUnit, OovDetection, OovEvent, OovKind, default_oov_policy, fail_closed_all_policy,
+  };
 
   let set = empty_registry(AlignmentFallback::SkipChunk);
-  let events = set
-    .detect_oov_per_run(&[korean_run(" 4", 0)])
-    .expect("detect_oov_per_run");
-  let refused = fail_closed_all_decisions(&events[0]);
-  let wildcard = default_oov_decisions(&events[0]);
+  let job = per_run_job(0, vec![korean_run(" 4", 0)]);
+  let decided = |policy: fn(&OovEvent) -> OovDecision| {
+    let detection = set.detect_oov(&job).expect("detect_oov");
+    let [unit] = detection.units() else {
+      panic!("one run, one unit");
+    };
+    assert_eq!(
+      unit.events().to_vec(),
+      vec![OovEvent::new(OovKind::NotInspected, 0, 0, Lang::Ko)],
+      "a unit no aligner can read is one NotInspected event, never an empty list"
+    );
+    detection
+      .decide(policy)
+      .into_units_for(&job, set.id())
+      .expect("this job, this set")
+      .pop()
+      .expect("one unit")
+  };
+  let refused = decided(fail_closed_all_policy);
+  let wildcard = decided(default_oov_policy);
 
   for fallback in [AlignmentFallback::SkipChunk, AlignmentFallback::Error] {
     assert!(
@@ -824,138 +667,86 @@ fn a_unit_no_aligner_can_read_is_resolved_policy_first() {
     Err(WorkFailure::LanguageUnsupported(_))
   ));
 
-  for fallback in [AlignmentFallback::SkipChunk, AlignmentFallback::Error] {
-    match resolve_not_inspected(&[], fallback, &Lang::Ko) {
-      Err(WorkFailure::Alignment(AlignmentError::Tokenization(failure))) => assert!(
-        failure.message().contains("exactly one decision"),
-        "{}",
-        failure.message()
-      ),
-      other => panic!("{fallback:?}: an empty batch is refused; got {other:?}"),
-    }
-  }
-
-  let read = crate::core::OovEvent::new(crate::core::OovKind::Symbol('4'), 1, 0, Lang::Ko)
-    .read_in(" 4", core::num::NonZeroU64::new(9).expect("9 != 0"));
-  let read = fail_closed_all_decisions(&[read]);
+  let read = OovDetection::of_unit(
+    AlignmentUnit::Run(0),
+    Lang::Ko,
+    vec![OovEvent::new(OovKind::Symbol('4'), 1, 0, Lang::Ko)],
+    Some(core::num::NonZeroU64::new(9).expect("9 != 0")),
+  )
+  .decide(fail_closed_all_policy);
   assert!(matches!(
     resolve_not_inspected(&read, AlignmentFallback::SkipChunk, &Lang::Ko),
     Err(WorkFailure::Alignment(AlignmentError::Tokenization(_)))
   ));
 }
 
-/// **A decision applies only to the unit it was detected for.** Two runs
-/// with the same text and layout, or with different texts and the same
-/// layout, cannot swap or replay each other's decisions; a decision
-/// detected through another registry (one swapped in between detection
-/// and dispatch) is refused; and a decision built by hand is refused.
-/// The matching payload passes.
+/// **A resolution applies only to the job it was detected for.** Two work
+/// items with the same chunk id, text, language and run layout are still
+/// two jobs: a resolution detected for one is refused for the other before
+/// any lookup, whether its units are read or not. The job's own resolution
+/// passes, and yields its units in order. A resolution cannot be cloned or
+/// built by hand (the `compile_fail` doctests on `JobResolution`), and
+/// `run_one_alignment` consumes it, so it applies once.
 #[test]
-fn a_decision_applies_only_to_the_unit_it_was_detected_for() {
-  use crate::core::fail_closed_all_decisions;
+fn a_resolution_applies_only_to_the_job_it_was_detected_for() {
+  use crate::core::{AlignmentUnit, fail_closed_all_policy, wildcard_all_policy};
 
-  let a = empty_registry(AlignmentFallback::SkipChunk);
-  let b = empty_registry(AlignmentFallback::SkipChunk);
-  let refused = |message: &str| message.contains("was not detected for this unit");
+  let set = empty_registry(AlignmentFallback::SkipChunk);
+  let layout = || vec![korean_run(" 4", 0), korean_run(" 4", 1)];
+  let first = per_run_job(7, layout());
+  let replayed_into = per_run_job(7, layout());
 
-  for texts in [[" 4", " 4"], [" a&b", " c&d"]] {
-    let runs = vec![korean_run(texts[0], 0), korean_run(texts[1], 1)];
-    let decisions: Vec<Vec<ResolvedOov>> = a
-      .detect_oov_per_run(&runs)
-      .expect("detect_oov_per_run")
-      .iter()
-      .map(|events| fail_closed_all_decisions(events))
-      .collect();
+  let units = set
+    .detect_oov(&first)
+    .expect("detect_oov")
+    .decide(wildcard_all_policy)
+    .into_units_for(&first, set.id())
+    .expect("the job's own resolution");
+  assert_eq!(
+    units.iter().map(|unit| unit.unit()).collect::<Vec<_>>(),
+    [AlignmentUnit::Run(0), AlignmentUnit::Run(1)]
+  );
 
-    let job = per_run_job(runs.clone(), decisions.clone());
-    assert!(
-      validate_decision_units(a.id(), &job).is_ok(),
-      "{texts:?}: the matching payload passes"
-    );
-
-    let swapped = per_run_job(
-      runs.clone(),
-      vec![decisions[1].clone(), decisions[0].clone()],
-    );
-    let replayed = per_run_job(
-      runs.clone(),
-      vec![decisions[0].clone(), decisions[0].clone()],
-    );
-    for (name, job, registry) in [
-      ("swapped", &swapped, a.id()),
-      ("replayed", &replayed, a.id()),
-      ("another registry", &job, b.id()),
-    ] {
-      match validate_decision_units(registry, job) {
-        Err(WorkFailure::Alignment(AlignmentError::Tokenization(failure))) => {
-          assert!(
-            refused(failure.message()),
-            "{texts:?} {name}: {}",
-            failure.message()
-          )
-        }
-        other => panic!("{texts:?} {name}: expected a refusal; got {other:?}"),
-      }
-    }
+  let resolution = set
+    .detect_oov(&first)
+    .expect("detect_oov")
+    .decide(fail_closed_all_policy);
+  assert_eq!(resolution.chunk_id(), replayed_into.chunk_id());
+  match resolution.into_units_for(&replayed_into, set.id()) {
+    Err(WorkFailure::Alignment(AlignmentError::Tokenization(failure))) => assert!(
+      failure.message().contains("detected for another job"),
+      "{}",
+      failure.message()
+    ),
+    other => panic!("a resolution replayed into another job must be refused; got {other:?}"),
   }
-
-  let runs = vec![korean_run(" 4", 0)];
-  let built = fail_closed_all_decisions(&[crate::core::OovEvent::new(
-    crate::core::OovKind::NotInspected,
-    0,
-    0,
-    Lang::Ko,
-  )]);
-  assert!(matches!(
-    validate_decision_units(a.id(), &per_run_job(runs, vec![built])),
-    Err(WorkFailure::Alignment(AlignmentError::Tokenization(_)))
-  ));
 }
 
-/// **A registry swapped in between detection and dispatch is refused.**
-/// A text registry A reads clean has no event, so its batch is empty; a
-/// registry B that cannot read the text must not take that absence for a
-/// decision, so the unit is refused before any aligner runs, under either
-/// fallback. A decision A made for a text it could not read is refused by
-/// B before any lookup.
+/// **A registry swapped in between detection and dispatch is refused.** A
+/// resolution is bound to the set that read it: another set refuses it
+/// before any lookup, under either fallback, so a unit one registry read
+/// clean (no event, nothing decided) can never pass for a decision on a
+/// registry that cannot read it, and no NotInspected decision crosses
+/// over either.
 #[test]
 fn a_registry_swapped_between_detection_and_dispatch_is_refused() {
-  use crate::core::default_oov_decisions;
+  use crate::core::default_oov_policy;
 
   for fallback in [AlignmentFallback::SkipChunk, AlignmentFallback::Error] {
-    let b = empty_registry(fallback);
-    let clean_on_a: Vec<ResolvedOov> = Vec::new();
-    match align_unit(&b, &Lang::Ko, &clean_on_a, |_| {
-      panic!("no aligner may run for a unit B cannot read")
-    }) {
-      Err(WorkFailure::Alignment(AlignmentError::Tokenization(failure))) => assert!(
-        failure.message().contains("exactly one decision"),
-        "{fallback:?}: {}",
-        failure.message()
-      ),
-      other => panic!("{fallback:?}: a clean batch from A is no decision for B; got {other:?}"),
-    }
-
     let a = empty_registry(fallback);
-    let runs = vec![korean_run(" 4", 0)];
-    let from_a: Vec<Vec<ResolvedOov>> = a
-      .detect_oov_per_run(&runs)
-      .expect("detect_oov_per_run")
-      .iter()
-      .map(|events| default_oov_decisions(events))
-      .collect();
-    let job = per_run_job(runs, from_a);
-    assert!(
-      validate_decision_units(a.id(), &job).is_ok(),
-      "{fallback:?}: A's own payload passes on A"
-    );
-    match validate_decision_units(b.id(), &job) {
+    let b = empty_registry(fallback);
+    let job = per_run_job(0, vec![korean_run(" 4", 0)]);
+    let from_a = a
+      .detect_oov(&job)
+      .expect("detect_oov")
+      .decide(default_oov_policy);
+    match from_a.into_units_for(&job, b.id()) {
       Err(WorkFailure::Alignment(AlignmentError::Tokenization(failure))) => assert!(
-        failure.message().contains("was not detected for this unit"),
+        failure.message().contains("through another AlignmentSet"),
         "{fallback:?}: {}",
         failure.message()
       ),
-      other => panic!("{fallback:?}: A's decision is no decision for B; got {other:?}"),
+      other => panic!("{fallback:?}: A's resolution is no resolution for B; got {other:?}"),
     }
   }
 }
@@ -1033,17 +824,6 @@ fn every_unit_has_exactly_one_named_outcome() {
     result.unaligned()[4].cause(),
     UnalignedCause::Failed(AlignmentError::NoAlignmentPath(_))
   ));
-}
-
-/// An empty outer vec ("no OOV expected") is accepted —
-/// `tokenize_with_word_map` surfaces `TokenizationFailed`
-/// downstream if a chunk hits an OOV anyway. This validator
-/// is about per-position language identity, not
-/// presence/absence.
-#[test]
-fn validate_oov_decision_languages_empty_passes() {
-  let empty: Vec<Vec<ResolvedOov>> = Vec::new();
-  assert!(validate_oov_decision_languages(&[], &Lang::En, &empty).is_ok());
 }
 
 #[test]

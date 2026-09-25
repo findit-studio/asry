@@ -582,6 +582,20 @@ impl AsrResult {
   }
 }
 
+/// One alignment unit of a chunk: its whole text, or one of the
+/// script-dispatched runs `Command::Alignment` carried.
+///
+/// A chunk whose command carried no runs is aligned as one unit, its
+/// whole text. One whose command carried runs is aligned run by run, each
+/// run a unit of its own, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AlignmentUnit {
+  /// The chunk's whole text.
+  Whole,
+  /// The run at this index of `Command::Alignment::runs`.
+  Run(usize),
+}
+
 /// Result of one chunk's word-level alignment. Empty `words` is a
 /// valid result (e.g., when whisper text was empty or normalisation
 /// produced an empty string). Fields are private; use

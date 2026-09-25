@@ -48,6 +48,10 @@ pub enum AlignmentFallback {
   /// `WorkFailure::LanguageUnsupportedForAlignment`. Useful when
   /// the indexer wants a hard signal that a language was missing
   /// from the registry.
+  ///
+  /// The caller's policy decides first: a `FailClosed` decision for
+  /// the unit's `OovKind::NotInspected` event refuses the unit, by
+  /// name, and only a `Wildcard` one reaches this fallback.
   Error,
 }
 

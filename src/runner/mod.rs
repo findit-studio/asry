@@ -56,21 +56,6 @@
 //!     }
 //!     Command::Alignment { chunk_id, samples, sub_segments: _,
 //!                              text, language, runs } => {
-//!       // Sans-I/O OOV resolution: per-run detect + decide.
-//!       // Each run gets its own decisions vec sized + ordered
-//!       // by the events `detect_oov` produces for that run's
-//!       // text + language. Whole-chunk fallback (when `runs`
-//!       // is empty) gets one inner vec.
-//!       let oov_decisions: Vec<Vec<asry::core::ResolvedOov>> =
-//!         if runs.is_empty() {
-//!           let events = alignment_set.detect_oov(&text, &language)?;
-//!           vec![asry::core::default_oov_decisions(&events)]
-//!         } else {
-//!           alignment_set.detect_oov_per_run(&runs)?
-//!             .iter()
-//!             .map(|ev| asry::core::default_oov_decisions(ev))
-//!             .collect()
-//!         };
 //!       // `AlignWorkItem::from_run_alignment` flips the
 //!       // command's output-timebase `sub_segments` into
 //!       // chunk-local 1/16000 (the form `Aligner::align`
@@ -79,12 +64,19 @@
 //!       // already drained — recoverable.
 //!       let job = AlignWorkItem::from_run_alignment(
 //!         &transcriber, chunk_id, samples, text, language,
-//!         runs, abort_flag.clone(), oov_decisions,
+//!         runs, abort_flag.clone(),
 //!       ).expect("chunk in flight");
+//!       // Sans-I/O OOV resolution: detect every unit of THIS
+//!       // job (its whole text, or each run), then decide. The
+//!       // resolution is bound to this job and this set, and
+//!       // `run_one_alignment` consumes it.
+//!       let resolution = alignment_set
+//!         .detect_oov(&job)?
+//!         .decide(asry::core::default_oov_policy);
 //!       // Fresh `RunOptions` per chunk so a watchdog's
 //!       // `terminate()` for chunk N does not poison chunk N+1.
 //!       let run_options = RunOptions::new().unwrap();
-//!       let aligned = run_one_alignment(&alignment_set, &job, &run_options)?;
+//!       let aligned = run_one_alignment(&alignment_set, &job, resolution, &run_options)?;
 //!       transcriber.handle_alignment(chunk_id, aligned)?;
 //!     }
 //!   }
@@ -152,4 +144,4 @@ pub use aligner::{
 };
 
 #[cfg(feature = "alignment")]
-pub use alignment_pool::{AlignWorkItem, run_one_alignment};
+pub use alignment_pool::{AlignWorkItem, JobDetection, JobResolution, run_one_alignment};

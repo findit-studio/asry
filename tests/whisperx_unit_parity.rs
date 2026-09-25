@@ -20,7 +20,7 @@
 //!    (`test_issue_1372_digits_comma_no_timestamps`) uses `"4,9"`.
 //!    The comma is a punctuation mark nobody reads aloud, dropped
 //!    under every policy, so the word aligns under
-//!    `wildcard_all_decisions` (WhisperX 1:1) and asry's default
+//!    `wildcard_all_policy` (WhisperX 1:1) and asry's default
 //!    alike.
 //!
 //! ## Why `bench-internals` / `__bench`
@@ -191,24 +191,19 @@ fn build_synthetic_emission(num_frames: usize, tokens: &[i32]) -> LogProbsTV {
 /// policy. Returns one `AlignedWord` per non-empty word in the
 /// text (mirroring WhisperX's `result["word_segments"]`).
 fn run_align(text: &str, num_frames: usize, duration_s: f32) -> Vec<AlignedWord> {
-  run_align_with_policy(
-    text,
-    num_frames,
-    duration_s,
-    asry::core::default_oov_decisions,
-  )
+  run_align_with_policy(text, num_frames, duration_s, asry::core::default_oov_policy)
 }
 
 /// Like [`run_align`] but the caller picks the OOV policy as
-/// a `fn(&[OovEvent]) -> Vec<ResolvedOov>` (e.g.
-/// `wildcard_all_decisions`, `fail_closed_all_decisions`, or
-/// a custom helper). The Sans-I/O entry point — every other
-/// test in this file is `run_align(...)` (default policy).
+/// a `fn(&OovEvent) -> OovDecision` (e.g. `wildcard_all_policy`,
+/// `fail_closed_all_policy`, or a custom one). The Sans-I/O entry
+/// point — every other test in this file is `run_align(...)`
+/// (default policy).
 fn run_align_with_policy(
   text: &str,
   num_frames: usize,
   duration_s: f32,
-  policy: fn(&[asry::core::OovEvent]) -> Vec<asry::core::ResolvedOov>,
+  policy: fn(&asry::core::OovEvent) -> asry::core::OovDecision,
 ) -> Vec<AlignedWord> {
   let tokenizer = load_tokenizer();
   let unk = tokenizer.token_to_id("<unk>");
@@ -225,7 +220,7 @@ fn run_align_with_policy(
     /* wildcard_boundary_per_word: */ &[],
   )
   .expect("OOV detection must succeed");
-  let oov_decisions = policy(&oov_events);
+  let oov_decisions = asry::__bench::resolve_events(&oov_events, policy);
 
   let tokenize_result = tokenize_with_word_map(
     &tokenizer,
@@ -414,9 +409,9 @@ fn known_neighbour_score_is_positive_around_unknown() {
 // Test 7 — formerly gated on the removed
 // `whisperx-strict-tokenizer` Cargo feature, now unconditional:
 // the test calls `tokenize_with_word_map` with
-// `wildcard_all_decisions` (the runtime equivalent the feature
+// `wildcard_all_policy` (the runtime equivalent the feature
 // flipped to). Default policy is asry's
-// `default_oov_decisions` (run_align uses that); test 7 opts
+// `default_oov_policy` (run_align uses that); test 7 opts
 // into the WhisperX 1:1 policy via data, no Cargo feature.
 // =====================================================================
 
@@ -426,7 +421,7 @@ fn known_neighbour_score_is_positive_around_unknown() {
 /// The comma is a mark read aloud only in context (the German "Komma"),
 /// so it is a punctuation mark nobody reads aloud: tokenization drops it
 /// under every policy, and the two digits are wildcards. The word aligns
-/// under `wildcard_all_decisions` (WhisperX's `*` placeholder 1:1) and
+/// under `wildcard_all_policy` (WhisperX's `*` placeholder 1:1) and
 /// under asry's default policy alike; the default used to refuse the
 /// chunk over the comma.
 #[test]
@@ -434,10 +429,11 @@ fn issue_1372_digits_comma_no_timestamps() {
   // 200 frames — WhisperX's regression reproducer uses the
   // same higher frame count because the German sentence is
   // long.
-  for policy in [
-    asry::core::wildcard_all_decisions,
-    asry::core::default_oov_decisions,
-  ] {
+  let policies: [fn(&asry::core::OovEvent) -> asry::core::OovDecision; 2] = [
+    asry::core::wildcard_all_policy,
+    asry::core::default_oov_policy,
+  ];
+  for policy in policies {
     let result = run_align_with_policy(
       "halt mit 4,9 nicht ins parlament",
       200,

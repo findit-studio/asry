@@ -35,7 +35,7 @@ use core::{
 use smol_str::format_smolstr;
 
 use crate::{
-  core::{AlignmentResult, OovEvent, ResolvedOov},
+  core::{AlignmentResult, OovDetection, OovResolution},
   runner::aligner::{
     algorithm::{
       compose::DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -207,20 +207,21 @@ impl EmissionsAligner {
   /// Detect out-of-vocabulary characters in `text`, as data — no policy
   /// decision is made.
   ///
-  /// Resolve the events with [`default_oov_decisions`], [`wildcard_all_decisions`],
-  /// [`fail_closed_all_decisions`], or your own policy, then hand the
-  /// result to [`prepare`](Self::prepare) with the same text: each event
-  /// is bound to `text` and to this aligner, and `prepare` refuses a
-  /// decision made for another text or by another aligner.
+  /// Returns the one way to decide them: an [`OovDetection`] bound to
+  /// `text` and to this aligner. Decide it with [`default_oov_policy`],
+  /// [`wildcard_all_policy`], [`fail_closed_all_policy`], or your own
+  /// closure, then hand the [`OovResolution`] to
+  /// [`prepare`](Self::prepare) with the same text: `prepare` refuses a
+  /// resolution detected in another text or by another aligner.
   ///
   /// Note what is NOT an argument: the tokenizer, the word count, the
   /// uppercase flag, the unk id, the boundary map. Every one of those was
   /// a positional parameter on the helper this replaces, and every one of
   /// them was a way to get it wrong.
   ///
-  /// [`default_oov_decisions`]: crate::core::oov::default_oov_decisions
-  /// [`wildcard_all_decisions`]: crate::core::oov::wildcard_all_decisions
-  /// [`fail_closed_all_decisions`]: crate::core::oov::fail_closed_all_decisions
+  /// [`default_oov_policy`]: crate::core::oov::default_oov_policy
+  /// [`wildcard_all_policy`]: crate::core::oov::wildcard_all_policy
+  /// [`fail_closed_all_policy`]: crate::core::oov::fail_closed_all_policy
   ///
   /// # Errors
   ///
@@ -230,12 +231,18 @@ impl EmissionsAligner {
   /// boundary map). A character the vocabulary cannot spell is an event,
   /// never an error: detection looks each character up in the vocabulary
   /// and never runs the tokenizer's `encode`. Punctuation-only input
-  /// yields an empty vec, not an error.
-  pub fn detect_oov(&self, text: &str) -> Result<Vec<OovEvent>, EmissionsError> {
-    self
+  /// yields no events, not an error.
+  pub fn detect_oov(&self, text: &str) -> Result<OovDetection, EmissionsError> {
+    let events = self
       .core
       .detect_oov(text)
-      .map_err(|e| to_emissions_error(e, Stage::Prepare))
+      .map_err(|e| to_emissions_error(e, Stage::Prepare))?;
+    Ok(OovDetection::of_text(
+      text,
+      self.core.language().clone(),
+      events,
+      self.core.id().get(),
+    ))
   }
 
   /// Steps 0-2: non-finite sample scan → speech mask → zero non-speech →
@@ -260,20 +267,19 @@ impl EmissionsAligner {
   /// mask, the normalise, and the tokenise, so cancellation lands before
   /// each O(n) stage rather than after its work is already spent.
   ///
-  /// [`EmissionsError::Tokenization`] also covers a cross-language
-  /// `oov_decisions` payload: every [`ResolvedOov`] must carry THIS
-  /// aligner's language. Positional matching deliberately ignores
-  /// language, so a foreign decision at a matching position would
-  /// otherwise apply another language's wildcard / fail-closed policy
-  /// silently. This check runs FIRST — ahead of the first abort poll — so a
-  /// malformed payload is still reported as the caller bug it is even when
-  /// `abort_flag` is already set; cancellation does not mask it.
+  /// [`EmissionsError::Tokenization`] also covers a `resolution` this
+  /// aligner did not detect in exactly `text`: decisions apply only to the
+  /// text and the aligner their detection read. This check runs FIRST —
+  /// ahead of the first abort poll — so a crossed resolution is still
+  /// reported as the caller bug it is even when `abort_flag` is already
+  /// set; cancellation does not mask it. `resolution` is consumed, so it
+  /// applies once.
   pub fn prepare<'a>(
     &self,
     samples: &[f32],
     speech: &SpeechSpans,
     text: &'a str,
-    oov_decisions: &[ResolvedOov],
+    resolution: OovResolution,
     abort_flag: &AtomicBool,
   ) -> Result<PreparedChunk<'a>, EmissionsError> {
     // Cancellable throughout, symmetric with `finish`. `prepare` is the
@@ -291,6 +297,10 @@ impl EmissionsAligner {
     // `Any` fallback: this aligner's own language IS the key the caller's
     // OOV policy must have been resolved against. The check itself is the
     // core's — see `AlignerCore::prepare`.
+    let oov_decisions = self
+      .core
+      .accept(&resolution, text)
+      .map_err(|e| to_emissions_error(e, Stage::Prepare))?;
     let expected = self.core.language().clone();
     self
       .core

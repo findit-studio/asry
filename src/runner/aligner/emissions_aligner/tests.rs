@@ -7,7 +7,10 @@ use mediatime::Timebase;
 
 use super::*;
 use crate::{
-  core::oov::default_oov_decisions,
+  core::{
+    OovDecision, OovEvent,
+    oov::{default_oov_policy, fail_closed_all_policy, wildcard_all_policy},
+  },
   runner::aligner::{
     emissions_api::{SampleSpan, SpanError},
     normalizer::{NormalizationError, NormalizedText, TextNormalizer},
@@ -71,6 +74,24 @@ const PERMUTED_TOKENIZER_JSON: &str = r#"{
 
 /// The vocab above has 32 entries.
 const VOCAB_SIZE: usize = 32;
+
+/// An OOV policy: one decision per event.
+type Policy = fn(&OovEvent) -> OovDecision;
+
+/// The three policies asry ships.
+const POLICIES: [Policy; 3] = [
+  default_oov_policy,
+  wildcard_all_policy,
+  fail_closed_all_policy,
+];
+
+/// `aligner`'s own detection of `text`, decided by the default policy.
+fn resolution(aligner: &EmissionsAligner, text: &str) -> OovResolution {
+  aligner
+    .detect_oov(text)
+    .expect("detect_oov")
+    .decide(default_oov_policy)
+}
 
 fn aligner() -> EmissionsAligner {
   EmissionsAligner::builder(Lang::En, TOKENIZER_JSON.as_bytes())
@@ -166,7 +187,13 @@ fn prepare_pads_short_audio_to_the_receptive_field_and_zeroes_non_speech() {
   // Speech only over the first 100 samples.
   let speech = SpeechSpans::new([SampleSpan::new(0, 100).expect("ok")]);
   let prepared = a
-    .prepare(&samples, &speech, "hello", &[], &AtomicBool::new(false))
+    .prepare(
+      &samples,
+      &speech,
+      "hello",
+      resolution(&a, "hello"),
+      &AtomicBool::new(false),
+    )
     .expect("prepare must succeed");
 
   let buf = prepared.encoder_input();
@@ -191,7 +218,13 @@ fn prepare_rejects_non_finite_audio_even_outside_the_speech_spans() {
   samples[700] = f32::NAN; // outside the speech span below
   let speech = SpeechSpans::new([SampleSpan::new(0, 100).expect("ok")]);
   // `PreparedChunk` has no `Debug` either — it carries the encoder buffer.
-  let Err(err) = a.prepare(&samples, &speech, "hello", &[], &AtomicBool::new(false)) else {
+  let Err(err) = a.prepare(
+    &samples,
+    &speech,
+    "hello",
+    resolution(&a, "hello"),
+    &AtomicBool::new(false),
+  ) else {
     panic!("a NaN anywhere in the raw audio is a hard error");
   };
   assert!(
@@ -209,7 +242,13 @@ fn trivial_chunks_skip_the_encoder() {
   let speech = SpeechSpans::all_speech();
 
   let prepared = a
-    .prepare(&samples, &speech, "!!!...", &[], &AtomicBool::new(false))
+    .prepare(
+      &samples,
+      &speech,
+      "!!!...",
+      resolution(&a, "!!!..."),
+      &AtomicBool::new(false),
+    )
     .expect("punctuation-only normalises to empty; that is not a failure");
   assert!(prepared.is_trivial());
   assert!(prepared.encoder_input().is_empty());
@@ -241,7 +280,13 @@ fn finish_rejects_a_vocab_dim_that_disagrees_with_the_tokenizer() {
   let samples = vec![0.1_f32; 3200];
   let speech = SpeechSpans::all_speech();
   let prepared = a
-    .prepare(&samples, &speech, "hello", &[], &AtomicBool::new(false))
+    .prepare(
+      &samples,
+      &speech,
+      "hello",
+      resolution(&a, "hello"),
+      &AtomicBool::new(false),
+    )
     .expect("prepare");
 
   let t = prepared.encoder_input().len() / 320;
@@ -273,7 +318,13 @@ fn finish_rejects_a_frame_count_that_cannot_match_the_audio() {
   let samples = vec![0.1_f32; 3200]; // 10 frames at hop 320
   let speech = SpeechSpans::all_speech();
   let prepared = a
-    .prepare(&samples, &speech, "hello", &[], &AtomicBool::new(false))
+    .prepare(
+      &samples,
+      &speech,
+      "hello",
+      resolution(&a, "hello"),
+      &AtomicBool::new(false),
+    )
     .expect("prepare");
 
   // Emissions from a 30 s chunk, handed to a 0.2 s one.
@@ -294,79 +345,73 @@ fn finish_rejects_a_frame_count_that_cannot_match_the_audio() {
 
 // ———————— The guard that lived in `Aligner` and not in the seam ————————
 
-/// **The seam validates OOV decision languages — it did not before.**
+/// **A resolution drives only the aligner that detected it.**
 ///
-/// The ORT `Aligner` has always rejected a cross-language `ResolvedOov`
-/// payload on its direct path. `EmissionsAligner::prepare` forwarded the
-/// decisions straight through, so an English aligner handed a Korean
-/// decision *at a matching position* applied the KOREAN policy to English
-/// text, silently.
+/// The ORT `Aligner` has always rejected a cross-language decision payload
+/// on its direct path, and `EmissionsAligner::prepare` once forwarded
+/// decisions straight through: an English aligner handed a Korean decision
+/// *at a matching position* applied the KOREAN policy to English text,
+/// silently. Positional matching ignores language on purpose, for
+/// `AlignerKey::Any`, so nothing else was looking.
 ///
-/// It slips through everything else on purpose:
-/// `OovEvent::matches_position` compares kind + char_index + word_index and
-/// deliberately IGNORES language, because `AlignerKey::Any` fallback needs
-/// it to. So nothing else was looking.
-///
-/// The guard now lives in `AlignerCore::prepare` — one implementation, both
-/// front ends.
+/// A resolution is bound to the aligner that detected it: a Korean
+/// aligner's decisions for the very same text and layout are refused.
 #[test]
-fn prepare_rejects_oov_decisions_resolved_for_another_language() {
-  use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
-
+fn prepare_refuses_a_resolution_another_aligner_detected() {
   let a = aligner(); // Lang::En
+  let korean = EmissionsAligner::builder(Lang::Ko, TOKENIZER_JSON.as_bytes())
+    .build()
+    .expect("build");
   let samples = vec![0.2_f32; 16_000];
 
-  // A decision made for Korean, whose POSITIONAL fields (kind, char_index,
-  // word_index) are exactly what an English detection would produce — so
-  // positional matching accepts it and only the language separates them.
-  let foreign = vec![ResolvedOov::new(
-    OovEvent::new(OovKind::Symbol('&'), 0, 0, Lang::Ko),
-    OovDecision::Wildcard,
-  )];
+  let foreign = korean
+    .detect_oov("&")
+    .expect("detect_oov")
+    .decide(wildcard_all_policy);
+  assert_eq!(foreign.resolved()[0].event().language(), &Lang::Ko);
 
   let Err(err) = a.prepare(
     &samples,
     &SpeechSpans::all_speech(),
     "&",
-    &foreign,
+    foreign,
     &AtomicBool::new(false),
   ) else {
-    panic!("a Korean decision must not drive an English aligner's OOV policy");
+    panic!("a Korean aligner's decision must not drive an English aligner's OOV policy");
   };
   let EmissionsError::Tokenization(f) = err else {
     panic!("expected a Tokenization error; got {err:?}");
   };
   assert!(
-    f.message().contains("oov_decisions[0].event.language")
-      && f.message().contains("Ko")
-      && f.message().contains("En"),
-    "diagnostic must cite the offending index and both languages; got {}",
+    f.message()
+      .contains("not detected by this aligner in this text"),
+    "{}",
     f.message()
   );
 }
 
-/// The dual: same-language decisions still flow through untouched.
+/// The dual: the aligner's own detection flows through untouched.
 ///
-/// Same `&` OOV at the same position as the rejection test above — the ONLY
-/// difference is that these decisions were detected from THIS aligner, so
-/// they carry `En`. `wildcard_all_decisions` rather than the default policy
-/// because `&` is a *pronounced* symbol, which the default fail-closes for
-/// unrelated (and correct) reasons.
+/// The same `&` at the same position as the refusal above — the ONLY
+/// difference is that THIS aligner detected it. `wildcard_all_policy`
+/// rather than the default policy because `&` is a *pronounced* symbol,
+/// which the default fail-closes for unrelated (and correct) reasons.
 #[test]
-fn prepare_accepts_oov_decisions_resolved_for_its_own_language() {
-  use crate::core::oov::wildcard_all_decisions;
-
+fn prepare_accepts_a_resolution_it_detected() {
   let a = aligner();
   let samples = vec![0.2_f32; 16_000];
-  let decisions = wildcard_all_decisions(&a.detect_oov("hello & world").expect("detect_oov"));
+  let decisions = a
+    .detect_oov("hello & world")
+    .expect("detect_oov")
+    .decide(wildcard_all_policy);
   a.prepare(
     &samples,
     &SpeechSpans::all_speech(),
     "hello & world",
-    &decisions,
+    decisions,
     &AtomicBool::new(false),
   )
-  .expect("decisions detected from THIS aligner carry its language");
+  .expect("this aligner's own detection of this text");
 }
 
 // —————————————— The check no DIMENSION check can make ——————————————
@@ -406,7 +451,7 @@ fn finish_rejects_a_prepared_chunk_from_a_different_aligner() {
       &samples,
       &SpeechSpans::all_speech(),
       "hello",
-      &[],
+      resolution(&a, "hello"),
       &AtomicBool::new(false),
     )
     .expect("prepare on A");
@@ -449,7 +494,7 @@ fn finish_rejects_a_foreign_trivial_chunk_too() {
       &samples,
       &SpeechSpans::all_speech(),
       "!!!...",
-      &[],
+      resolution(&a, "!!!..."),
       &AtomicBool::new(false),
     )
     .expect("prepare on A");
@@ -479,7 +524,7 @@ fn finish_accepts_the_chunk_its_own_prepare_minted() {
       &samples,
       &SpeechSpans::all_speech(),
       "hello",
-      &[],
+      resolution(&a, "hello"),
       &AtomicBool::new(false),
     )
     .expect("prepare");
@@ -522,14 +567,17 @@ fn alignkit_call_site_aligns_end_to_end() {
   let samples = vec![0.2_f32; 16_000]; // 1 s at 16 kHz
   let abort = AtomicBool::new(false);
 
-  let decisions = default_oov_decisions(&aligner.detect_oov(transcript).expect("detect_oov"));
+  let decisions = aligner
+    .detect_oov(transcript)
+    .expect("detect_oov")
+    .decide(default_oov_policy);
 
   // VAD spans, in sample space — no timebase to get wrong. Or, with no
   // VAD at all, say so explicitly: `SpeechSpans::all_speech()`.
   let speech = SpeechSpans::all_speech();
 
   let prepared = aligner
-    .prepare(&samples, &speech, transcript, &decisions, &abort)
+    .prepare(&samples, &speech, transcript, decisions, &abort)
     .expect("prepare");
   if prepared.is_trivial() {
     panic!("'hello world' is not trivial");
@@ -573,7 +621,7 @@ fn prepared_chunk_is_consumed_by_finish() {
       &samples,
       &SpeechSpans::all_speech(),
       "hello",
-      &[],
+      resolution(&a, "hello"),
       &AtomicBool::new(false),
     )
     .expect("prepare");
@@ -596,7 +644,7 @@ fn finish_honours_the_abort_flag() {
       &samples,
       &SpeechSpans::all_speech(),
       "hello",
-      &[],
+      resolution(&a, "hello"),
       &AtomicBool::new(false),
     )
     .expect("prepare");
@@ -613,21 +661,27 @@ fn finish_honours_the_abort_flag() {
 
 // —————————————————— prepare-stage cancellation ——————————————————
 
-/// A normalizer that MUST NOT be called: it panics on invocation.
+/// A normalizer that MUST NOT be called once armed: it panics on
+/// invocation then, and normalizes as English before.
 ///
 /// The normalise step is where a public, caller-supplied normalizer runs
 /// over unbounded text — the O(n) work `prepare`'s abort poll exists to get
-/// ahead of. Building an aligner with this normalizer turns "did `prepare`
-/// reach the normalise step?" into a hard pass/fail: if the guard is dead,
-/// the panic fires.
-struct PanicNormalizer;
+/// ahead of. Arming it after detection turns "did `prepare` reach the
+/// normalise step?" into a hard pass/fail: if the guard is dead, the panic
+/// fires. Detection runs disarmed, so the aligner can decide its own text.
+struct PanicNormalizer {
+  armed: std::sync::Arc<AtomicBool>,
+  english: crate::runner::aligner::normalizers::EnglishNormalizer,
+}
 
 impl TextNormalizer for PanicNormalizer {
-  fn normalize<'a>(&self, _text: &'a str) -> Result<NormalizedText<'a>, NormalizationError> {
-    panic!(
+  fn normalize<'a>(&self, text: &'a str) -> Result<NormalizedText<'a>, NormalizationError> {
+    assert!(
+      !self.armed.load(core::sync::atomic::Ordering::SeqCst),
       "prepare invoked the custom normalizer despite an already-set abort flag — the \
        prepare-stage cancellation guard is dead"
     );
+    self.english.normalize(text)
   }
 
   // English-shape: TOKENIZER_JSON carries a `|`, so the build-time
@@ -637,11 +691,17 @@ impl TextNormalizer for PanicNormalizer {
   }
 }
 
-fn aligner_with_panic_normalizer() -> EmissionsAligner {
-  EmissionsAligner::builder(Lang::En, TOKENIZER_JSON.as_bytes())
-    .normalizer(Box::new(PanicNormalizer))
+/// An aligner whose normalizer panics once the returned flag is set.
+fn aligner_with_panic_normalizer() -> (EmissionsAligner, std::sync::Arc<AtomicBool>) {
+  let armed = std::sync::Arc::new(AtomicBool::new(false));
+  let aligner = EmissionsAligner::builder(Lang::En, TOKENIZER_JSON.as_bytes())
+    .normalizer(Box::new(PanicNormalizer {
+      armed: std::sync::Arc::clone(&armed),
+      english: crate::runner::aligner::normalizers::EnglishNormalizer::new(),
+    }))
     .build()
-    .expect("build with the sentinel normalizer")
+    .expect("build with the sentinel normalizer");
+  (aligner, armed)
 }
 
 /// **`prepare` aborts BEFORE doing the O(n) work.**
@@ -651,22 +711,24 @@ fn aligner_with_panic_normalizer() -> EmissionsAligner {
 /// tripped could not stop the seam from scanning, masking, normalising (via
 /// a public custom normalizer), and tokenising over unbounded audio + text.
 ///
-/// With an already-SET abort flag and an empty (hence valid) decision
-/// payload, `prepare` must return [`EmissionsError::Aborted`] at the first
+/// With an already-SET abort flag and the aligner's own (hence valid)
+/// resolution, `prepare` must return [`EmissionsError::Aborted`] at the first
 /// poll — ahead of the normalise step. [`PanicNormalizer`] panics if it is
 /// ever reached, so this test passing is a direct proof that the O(n) work
 /// was skipped. Against the old `never`-flag seam it would instead panic.
 #[test]
 fn prepare_aborts_before_the_custom_normalizer_runs() {
-  let a = aligner_with_panic_normalizer();
+  let (a, armed) = aligner_with_panic_normalizer();
   let samples = vec![0.2_f32; 16_000];
   let aborted = AtomicBool::new(true);
+  let decisions = resolution(&a, "hello world");
+  armed.store(true, core::sync::atomic::Ordering::SeqCst);
 
   let Err(err) = a.prepare(
     &samples,
     &SpeechSpans::all_speech(),
     "hello world",
-    &[],
+    decisions,
     &aborted,
   ) else {
     panic!("an already-set abort flag must stop prepare before it does any work");
@@ -677,50 +739,40 @@ fn prepare_aborts_before_the_custom_normalizer_runs() {
   );
 }
 
-/// **A malformed decision payload wins over cancellation.**
+/// **A crossed resolution wins over cancellation.**
 ///
-/// The cross-language decision check runs FIRST in `AlignerCore::prepare` —
-/// ahead of the first abort poll — exactly as the ORT direct path orders it:
-/// a cross-language payload is a caller bug that stays a caller bug even
-/// after a watchdog has fired, and the specific diagnostic is worth more
-/// than a generic timeout. So with the abort flag SET, a foreign-language
-/// decision must still surface as the language/decision error, NOT as
-/// `Aborted` — cancellation does not mask it.
+/// The binding check runs FIRST in `EmissionsAligner::prepare` — ahead of
+/// the first abort poll — exactly as the ORT direct path orders it: a
+/// resolution detected by another aligner is a caller bug that stays a
+/// caller bug even after a watchdog has fired, and the specific diagnostic
+/// is worth more than a generic timeout. So with the abort flag SET, it
+/// must still surface as the binding error, NOT as `Aborted`.
 ///
 /// [`PanicNormalizer`] also proves the check precedes the normalise step:
 /// neither the abort poll nor the normalizer is reached.
 #[test]
-fn a_malformed_decision_wins_over_a_set_abort_flag() {
-  use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
-
-  let a = aligner_with_panic_normalizer();
+fn a_crossed_resolution_wins_over_a_set_abort_flag() {
+  let (a, armed) = aligner_with_panic_normalizer();
+  armed.store(true, core::sync::atomic::Ordering::SeqCst);
   let samples = vec![0.2_f32; 16_000];
 
-  // A Korean decision whose positional fields match an English detection, so
-  // only the language separates them — the exact payload the guard rejects.
-  let foreign = vec![ResolvedOov::new(
-    OovEvent::new(OovKind::Symbol('&'), 0, 0, Lang::Ko),
-    OovDecision::Wildcard,
-  )];
+  // Another aligner's detection of the same text.
+  let foreign = aligner()
+    .detect_oov("&")
+    .expect("detect_oov")
+    .decide(wildcard_all_policy);
   let aborted = AtomicBool::new(true);
 
-  let Err(err) = a.prepare(
-    &samples,
-    &SpeechSpans::all_speech(),
-    "&",
-    &foreign,
-    &aborted,
-  ) else {
-    panic!("a cross-language decision must be rejected even under cancellation");
+  let Err(err) = a.prepare(&samples, &SpeechSpans::all_speech(), "&", foreign, &aborted) else {
+    panic!("a crossed resolution must be refused even under cancellation");
   };
   let EmissionsError::Tokenization(f) = err else {
-    panic!("cancellation must not mask the language error; got {err:?}");
+    panic!("cancellation must not mask the crossed resolution; got {err:?}");
   };
   assert!(
-    f.message().contains("oov_decisions[0].event.language")
-      && f.message().contains("Ko")
-      && f.message().contains("En"),
-    "the decision error must win over abort and name both languages; got {}",
+    f.message()
+      .contains("not detected by this aligner in this text"),
+    "the binding error must win over abort; got {}",
     f.message()
   );
 }
@@ -742,7 +794,13 @@ fn rescaled_vad_spans_reach_prepare() {
   let a = aligner();
   let samples = vec![0.2_f32; 16_000];
   let prepared = a
-    .prepare(&samples, &spans, "hello", &[], &AtomicBool::new(false))
+    .prepare(
+      &samples,
+      &spans,
+      "hello",
+      resolution(&a, "hello"),
+      &AtomicBool::new(false),
+    )
     .expect("prepare with rescaled spans");
   let buf = prepared.encoder_input();
   assert!(buf[..8_000].iter().all(|&s| s == 0.2), "speech survives");
@@ -783,18 +841,18 @@ const NO_UNK_TOKENIZER_JSON: &str = r#"{
 /// has no unknown token.
 #[test]
 fn a_character_the_vocabulary_cannot_spell_is_an_oov_event() {
-  use crate::core::{OovEvent, OovKind, fail_closed_all_decisions};
+  use crate::core::OovKind;
 
   let a = EmissionsAligner::builder(Lang::En, NO_UNK_TOKENIZER_JSON.as_bytes())
     .blank_token_id(0)
     .build()
     .expect("a CTC alphabet with no unknown token builds");
   let text = "take 4 cats";
-  let events = a
+  let detection = a
     .detect_oov(text)
     .expect("an unspellable character is an event, never an error");
   assert_eq!(
-    events,
+    detection.events().to_vec(),
     vec![OovEvent::new(OovKind::Symbol('4'), 5, 1, Lang::En)]
   );
 
@@ -806,7 +864,7 @@ fn a_character_the_vocabulary_cannot_spell_is_an_oov_event() {
       &samples,
       &speech,
       text,
-      &default_oov_decisions(&events),
+      detection.decide(default_oov_policy),
       &abort,
     )
     .expect("the default policy wildcards a digit");
@@ -816,7 +874,9 @@ fn a_character_the_vocabulary_cannot_spell_is_an_oov_event() {
     &samples,
     &speech,
     text,
-    &fail_closed_all_decisions(&events),
+    a.detect_oov(text)
+      .expect("detect_oov")
+      .decide(fail_closed_all_policy),
     &abort,
   ) else {
     panic!("a refused character refuses the chunk");
@@ -834,8 +894,6 @@ fn a_character_the_vocabulary_cannot_spell_is_an_oov_event() {
 /// is still an event, and the fail-closed policy still refuses it by name.
 #[test]
 fn punctuated_text_prepares_under_every_policy() {
-  use crate::core::{fail_closed_all_decisions, wildcard_all_decisions};
-
   let a = aligner();
   let samples = vec![0.2_f32; 16_000];
   let speech = SpeechSpans::all_speech();
@@ -843,24 +901,29 @@ fn punctuated_text_prepares_under_every_policy() {
 
   let text = "\u{201C}Hello,\u{201D} she said \u{2014} isn\u{2019}t it (really) well-known? \
               \u{AB}Yes\u{2026}\u{BB} *U.S.A.*";
-  let events = a.detect_oov(text).expect("detect_oov");
-  assert!(events.is_empty(), "no mark is an event; got {events:?}");
-  for decisions in [
-    default_oov_decisions(&events),
-    wildcard_all_decisions(&events),
-    fail_closed_all_decisions(&events),
-  ] {
+  let detection = a.detect_oov(text).expect("detect_oov");
+  assert!(
+    detection.events().is_empty(),
+    "no mark is an event; got {:?}",
+    detection.events()
+  );
+  for policy in POLICIES {
+    let decisions = a.detect_oov(text).expect("detect_oov").decide(policy);
     let prepared = a
-      .prepare(&samples, &speech, text, &decisions, &abort)
+      .prepare(&samples, &speech, text, decisions, &abort)
       .expect("every policy prepares punctuated text");
     assert!(!prepared.is_trivial());
   }
 
-  let events = a
+  let detection = a
     .detect_oov("They sold AT&T, then left.")
     .expect("detect_oov");
   assert_eq!(
-    events.iter().map(OovEvent::char).collect::<Vec<_>>(),
+    detection
+      .events()
+      .iter()
+      .map(OovEvent::char)
+      .collect::<Vec<_>>(),
     [Some('&')],
     "only the spoken character is an event"
   );
@@ -868,7 +931,7 @@ fn punctuated_text_prepares_under_every_policy() {
     &samples,
     &speech,
     "They sold AT&T, then left.",
-    &fail_closed_all_decisions(&events),
+    detection.decide(fail_closed_all_policy),
     &abort,
   ) else {
     panic!("the fail-closed policy refuses the spoken `&`");
@@ -889,16 +952,10 @@ fn punctuated_text_prepares_under_every_policy() {
 /// and no policy ever saw it.
 #[test]
 fn a_spoken_segment_without_a_script_reaches_detection_under_every_policy() {
-  use crate::{
-    align::{
-      SegmentLike, dispatch_segments,
-      script_dispatch::{TokenInfo, runs_reproduce_text},
-    },
-    core::{OovDecision, fail_closed_all_decisions, wildcard_all_decisions},
+  use crate::align::{
+    SegmentLike, dispatch_segments,
+    script_dispatch::{TokenInfo, runs_reproduce_text},
   };
-
-  /// An OOV policy: one decision per event, in order.
-  type Policy = fn(&[OovEvent]) -> Vec<ResolvedOov>;
 
   struct Segment(&'static str, i64, i64);
   impl SegmentLike for Segment {
@@ -920,12 +977,6 @@ fn a_spoken_segment_without_a_script_reaches_detection_under_every_policy() {
   let samples = vec![0.2_f32; 16_000];
   let speech = SpeechSpans::all_speech();
   let abort = AtomicBool::new(false);
-  let policies: [Policy; 3] = [
-    default_oov_decisions,
-    wildcard_all_decisions,
-    fail_closed_all_decisions,
-  ];
-
   for (spoken, decided) in [
     ("4", vec![Some('4')]),
     ("&", vec![Some('&')]),
@@ -943,19 +994,27 @@ fn a_spoken_segment_without_a_script_reaches_detection_under_every_policy() {
     };
     assert_eq!((hello.text(), second.text()), ("hello", spoken));
 
-    let events = a.detect_oov(second.text()).expect("detect_oov");
+    let detection = a.detect_oov(second.text()).expect("detect_oov");
     assert_eq!(
-      events.iter().map(OovEvent::char).collect::<Vec<_>>(),
+      detection
+        .events()
+        .iter()
+        .map(OovEvent::char)
+        .collect::<Vec<_>>(),
       decided,
       "{spoken:?}"
     );
-    for policy in policies {
-      let decisions = policy(&events);
+    for policy in POLICIES {
+      let decisions = a
+        .detect_oov(second.text())
+        .expect("detect_oov")
+        .decide(policy);
       let refused = decisions
+        .resolved()
         .iter()
         .find(|resolved| resolved.decision() == OovDecision::FailClosed)
         .and_then(|resolved| resolved.event().char());
-      match a.prepare(&samples, &speech, second.text(), &decisions, &abort) {
+      match a.prepare(&samples, &speech, second.text(), decisions, &abort) {
         Ok(prepared) => {
           assert_eq!(
             refused, None,
@@ -979,15 +1038,15 @@ fn a_spoken_segment_without_a_script_reaches_detection_under_every_policy() {
 
 // ————————————— Decisions bind to the unit they were detected in —————————————
 
-/// **A decision applies only to the text and the aligner that detected
-/// it.** Two texts with the same event layout (`&` at the same char and
-/// word index) cannot use each other's decisions; another aligner's
-/// decisions are refused even for the same text; a hand-built event is
-/// refused. The detected payload passes.
+/// **A resolution applies only to the text and the aligner that detected
+/// it, and only once.** Two texts with the same event layout (`&` at the
+/// same char and word index) cannot use each other's resolution, and
+/// another aligner refuses one even for the same text; the aligner's own
+/// detection of the text passes. `prepare` consumes a resolution, and no
+/// resolution can be cloned or built by hand (the `compile_fail` doctests
+/// on [`OovResolution`]).
 #[test]
-fn a_decision_binds_to_the_text_and_aligner_that_detected_it() {
-  use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov, wildcard_all_decisions};
-
+fn a_resolution_binds_to_the_text_and_aligner_that_detected_it() {
   let a = aligner();
   let b = EmissionsAligner::builder(Lang::En, PERMUTED_TOKENIZER_JSON.as_bytes())
     .build()
@@ -995,36 +1054,44 @@ fn a_decision_binds_to_the_text_and_aligner_that_detected_it() {
   let samples = vec![0.2_f32; 16_000];
   let speech = SpeechSpans::all_speech();
   let abort = AtomicBool::new(false);
+  let detect = |aligner: &EmissionsAligner, text: &str| {
+    aligner
+      .detect_oov(text)
+      .expect("detect_oov")
+      .decide(wildcard_all_policy)
+  };
 
-  let sold = wildcard_all_decisions(&a.detect_oov("sold at&t").expect("detect_oov"));
-  let told = wildcard_all_decisions(&a.detect_oov("told at&t").expect("detect_oov"));
-  assert_eq!(sold, told, "the same layout: equal as positional payloads");
-  a.prepare(&samples, &speech, "sold at&t", &sold, &abort)
-    .expect("an aligner accepts the decisions it detected for this text");
+  let sold = detect(&a, "sold at&t");
+  let told = detect(&a, "told at&t");
+  assert_eq!(
+    sold.resolved(),
+    told.resolved(),
+    "the same layout: equal as positional payloads"
+  );
+  a.prepare(&samples, &speech, "sold at&t", sold, &abort)
+    .expect("an aligner accepts its own detection of this text");
 
-  let built = vec![ResolvedOov::new(
-    OovEvent::new(OovKind::Symbol('&'), 7, 1, Lang::En),
-    OovDecision::Wildcard,
-  )];
   for (what, result) in [
     (
       "another text, same layout",
-      a.prepare(&samples, &speech, "told at&t", &sold, &abort),
+      a.prepare(&samples, &speech, "sold at&t", told, &abort),
     ),
     (
       "another aligner, same text",
-      b.prepare(&samples, &speech, "sold at&t", &sold, &abort),
-    ),
-    (
-      "an event built by hand",
-      a.prepare(&samples, &speech, "sold at&t", &built, &abort),
+      b.prepare(
+        &samples,
+        &speech,
+        "sold at&t",
+        detect(&a, "sold at&t"),
+        &abort,
+      ),
     ),
   ] {
     match result {
       Err(EmissionsError::Tokenization(failure)) => assert!(
         failure
           .message()
-          .contains("was not detected by this aligner in this text"),
+          .contains("not detected by this aligner in this text"),
         "{what}: {}",
         failure.message()
       ),
@@ -1045,7 +1112,7 @@ fn a_punctuation_only_text_is_named_no_alignable_text() {
   let samples = vec![0.2_f32; 16_000];
   for text in ["!!!...", "\u{AB}\u{2026}\u{BB} *"] {
     assert!(
-      a.detect_oov(text).expect("detect_oov").is_empty(),
+      a.detect_oov(text).expect("detect_oov").events().is_empty(),
       "{text:?}"
     );
     let prepared = a
@@ -1053,7 +1120,7 @@ fn a_punctuation_only_text_is_named_no_alignable_text() {
         &samples,
         &SpeechSpans::all_speech(),
         text,
-        &[],
+        resolution(&a, text),
         &AtomicBool::new(false),
       )
       .expect("prepare");
@@ -1096,7 +1163,7 @@ fn a_fully_masked_text_is_named_no_surviving_words() {
       &samples,
       &SpeechSpans::new([]),
       "hello world",
-      &[],
+      resolution(&a, "hello world"),
       &AtomicBool::new(false),
     )
     .expect("prepare");

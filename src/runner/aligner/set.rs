@@ -56,10 +56,10 @@ pub enum AlignmentLookup<'a> {
 pub struct AlignmentSet {
   aligners: HashMap<AlignerKey, Mutex<Aligner>>,
   fallback: AlignmentFallback,
-  /// This registry's process-unique identity. Detection stamps it on
-  /// every event it reports, and dispatch refuses a decision detected
-  /// through another registry: the registry is fixed once built, so
-  /// the identity names the snapshot detection used.
+  /// This registry's process-unique identity. A job's detection is bound
+  /// to it, and dispatch refuses a resolution detected through another
+  /// registry: the registry is fixed once built, so the identity names
+  /// the snapshot detection used.
   id: NonZeroU64,
 }
 
@@ -82,7 +82,7 @@ impl AlignmentSet {
     }
   }
 
-  /// This registry's identity, as detection stamps it.
+  /// This registry's identity, as a job's detection is bound to it.
   pub(crate) const fn id(&self) -> NonZeroU64 {
     self.id
   }
@@ -105,115 +105,78 @@ impl AlignmentSet {
     self.aligners.is_empty()
   }
 
-  /// Detect out-of-vocab characters in `text` against the
-  /// aligner registered for `language` (or
-  /// [`AlignerKey::Any`]'s aligner if no language-specific one
-  /// is registered). Returns events in the order
-  /// [`tokenize_with_word_map`](crate::runner::aligner::algorithm::tokenize::tokenize_with_word_map)
-  /// would encounter them — caller-supplied `&[ResolvedOov]`
-  /// on the resulting [`AlignWorkItem::oov_decisions`](crate::AlignWorkItem)
-  /// must be in the same order.
+  /// Detect out-of-vocab characters in every alignment unit of `job`:
+  /// its whole text when it has no runs, or each of its runs, against the
+  /// aligner registered for the unit's language (or [`AlignerKey::Any`]'s
+  /// when no language-specific one is registered).
   ///
-  /// When no aligner matches (a registry miss), nothing can read
-  /// the text. It is reported as exactly one
-  /// [`OovKind::NotInspected`](crate::core::OovKind::NotInspected)
-  /// event in `language`, never as an empty list, which would
-  /// claim the text clean. The caller's policy decides it like any
-  /// other event: `FailClosed` refuses the text, `Wildcard` leaves
-  /// it to the registry's [`AlignmentFallback`] (`SkipChunk` skips
-  /// it, `Error` fails the chunk). The alignment result names a
-  /// skipped or refused text in
-  /// [`AlignmentResult::unaligned`](crate::AlignmentResult::unaligned).
+  /// Returns the one way to decide them: a
+  /// [`JobDetection`](crate::JobDetection) bound to this very work item
+  /// (its `ChunkId` with it) and to this set. Decide it with a policy
+  /// from [`crate::core::oov`] (or a closure) and hand the
+  /// [`JobResolution`](crate::JobResolution) to
+  /// [`run_one_alignment`](crate::run_one_alignment) with the same job and
+  /// set; it refuses a resolution detected for another job or through
+  /// another set.
   ///
-  /// Sans-I/O OOV resolution entry point: callers feed the
-  /// returned events into a policy helper
-  /// (`crate::core::oov::default_oov_decisions` etc.) and
-  /// pass the resulting decisions to
-  /// `AlignWorkItem::from_run_alignment`.
+  /// Each unit's events carry the unit's REQUESTED language, also when
+  /// the `Any` aligner reads it, so a per-language policy decides on the
+  /// chunk's or run's language, not the fallback aligner's.
   ///
-  /// Each event is bound to `text`, the aligner that read it and
-  /// this set, as the whole chunk: dispatch accepts a decision for
-  /// it only on a whole-chunk job with this text, through this set.
-  /// A job with runs takes [`Self::detect_oov_per_run`]'s events,
-  /// which are bound to their runs.
+  /// When no aligner matches a unit (a registry miss), nothing can read
+  /// it. It is reported as exactly one
+  /// [`OovKind::NotInspected`](crate::core::OovKind::NotInspected) event
+  /// in its language, never as an empty list, which would claim it clean.
+  /// The caller's policy decides it like any other event: `FailClosed`
+  /// refuses the unit, `Wildcard` leaves it to the registry's
+  /// [`AlignmentFallback`] (`SkipChunk` skips it, `Error` fails the
+  /// chunk).
+  ///
+  /// Returns `Err` on the first unit whose detection fails (a
+  /// normalisation error). A character a unit's vocabulary cannot spell
+  /// is an event, not a failure.
   pub fn detect_oov(
     &self,
-    text: &str,
-    language: &Lang,
-  ) -> Result<Vec<crate::core::OovEvent>, crate::types::WorkFailure> {
-    let aligner_mu = match self.lookup(language) {
-      AlignmentLookup::Hit { aligner, .. } | AlignmentLookup::AnyFallback { aligner } => aligner,
-      AlignmentLookup::Miss { .. } => {
-        return Ok(vec![crate::core::OovEvent::not_inspected(
-          text,
-          language.clone(),
-          self.id,
-        )]);
-      }
-    };
-    let guard = aligner_mu.lock().unwrap_or_else(|p| p.into_inner());
-    let mut events = guard.detect_oov(text)?;
-    // // `Aligner::detect_oov` stamps every event with its OWN
-    // construction language. When `lookup` falls back to
-    // `AlignerKey::Any` (e.g. an English aligner registered
-    // as the multilingual fallback for an unsupported
-    // language), the caller's requested language is
-    // overwritten with the fallback aligner's language.
-    // Per-language policy (e.g. wildcard-en /
-    // fail-closed-ko) then sees the wrong key. Patch the
-    // event language back to the caller's request so the
-    // policy decides on the run/chunk language, not the
-    // aligner's construction-time tag.
-    for ev in &mut events {
-      ev.set_language(language.clone());
-      // Bind the event to this registry too: dispatch through another
-      // one refuses it.
-      ev.through_registry(self.id, None);
-    }
-    Ok(events)
-  }
+    job: &crate::AlignWorkItem,
+  ) -> Result<crate::JobDetection, crate::types::WorkFailure> {
+    use crate::core::{AlignmentUnit, OovDetection, OovEvent, OovKind};
 
-  /// Detect OOV chars per-run for a code-switched chunk's
-  /// script-dispatched runs. Returns `events_per_run[i]`
-  /// matching `runs[i]` order; empty when `runs` is empty.
-  /// Each run's events are detected against its own
-  /// language's aligner (`runs[i].language()`), and each is
-  /// bound to its run, its text and this set: dispatch refuses a
-  /// decision for it at another run index, for another text, or
-  /// through another set.
-  ///
-  /// Companion to [`Self::detect_oov`]. Use this when
-  /// `Command::Alignment::runs` is non-empty (the typical
-  /// `WhisperAsrSource` path); use [`Self::detect_oov`] for
-  /// the whole-chunk path. Those runs cover every spoken
-  /// character of the chunk's text, so each one is detected in
-  /// exactly one run.
-  ///
-  /// Returns `Err` immediately on the first per-run detection
-  /// failure (a normalisation error), so the caller can
-  /// surface the failure to the chunk before alignment. A
-  /// character a run's vocabulary cannot spell is an event,
-  /// not a failure.
-  ///
-  /// introduced
-  /// to thread caller policy through the per-run path —
-  /// the dispatcher silently substituted
-  /// `default_oov_decisions` regardless of caller intent.
-  pub fn detect_oov_per_run(
-    &self,
-    runs: &[crate::align::Run],
-  ) -> Result<Vec<Vec<crate::core::OovEvent>>, crate::types::WorkFailure> {
-    let mut out = Vec::with_capacity(runs.len());
-    for (run_index, run) in runs.iter().enumerate() {
-      let mut events = self.detect_oov(run.text(), run.language())?;
-      // Bind each event to its run: dispatch refuses a decision made
-      // for another run, even one with the same text and layout.
-      for event in &mut events {
-        event.through_registry(self.id, Some(run_index));
-      }
-      out.push(events);
+    let units: Vec<(AlignmentUnit, &str, &Lang)> = if job.runs().is_empty() {
+      vec![(AlignmentUnit::Whole, job.text().as_str(), job.language())]
+    } else {
+      job
+        .runs()
+        .iter()
+        .enumerate()
+        .map(|(index, run)| (AlignmentUnit::Run(index), run.text(), run.language()))
+        .collect()
+    };
+    let mut detections = Vec::with_capacity(units.len());
+    for (unit, text, language) in units {
+      let detection = match self.lookup(language) {
+        AlignmentLookup::Hit { aligner, .. } | AlignmentLookup::AnyFallback { aligner } => {
+          let guard = aligner.lock().unwrap_or_else(|p| p.into_inner());
+          let mut events = guard.detect_events(text)?;
+          // The aligner stamps every event with its OWN language. Under
+          // `AlignerKey::Any` that is the fallback aligner's, and a
+          // per-language policy (wildcard-en / fail-closed-ko) would then
+          // see the wrong key: relabel each event with the unit's
+          // requested language.
+          for event in &mut events {
+            event.set_language(language.clone());
+          }
+          OovDetection::of_unit(unit, language.clone(), events, Some(guard.id()))
+        }
+        AlignmentLookup::Miss { .. } => OovDetection::of_unit(
+          unit,
+          language.clone(),
+          vec![OovEvent::new(OovKind::NotInspected, 0, 0, language.clone())],
+          None,
+        ),
+      };
+      detections.push(detection);
     }
-    Ok(out)
+    Ok(crate::JobDetection::new(job, self.id, detections))
   }
 
   /// Look up an aligner for `language`, applying the
@@ -265,58 +228,6 @@ mod tests {
         assert_eq!(fallback, AlignmentFallback::Error);
       }
       _ => panic!("expected Miss"),
-    }
-  }
-
-  /// **A text no aligner can read is never reported clean.** On a
-  /// registry miss, detection answers exactly one `NotInspected` event in
-  /// the requested language, whole-text and per run alike, whichever
-  /// fallback the registry has; never the empty list an inspected text
-  /// spelled whole would give.
-  #[test]
-  fn a_text_no_aligner_can_read_is_one_not_inspected_event() {
-    use smol_str::SmolStr;
-
-    use crate::{
-      align::{BoundsSource, Run},
-      core::{OovEvent, OovKind},
-    };
-
-    for fallback in [AlignmentFallback::SkipChunk, AlignmentFallback::Error] {
-      let set = AlignmentSet::from_parts(HashMap::new(), fallback);
-      assert_eq!(
-        set
-          .detect_oov("take 4 cats", &Lang::Ko)
-          .expect("detect_oov"),
-        vec![OovEvent::new(OovKind::NotInspected, 0, 0, Lang::Ko)],
-        "{fallback:?}"
-      );
-      let runs = [
-        Run::new(
-          Lang::En,
-          SmolStr::new("hello"),
-          0,
-          500,
-          0,
-          BoundsSource::Segment,
-        ),
-        Run::new(
-          Lang::Ko,
-          SmolStr::new(" 4"),
-          500,
-          900,
-          1,
-          BoundsSource::Segment,
-        ),
-      ];
-      assert_eq!(
-        set.detect_oov_per_run(&runs).expect("detect_oov_per_run"),
-        vec![
-          vec![OovEvent::new(OovKind::NotInspected, 0, 0, Lang::En)],
-          vec![OovEvent::new(OovKind::NotInspected, 0, 0, Lang::Ko)],
-        ],
-        "{fallback:?}"
-      );
     }
   }
 

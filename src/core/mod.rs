@@ -9,12 +9,12 @@ pub mod oov;
 mod transcriber;
 
 pub use command::{
-  AlignmentResult, AsrParams, AsrParamsOverride, AsrResult, Command, SamplingStrategy, Unaligned,
-  UnalignedCause,
+  AlignmentResult, AlignmentUnit, AsrParams, AsrParamsOverride, AsrResult, Command,
+  SamplingStrategy, Unaligned, UnalignedCause,
 };
 pub use event::Event;
 pub use oov::{
-  OovDecision, OovEvent, OovKind, ResolvedOov, default_oov_decisions, fail_closed_all_decisions,
-  wildcard_all_decisions,
+  OovDecision, OovDetection, OovEvent, OovKind, OovResolution, ResolvedOov, default_oov_policy,
+  fail_closed_all_policy, wildcard_all_policy,
 };
 pub use transcriber::{LanguagePolicy, Transcriber, TranscriberOptions};

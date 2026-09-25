@@ -217,35 +217,47 @@ impl Aligner {
     self.core.language()
   }
 
-  /// Detect out-of-vocab characters in `text` against this
-  /// aligner's wav2vec2 vocab + per-language normalizer,
-  /// without making any policy decision. Returns events in
-  /// the order [`tokenize_with_word_map`](crate::runner::aligner::algorithm::tokenize::tokenize_with_word_map)
-  /// will encounter them — caller-supplied `&[ResolvedOov]`
-  /// to `align_chunk_with_abort` (or via
-  /// [`AlignWorkItem::oov_decisions`](crate::AlignWorkItem))
-  /// must be in the same order.
+  /// Detect out-of-vocab characters in `text` against this aligner's
+  /// wav2vec2 vocab + per-language normalizer, without making any
+  /// policy decision.
   ///
-  /// Sans-I/O OOV resolution: the library produces events as
-  /// data, the caller decides via pure functions in
-  /// [`crate::core::oov`] (or a custom policy), then passes
-  /// the decisions back as data. No callbacks, no traits the
-  /// library holds.
+  /// Returns the one way to decide them: an [`OovDetection`] bound to
+  /// `text` and to this aligner. Decide it with a policy from
+  /// [`crate::core::oov`] (or a closure), then hand the
+  /// [`OovResolution`] to [`Self::align_chunk_with_abort`] with the same
+  /// text, which refuses a resolution detected in another text or by
+  /// another aligner.
   ///
-  /// Each event is bound to `text` and to this aligner:
-  /// [`Self::align_chunk_with_abort`] refuses a decision made for
-  /// an event detected in another text or by another aligner.
+  /// No events for in-vocab text. A character the vocabulary cannot
+  /// spell is an event, never an error: detection looks each character
+  /// up in the vocabulary and never runs the tokenizer's `encode`.
+  /// Returns an error only on normalizer rejection, or on normalizer
+  /// output whose word count disagrees with its boundary map
+  /// (`NormalizationError::EmptyText` for punctuation-only input is no
+  /// events: there's nothing to align, so nothing to decide).
   ///
-  /// Returns an empty vec for in-vocab text. A character the
-  /// vocabulary cannot spell is an event, never an error:
-  /// detection looks each character up in the vocabulary and
-  /// never runs the tokenizer's `encode`. Returns an error only
-  /// on normalizer rejection, or on normalizer output whose
-  /// word count disagrees with its boundary map
-  /// (`NormalizationError::EmptyText` for punctuation-only
-  /// input is converted to an empty event vec — there's
-  /// nothing to align, so nothing to decide).
+  /// [`OovDetection`]: crate::core::OovDetection
+  /// [`OovResolution`]: crate::core::OovResolution
   pub fn detect_oov(
+    &self,
+    text: &str,
+  ) -> Result<crate::core::OovDetection, crate::types::WorkFailure> {
+    Ok(crate::core::OovDetection::of_text(
+      text,
+      self.core.language().clone(),
+      self.core.detect_oov(text)?,
+      self.core.id().get(),
+    ))
+  }
+
+  /// This aligner's identity, as a detection it made is bound to it.
+  pub(crate) const fn id(&self) -> core::num::NonZeroU64 {
+    self.core.id().get()
+  }
+
+  /// The OOV events of `text`, undecided: what `AlignmentSet::detect_oov`
+  /// binds to a unit of a pool job.
+  pub(crate) fn detect_events(
     &self,
     text: &str,
   ) -> Result<Vec<crate::core::OovEvent>, crate::types::WorkFailure> {
@@ -405,32 +417,24 @@ impl Aligner {
         self.core.language().clone(),
       )))
     })?;
-    // Default OOV policy for the no-abort entrypoint:
-    // detect events first, apply the historical default
-    // (`alphanumeric → wildcard, pronounced → fail-closed`).
-    // Power users that want `wildcard_all_decisions` or a
-    // custom policy should use `align_chunk_with_abort` and
-    // supply explicit decisions.
-    let oov_events = self.detect_oov(text)?;
-    let oov_decisions = crate::core::default_oov_decisions(&oov_events);
-    // Self-generated decisions, so they carry this aligner's language by
-    // construction; naming it as the key is a tautology here, and that is
-    // exactly the point — there is no call path into the core that does
-    // not state one.
-    let expected = self.core.language().clone();
-    self
-      .align(
-        samples,
-        sub_segments,
-        text,
-        chunk_first_sample_in_stream,
-        samples_to_output_range,
-        &abort_flag,
-        &run_options,
-        &oov_decisions,
-        &expected,
-      )
-      .map(|composed| composed.into_result(&expected))
+    // Default OOV policy for the no-abort entrypoint: detect, then
+    // decide with the historical default (`alphanumeric → wildcard,
+    // pronounced → fail-closed`). Power users that want
+    // `wildcard_all_policy` or a custom policy should use
+    // `align_chunk_with_abort` with their own resolution.
+    let resolution = self
+      .detect_oov(text)?
+      .decide(crate::core::default_oov_policy);
+    self.align_chunk_with_abort(
+      samples,
+      sub_segments,
+      text,
+      chunk_first_sample_in_stream,
+      samples_to_output_range,
+      &abort_flag,
+      &run_options,
+      resolution,
+    )
   }
 
   /// Cancellable alignment entrypoint: caller owns the
@@ -451,6 +455,12 @@ impl Aligner {
   /// `RunOptions` lives in [`crate::ort::session::RunOptions`].
   /// Construct one per align call (or share a pool — `terminate`
   /// is process-wide for the underlying ORT graph).
+  ///
+  /// `resolution` is this aligner's [`Self::detect_oov`] of `text`,
+  /// decided. It is consumed, so it applies once; one detected in another
+  /// text or by another aligner is refused as
+  /// [`AlignmentError::Tokenization`](crate::types::AlignmentError::Tokenization)
+  /// before anything is tokenized.
   #[allow(
     clippy::too_many_arguments,
     reason = "7 args carry independent semantic inputs (audio, \
@@ -467,15 +477,16 @@ impl Aligner {
     samples_to_output_range: F,
     abort_flag: &core::sync::atomic::AtomicBool,
     run_options: &RunOptions,
-    // Caller-resolved per-OOV-event decisions. See
-    // `Self::align`'s `oov_decisions` parameter and
-    // `crate::core::oov` for the full Sans-I/O resolution
-    // flow.
-    oov_decisions: &[crate::core::ResolvedOov],
+    // The caller's decisions for `text`: this aligner's
+    // `detect_oov(text)`, decided. Consumed, so it applies once.
+    resolution: crate::core::OovResolution,
   ) -> Result<AlignmentResult, WorkFailure>
   where
     F: Fn(u64, u64) -> TimeRange,
   {
+    // The resolution must be this aligner's detection of this very text,
+    // checked before anything is tokenized.
+    let oov_decisions = self.core.accept(&resolution, text)?;
     // No `Any` fallback at this layer — `align_chunk_with_abort` is
     // bound to a specific `Aligner`, so `self.language` IS the key the
     // caller's OOV policy was resolved against. The check itself lives

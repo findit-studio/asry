@@ -168,11 +168,11 @@ fn boundary_fail_closed(position: &str) -> EmissionsError {
 // (the `whisperx-strict-tokenizer` Cargo feature went with it).
 // Policy is now caller-supplied as data — see
 // `crate::core::oov`:
-// * `default_oov_decisions` — historical default
+// * `default_oov_policy` — historical default
 // (alphanumeric/apostrophe → wildcard, pronounced → fail-closed).
-// * `wildcard_all_decisions` — replaces the removed
+// * `wildcard_all_policy` — replaces the removed
 // `whisperx-strict-tokenizer` feature (WhisperX 1:1).
-// * `fail_closed_all_decisions` — strictest.
+// * `fail_closed_all_policy` — strictest.
 //
 // `tokenize_with_word_map` consumes the resulting
 // `&[ResolvedOov]` per OOV position in `detect_oov_events`
@@ -253,7 +253,7 @@ pub fn detect_oov_events(
   // "no boundary wildcards") or `word_count`-long. Each
   // requested wildcard is surfaced as an
   // `OovKind::BoundaryPunct` event so strict callers
-  // (`fail_closed_all_decisions`) can refuse it.
+  // (`fail_closed_all_policy`) can refuse it.
   wildcard_boundary_per_word: &[crate::runner::aligner::normalizer::WildcardBoundary],
 ) -> Result<Vec<crate::core::OovEvent>, EmissionsError> {
   use crate::core::OovEvent;
@@ -424,7 +424,7 @@ pub fn tokenize_with_word_map(
   // order [`detect_oov_events`] would have produced them.
   // Required: produce via `detect_oov_events` + a policy
   // helper from `crate::core::oov` (e.g.
-  // `default_oov_decisions`, `wildcard_all_decisions`). An
+  // `default_oov_policy`, `wildcard_all_policy`). An
   // empty slice means "no OOV expected"; encountering one
   // anyway raises `TokenizationFailed`. Each
   // `ResolvedOov.event` must match the freshly-detected event
@@ -541,7 +541,7 @@ pub fn tokenize_with_word_map(
     // padding aligns its `*` placeholders ahead of the word's
     // letters, in source order. Each wildcard consults
     // `oov_decisions`, so strict callers
-    // (`fail_closed_all_decisions`) fail closed on requested
+    // (`fail_closed_all_policy`) fail closed on requested
     // padding too.
     for _ in 0..prefix_wildcards {
       let decision =
@@ -710,7 +710,7 @@ mod tests {
   use super::*;
   use crate::{
     align::punctuation::READ_ALOUD,
-    core::{OovEvent, OovKind, ResolvedOov},
+    core::{OovEvent, OovKind},
     runner::aligner::{
       core::{detect_unk_token_id, detect_vocab_uppercase_only, load_tokenizer_bytes_with_compat},
       normalizer::{TextNormalizer, WildcardBoundary},
@@ -761,7 +761,7 @@ mod tests {
   /// → fail-closed) for tests written against
   /// `tokenize_with_word_map` before slice 4 made decisions
   /// caller-supplied. Calls `detect_oov_events` + the
-  /// `default_oov_decisions` helper.
+  /// `default_oov_policy`.
   fn tokenize_with_default_oov(
     tokenizer: &Tokenizer,
     normalized: &str,
@@ -781,7 +781,7 @@ mod tests {
       language,
       wildcard_boundary_per_word,
     )?;
-    let decisions = crate::core::default_oov_decisions(&events);
+    let decisions = crate::core::oov::resolve_events(&events, crate::core::default_oov_policy);
     tokenize_with_word_map(
       tokenizer,
       normalized,
@@ -1204,7 +1204,7 @@ mod tests {
   /// (`tokenize_with_default_oov` — alphanumeric → wildcard,
   /// pronounced → fail-closed). Callers who want the
   /// WhisperX wildcard-everything behaviour now opt in at
-  /// runtime via `wildcard_all_decisions` (see
+  /// runtime via `wildcard_all_policy` (see
   /// `whisperx_unit_parity::issue_1372_digits_comma_no_timestamps`)
   /// instead of via a Cargo feature; the cfg gate this test
   /// previously carried is gone with the removed
@@ -1536,7 +1536,7 @@ mod tests {
     let tok = word_level_tokenizer(&LETTERS, false);
     let events = detect_oov_events(&tok, "b4d", 1, true, None, &Lang::En, &[]).expect("detect");
 
-    let wildcard = crate::core::wildcard_all_decisions(&events);
+    let wildcard = crate::core::oov::resolve_events(&events, crate::core::wildcard_all_policy);
     let tokenized =
       tokenize_with_word_map(&tok, "b4d", 1, false, true, None, &[], &Lang::En, &wildcard)
         .expect("a character the caller decided tokenizes");
@@ -1546,7 +1546,7 @@ mod tests {
       [id_of("B"), WILDCARD_TOKEN_ID, id_of("D")]
     );
 
-    let refused = crate::core::fail_closed_all_decisions(&events);
+    let refused = crate::core::oov::resolve_events(&events, crate::core::fail_closed_all_policy);
     let err = tokenize_with_word_map(&tok, "b4d", 1, false, true, None, &[], &Lang::En, &refused)
       .expect_err("a refused character refuses the chunk");
     assert!(
@@ -1691,7 +1691,8 @@ mod tests {
             events_by_encode_probe(tok, &text, uppercase_input, unk, &[]),
             "{name}: {ch:?}, uppercase_input = {uppercase_input}"
           );
-          let decisions = crate::core::wildcard_all_decisions(&events);
+          let decisions =
+            crate::core::oov::resolve_events(&events, crate::core::wildcard_all_policy);
           let tokenized = tokenize_with_word_map(
             tok,
             &text,
@@ -1759,13 +1760,13 @@ mod tests {
   }
 
   /// An OOV policy: one decision per event, in order.
-  type Policy = fn(&[OovEvent]) -> Vec<ResolvedOov>;
+  type Policy = fn(&OovEvent) -> crate::core::OovDecision;
 
   /// The three shipped policies.
   const POLICIES: [Policy; 3] = [
-    crate::core::default_oov_decisions,
-    crate::core::wildcard_all_decisions,
-    crate::core::fail_closed_all_decisions,
+    crate::core::default_oov_policy,
+    crate::core::wildcard_all_policy,
+    crate::core::fail_closed_all_policy,
   ];
 
   /// `text` through `normalizer`, detection, `policy` and tokenization, in
@@ -1800,7 +1801,7 @@ mod tests {
       unk,
       normalized.wildcard_boundary_per_word(),
       language,
-      &policy(&events),
+      &crate::core::oov::resolve_events(&events, policy),
     );
     (events, tokenized)
   }
@@ -1821,7 +1822,7 @@ mod tests {
       &english,
       "hello she said isn't it really well known yes usa",
       &Lang::En,
-      crate::core::fail_closed_all_decisions,
+      crate::core::fail_closed_all_policy,
     );
     let words = words.expect("the words alone tokenize");
     for policy in POLICIES {
@@ -1891,7 +1892,7 @@ mod tests {
         unk,
         &[],
         &Lang::En,
-        &crate::core::fail_closed_all_decisions(&events),
+        &crate::core::oov::resolve_events(&events, crate::core::fail_closed_all_policy),
       );
       match refused {
         Err(EmissionsError::SemanticOutOfVocab(failure)) => assert!(
@@ -1909,7 +1910,7 @@ mod tests {
       &english,
       "The AT&T deal, 50% done.",
       &Lang::En,
-      crate::core::fail_closed_all_decisions,
+      crate::core::fail_closed_all_policy,
     );
     let decided: Vec<Option<char>> = events.iter().map(OovEvent::char).collect();
     assert_eq!(decided, [Some('&'), Some('5'), Some('0'), Some('%')]);

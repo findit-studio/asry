@@ -232,41 +232,6 @@ pub(crate) fn validate_decision_languages(
   Ok(())
 }
 
-/// Validate that every supplied decision was made for an event this
-/// aligner detected in exactly `text`.
-///
-/// Positional identity ([`OovEvent::matches_position`](crate::core::OovEvent::matches_position))
-/// compares kinds and indices only, so two texts with the same event
-/// layout (`"a&b"` and `"c&d"`) would accept each other's decisions, and
-/// a decision detected by another aligner (another registry's, or before
-/// a registry swap) would pass wherever its layout matched. Detection
-/// stamps each event with the text it read and the aligner that read it;
-/// a decision whose event carries another text, another aligner, or no
-/// stamp at all (an event built by hand) is refused before tokenization.
-pub(crate) fn validate_decision_origins(
-  oov_decisions: &[crate::core::ResolvedOov],
-  text: &str,
-  reader: NonZeroU64,
-  language: &Lang,
-) -> Result<(), WorkFailure> {
-  for (i, resolved) in oov_decisions.iter().enumerate() {
-    if !resolved.event().read_by(text, reader) {
-      return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
-        AlignmentFailure::new(
-          format_smolstr!(
-            "oov_decisions[{i}] was not detected by this aligner in this text: its event was \
- detected in another text or by another aligner, or was built by hand. Decisions bind to \
- the unit their events were detected in; recompute them via `detect_oov(text)` on this \
- aligner and a policy helper from `crate::core::oov`."
-          ),
-          language.clone(),
-        ),
-      )));
-    }
-  }
-  Ok(())
-}
-
 /// Coerce a user-supplied speech-coverage threshold into the
 /// valid `[0.0, 1.0]` range. NaN resets to the default.
 ///
@@ -608,7 +573,7 @@ impl AlignerId {
     Self(NonZeroU64::new(raw).expect("AlignerId counter overflowed u64"))
   }
 
-  /// The raw id, as detection stamps it on the events it reports.
+  /// The raw id, as a detection this aligner made is bound to it.
   pub(crate) const fn get(self) -> NonZeroU64 {
     self.0
   }
@@ -802,6 +767,11 @@ impl AlignerCore {
     prepared.owner == self.id
   }
 
+  /// This core's identity: what a detection it made is bound to.
+  pub(crate) const fn id(&self) -> AlignerId {
+    self.id
+  }
+
   pub(crate) const fn language(&self) -> &Lang {
     &self.language
   }
@@ -874,14 +844,34 @@ impl AlignerCore {
       normalized.wildcard_boundary_per_word(),
     )
     .map_err(|e| e.into_work_failure(&self.language))?;
-    // Bind every event to the text this aligner read: `prepare` accepts
-    // a decision only for the text and the aligner it was detected in.
-    Ok(
-      events
-        .into_iter()
-        .map(|event| event.read_in(text, self.id.get()))
-        .collect(),
-    )
+    Ok(events)
+  }
+
+  /// The decisions of `resolution`, when this aligner detected it in
+  /// exactly `text`: the check a direct front end (`Aligner`,
+  /// `EmissionsAligner`) runs before it tokenizes.
+  ///
+  /// A resolution is bound to the aligner and the text its detection
+  /// read. Positional identity alone cannot tell two texts with the same
+  /// event layout apart (`"sold at&t"`, `"told at&t"`), nor two aligners
+  /// with the same vocabulary size, so a resolution detected anywhere else
+  /// is refused here, as `AlignmentError::Tokenization`, before any
+  /// tokenization.
+  pub(crate) fn accept<'r>(
+    &self,
+    resolution: &'r crate::core::OovResolution,
+    text: &str,
+  ) -> Result<&'r [crate::core::ResolvedOov], WorkFailure> {
+    resolution.for_text(text, self.id.get()).ok_or_else(|| {
+      WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(
+        SmolStr::new_static(
+          "this OovResolution was not detected by this aligner in this text: decisions apply \
+ only to the text and the aligner their detection read. Detect this text with this \
+ aligner's `detect_oov` and decide that detection.",
+        ),
+        self.language.clone(),
+      )))
+    })
   }
 
   /// Steps 0-2 of the alignment pipeline, up to (but not including)
@@ -911,7 +901,6 @@ impl AlignerCore {
     // when a watchdog has already fired, and the diagnostic is worth more
     // than a timeout.
     validate_decision_languages(oov_decisions, expected_decision_language)?;
-    validate_decision_origins(oov_decisions, text, self.id.get(), &self.language)?;
 
     if abort_flag.load(Ordering::Relaxed) {
       return Err(timed_out());
