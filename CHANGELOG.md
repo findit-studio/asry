@@ -165,6 +165,22 @@ BREAKING
 
 FIXED
 
+- **The frame-count check reads the declared receptive field and hop.**
+  `finish` (both front ends) accepted `T` frames only when `T · hop` lay
+  within two hops of the chunk's real length. That window fits wav2vec2's
+  400-sample receptive field and nothing much wider: a front end whose
+  receptive field spans more than about three hops, correctly declared,
+  was refused as `StrideMismatch` (receptive field 640, hop 160: 97 frames
+  for 16 000 samples, `97 · 160 = 15 520`, below the window's 15 680). Now
+  `T` must lie in `[floor((L - rf) / hop) + 1, floor(L / hop) + 1]` for the
+  encoder input's length `L` (the chunk, padded to the receptive field
+  when shorter) and the declared receptive field `rf` and hop `hop`: from
+  the frame count of a valid convolution to that of a front end that pads
+  its input ("same" padding gives `ceil(L / hop)`, a centred grid
+  `floor(L / hop) + 1`). The chunk's real length still bounds the speech
+  gates and the word ranges. For wav2vec2 on 16 000 samples the band is 49
+  to 51 frames (it was 48 to 52); a hop declared at twice or half the true
+  stride is refused as before.
 - **A punctuation mark nobody reads aloud is dropped: never a wildcard,
   never an OOV event.** A mark has no acoustic realization, so it is no
   alignment target, yet alignment made one of it three ways: the Latin

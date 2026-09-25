@@ -685,7 +685,7 @@ struct PreparedInner<'a> {
   /// hands ORT.
   encoder_input: Vec<f32>,
   /// The chunk's REAL audio length (`samples.len()`), before padding.
-  /// Drives the stride check and word-range clamping.
+  /// Drives the speech gates and word-range clamping.
   real_samples: usize,
   /// The coalesced VAD spans, in sample space. Carried here so `finish`
   /// cannot be handed a DIFFERENT set than `prepare` masked with.
@@ -724,12 +724,11 @@ impl PreparedChunk<'_> {
   /// [`is_trivial`](Self::is_trivial).
   ///
   /// Public and read-only so a caller composing `prepare` → their own encoder
-  /// → `finish` can truncate their encoder's frames from the SAME authoritative
-  /// extent `finish` validates against, instead of mis-deriving it from
-  /// `encoder_input().len()` — the PADDED length, which for a short chunk is one
-  /// or more frames longer and would silently keep frames that are all
-  /// zero-pad. Fixed at `prepare` time from the audio itself; there is no
-  /// setter, and reading it cannot change what `finish` sees.
+  /// → `finish` knows how much of [`encoder_input`](Self::encoder_input) is
+  /// audio: `finish` keeps no word past it. The frame count `finish` accepts
+  /// is read from the length of `encoder_input` itself, with the declared
+  /// receptive field and hop. Fixed at `prepare` time from the audio itself;
+  /// there is no setter, and reading it cannot change what `finish` sees.
   #[must_use]
   pub fn real_samples(&self) -> usize {
     self.inner.as_ref().map_or(0, |i| i.real_samples)
@@ -1237,21 +1236,20 @@ impl AlignerCore {
       }
     }
 
-    // Two-sided stride check: the encoded time `T * hop_samples` must
-    // lie within `real_samples ± 2*hop_samples`. Catches both
-    // stride-too-small (T*hop overshoots — `compose_words` would emit
-    // ranges past the chunk's audio) and stride-too-large (T*hop
-    // undershoots — `compose_words` would compress every word into the
-    // first portion of the chunk). Fatal: the only recovery is fixing
-    // the model / `hop_samples` config, not retrying.
-    //
-    // Fed the REAL, unpadded extent — `samples.len()` at the original
-    // call site, `prepared.real_samples` now. Same value. The emissions
-    // seam has never run this check at all.
+    // Two-sided stride check: `T` must be a frame count the declared
+    // front end (its receptive field and hop) gives for the input the
+    // encoder read, the PADDED buffer. Catches both stride-too-small
+    // (too many frames: `compose_words` would emit ranges past the
+    // chunk's audio) and stride-too-large (too few: `compose_words` would
+    // crowd every word into the first portion of the chunk). Fatal: the
+    // only recovery is declaring the model's stride, not retrying. The
+    // real extent drives only the speech gates and the word-range clamp
+    // below.
     validate_stride_extent(
       log_probs.t(),
       self.hop_samples.get(),
-      prepared.real_samples,
+      self.receptive_field_samples.get(),
+      prepared.encoder_input.len(),
       &self.language,
     )?;
 

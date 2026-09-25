@@ -1374,3 +1374,65 @@ fn a_short_chunk_pads_to_the_stated_receptive_field() {
     assert_eq!(prepared.real_samples(), samples);
   }
 }
+
+/// **The frame count is checked against the declared receptive field and
+/// hop.** On 16 000 samples, a front end with receptive field 640 and hop
+/// 160 emits 97 frames as a valid convolution, and wav2vec2's (400 / 320)
+/// 49: each passes under its own declaration and aligns the text. The 97
+/// frames under a hop declared at twice the true stride (320) are refused
+/// as `StrideMismatch`, by name.
+#[test]
+fn the_frame_count_is_checked_against_the_declared_front_end() {
+  let hop = |samples: u32| NonZeroU32::new(samples).expect("nonzero");
+  let samples = vec![0.2_f32; 16_000];
+  let clock = || OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
+  let emissions = |t: usize| {
+    Emissions::from_logits(
+      t,
+      NonZeroUsize::new(VOCAB_SIZE).expect("32 != 0"),
+      vec![0.0_f32; t * VOCAB_SIZE],
+    )
+    .expect("well-formed logits")
+  };
+  let finish = |field: u32, stride: u32, t: usize| {
+    let a = EmissionsAligner::builder(Lang::En, TOKENIZER_JSON.as_bytes())
+      .receptive_field_samples(hop(field))
+      .hop_samples(hop(stride))
+      .build()
+      .expect("build");
+    let prepared = a
+      .prepare(
+        &samples,
+        &SpeechSpans::all_speech(),
+        "hello world",
+        resolution(&a, "hello world"),
+        &AtomicBool::new(false),
+      )
+      .expect("prepare");
+    assert_eq!(prepared.encoder_input().len(), 16_000);
+    a.finish(prepared, &emissions(t), clock(), &AtomicBool::new(false))
+  };
+
+  for (field, stride, t) in [(640, 160, 97), (400, 320, 49)] {
+    match finish(field, stride, t) {
+      Ok(UnitOutcome::Aligned(words)) => assert_eq!(
+        words
+          .words()
+          .iter()
+          .map(crate::types::Word::text)
+          .collect::<Vec<_>>(),
+        ["hello", "world"],
+        "{field} / {stride}"
+      ),
+      other => panic!("{field} / {stride}, {t} frames: expected the words; got {other:?}"),
+    }
+  }
+  match finish(640, 320, 97) {
+    Err(EmissionsError::StrideMismatch(failure)) => assert!(
+      failure.message().contains("smaller stride"),
+      "{}",
+      failure.message()
+    ),
+    other => panic!("a hop declared at twice the true stride must be refused; got {other:?}"),
+  }
+}

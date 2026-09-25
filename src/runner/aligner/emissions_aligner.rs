@@ -351,9 +351,13 @@ impl EmissionsAligner {
   ///
   /// # Errors
   ///
-  /// [`EmissionsError::StrideMismatch`] if `emissions.frames() · hop` is
-  /// outside the chunk's real extent ± 2 frames — which also catches
-  /// pairing `prepared` with emissions from materially different audio;
+  /// [`EmissionsError::StrideMismatch`] if `emissions.frames()` is not a
+  /// frame count the declared front end gives for
+  /// [`PreparedChunk::encoder_input`]: from the `floor((L - rf) / hop) + 1`
+  /// frames of a valid convolution to the `floor(L / hop) + 1` of one that
+  /// pads its input, for input length `L`, receptive field `rf` and hop
+  /// `hop`. That also catches pairing `prepared` with emissions from
+  /// materially different audio;
   /// [`EmissionsError::VocabMismatch`] if `emissions.vocab()` disagrees
   /// with [`vocab_size`](Self::vocab_size); [`EmissionsError::Config`]
   /// if the blank id does not fit the vocab;
@@ -412,7 +416,8 @@ impl EmissionsAligner {
     validate_stride_extent(
       emissions.frames(),
       self.core.hop_samples().get(),
-      prepared.real_samples(),
+      self.core.receptive_field_samples().get(),
+      prepared.encoder_input().len(),
       language,
     )
     .map_err(|e| EmissionsError::StrideMismatch(work_failure_message(e)))?;

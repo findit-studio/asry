@@ -107,11 +107,14 @@ pub enum EmissionsError {
   Config(EmissionsFailure),
 
   /// The encoder returned a frame count that cannot correspond to the
-  /// audio it was handed: `T · hop` is outside `real_samples ± 2·hop`.
+  /// input it was handed: `T` is outside
+  /// `[floor((L - rf) / hop) + 1, floor(L / hop) + 1]` for the encoder
+  /// input's length `L` and the declared receptive field `rf` and hop
+  /// `hop`, the counts from a valid convolution to one that pads its input.
   ///
-  /// Either the model's stride differs from the configured
-  /// `hop_samples`, or the emissions came from *different audio than the
-  /// `PreparedChunk` they were paired with*. Left unchecked, composition
+  /// Either the model's stride differs from the declared `hop_samples`,
+  /// or the emissions came from *different audio than the `PreparedChunk`
+  /// they were paired with*. Left unchecked, composition
   /// emits word ranges past the chunk's audio (stride too small) or
   /// compresses every word into its first portion (stride too large) —
   /// plausible-looking timings that are simply wrong.

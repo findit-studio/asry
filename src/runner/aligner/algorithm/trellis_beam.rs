@@ -102,8 +102,8 @@ const BEAM_NODE_BUDGET: usize = 2_000_000;
 /// that [`align_emissions`] will attempt.
 ///
 /// The `alignment` pool path bounds `T` structurally: the encoder
-/// stride check (`validate_stride_extent`) requires `T · hop ≈ chunk
-/// samples`, so a real 30 s chunk yields `T ≈ 1500`. A bare
+/// stride check (`validate_stride_extent`) holds `T` to about
+/// `chunk samples / hop`, so a real 30 s chunk yields `T ≈ 1500`. A bare
 /// `emissions` caller supplies [`LogProbsTV`] directly with no such
 /// bound, so a degenerate `num_tokens = 1, T = 32 M` lattice — under
 /// the `T · num_tokens ≤ 32 M` trellis-cell cap, so [`get_trellis`]
