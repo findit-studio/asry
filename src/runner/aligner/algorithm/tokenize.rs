@@ -29,12 +29,12 @@ pub struct TokenizedText {
   /// All non-wildcard ids are non-negative and fit in `u32`.
   token_ids: Vec<i32>,
   /// Per-token mapping back to the normalised-word index. `None`
-  /// for tokens that have no natural word index (word-delimiter
-  /// `|`, special tokens like `<s>`, `<pad>`, `<unk>`).
+  /// for tokens that have no natural word index (the word
+  /// delimiter, special tokens like `<s>`, `<pad>`, `<unk>`).
   word_idx_per_token: Vec<Option<usize>>,
-  /// The wav2vec2 word-delimiter `|` token id, when the
-  /// tokenizer exposes one and the normaliser opted in. The
-  /// trellis-beam orchestrator uses this to recognise
+  /// The word-delimiter token id (`|` for wav2vec2), when the
+  /// normaliser opted in and the vocabulary spells the delimiter.
+  /// The trellis-beam orchestrator uses this to recognise
   /// separators in `merge_words`.
   separator_token_id: Option<u32>,
 }
@@ -66,7 +66,7 @@ impl TokenizedText {
     &self.word_idx_per_token
   }
 
-  /// The wav2vec2 word-delimiter `|` token id, when present.
+  /// The word-delimiter token id, when present.
   #[must_use]
   pub const fn separator_token_id(&self) -> Option<u32> {
     self.separator_token_id
@@ -342,13 +342,14 @@ pub fn detect_oov_events(
 /// The wav2vec2 vocab uses a single character per token (a letter,
 /// a digit, the apostrophe, the word delimiter `|`, or a special
 /// like `<pad>`). Each word is tokenised on its own, so every token
-/// maps to its word's index, and a `|` goes between two words that
-/// produced tokens only when `use_word_delimiter` says whitespace is
-/// a real word break: `true` for English, `false` for Chinese and
-/// Japanese, whose whitespace is an indexing device that must not put
-/// a delimiter nobody spoke into the CTC graph. `uppercase_input`
-/// projects ASCII to uppercase before the vocabulary lookup, for a
-/// vocab that covers `A`-`Z` only (`wav2vec2-base-960h`).
+/// maps to its word's index, and the `word_delimiter` token goes
+/// between two words that produced tokens only when there is one:
+/// `Some` when whitespace is a real word break (English, whose
+/// wav2vec2 delimiter is `|`), `None` for Chinese and Japanese, whose
+/// whitespace is an indexing device that must not put a delimiter
+/// nobody spoke into the CTC graph. `uppercase_input` projects ASCII to
+/// uppercase before the vocabulary lookup, for a vocab that covers
+/// `A`-`Z` only (`wav2vec2-base-960h`).
 ///
 /// Each character is classified as [`detect_oov_events`] classifies
 /// it:
@@ -403,7 +404,9 @@ pub fn tokenize_with_word_map(
   tokenizer: &Tokenizer,
   normalized: &str,
   word_count: usize,
-  use_word_delimiter: bool,
+  // The token that separates words, when whitespace is a word break;
+  // `None` when it is not.
+  word_delimiter: Option<&str>,
   uppercase_input: bool,
   unk_token_id: Option<u32>,
   // Per-word `(prefix, suffix)` count of wildcard tokens to
@@ -626,15 +629,11 @@ pub fn tokenize_with_word_map(
   }
 
   // Pass 2: flatten into the final token stream, inserting the
-  // `|` delimiter only between adjacent NON-EMPTY groups when
-  // the normaliser opted in. The orphan-delimiter rule still
-  // applies — an empty group (a word of dropped marks) leaves no
-  // stray `|` for the trellis to attribute frames to.
-  let delim_id = if use_word_delimiter {
-    tokenizer.token_to_id("|")
-  } else {
-    None
-  };
+  // delimiter only between adjacent NON-EMPTY groups when the
+  // normaliser opted in. The orphan-delimiter rule still applies — an
+  // empty group (a word of dropped marks) leaves no stray delimiter for
+  // the trellis to attribute frames to.
+  let delim_id = word_delimiter.and_then(|token| tokenizer.token_to_id(token));
   let mut last_emitted_word: Option<usize> = None;
   for (word_idx, group) in per_word_tokens.iter().enumerate() {
     if group.is_empty() {
@@ -647,14 +646,14 @@ pub fn tokenize_with_word_map(
       // path above ([high]).
       let signed_d = i32::try_from(d).map_err(|_| {
         EmissionsError::Tokenization(EmissionsFailure::new(format_smolstr!(
-          "tokenizer returned `|` delimiter id {} which exceeds i32::MAX",
+          "tokenizer returned delimiter id {} which exceeds i32::MAX",
           d
         )))
       })?;
       if signed_d < 0 {
         return Err(EmissionsError::Tokenization(EmissionsFailure::new(
           format_smolstr!(
-            "tokenizer returned negative-after-cast `|` delimiter id {} (raw {})",
+            "tokenizer returned negative-after-cast delimiter id {} (raw {})",
             signed_d,
             d
           ),
@@ -786,7 +785,7 @@ mod tests {
       tokenizer,
       normalized,
       word_count,
-      use_word_delimiter,
+      use_word_delimiter.then_some("|"),
       uppercase_input,
       unk_token_id,
       wildcard_boundary_per_word,
@@ -858,8 +857,17 @@ mod tests {
       crate::core::ResolvedOov::new(real_event, crate::core::OovDecision::Wildcard),
       crate::core::ResolvedOov::new(extra_event, crate::core::OovDecision::Wildcard),
     ];
-    let result =
-      tokenize_with_word_map(&tok, "AT&T", 1, true, true, unk, &[], &Lang::En, &too_long);
+    let result = tokenize_with_word_map(
+      &tok,
+      "AT&T",
+      1,
+      Some("|"),
+      true,
+      unk,
+      &[],
+      &Lang::En,
+      &too_long,
+    );
     match result {
       Err(EmissionsError::Tokenization(payload)) => {
         assert!(
@@ -896,8 +904,17 @@ mod tests {
       crate::core::ResolvedOov::new(real_event, crate::core::OovDecision::FailClosed),
       crate::core::ResolvedOov::new(extra_event, crate::core::OovDecision::Wildcard),
     ];
-    let result =
-      tokenize_with_word_map(&tok, "AT&T", 1, true, true, unk, &[], &Lang::En, &too_long);
+    let result = tokenize_with_word_map(
+      &tok,
+      "AT&T",
+      1,
+      Some("|"),
+      true,
+      unk,
+      &[],
+      &Lang::En,
+      &too_long,
+    );
     match result {
       Err(EmissionsError::Tokenization(_)) => {
         // Correct: stale-payload mismatch surfaces as
@@ -943,7 +960,7 @@ mod tests {
       &tok,
       "AT&T",
       1,
-      true,
+      Some("|"),
       true,
       unk,
       &[],
@@ -1000,8 +1017,17 @@ mod tests {
       ),
       crate::core::OovDecision::Wildcard,
     )];
-    let result =
-      tokenize_with_word_map(&tok, "AT&T", 1, true, true, unk, &[], &Lang::En, &resolved);
+    let result = tokenize_with_word_map(
+      &tok,
+      "AT&T",
+      1,
+      Some("|"),
+      true,
+      unk,
+      &[],
+      &Lang::En,
+      &resolved,
+    );
     assert!(
       result.is_ok(),
       "Any-fallback identity check must compare positional fields \
@@ -1054,7 +1080,7 @@ mod tests {
       &tok,
       "hello",
       /* word_count: */ 1,
-      /* use_word_delimiter: */ true,
+      /* word_delimiter: */ Some("|"),
       /* uppercase_input: */ true,
       /* unk_token_id: */ unk,
       /* wildcard_boundary_per_word: */ &[],
@@ -1297,7 +1323,7 @@ mod tests {
       &tok,
       "hello world",
       2,
-      /* use_word_delimiter: */ true,
+      /* word_delimiter: */ Some("|"),
       true,
       unk,
       /* wildcard_boundary_per_word: */ &[],
@@ -1317,7 +1343,7 @@ mod tests {
       &tok,
       "hello world",
       2,
-      /* use_word_delimiter: */ false,
+      /* word_delimiter: */ None,
       true,
       unk,
       /* wildcard_boundary_per_word: */ &[],
@@ -1458,7 +1484,7 @@ mod tests {
       &tok,
       "hello world",
       2,
-      true,
+      Some("|"),
       true,
       unk,
       &[
@@ -1538,7 +1564,7 @@ mod tests {
 
     let wildcard = crate::core::oov::resolve_events(&events, crate::core::wildcard_all_policy);
     let tokenized =
-      tokenize_with_word_map(&tok, "b4d", 1, false, true, None, &[], &Lang::En, &wildcard)
+      tokenize_with_word_map(&tok, "b4d", 1, None, true, None, &[], &Lang::En, &wildcard)
         .expect("a character the caller decided tokenizes");
     let id_of = |token: &str| tok.token_to_id(token).expect("in the alphabet") as i32;
     assert_eq!(
@@ -1547,7 +1573,7 @@ mod tests {
     );
 
     let refused = crate::core::oov::resolve_events(&events, crate::core::fail_closed_all_policy);
-    let err = tokenize_with_word_map(&tok, "b4d", 1, false, true, None, &[], &Lang::En, &refused)
+    let err = tokenize_with_word_map(&tok, "b4d", 1, None, true, None, &[], &Lang::En, &refused)
       .expect_err("a refused character refuses the chunk");
     assert!(
       matches!(err, EmissionsError::SemanticOutOfVocab(_)),
@@ -1697,7 +1723,7 @@ mod tests {
             tok,
             &text,
             1,
-            false,
+            None,
             uppercase_input,
             unk,
             &[],
@@ -1796,7 +1822,7 @@ mod tests {
       tok,
       normalized.normalized(),
       words,
-      normalizer.use_word_delimiter(),
+      normalizer.use_word_delimiter().then_some("|"),
       uppercase_input,
       unk,
       normalized.wildcard_boundary_per_word(),
@@ -1887,7 +1913,7 @@ mod tests {
         &tok,
         &text,
         1,
-        true,
+        Some("|"),
         true,
         unk,
         &[],

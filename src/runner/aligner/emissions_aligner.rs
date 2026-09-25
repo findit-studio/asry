@@ -32,7 +32,7 @@ use core::{
   time::Duration,
 };
 
-use smol_str::format_smolstr;
+use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
   core::{OovDetection, OovResolution, UnalignedCause, UnitOutcome},
@@ -43,9 +43,9 @@ use crate::{
       errors::{EmissionsError, EmissionsFailure},
     },
     core::{
-      AlignerCore, AlignerCoreLoadError, PreparedChunk, capture_vocab_size, detect_blank_token_id,
-      detect_unk_token_id, detect_vocab_uppercase_only, load_tokenizer_bytes_with_compat,
-      validate_word_delimiter_present,
+      AlignerCore, AlignerCoreLoadError, PreparedChunk, WAV2VEC2_RECEPTIVE_FIELD_SAMPLES,
+      WAV2VEC2_WORD_DELIMITER, capture_vocab_size, detect_blank_token_id, detect_unk_token_id,
+      load_tokenizer_bytes_with_compat, validate_word_delimiter_present,
     },
     emissions_api::{Emissions, OutputClock, SpeechCoverage, SpeechSpans},
     normalizer::DynTextNormalizer,
@@ -157,6 +157,9 @@ impl EmissionsAligner {
       tokenizer_json: tokenizer_json.to_vec(),
       normalizer: None,
       hop_samples: DEFAULT_HOP_SAMPLES,
+      word_delimiter: SmolStr::new_static(WAV2VEC2_WORD_DELIMITER),
+      letter_case: LetterCase::Upper,
+      receptive_field_samples: WAV2VEC2_RECEPTIVE_FIELD_SAMPLES,
       min_speech_coverage: SpeechCoverage::DEFAULT,
       max_intra_silent_run: DEFAULT_MAX_INTRA_SILENT_RUN,
       blank_token_id: None,
@@ -184,6 +187,29 @@ impl EmissionsAligner {
   #[must_use]
   pub const fn hop_samples(&self) -> NonZeroU32 {
     self.core.hop_samples()
+  }
+
+  /// The token tokenization puts between words, as built.
+  #[must_use]
+  pub fn word_delimiter(&self) -> &str {
+    self.core.word_delimiter()
+  }
+
+  /// How tokenization looks letters up in the vocabulary, as built.
+  #[must_use]
+  pub const fn letter_case(&self) -> LetterCase {
+    if self.core.vocab_uppercase_only() {
+      LetterCase::Upper
+    } else {
+      LetterCase::AsWritten
+    }
+  }
+
+  /// The length, in 16 kHz samples, `prepare` zero-pads a shorter chunk
+  /// to, as built.
+  #[must_use]
+  pub const fn receptive_field_samples(&self) -> NonZeroU32 {
+    self.core.receptive_field_samples()
   }
 
   /// The language this aligner was built for.
@@ -246,8 +272,8 @@ impl EmissionsAligner {
   }
 
   /// Steps 0-2: non-finite sample scan → speech mask → zero non-speech →
-  /// pad to wav2vec2's 400-sample receptive field → normalise →
-  /// tokenise.
+  /// pad to the stated receptive field (400 samples, wav2vec2's, by
+  /// default) → normalise → tokenise.
   ///
   /// Feed [`PreparedChunk::encoder_input`] to your encoder — it is the
   /// EXACT buffer `Aligner` hands ORT. You do not re-implement the mask,
@@ -429,15 +455,48 @@ fn work_failure_message(err: WorkFailure) -> EmissionsFailure {
   }
 }
 
+/// How tokenization looks a letter up in the vocabulary.
+///
+/// Stated, never inferred from the vocabulary: the caller asserts which
+/// case its vocabulary spells letters in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LetterCase {
+  /// Look ASCII letters up in upper case: the vocabulary spells `A`-`Z`,
+  /// as wav2vec2-base-960h's does. The English wav2vec2 convention, and
+  /// the default.
+  #[default]
+  Upper,
+  /// Look every character up as the normalizer wrote it: the vocabulary
+  /// is case-sensitive, or spells letters in the case the normalizer
+  /// writes (lower case, for asry's normalizers).
+  AsWritten,
+}
+
 /// Builder for [`EmissionsAligner`]. Runs the same construction guards
 /// `Aligner::from_paths` does — blank-id detection, unk id, the
-/// uppercase-vocab probe, the vocab-size capture, and `|` delimiter
-/// validation against the normalizer.
+/// vocab-size capture, and word-delimiter validation against the
+/// normalizer.
+///
+/// # What the caller states
+///
+/// Three properties of the vocabulary and the acoustic front end are
+/// stated, never read off the vocabulary: the word delimiter
+/// ([`word_delimiter`](Self::word_delimiter)), the letter case
+/// ([`letter_case`](Self::letter_case)), and the receptive field
+/// ([`receptive_field_samples`](Self::receptive_field_samples)). Each
+/// defaults to the English wav2vec2 convention (`|`, upper case, 400
+/// samples), and a model that differs states its own. asry aligns
+/// correctly for correctly declared inputs; declaring the model's
+/// properties is the caller's part.
 pub struct EmissionsAlignerBuilder {
   language: Lang,
   tokenizer_json: Vec<u8>,
   normalizer: Option<DynTextNormalizer>,
   hop_samples: NonZeroU32,
+  word_delimiter: SmolStr,
+  letter_case: LetterCase,
+  receptive_field_samples: NonZeroU32,
   min_speech_coverage: SpeechCoverage,
   max_intra_silent_run: Duration,
   blank_token_id: Option<u32>,
@@ -460,6 +519,38 @@ impl EmissionsAlignerBuilder {
   #[must_use]
   pub const fn hop_samples(mut self, hop: NonZeroU32) -> Self {
     self.hop_samples = hop;
+    self
+  }
+
+  /// The vocabulary token that separates words, put between two words
+  /// when the normalizer delimits words. Default `|`, the English
+  /// wav2vec2 convention; a vocabulary delimited by a space states
+  /// `" "`.
+  ///
+  /// [`build`](Self::build) refuses a vocabulary that does not spell it
+  /// when the normalizer delimits words.
+  #[must_use]
+  pub fn word_delimiter(mut self, token: &str) -> Self {
+    self.word_delimiter = SmolStr::new(token);
+    self
+  }
+
+  /// How tokenization looks letters up in the vocabulary. Default
+  /// [`LetterCase::Upper`], the English wav2vec2 convention; a
+  /// case-sensitive or lower-case vocabulary states
+  /// [`LetterCase::AsWritten`].
+  #[must_use]
+  pub const fn letter_case(mut self, case: LetterCase) -> Self {
+    self.letter_case = case;
+    self
+  }
+
+  /// The acoustic front end's receptive field, in 16 kHz samples: the
+  /// length [`prepare`](EmissionsAligner::prepare) zero-pads a shorter
+  /// chunk to. Default 400, wav2vec2's.
+  #[must_use]
+  pub const fn receptive_field_samples(mut self, samples: NonZeroU32) -> Self {
+    self.receptive_field_samples = samples;
     self
   }
 
@@ -496,8 +587,8 @@ impl EmissionsAlignerBuilder {
   ///
   /// [`EmissionsError::Config`] if the tokenizer JSON does not parse, if
   /// no CTC blank token can be resolved, if the language has no default
-  /// normalizer and none was supplied, or if the normalizer needs a `|`
-  /// word-delimiter the tokenizer does not have.
+  /// normalizer and none was supplied, or if the normalizer delimits
+  /// words and the tokenizer does not spell the stated word delimiter.
   pub fn build(self) -> Result<EmissionsAligner, EmissionsError> {
     let tokenizer = load_tokenizer_bytes_with_compat(&self.tokenizer_json, "tokenizer.json")
       .map_err(load_error)?;
@@ -523,10 +614,13 @@ impl EmissionsAlignerBuilder {
     };
 
     let unk_token_id = detect_unk_token_id(&tokenizer);
-    let vocab_uppercase_only = detect_vocab_uppercase_only(&tokenizer);
 
-    validate_word_delimiter_present(&tokenizer, normalizer.use_word_delimiter())
-      .map_err(load_error)?;
+    validate_word_delimiter_present(
+      &tokenizer,
+      normalizer.use_word_delimiter(),
+      &self.word_delimiter,
+    )
+    .map_err(load_error)?;
 
     let tokenizer_vocab_size = capture_vocab_size(&tokenizer).ok_or_else(|| {
       EmissionsError::Config(EmissionsFailure::new(format_smolstr!(
@@ -541,9 +635,11 @@ impl EmissionsAlignerBuilder {
         self.language,
         normalizer,
         self.hop_samples,
+        self.word_delimiter,
+        self.receptive_field_samples,
         blank_token_id,
         unk_token_id,
-        vocab_uppercase_only,
+        matches!(self.letter_case, LetterCase::Upper),
         tokenizer_vocab_size,
         self.min_speech_coverage,
         self.max_intra_silent_run,

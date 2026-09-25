@@ -80,6 +80,17 @@ impl AlignerCoreLoadError {
   }
 }
 
+/// The word delimiter of the English wav2vec2 vocabularies
+/// (wav2vec2-base-960h and its kin): `|`.
+pub(crate) const WAV2VEC2_WORD_DELIMITER: &str = "|";
+
+/// The receptive field of wav2vec2's CNN front end, in 16 kHz samples:
+/// the shortest input its first stride-conv reads.
+pub(crate) const WAV2VEC2_RECEPTIVE_FIELD_SAMPLES: NonZeroU32 = match NonZeroU32::new(400) {
+  Some(samples) => samples,
+  None => unreachable!(),
+};
+
 /// Read the CTC blank-token id from a HuggingFace tokenizer.
 pub(crate) fn detect_blank_token_id(tok: &Tokenizer) -> Option<u32> {
   // Standard wav2vec2 convention: pad token == CTC blank.
@@ -141,11 +152,11 @@ pub(crate) fn capture_vocab_size(tok: &Tokenizer) -> Option<NonZeroUsize> {
   NonZeroUsize::new(tok.get_vocab_size(true))
 }
 
-/// Validate that the tokenizer exposes the wav2vec2 `|`
-/// word-delimiter token whenever the normaliser declared
+/// Validate that the tokenizer spells the word-delimiter token `delimiter`
+/// (`|` for wav2vec2) whenever the normaliser declared
 /// `use_word_delimiter == true`.
 ///
-/// Without this check, a missing `|` token slips through silently
+/// Without this check, a missing delimiter slips through silently
 /// — `tokenize_with_word_map` would simply emit no inter-word
 /// delimiter, glueing adjacent words together in the CTC graph.
 /// Word timings would then be plausible but wrong with no
@@ -159,18 +170,20 @@ pub(crate) fn capture_vocab_size(tok: &Tokenizer) -> Option<NonZeroUsize> {
 pub(crate) fn validate_word_delimiter_present(
   tokenizer: &Tokenizer,
   use_word_delimiter: bool,
+  delimiter: &str,
 ) -> Result<(), AlignerCoreLoadError> {
   if !use_word_delimiter {
     return Ok(());
   }
-  if tokenizer.token_to_id("|").is_some() {
+  if tokenizer.token_to_id(delimiter).is_some() {
     return Ok(());
   }
-  Err(AlignerCoreLoadError::new(SmolStr::from(
-    "tokenizer is missing the `|` word-delimiter token, but the language's normaliser \
- declared `use_word_delimiter = true`. wav2vec2 word-segmented vocabularies require \
- a `|` token between spoken words. Either swap to a tokenizer that exposes `|`, or \
- supply a normaliser whose `use_word_delimiter` returns false (char-level segmentation).",
+  Err(AlignerCoreLoadError::new(format_smolstr!(
+    "tokenizer is missing the {delimiter:?} word-delimiter token, but the language's \
+ normaliser declared `use_word_delimiter = true`. Word-segmented CTC vocabularies need a \
+ token between spoken words. Either use a tokenizer that spells {delimiter:?}, name the \
+ delimiter your vocabulary uses, or supply a normaliser whose `use_word_delimiter` returns \
+ false (char-level segmentation).",
   )))
 }
 
@@ -617,8 +630,15 @@ pub(crate) struct AlignerCore {
   /// panic a caller sees is unchanged; the emissions builder simply
   /// cannot spell zero.
   hop_samples: NonZeroU32,
+  /// The token tokenization puts between words when the normaliser
+  /// delimits words: `|` for wav2vec2.
+  word_delimiter: SmolStr,
+  /// The length `prepare` zero-pads a shorter chunk to: the acoustic
+  /// front end's receptive field, 400 samples for wav2vec2.
+  receptive_field_samples: NonZeroU32,
   blank_token_id: u32,
   unk_token_id: Option<u32>,
+  /// Look ASCII letters up in upper case.
   vocab_uppercase_only: bool,
   /// Tokenizer vocab size, captured at construction. The encoder's
   /// `V` MUST equal this — [`finish`](Self::finish) enforces it. See
@@ -660,8 +680,9 @@ pub struct PreparedChunk<'a> {
 }
 
 struct PreparedInner<'a> {
-  /// Silence-zeroed and zero-padded to wav2vec2's 400-sample
-  /// receptive field — the exact buffer `Aligner` hands ORT.
+  /// Silence-zeroed and zero-padded to the front end's receptive
+  /// field (400 samples for wav2vec2) — the exact buffer `Aligner`
+  /// hands ORT.
   encoder_input: Vec<f32>,
   /// The chunk's REAL audio length (`samples.len()`), before padding.
   /// Drives the stride check and word-range clamping.
@@ -675,7 +696,8 @@ struct PreparedInner<'a> {
 
 impl PreparedChunk<'_> {
   /// **Feed EXACTLY this to your encoder.** Silence-zeroed and
-  /// zero-padded to wav2vec2's 400-sample receptive field — identical to
+  /// zero-padded to the front end's receptive field (400 samples for
+  /// wav2vec2) — identical to
   /// the buffer `Aligner` hands ORT.
   ///
   /// You do not re-implement the mask, the zeroing, or the pad, which is
@@ -695,7 +717,7 @@ impl PreparedChunk<'_> {
     self.inner.is_none()
   }
 
-  /// The chunk's REAL audio length in 16 kHz samples, BEFORE the 400-sample
+  /// The chunk's REAL audio length in 16 kHz samples, BEFORE the
   /// receptive-field zero-padding that [`encoder_input`](Self::encoder_input)
   /// carries — a slice length (`samples.len()`), never a caller integer, which
   /// is exactly why `finish` cannot be lied to about it. Zero when
@@ -711,6 +733,12 @@ impl PreparedChunk<'_> {
   #[must_use]
   pub fn real_samples(&self) -> usize {
     self.inner.as_ref().map_or(0, |i| i.real_samples)
+  }
+
+  /// The token stream tokenization produced: empty when trivial.
+  #[cfg(test)]
+  pub(crate) fn token_ids(&self) -> &[i32] {
+    self.inner.as_ref().map_or(&[], |i| i.tokenized.token_ids())
   }
 }
 
@@ -733,6 +761,8 @@ impl AlignerCore {
     language: Lang,
     normalizer: DynTextNormalizer,
     hop_samples: NonZeroU32,
+    word_delimiter: SmolStr,
+    receptive_field_samples: NonZeroU32,
     blank_token_id: u32,
     unk_token_id: Option<u32>,
     vocab_uppercase_only: bool,
@@ -746,6 +776,8 @@ impl AlignerCore {
       language,
       normalizer,
       hop_samples,
+      word_delimiter,
+      receptive_field_samples,
       blank_token_id,
       unk_token_id,
       vocab_uppercase_only,
@@ -786,6 +818,18 @@ impl AlignerCore {
 
   pub(crate) const fn blank_token_id(&self) -> u32 {
     self.blank_token_id
+  }
+
+  pub(crate) fn word_delimiter(&self) -> &str {
+    &self.word_delimiter
+  }
+
+  pub(crate) const fn receptive_field_samples(&self) -> NonZeroU32 {
+    self.receptive_field_samples
+  }
+
+  pub(crate) const fn vocab_uppercase_only(&self) -> bool {
+    self.vocab_uppercase_only
   }
 
   pub(crate) const fn vocab_size(&self) -> NonZeroUsize {
@@ -876,7 +920,7 @@ impl AlignerCore {
 
   /// Steps 0-2 of the alignment pipeline, up to (but not including)
   /// the encoder: non-finite sample scan → speech mask → zero
-  /// non-speech → pad to 400 → normalise → tokenise.
+  /// non-speech → pad to the receptive field → normalise → tokenise.
   ///
   /// The body is `Aligner::align`'s, unchanged. The only thing that
   /// moved is where it stops.
@@ -983,7 +1027,10 @@ impl AlignerCore {
       &self.tokenizer,
       normalized.normalized(),
       n_words,
-      self.normalizer.use_word_delimiter(),
+      self
+        .normalizer
+        .use_word_delimiter()
+        .then_some(self.word_delimiter.as_str()),
       self.vocab_uppercase_only,
       self.unk_token_id,
       normalized.wildcard_boundary_per_word(),
@@ -1034,10 +1081,12 @@ impl AlignerCore {
       .map(|(&s, &is_speech)| if is_speech { s } else { 0.0_f32 })
       .collect();
 
-    // wav2vec2's CNN front-end has a minimum input length (the
-    // receptive field of the first stride-conv) of 400 samples at
-    // 16 kHz. WhisperX's `align()` pads with zeros to 400 if the slice
-    // is shorter (`alignment.py:243-247`). Without this padding, the
+    // The acoustic front end has a minimum input length, its receptive
+    // field: 400 samples at 16 kHz for wav2vec2's CNN (the first
+    // stride-conv), the default. WhisperX's `align()` pads with zeros to
+    // 400 if the slice is shorter (`alignment.py:243-247`); a front end
+    // with another receptive field states it, and short chunks pad to
+    // that. Without this padding, the
     // model's first conv produces a degenerate output for very short
     // segments — typical for a 1-2 word segment after Whisper splits on
     // a brief utterance — and the encoder either errors out or emits
@@ -1047,12 +1096,13 @@ impl AlignerCore {
     //
     // Owned rather than the `Cow` this was: `PreparedChunk` carries the
     // buffer across the seam, so it must own it. Same values, same
-    // allocation count — the `>= 400` arm moves the vec instead of
-    // borrowing it.
-    let encoder_input: Vec<f32> = if normalized_samples.len() < 400 {
-      let mut buf = Vec::with_capacity(400);
+    // allocation count — the `>= receptive_field` arm moves the vec
+    // instead of borrowing it.
+    let receptive_field = self.receptive_field_samples.get() as usize;
+    let encoder_input: Vec<f32> = if normalized_samples.len() < receptive_field {
+      let mut buf = Vec::with_capacity(receptive_field);
       buf.extend_from_slice(&normalized_samples);
-      buf.resize(400, 0.0_f32);
+      buf.resize(receptive_field, 0.0_f32);
       buf
     } else {
       normalized_samples
@@ -1723,7 +1773,7 @@ mod tests {
   #[test]
   fn delimiter_check_passes_when_token_present_and_required() {
     let tok = tokenizer_with_pipe_delimiter();
-    assert!(validate_word_delimiter_present(&tok, true).is_ok());
+    assert!(validate_word_delimiter_present(&tok, true, "|").is_ok());
   }
 
   /// The delimiter diagnostic is unchanged by the de-gating: the
@@ -1733,10 +1783,10 @@ mod tests {
   #[test]
   fn delimiter_check_fails_when_required_but_missing() {
     let tok = tokenizer_without_pipe_delimiter();
-    let err = validate_word_delimiter_present(&tok, true).unwrap_err();
+    let err = validate_word_delimiter_present(&tok, true, "|").unwrap_err();
     let message = err.message();
     assert!(
-      message.contains("`|` word-delimiter"),
+      message.contains("\"|\" word-delimiter"),
       "must call out the missing delimiter; got {message}"
     );
   }
@@ -1747,7 +1797,7 @@ mod tests {
     // Missing `|` is fine — char-segmented inputs don't use
     // inter-word delimiters in the CTC graph.
     let tok = tokenizer_without_pipe_delimiter();
-    assert!(validate_word_delimiter_present(&tok, false).is_ok());
+    assert!(validate_word_delimiter_present(&tok, false, "|").is_ok());
   }
 
   // --- BERT-style specials at non-zero ids (kresnik Korean shape) ---
@@ -1822,7 +1872,7 @@ mod tests {
     // check must short-circuit on `false` regardless of whether
     // the tokenizer happens to expose `|`.
     let tok = tokenizer_kresnik_shape();
-    assert!(validate_word_delimiter_present(&tok, false).is_ok());
+    assert!(validate_word_delimiter_present(&tok, false, "|").is_ok());
   }
 
   /// The uppercase probe fires on a wav2vec2-base-960h-shape vocab

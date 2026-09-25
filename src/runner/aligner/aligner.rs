@@ -5,7 +5,7 @@ use std::path::Path;
 
 use mediatime::TimeRange;
 use ort::session::{RunOptions, Session};
-use smol_str::format_smolstr;
+use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
   core::{UnalignedCause, UnitOutcome},
@@ -13,9 +13,9 @@ use crate::{
     RunnerError,
     aligner::{
       core::{
-        AlignerCore, AlignerCoreLoadError, capture_vocab_size, detect_blank_token_id,
-        detect_unk_token_id, detect_vocab_uppercase_only, load_tokenizer_with_compat,
-        validate_word_delimiter_present,
+        AlignerCore, AlignerCoreLoadError, WAV2VEC2_RECEPTIVE_FIELD_SAMPLES,
+        WAV2VEC2_WORD_DELIMITER, capture_vocab_size, detect_blank_token_id, detect_unk_token_id,
+        detect_vocab_uppercase_only, load_tokenizer_with_compat, validate_word_delimiter_present,
       },
       emissions_api::{SpanError, SpeechCoverage, SpeechSpans},
       normalizer::DynTextNormalizer,
@@ -173,8 +173,12 @@ impl Aligner {
     // (the English-shape default), the tokenizer MUST expose a
     // `|` token. See [`validate_word_delimiter_present`] for the
     // rationale.
-    validate_word_delimiter_present(&tokenizer, normalizer.use_word_delimiter())
-      .map_err(lift_core_load_error)?;
+    validate_word_delimiter_present(
+      &tokenizer,
+      normalizer.use_word_delimiter(),
+      WAV2VEC2_WORD_DELIMITER,
+    )
+    .map_err(lift_core_load_error)?;
 
     // Snapshot the tokenizer's vocab size (including added
     // tokens) so per-align validation can reject ORT outputs
@@ -202,6 +206,8 @@ impl Aligner {
         language,
         normalizer,
         DEFAULT_HOP_SAMPLES,
+        SmolStr::new_static(WAV2VEC2_WORD_DELIMITER),
+        WAV2VEC2_RECEPTIVE_FIELD_SAMPLES,
         blank_token_id,
         unk_token_id,
         vocab_uppercase_only,

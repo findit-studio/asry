@@ -226,7 +226,7 @@ fn run_align_with_policy(
     &tokenizer,
     text,
     word_count,
-    /* use_word_delimiter: */ true,
+    /* word_delimiter: */ Some("|"),
     /* uppercase_input: */ true,
     /* unk_token_id: */ unk,
     /* wildcard_boundary_per_word: */ &[],

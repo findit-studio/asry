@@ -147,7 +147,7 @@ fn builder_rejects_a_tokenizer_missing_the_word_delimiter() {
     panic!("expected a Config error");
   };
   assert!(
-    f.message().contains("`|` word-delimiter"),
+    f.message().contains("\"|\" word-delimiter"),
     "diagnostic must name the missing delimiter; got {}",
     f.message()
   );
@@ -1179,4 +1179,162 @@ fn a_fully_masked_text_is_named_no_surviving_words() {
     ),
     "{result:?}"
   );
+}
+
+// ——————————— The stated vocabulary and front-end properties ———————————
+
+/// **A space-delimited vocabulary aligns under its stated delimiter.** The
+/// table spells a space where wav2vec2's spells `|`. Nothing is inferred
+/// from it: the default `|` is refused at build, by name, because the
+/// table does not spell it, and with `word_delimiter(" ")` stated the space
+/// token goes between the words and the text aligns word by word.
+#[test]
+fn a_space_delimited_vocabulary_aligns_under_its_stated_delimiter() {
+  let json = TOKENIZER_JSON.replace("\"|\": 4", "\" \": 4");
+  assert_ne!(json, TOKENIZER_JSON, "the table spells a space, not `|`");
+
+  let Err(EmissionsError::Config(failure)) =
+    EmissionsAligner::builder(Lang::En, json.as_bytes()).build()
+  else {
+    panic!("the default `|` must be refused for a table that does not spell it");
+  };
+  assert!(failure.message().contains("\"|\""), "{}", failure.message());
+
+  let a = EmissionsAligner::builder(Lang::En, json.as_bytes())
+    .word_delimiter(" ")
+    .build()
+    .expect("a stated delimiter the table spells builds");
+  assert_eq!(a.word_delimiter(), " ");
+  let samples = vec![0.2_f32; 16_000];
+  let abort = AtomicBool::new(false);
+  let prepared = a
+    .prepare(
+      &samples,
+      &SpeechSpans::all_speech(),
+      "hello world",
+      resolution(&a, "hello world"),
+      &abort,
+    )
+    .expect("prepare");
+  // H E L L O <space> W O R L D, by the table's ids.
+  assert_eq!(
+    prepared.token_ids(),
+    [11, 5, 15, 15, 8, 4, 18, 8, 13, 15, 14]
+  );
+
+  let (t, logits) = fake_encoder(&prepared, 320);
+  let emissions = Emissions::from_logits(t, a.vocab_size(), logits).expect("ok");
+  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
+  let outcome = a
+    .finish(prepared, &emissions, clock, &abort)
+    .expect("finish");
+  assert_eq!(
+    outcome
+      .words()
+      .iter()
+      .map(crate::types::Word::text)
+      .collect::<Vec<_>>(),
+    ["hello", "world"],
+    "the space token separates the words"
+  );
+}
+
+/// A table that spells both cases, each letter its own column.
+const CASED_TOKENIZER_JSON: &str = r#"{
+ "version": "1.0",
+ "truncation": null,
+ "padding": null,
+ "added_tokens": [],
+ "normalizer": null,
+ "pre_tokenizer": null,
+ "post_processor": null,
+ "decoder": null,
+ "model": {
+ "type": "WordLevel",
+ "vocab": {
+ "<pad>": 0, "<unk>": 1, "|": 2,
+ "H": 3, "E": 4, "L": 5, "O": 6,
+ "h": 7, "e": 8, "l": 9, "o": 10
+ },
+ "unk_token": "<unk>"
+ }
+ }"#;
+
+/// **A case-sensitive vocabulary is looked up in the stated case.** The
+/// table spells `H` and `h` as different columns, so nothing about it says
+/// which to use. Under the default, the English wav2vec2 convention,
+/// letters are looked up in upper case; with `LetterCase::AsWritten`
+/// stated, as the normalizer wrote them (lower case). The table never
+/// decides: the same text takes the uppercase columns under `Upper`, even
+/// though the table spells the lowercase letters too.
+#[test]
+fn a_case_sensitive_vocabulary_is_looked_up_in_the_stated_case() {
+  let samples = vec![0.2_f32; 16_000];
+  let abort = AtomicBool::new(false);
+  for (case, expected) in [
+    (None, [3, 4, 5, 5, 6]),
+    (Some(LetterCase::Upper), [3, 4, 5, 5, 6]),
+    (Some(LetterCase::AsWritten), [7, 8, 9, 9, 10]),
+  ] {
+    let builder = EmissionsAligner::builder(Lang::En, CASED_TOKENIZER_JSON.as_bytes());
+    let a = match case {
+      Some(case) => builder.letter_case(case),
+      None => builder,
+    }
+    .build()
+    .expect("build");
+    assert_eq!(a.letter_case(), case.unwrap_or_default(), "{case:?}");
+    let prepared = a
+      .prepare(
+        &samples,
+        &SpeechSpans::all_speech(),
+        "Hello",
+        resolution(&a, "Hello"),
+        &abort,
+      )
+      .expect("prepare");
+    assert_eq!(prepared.token_ids(), expected, "{case:?}");
+  }
+}
+
+/// **A short chunk pads to the stated receptive field.** wav2vec2's 400
+/// samples by default; a front end that reads 640 states it, and a chunk
+/// already longer than the field is not padded.
+#[test]
+fn a_short_chunk_pads_to_the_stated_receptive_field() {
+  let abort = AtomicBool::new(false);
+  let wide = NonZeroU32::new(640).expect("640 != 0");
+  for (field, samples, padded) in [
+    (None, 200, 400),
+    (Some(wide), 200, 640),
+    (None, 1_000, 1_000),
+    (Some(wide), 1_000, 1_000),
+  ] {
+    let builder = EmissionsAligner::builder(Lang::En, TOKENIZER_JSON.as_bytes());
+    let a = match field {
+      Some(field) => builder.receptive_field_samples(field),
+      None => builder,
+    }
+    .build()
+    .expect("build");
+    assert_eq!(
+      a.receptive_field_samples().get(),
+      field.map_or(400, NonZeroU32::get)
+    );
+    let prepared = a
+      .prepare(
+        &vec![0.2_f32; samples],
+        &SpeechSpans::all_speech(),
+        "hello",
+        resolution(&a, "hello"),
+        &abort,
+      )
+      .expect("prepare");
+    assert_eq!(
+      prepared.encoder_input().len(),
+      padded,
+      "{field:?}, {samples}"
+    );
+    assert_eq!(prepared.real_samples(), samples);
+  }
 }

@@ -96,6 +96,32 @@ BREAKING
     `Transcriber`.
   - `TranscriberError` has the new variant `UnaccountedAlignment`; an
     exhaustive `match` needs an arm for it.
+- **`EmissionsAlignerBuilder` states the word delimiter, the letter case and
+  the receptive field instead of taking them from English wav2vec2 or the
+  vocabulary.** The builder always used `|` as the word delimiter and
+  400 samples as the receptive field, and guessed the letter case from the
+  table (upper case when it spells `A` but not `a`). A model whose table is
+  delimited by a space, spells both cases as distinct columns, or whose
+  front end reads another receptive field could not be described. Now:
+  - `word_delimiter(token)`, `letter_case(LetterCase)` and
+    `receptive_field_samples(samples)` state them, with the English wav2vec2
+    conventions as defaults: `|`, `LetterCase::Upper` and 400. Nothing is
+    read off the table. `build` refuses, by name, a stated or default
+    delimiter the table does not spell when the normalizer delimits words,
+    and letters are looked up in the stated case whatever the table spells.
+    `EmissionsAligner::word_delimiter`, `letter_case` and
+    `receptive_field_samples` read them back.
+  - The caller asserts these properties of its model. asry aligns correctly
+    for correctly declared inputs; it does not second-guess a declaration.
+
+  Migration:
+  - A vocabulary that spells letters only in lower case, or in both cases as
+    distinct columns, and relied on the guess: state
+    `.letter_case(LetterCase::AsWritten)`. The default is upper case, the
+    English wav2vec2 convention, for every table.
+  - A space-delimited vocabulary: state `.word_delimiter(" ")`.
+  - `Aligner::from_paths` (ORT) is unchanged: `|`, 400 samples, and the
+    letter case read from its table.
 
 FIXED
 

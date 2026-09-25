@@ -135,6 +135,17 @@ pub use ort;
 /// | supply `V = 0`, a `T` that OOMs, or a non-log-probability | [`Emissions`](emissions::Emissions) is the one door, and it checks all three |
 /// | disagree with asry about the sample count, frame count, or stride | asry derives all three from slices that physically exist |
 /// | run a CTC head whose width disagrees with the tokenizer | `finish` validates it — the check this seam has NEVER run |
+///
+/// # What the caller asserts
+///
+/// asry aligns correctly for correctly declared inputs: any transcript
+/// text, any audio. The model's properties are the caller's to declare,
+/// and asry takes them as declared: that the vocabulary is the model's
+/// own, and the blank id, the word delimiter, the letter case, the hop and
+/// the receptive field are the model's. It checks what a declaration makes
+/// checkable (a delimiter the vocabulary does not spell, a head width that
+/// disagrees with the vocabulary), and does not defend against a model,
+/// vocabulary or configuration declared wrongly.
 #[cfg(feature = "emissions")]
 #[cfg_attr(docsrs, doc(cfg(feature = "emissions")))]
 pub mod emissions {
@@ -157,7 +168,7 @@ pub mod emissions {
       },
       core::PreparedChunk,
       default_normalizer_for,
-      emissions_aligner::{EmissionsAligner, EmissionsAlignerBuilder},
+      emissions_aligner::{EmissionsAligner, EmissionsAlignerBuilder, LetterCase},
       emissions_api::{Emissions, OutputClock, SampleSpan, SpanError, SpeechCoverage, SpeechSpans},
     },
   };
