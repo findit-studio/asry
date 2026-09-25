@@ -903,6 +903,37 @@ fn a_pool_completion_answers_only_its_own_command() {
   }
 }
 
+/// **A persistent normalisation failure answers the chunk.** When a job's
+/// OOV detection fails, the job still owns its request, and
+/// `AlignWorkItem::failed` answers the command with that failure: delivered,
+/// it is the chunk's `Event::Error`, and nothing awaits alignment any more,
+/// whole or run by run.
+#[test]
+fn a_detection_failure_answers_its_chunk() {
+  use crate::core::Event;
+
+  for runs in [
+    Vec::new(),
+    vec![korean_run("hello", 0), korean_run(" world", 1)],
+  ] {
+    let (mut t, request) = transcriber_awaiting_alignment("hello world", runs);
+    let job = AlignWorkItem::new(request, Arc::new(AtomicBool::new(false)));
+    let failure = WorkFailure::Alignment(AlignmentError::Normalization(AlignmentFailure::new(
+      SmolStr::new_static("the normaliser's rule failed"),
+      Lang::Ko,
+    )));
+    let completion = job.failed(failure);
+    assert!(matches!(
+      completion.failure(),
+      Some(WorkFailure::Alignment(AlignmentError::Normalization(_)))
+    ));
+    t.complete(completion)
+      .expect("the failure answers the job's own command");
+    assert!(matches!(t.poll_event(), Some(Event::Error { .. })));
+    assert_eq!(t.in_flight_chunk_count(), 0);
+  }
+}
+
 #[test]
 fn clip_sub_segments_rejects_non_16000_timebase() {
   use core::num::NonZeroI32;

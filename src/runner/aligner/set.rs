@@ -133,8 +133,11 @@ impl AlignmentSet {
   /// chunk).
   ///
   /// Returns `Err` on the first unit whose detection fails (a
-  /// normalisation error). A character a unit's vocabulary cannot spell
-  /// is an event, not a failure.
+  /// normalisation error). The job still holds its request: answer it with
+  /// [`AlignWorkItem::failed`](crate::AlignWorkItem::failed), so the chunk
+  /// resolves to its `Event::Error` instead of awaiting alignment. A
+  /// character a unit's vocabulary cannot spell is an event, not a
+  /// failure.
   pub fn detect_oov(
     &self,
     job: &crate::AlignWorkItem,

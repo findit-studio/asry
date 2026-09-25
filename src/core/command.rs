@@ -1197,9 +1197,17 @@ impl AlignmentCompletion {
 /// still be completed: a completion delivered to a transcriber that did not
 /// issue its command can be delivered to the one that did.
 ///
-/// It converts into its [`TranscriberError`](crate::types::TranscriberError)
-/// (dropping the completion), so `?` works where a `TranscriberError` is
-/// expected.
+/// Propagating it keeps the completion: `?` carries it whole into
+/// `RunnerError::RefusedCompletion` (or a boxed error), from which
+/// [`into_completion`](Self::into_completion) takes it back. No conversion
+/// drops it; [`discard_completion`](Self::discard_completion) does, by
+/// name.
+///
+/// ```compile_fail
+/// fn lossy(refused: asry::RefusedCompletion) -> asry::TranscriberError {
+///   refused.into()
+/// }
+/// ```
 #[derive(Debug, thiserror::Error)]
 #[error("{}", .0.error)]
 pub struct RefusedCompletion(Box<Refusal>);
@@ -1230,11 +1238,12 @@ impl RefusedCompletion {
   pub fn into_completion(self) -> AlignmentCompletion {
     self.0.completion
   }
-}
 
-impl From<RefusedCompletion> for crate::types::TranscriberError {
-  fn from(refused: RefusedCompletion) -> Self {
-    refused.0.error
+  /// Why the completion was refused, dropping the completion: its command
+  /// can then never be answered, and its chunk awaits alignment for good.
+  #[must_use = "the completion is dropped; keep the refusal at least"]
+  pub fn discard_completion(self) -> crate::types::TranscriberError {
+    self.0.error
   }
 }
 

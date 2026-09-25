@@ -110,6 +110,18 @@ impl AlignWorkItem {
     }
   }
 
+  /// Answer this job's command with `failure`, when the job cannot run:
+  /// its OOV detection failed ([`AlignmentSet::detect_oov`] returned a
+  /// normalisation error), or the driver cannot run it. The chunk's
+  /// terminal event is its `Event::Error`.
+  ///
+  /// The job owns its request, so a job that does not run still answers
+  /// its command; hand the completion to
+  /// [`Transcriber::complete`](crate::core::Transcriber::complete).
+  pub fn failed(self, failure: WorkFailure) -> AlignmentCompletion {
+    self.request.failed(failure)
+  }
+
   /// This work item's own identity.
   pub(crate) const fn id(&self) -> JobId {
     self.id

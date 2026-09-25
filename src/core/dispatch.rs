@@ -1754,6 +1754,60 @@ mod tests {
     }
   }
 
+  /// **Propagating a refused completion keeps it retrievable.** `?` carries
+  /// a refused completion into `RunnerError` whole, as
+  /// `RunnerError::RefusedCompletion`; taken back out, it answers the
+  /// command it was built for. Only `RefusedCompletion::discard_completion`
+  /// drops it, by name; no conversion into `TranscriberError` exists (the
+  /// `compile_fail` doctest on `RefusedCompletion`).
+  #[cfg(feature = "runner")]
+  #[test]
+  fn a_propagated_refusal_keeps_its_completion() {
+    use crate::{
+      core::{UnalignedCause, UnitAlignment},
+      runner::RunnerError,
+    };
+
+    fn deliver(d: &mut Dispatch, completion: AlignmentCompletion) -> Result<(), RunnerError> {
+      d.complete(completion)?;
+      Ok(())
+    }
+    let unaligned = |_| UnitAlignment::Unaligned(UnalignedCause::NoSurvivingWords);
+    let b = make_buffer_with_samples(10_000);
+    let mut a = aligning_dispatch();
+    let mut z = aligning_dispatch();
+    let _own = await_alignment(&mut a, &b, 0, "hello world", Vec::new());
+    let from_z = await_alignment(&mut z, &b, 0, "hello world", Vec::new());
+    let completion = match deliver(&mut a, answer(from_z, unaligned)) {
+      Err(RunnerError::RefusedCompletion(refused)) => {
+        assert!(matches!(
+          refused.error(),
+          TranscriberError::ForeignAlignment(_)
+        ));
+        refused.into_completion()
+      }
+      other => panic!("the refusal propagates with its completion; got {other:?}"),
+    };
+    assert!(awaiting_alignment(&z, 0));
+    deliver(&mut z, completion).expect("taken back out, the completion answers its command");
+    flush(&mut z);
+    assert!(matches!(
+      z.pending_events.front(),
+      Some(Event::Transcript(t)) if t.chunk_id() == ChunkId::from_raw(0)
+    ));
+
+    // Discarding the completion is a named step, and keeps the refusal.
+    let mut z = aligning_dispatch();
+    let from_z = await_alignment(&mut z, &b, 0, "hello world", Vec::new());
+    let refused = a
+      .complete(answer(from_z, unaligned))
+      .expect_err("another transcriber's completion is refused");
+    assert!(matches!(
+      refused.discard_completion(),
+      TranscriberError::ForeignAlignment(_)
+    ));
+  }
+
   /// **Each unit's outcome reaches the terminal event, distinctly.** The
   /// transcript keeps the alignment report its completion carried: a chunk
   /// aligned whole reports its one outcome, and one aligned run by run

@@ -82,11 +82,12 @@ pub enum RunnerError {
   /// converts every push/inject error from the core into this variant.
   #[error("transcriber: {0}")]
   Transcriber(#[from] TranscriberError),
-}
 
-impl From<crate::core::RefusedCompletion> for RunnerError {
-  /// The refusal, as the state machine's error; the completion is dropped.
-  fn from(refused: crate::core::RefusedCompletion) -> Self {
-    Self::Transcriber(refused.into())
-  }
+  /// A completion `Transcriber::complete` refused, carried whole: `?`
+  /// keeps it, and [`RefusedCompletion::into_completion`] takes it back
+  /// out to answer its command.
+  ///
+  /// [`RefusedCompletion::into_completion`]: crate::core::RefusedCompletion::into_completion
+  #[error("refused completion: {0}")]
+  RefusedCompletion(#[from] crate::core::RefusedCompletion),
 }

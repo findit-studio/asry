@@ -65,16 +65,20 @@
 //!       // job (its whole text, or each run), then decide. The
 //!       // resolution is bound to this job and this set, and
 //!       // `run_one_alignment` consumes it.
-//!       let resolution = alignment_set
-//!         .detect_oov(&job)?
-//!         .decide(asry::core::default_oov_policy);
 //!       // Fresh `RunOptions` per chunk so a watchdog's
 //!       // `terminate()` for chunk N does not poison chunk N+1.
 //!       let run_options = RunOptions::new().unwrap();
 //!       // Success or failure, the job answers through its request:
 //!       // the completion carries the command's ticket, and the
-//!       // transcriber takes no other.
-//!       let completion = run_one_alignment(&alignment_set, job, resolution, &run_options);
+//!       // transcriber takes no other. A detection that fails (a
+//!       // normalisation error) answers the job's command too.
+//!       let completion = match alignment_set.detect_oov(&job) {
+//!         Ok(detection) => {
+//!           let resolution = detection.decide(asry::core::default_oov_policy);
+//!           run_one_alignment(&alignment_set, job, resolution, &run_options)
+//!         }
+//!         Err(failure) => job.failed(failure),
+//!       };
 //!       transcriber.complete(completion)?;
 //!     }
 //!   }
