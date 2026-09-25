@@ -46,12 +46,14 @@ pub use types::{
   AlignmentError, AlignmentFailure, AsrError, AsrFailure, Backpressure, ChunkId,
   GapExceedsTolerance, InconsistentTimebase, InvalidTimebase, Lang,
   LanguageUnsupportedForAlignment, PtsRegression, PushKind, TranscriberError, Transcript,
-  VadAheadOfAudio, VadSegment, Word, WorkFailure, WorkerHangTimeout, WorkerKind,
+  UnaccountedAlignment, VadAheadOfAudio, VadSegment, Word, WorkFailure, WorkerHangTimeout,
+  WorkerKind,
 };
 
 pub use core::{
-  AlignmentResult, AlignmentUnit, AsrParams, AsrParamsOverride, AsrResult, Command, Event,
-  LanguagePolicy, SamplingStrategy, Transcriber, TranscriberOptions, Unaligned, UnalignedCause,
+  AlignedWords, AlignmentResult, AlignmentUnit, AsrParams, AsrParamsOverride, AsrResult, Command,
+  Event, LanguagePolicy, SamplingStrategy, Transcriber, TranscriberOptions, UnalignedCause,
+  UnitOutcome,
 };
 
 // Reachable under `runner` (whisper.cpp ASR) OR `emissions` (the
@@ -138,7 +140,7 @@ pub use ort;
 pub mod emissions {
   pub use crate::{
     core::{
-      AlignmentUnit,
+      AlignedWords, AlignmentUnit, UnalignedCause, UnitOutcome,
       oov::{
         OovDecision, OovDetection, OovEvent, OovKind, OovResolution, ResolvedOov,
         default_oov_policy, fail_closed_all_policy, wildcard_all_policy,

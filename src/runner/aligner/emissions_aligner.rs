@@ -35,7 +35,7 @@ use core::{
 use smol_str::format_smolstr;
 
 use crate::{
-  core::{AlignmentResult, OovDetection, OovResolution},
+  core::{OovDetection, OovResolution, UnalignedCause, UnitOutcome},
   runner::aligner::{
     algorithm::{
       compose::DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -43,9 +43,9 @@ use crate::{
       errors::{EmissionsError, EmissionsFailure},
     },
     core::{
-      AlignerCore, AlignerCoreLoadError, Composed, PreparedChunk, capture_vocab_size,
-      detect_blank_token_id, detect_unk_token_id, detect_vocab_uppercase_only,
-      load_tokenizer_bytes_with_compat, validate_word_delimiter_present,
+      AlignerCore, AlignerCoreLoadError, PreparedChunk, capture_vocab_size, detect_blank_token_id,
+      detect_unk_token_id, detect_vocab_uppercase_only, load_tokenizer_bytes_with_compat,
+      validate_word_delimiter_present,
     },
     emissions_api::{Emissions, OutputClock, SpeechCoverage, SpeechSpans},
     normalizer::DynTextNormalizer,
@@ -311,6 +311,12 @@ impl EmissionsAligner {
   /// Steps 3-9. **Consumes `prepared`**, so a chunk cannot be finished
   /// twice.
   ///
+  /// Returns the text's one [`UnitOutcome`]: its aligned words, or
+  /// `Unaligned` with the reason it has none (`NoAlignableText` for a
+  /// trivial chunk, `NoSurvivingWords` when the speech gates kept no
+  /// word). Wrap it in `AlignmentResult::whole` to hand it to a
+  /// `Transcriber`.
+  ///
   /// Runs the stride-extent and vocab-width checks — neither
   /// of which the emissions seam has ever run — then the pinned
   /// trellis → beam → merge_repeats → merge_words, then derives
@@ -335,7 +341,7 @@ impl EmissionsAligner {
     emissions: &Emissions,
     clock: OutputClock,
     abort_flag: &AtomicBool,
-  ) -> Result<AlignmentResult, EmissionsError> {
+  ) -> Result<UnitOutcome, EmissionsError> {
     // ——— The chunk must be OURS ———
     //
     // Ahead of everything else, including the trivial short-circuit: a
@@ -364,7 +370,7 @@ impl EmissionsAligner {
     // validate the emissions against. Short-circuit exactly as the ORT
     // path does.
     if prepared.is_trivial() {
-      return Ok(Composed::NoAlignableText.into_result(self.core.language()));
+      return Ok(UnitOutcome::Unaligned(UnalignedCause::NoAlignableText));
     }
 
     // ——— The two checks the seam has NEVER run ———
@@ -403,7 +409,6 @@ impl EmissionsAligner {
         |start, end| clock.range(start, end),
         abort_flag,
       )
-      .map(|composed| composed.into_result(self.core.language()))
       .map_err(|e| to_emissions_error(e, Stage::Finish))
   }
 }

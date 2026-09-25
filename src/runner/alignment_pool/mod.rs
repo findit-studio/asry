@@ -31,11 +31,11 @@ use ort::session::RunOptions;
 
 use crate::{
   align::{Run, script_dispatch::runs_reproduce_text},
-  core::{AlignmentResult, OovDecision, OovResolution, ResolvedOov, Unaligned, UnalignedCause},
-  runner::aligner::{Aligner, AlignmentFallback, AlignmentLookup, AlignmentSet, core::Composed},
+  core::{AlignmentResult, OovDecision, OovResolution, ResolvedOov, UnalignedCause, UnitOutcome},
+  runner::aligner::{Aligner, AlignmentFallback, AlignmentLookup, AlignmentSet},
   types::{
-    AlignmentError, AlignmentFailure, ChunkId, Lang, LanguageUnsupportedForAlignment, Word,
-    WorkFailure, WorkerHangTimeout, WorkerKind,
+    AlignmentError, AlignmentFailure, ChunkId, Lang, LanguageUnsupportedForAlignment, WorkFailure,
+    WorkerHangTimeout, WorkerKind,
   },
 };
 
@@ -376,11 +376,7 @@ pub fn run_one_alignment(
       if let UnitOutcome::Unaligned(cause) = &outcome {
         log_unaligned(job.chunk_id, None, &job.language, cause);
       }
-      account(vec![Unit {
-        run_index: None,
-        language: job.language.clone(),
-        outcome,
-      }])
+      AlignmentResult::whole(outcome)
     })
   } else {
     dispatch_runs(set, job, units, run_options)
@@ -402,51 +398,6 @@ pub fn run_one_alignment(
   }
 }
 
-/// The one terminal outcome of an alignment unit.
-#[derive(Debug)]
-enum UnitOutcome {
-  /// Words aligned from the unit; never empty.
-  Aligned(Vec<Word>),
-  /// No word came from the unit, and why.
-  Unaligned(UnalignedCause),
-}
-
-impl From<Composed> for UnitOutcome {
-  fn from(composed: Composed) -> Self {
-    match composed {
-      Composed::Words(words) => Self::Aligned(words),
-      Composed::NoAlignableText => Self::Unaligned(UnalignedCause::NoAlignableText),
-      Composed::NoSurvivingWords => Self::Unaligned(UnalignedCause::NoSurvivingWords),
-    }
-  }
-}
-
-/// An alignment unit and its terminal outcome.
-struct Unit {
-  run_index: Option<usize>,
-  language: Lang,
-  outcome: UnitOutcome,
-}
-
-/// The job's result, built from exactly one outcome per unit: each
-/// unit's words, or its record naming why it has none.
-fn account(units: Vec<Unit>) -> AlignmentResult {
-  let mut words = Vec::new();
-  let mut unaligned = Vec::new();
-  for unit in units {
-    match unit.outcome {
-      UnitOutcome::Aligned(unit_words) => words.extend(unit_words),
-      UnitOutcome::Unaligned(cause) => {
-        unaligned.push(Unaligned::new(unit.run_index, unit.language, cause));
-      }
-    }
-  }
-  // enforce the `Transcript::words()` time-order invariant for
-  // multi-run chunks. See [`sort_words_by_pts`] for the rationale.
-  sort_words_by_pts(&mut words);
-  AlignmentResult::new(words).with_unaligned(unaligned)
-}
-
 /// Align one unit in `language`, or say why it gives no words: exactly
 /// one outcome, or an error that fails the job.
 ///
@@ -459,7 +410,7 @@ fn align_unit(
   set: &AlignmentSet,
   language: &Lang,
   unit: &OovResolution,
-  align: impl FnOnce(&mut Aligner, &[ResolvedOov]) -> Result<Composed, WorkFailure>,
+  align: impl FnOnce(&mut Aligner, &[ResolvedOov]) -> Result<UnitOutcome, WorkFailure>,
 ) -> Result<UnitOutcome, WorkFailure> {
   let aligner = match set.lookup(language) {
     AlignmentLookup::Hit { aligner, .. } | AlignmentLookup::AnyFallback { aligner } => aligner,
@@ -487,7 +438,7 @@ fn align_unit(
     )))
   })?;
   match align(&mut guard, decisions) {
-    Ok(composed) => Ok(UnitOutcome::from(composed)),
+    Ok(outcome) => Ok(outcome),
     Err(WorkFailure::Alignment(err)) if alignment_error_is_recoverable(&err) => {
       Ok(UnitOutcome::Unaligned(UnalignedCause::Failed(err)))
     }
@@ -651,7 +602,7 @@ fn run_under_lock(
   run_options: &RunOptions,
   abort_flag: &AtomicBool,
   decisions: &[ResolvedOov],
-) -> Result<Composed, WorkFailure> {
+) -> Result<UnitOutcome, WorkFailure> {
   let bound = job.samples_to_output_range.clone();
   // The key is the REQUESTED language, not `aligner.language()`: a
   // registry miss may have landed this chunk on the multilingual
@@ -757,7 +708,7 @@ impl BoundsSourceCounters {
 /// [`OovKind::NotInspected`](crate::core::OovKind::NotInspected) event
 /// refuses it, or hands it to the fallback, which skips it
 /// (`SkipChunk`) or fails the job (`Error`). The result names a refused
-/// or skipped run in [`AlignmentResult::unaligned`], and a run whose
+/// or skipped run as its [`UnitOutcome::Unaligned`] outcome, and a run whose
 /// alignment fails recoverably too.
 ///
 /// **Telemetry.** Logs one `script_dispatch chunk=...` line per
@@ -787,7 +738,7 @@ fn dispatch_runs(
   run_options: &RunOptions,
 ) -> Result<AlignmentResult, WorkFailure> {
   let mut counters = BoundsSourceCounters::default();
-  let mut units: Vec<Unit> = Vec::with_capacity(job.runs.len());
+  let mut outcomes: Vec<UnitOutcome> = Vec::with_capacity(job.runs.len());
   let dispatch_started_at = Instant::now();
 
   // `into_units_for` returned one resolution per run, in run order.
@@ -853,53 +804,25 @@ fn dispatch_runs(
       // reverse-mapping from text/timing. The aligner itself doesn't
       // know the run language; we attach it here at the dispatch
       // boundary.
-      UnitOutcome::Aligned(words) => UnitOutcome::Aligned(
-        words
-          .into_iter()
-          .map(|word| word.with_language(Some(run.language().clone())))
-          .collect(),
-      ),
+      UnitOutcome::Aligned(words) => {
+        UnitOutcome::Aligned(words.map(|word| word.with_language(Some(run.language().clone()))))
+      }
       UnitOutcome::Unaligned(cause) => {
         counters.observe_unaligned();
         log_unaligned(job.chunk_id, Some(run_idx), run.language(), &cause);
         UnitOutcome::Unaligned(cause)
       }
     };
-    units.push(Unit {
-      run_index: Some(run_idx),
-      language: run.language().clone(),
-      outcome,
-    });
+    // Exactly one outcome per run, at the run's index.
+    outcomes.push(outcome);
     // A `Wholeclip` run aligns against the full chunk audio, which
     // over-counts duration but keeps every dispatched language's
-    // words; `account` restores the public `Transcript::words()`
-    // time order across multi-run output.
+    // words; `AlignmentResult::into_words` restores the public
+    // `Transcript::words()` time order across multi-run output.
   }
 
   emit_telemetry(job.chunk_id, &counters);
-  Ok(account(units))
-}
-
-/// Stable-sort a multi-run word stream by start PTS (then end
-/// PTS as tiebreaker) so the merged output respects the
-/// `Transcript::words()` time-order contract.
-///
-/// Each per-run aligner emits its own words inside its sliced
-/// audio window, which [`compute_run_bounds`] guarantees is
-/// monotone vs. neighbouring runs for Dtw / Segment bounds.
-/// `Wholeclip` runs (and any overlapping bounds a pluggable
-/// [`crate::runner::AsrSource`] happens to feed) can land
-/// words at arbitrary positions across the chunk, so appending
-/// in run-order leaves the merged stream out of time order.
-///
-/// extracted as a free
-/// function so the sort's contract is testable without
-/// standing up a real `Aligner` / ORT.
-fn sort_words_by_pts(words: &mut [Word]) {
-  words.sort_by_key(|w| {
-    let r = w.range();
-    (r.start_pts(), r.end_pts())
-  });
+  Ok(AlignmentResult::runs(outcomes))
 }
 
 /// Translate a run's `(audio_t0_ms, audio_t1_ms)` into chunk-local
@@ -1046,7 +969,7 @@ fn run_one_per_run(
   run_options: &RunOptions,
   // The decisions for THIS run's text, as detection found its events.
   oov_decisions: &[ResolvedOov],
-) -> Result<Composed, WorkFailure> {
+) -> Result<UnitOutcome, WorkFailure> {
   let bound = samples_to_output_range.clone();
   // Per-run key: `run.language()`, the language THIS run's events carry,
   // as detection relabelled them. Not `aligner.language()` — the run may

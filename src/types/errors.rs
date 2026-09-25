@@ -18,7 +18,10 @@ use std::time::Duration;
 
 use smol_str::SmolStr;
 
-use crate::types::{ChunkId, Lang};
+use crate::{
+  core::AlignmentUnit,
+  types::{ChunkId, Lang},
+};
 
 /// Push or inject failure on the state machine.
 #[derive(Clone, Debug, thiserror::Error)]
@@ -48,9 +51,64 @@ pub enum TranscriberError {
   /// Caller `inject_*`-ed a chunk_id that does not match in-flight.
   #[error("unknown or already-resolved chunk_id {0}")]
   UnknownChunk(ChunkId),
+  /// `handle_alignment` got a result that does not give each of the
+  /// chunk's alignment units exactly one outcome. The chunk stays
+  /// awaiting alignment.
+  #[error("{0}")]
+  UnaccountedAlignment(UnaccountedAlignment),
   /// Caller called `handle_eof` and then attempted to push.
   #[error("operation rejected after handle_eof")]
   AfterEof,
+}
+
+/// An alignment result that does not account for the chunk's alignment
+/// units: its units are not exactly the ones the chunk's
+/// `Command::Alignment` asked for (the whole text when it carried no
+/// runs, else one per run, in order).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "alignment result for chunk {chunk_id} gives outcomes for units {received:?}, but the \
+   chunk's alignment units are {expected:?}"
+)]
+pub struct UnaccountedAlignment {
+  chunk_id: ChunkId,
+  expected: Vec<AlignmentUnit>,
+  received: Vec<AlignmentUnit>,
+}
+
+impl UnaccountedAlignment {
+  /// Construct from the chunk, the units it expected, and the units the
+  /// result gave an outcome.
+  #[must_use]
+  pub const fn new(
+    chunk_id: ChunkId,
+    expected: Vec<AlignmentUnit>,
+    received: Vec<AlignmentUnit>,
+  ) -> Self {
+    Self {
+      chunk_id,
+      expected,
+      received,
+    }
+  }
+
+  /// The chunk the result was for.
+  #[must_use]
+  pub const fn chunk_id(&self) -> ChunkId {
+    self.chunk_id
+  }
+
+  /// The chunk's alignment units, in order.
+  #[must_use]
+  pub fn expected(&self) -> &[AlignmentUnit] {
+    &self.expected
+  }
+
+  /// The units the result gave an outcome, in order.
+  #[must_use]
+  pub fn received(&self) -> &[AlignmentUnit] {
+    &self.received
+  }
 }
 
 /// PTS regression payload.

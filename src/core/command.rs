@@ -13,7 +13,7 @@ use mediatime::TimeRange;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
-use crate::types::{ChunkId, Lang};
+use crate::types::{ChunkId, Lang, Word};
 
 /// Universal ASR knobs. Each field corresponds to either a knob
 /// exposed by whisper-rs's `FullParams` or a parameter the runner's
@@ -596,145 +596,212 @@ pub enum AlignmentUnit {
   Run(usize),
 }
 
-/// Result of one chunk's word-level alignment. Empty `words` is a
-/// valid result (e.g., when whisper text was empty or normalisation
-/// produced an empty string). Fields are private; use
-/// [`AlignmentResult::new`] and accessors.
+/// A non-empty list of the words an alignment unit aligned, in time
+/// order.
 ///
-/// Every alignment unit (the whole chunk, or one script-dispatched
-/// run) either contributes words or is named in [`Self::unaligned`]
-/// with the reason it contributed none: nothing could read it, a policy
-/// refused it, it held nothing alignable, the speech gates kept none of
-/// its words, or its alignment failed recoverably. An empty `words`
-/// never stands in for a reason.
+/// A unit that aligned no word is [`UnitOutcome::Unaligned`], with its
+/// reason, so an empty list never stands in for one.
 #[derive(Clone, Debug)]
-#[cfg(feature = "alignment")]
+pub struct AlignedWords(Vec<Word>);
+
+impl AlignedWords {
+  /// The words, or `None` when there are none.
+  #[must_use]
+  pub fn new(words: Vec<Word>) -> Option<Self> {
+    if words.is_empty() {
+      None
+    } else {
+      Some(Self(words))
+    }
+  }
+
+  /// The words; never empty.
+  #[must_use]
+  pub fn words(&self) -> &[Word] {
+    &self.0
+  }
+
+  /// Take the words; never empty.
+  #[must_use]
+  pub fn into_words(self) -> Vec<Word> {
+    self.0
+  }
+
+  /// Rewrite each word with `f`. As many words as before, so never empty.
+  pub(crate) fn map(self, f: impl FnMut(Word) -> Word) -> Self {
+    Self(self.0.into_iter().map(f).collect())
+  }
+}
+
+/// What one alignment unit came to: its words, or the reason it has
+/// none.
+#[derive(Clone, Debug)]
+pub enum UnitOutcome {
+  /// The unit aligned these words.
+  Aligned(AlignedWords),
+  /// The unit contributed no words, for this reason.
+  Unaligned(UnalignedCause),
+}
+
+impl UnitOutcome {
+  /// The unit's words: empty when it is unaligned.
+  #[must_use]
+  pub fn words(&self) -> &[Word] {
+    match self {
+      Self::Aligned(words) => words.words(),
+      Self::Unaligned(_) => &[],
+    }
+  }
+
+  /// Why the unit contributed no words, or `None` when it aligned.
+  #[must_use]
+  pub const fn cause(&self) -> Option<&UnalignedCause> {
+    match self {
+      Self::Aligned(_) => None,
+      Self::Unaligned(cause) => Some(cause),
+    }
+  }
+
+  /// `words` as aligned, or [`UnalignedCause::NoSurvivingWords`] when
+  /// the speech gates kept none of them.
+  pub(crate) fn from_words(words: Vec<Word>) -> Self {
+    AlignedWords::new(words).map_or(
+      Self::Unaligned(UnalignedCause::NoSurvivingWords),
+      Self::Aligned,
+    )
+  }
+}
+
+/// The result of one chunk's word-level alignment: exactly one outcome
+/// for each of its alignment units.
+///
+/// A chunk whose `Command::Alignment` carried no runs has one unit, its
+/// whole text ([`AlignmentResult::whole`]); one whose command carried
+/// runs has one unit per run, in order ([`AlignmentResult::runs`]). No
+/// other shape can be built, so no unit is missing from a result or
+/// answered twice in it, and
+/// [`Transcriber::handle_alignment`](crate::core::Transcriber::handle_alignment)
+/// refuses a result whose units are not the chunk's.
+///
+/// Each unit contributes words or names why it has none: nothing could
+/// read it, a policy refused it, it held nothing alignable, the speech
+/// gates kept none of its words, or its alignment failed recoverably. An
+/// empty word list never stands in for a reason.
+#[derive(Clone, Debug)]
 pub struct AlignmentResult {
-  words: Vec<crate::types::Word>,
-  unaligned: Vec<Unaligned>,
+  /// A whole-text result; `outcomes` then holds exactly one.
+  whole: bool,
+  outcomes: Vec<UnitOutcome>,
 }
 
-#[cfg(feature = "alignment")]
 impl AlignmentResult {
-  /// Construct from a list of per-word alignment entries.
-  pub fn new(words: Vec<crate::types::Word>) -> Self {
+  /// The result of aligning a chunk's whole text: its one unit's
+  /// outcome.
+  #[must_use]
+  pub fn whole(outcome: UnitOutcome) -> Self {
     Self {
-      words,
-      unaligned: Vec::new(),
+      whole: true,
+      outcomes: vec![outcome],
     }
   }
 
-  /// Builder-style: record the alignment units that contributed no
-  /// words, and why.
+  /// The result of aligning a chunk run by run: `outcomes[i]` is the
+  /// outcome of run `i` of `Command::Alignment::runs`.
   #[must_use]
-  pub fn with_unaligned(mut self, unaligned: Vec<Unaligned>) -> Self {
-    self.unaligned = unaligned;
+  pub fn runs(outcomes: Vec<UnitOutcome>) -> Self {
+    Self {
+      whole: false,
+      outcomes,
+    }
+  }
+
+  /// Each alignment unit with its outcome, in unit order.
+  pub fn units(&self) -> impl ExactSizeIterator<Item = (AlignmentUnit, &UnitOutcome)> + '_ {
+    let whole = self.whole;
     self
+      .outcomes
+      .iter()
+      .enumerate()
+      .map(move |(index, outcome)| {
+        let unit = if whole {
+          AlignmentUnit::Whole
+        } else {
+          AlignmentUnit::Run(index)
+        };
+        (unit, outcome)
+      })
   }
 
-  /// Per-word alignment entries.
-  pub fn words(&self) -> &[crate::types::Word] {
-    &self.words
-  }
-
-  /// The alignment units that contributed no words, and why, in the
-  /// order they were dispatched. Empty when every unit was aligned.
-  pub fn unaligned(&self) -> &[Unaligned] {
-    &self.unaligned
-  }
-
-  /// Consume the result, returning ownership of the words vector.
-  pub fn into_words(self) -> Vec<crate::types::Word> {
-    self.words
-  }
-}
-
-/// Stub when alignment feature is off so other code paths can refer
-/// to the type without a feature gate.
-#[derive(Clone, Debug)]
-#[cfg(not(feature = "alignment"))]
-pub struct AlignmentResult {
-  words: Vec<crate::types::Word>,
-  unaligned: Vec<Unaligned>,
-}
-
-#[cfg(not(feature = "alignment"))]
-impl AlignmentResult {
-  /// Construct from a list of per-word alignment entries (always
-  /// empty without the `alignment` feature).
-  pub fn new(words: Vec<crate::types::Word>) -> Self {
-    Self {
-      words,
-      unaligned: Vec::new(),
-    }
-  }
-
-  /// Builder-style: record the alignment units that contributed no
-  /// words, and why.
-  #[must_use]
-  pub fn with_unaligned(mut self, unaligned: Vec<Unaligned>) -> Self {
-    self.unaligned = unaligned;
+  /// The units that contributed no words, each with its reason, in unit
+  /// order. Empty when every unit aligned.
+  pub fn unaligned(&self) -> impl Iterator<Item = (AlignmentUnit, &UnalignedCause)> + '_ {
     self
+      .units()
+      .filter_map(|(unit, outcome)| outcome.cause().map(|cause| (unit, cause)))
   }
 
-  /// Per-word alignment entries (always empty without the
-  /// `alignment` feature).
-  pub fn words(&self) -> &[crate::types::Word] {
-    &self.words
+  /// Every aligned word, in unit order.
+  pub fn words(&self) -> impl Iterator<Item = &Word> + '_ {
+    self.outcomes.iter().flat_map(UnitOutcome::words)
   }
 
-  /// The alignment units that contributed no words, and why.
-  pub fn unaligned(&self) -> &[Unaligned] {
-    &self.unaligned
-  }
-
-  /// Consume the result, returning ownership of the words vector.
-  pub fn into_words(self) -> Vec<crate::types::Word> {
-    self.words
-  }
-}
-
-/// An alignment unit that contributed no words to an
-/// [`AlignmentResult`], and why: the whole chunk, or one
-/// script-dispatched run.
-#[derive(Clone, Debug)]
-pub struct Unaligned {
-  run_index: Option<usize>,
-  language: Lang,
-  cause: UnalignedCause,
-}
-
-impl Unaligned {
-  /// Construct from the unit (`None` for the whole chunk, or the
-  /// index of the run in `Command::Alignment::runs`), its language,
-  /// and the cause.
+  /// Take every aligned word, in time order across units: the order
+  /// `Transcript::words` keeps.
   #[must_use]
-  pub const fn new(run_index: Option<usize>, language: Lang, cause: UnalignedCause) -> Self {
-    Self {
-      run_index,
-      language,
-      cause,
+  pub fn into_words(self) -> Vec<Word> {
+    let mut words: Vec<Word> = self
+      .outcomes
+      .into_iter()
+      .filter_map(|outcome| match outcome {
+        UnitOutcome::Aligned(words) => Some(words.into_words()),
+        UnitOutcome::Unaligned(_) => None,
+      })
+      .flatten()
+      .collect();
+    sort_words_by_pts(&mut words);
+    words
+  }
+
+  /// Whether this result gives each alignment unit of a chunk whose
+  /// command carried `runs` runs exactly one outcome: the whole text
+  /// when `runs` is 0, else runs `0..runs`.
+  pub(crate) fn accounts_for(&self, runs: usize) -> bool {
+    if runs == 0 {
+      self.whole
+    } else {
+      !self.whole && self.outcomes.len() == runs
     }
   }
 
-  /// The run this record is about, by its index in
-  /// `Command::Alignment::runs`; `None` for the whole chunk.
-  #[must_use]
-  pub const fn run_index(&self) -> Option<usize> {
-    self.run_index
+  /// The units this result gives an outcome, in order.
+  pub(crate) fn unit_list(&self) -> Vec<AlignmentUnit> {
+    self.units().map(|(unit, _)| unit).collect()
   }
+}
 
-  /// The unit's language: the chunk's, or the run's.
-  #[must_use]
-  pub const fn language(&self) -> &Lang {
-    &self.language
+/// The alignment units of a chunk whose command carried `runs` runs: its
+/// whole text when there are none, else each run.
+pub(crate) fn alignment_units(runs: usize) -> Vec<AlignmentUnit> {
+  if runs == 0 {
+    vec![AlignmentUnit::Whole]
+  } else {
+    (0..runs).map(AlignmentUnit::Run).collect()
   }
+}
 
-  /// Why the unit contributed no words.
-  #[must_use]
-  pub const fn cause(&self) -> &UnalignedCause {
-    &self.cause
-  }
+/// Stable-sort a word stream by start PTS, then end PTS, so words merged
+/// from several runs keep the `Transcript::words()` time order.
+///
+/// Each run's aligner emits its words inside its own audio window, which
+/// the dispatcher's bounds keep monotone for `Dtw` and `Segment` runs. A
+/// `Wholeclip` run (and any overlapping bounds a pluggable `AsrSource`
+/// feeds) can land words anywhere in the chunk, so appending in run order
+/// can leave the stream out of time order.
+pub(crate) fn sort_words_by_pts(words: &mut [Word]) {
+  words.sort_by_key(|word| {
+    let range = word.range();
+    (range.start_pts(), range.end_pts())
+  });
 }
 
 /// Why an alignment unit contributed no words.
@@ -1035,6 +1102,85 @@ pub(crate) type ChunkAudio = Arc<[f32]>;
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// **A result gives each alignment unit exactly one outcome.** Aligned
+  /// words are never empty, so a unit with none is `Unaligned` with its
+  /// reason; the runs shape gives run `i` the outcome at `i`, the whole
+  /// shape gives the whole text its one outcome; `unaligned` names exactly
+  /// the units without words, and `into_words` keeps every aligned word, in
+  /// time order across runs.
+  #[test]
+  fn a_result_gives_each_unit_exactly_one_outcome() {
+    use core::num::NonZeroI32;
+
+    use crate::types::{AlignmentError, AlignmentFailure};
+
+    let word = |text: &str, start: i64| {
+      Word::new(
+        SmolStr::new(text),
+        TimeRange::new(
+          start,
+          start + 10,
+          mediatime::Timebase::new(1, NonZeroI32::new(1_000).expect("1000 != 0")),
+        ),
+        0.9,
+      )
+    };
+    assert!(AlignedWords::new(Vec::new()).is_none(), "never empty");
+    assert!(matches!(
+      UnitOutcome::from_words(Vec::new()),
+      UnitOutcome::Unaligned(UnalignedCause::NoSurvivingWords)
+    ));
+
+    let failed =
+      AlignmentError::NoAlignmentPath(AlignmentFailure::new(SmolStr::new("too short"), Lang::En));
+    let result = AlignmentResult::runs(vec![
+      UnitOutcome::from_words(vec![word("b", 20)]),
+      UnitOutcome::Unaligned(UnalignedCause::Skipped),
+      UnitOutcome::Unaligned(UnalignedCause::Refused),
+      UnitOutcome::Unaligned(UnalignedCause::NoAlignableText),
+      UnitOutcome::Unaligned(UnalignedCause::NoSurvivingWords),
+      UnitOutcome::Unaligned(UnalignedCause::Failed(failed)),
+      UnitOutcome::from_words(vec![word("a", 0)]),
+    ]);
+    assert_eq!(
+      result.unit_list(),
+      (0..7).map(AlignmentUnit::Run).collect::<Vec<_>>()
+    );
+    assert!(result.accounts_for(7));
+    assert!(!result.accounts_for(6) && !result.accounts_for(8) && !result.accounts_for(0));
+    let unaligned: Vec<AlignmentUnit> = result.unaligned().map(|(unit, _)| unit).collect();
+    assert_eq!(
+      unaligned,
+      (1..6).map(AlignmentUnit::Run).collect::<Vec<_>>()
+    );
+    assert!(matches!(
+      result.unaligned().last(),
+      Some((
+        _,
+        UnalignedCause::Failed(AlignmentError::NoAlignmentPath(_))
+      ))
+    ));
+    assert_eq!(
+      result.words().map(Word::text).collect::<Vec<_>>(),
+      ["b", "a"],
+      "unit order"
+    );
+    assert_eq!(
+      result
+        .into_words()
+        .iter()
+        .map(Word::text)
+        .collect::<Vec<_>>(),
+      ["a", "b"],
+      "time order"
+    );
+
+    let whole = AlignmentResult::whole(UnitOutcome::Unaligned(UnalignedCause::Refused));
+    assert_eq!(whole.unit_list(), [AlignmentUnit::Whole]);
+    assert!(whole.accounts_for(0) && !whole.accounts_for(1));
+    assert!(!AlignmentResult::runs(Vec::new()).accounts_for(0));
+  }
 
   #[test]
   fn asr_params_defaults_match_spec() {

@@ -55,6 +55,47 @@ BREAKING
   - New: `AlignmentUnit` (`Whole`, or `Run(index)` of
     `Command::Alignment::runs`) names the unit a detection or resolution is
     for.
+- **An alignment result is exactly one outcome per unit, and the transcriber
+  checks it.** `AlignmentResult` was a word list anyone could build empty
+  (`AlignmentResult::new(Vec::new())`), and `Transcriber::handle_alignment`
+  consumed only its words: a chunk awaiting alignment could be resolved
+  with no outcome at all, and zero words told a caller nothing about why.
+  Now:
+  - **`UnitOutcome`** is one unit's outcome: `Aligned(AlignedWords)`, whose
+    words are never empty (`AlignedWords::new` returns `None` for none), or
+    `Unaligned(UnalignedCause)`, with the reason: `Skipped`, `Refused`,
+    `NoAlignableText` (it normalised to nothing, or held only marks nobody
+    reads aloud), `NoSurvivingWords` (the speech gates dropped every word)
+    or `Failed` (a recoverable alignment failure, such as a policy refusing
+    a spoken character).
+  - **`AlignmentResult`** is built only as `AlignmentResult::whole(outcome)`
+    or `AlignmentResult::runs(outcomes)` (run `i`'s outcome at `i`), so no
+    unit is missing from it or answered twice. `units()` yields each unit
+    with its outcome, `unaligned()` the units without words and their
+    reasons, `words()` every word in unit order, and `into_words()` every
+    word in time order.
+  - **`Transcriber::handle_alignment` refuses a result whose units are not
+    the chunk's**, as the new `TranscriberError::UnaccountedAlignment` (with
+    `UnaccountedAlignment`: the chunk, the units it expected and the units
+    the result gave), before consuming anything: the chunk stays awaiting
+    alignment. A chunk aligned whole takes `whole`, one aligned run by run
+    takes `runs` with one outcome per run.
+  - `run_one_alignment` builds one outcome per unit on both roads, and
+    `Aligner::align_chunk`, `Aligner::align_chunk_with_abort` and
+    `EmissionsAligner::finish` return the aligned text's `UnitOutcome`.
+
+  Migration:
+  - A driver that feeds `handle_alignment` from its own aligner wraps its
+    words: `AlignmentResult::whole(AlignedWords::new(words).map_or(
+    UnitOutcome::Unaligned(cause), UnitOutcome::Aligned))` for a whole-text
+    chunk, `AlignmentResult::runs(..)` with one outcome per run otherwise.
+  - `result.words()` is an iterator now; `into_words()` still returns every
+    word, in time order.
+  - The direct front ends return a `UnitOutcome`: read its words with
+    `outcome.words()`, or wrap it in `AlignmentResult::whole` for a
+    `Transcriber`.
+  - `TranscriberError` has the new variant `UnaccountedAlignment`; an
+    exhaustive `match` needs an arm for it.
 
 FIXED
 
@@ -141,17 +182,6 @@ FIXED
     a detection decides every event, so its resolution cannot leave the
     `NotInspected` event out: no empty or missing decision can stand in for
     a skip.
-- **Every alignment unit ends with exactly one named outcome.**
-  `AlignmentResult::unaligned` (new, with `Unaligned` and `UnalignedCause`)
-  names every unit that contributed no words, the whole chunk or a run by
-  its index, with its language and cause: skipped, refused, no alignable
-  text (it normalised to nothing, or held only silent marks), no surviving
-  words (the speech gates dropped them all), or a recoverable alignment
-  failure such as a policy refusing a spoken character. `run_one_alignment`
-  fills it on both roads, one outcome per unit by construction, and
-  `Aligner::align_chunk`, `Aligner::align_chunk_with_abort` and
-  `EmissionsAligner::finish` name an empty result's reason the same way.
-  An empty word list no longer stands in for a reason.
 
 ## 0.2.0
 

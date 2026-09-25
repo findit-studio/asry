@@ -107,8 +107,8 @@ impl LatinRules {
 ///
 /// **Empty result.** If normalisation produces zero words,
 /// `normalize` returns [`NormalizationError::EmptyText`].
-/// `Aligner::align` short-circuits this to
-/// `Ok(AlignmentResult::new(Vec::new()))` so a punctuation-only
+/// `Aligner::align` short-circuits this to the unit's
+/// `Unaligned(NoAlignableText)` outcome, so a punctuation-only
 /// transcript surfaces as `Transcript { text, words: [] }`
 /// rather than `Event::Error`.
 #[derive(Clone, Copy, Debug)]

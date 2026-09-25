@@ -79,8 +79,8 @@
 //! ## Every unit ends named
 //!
 //! Every alignment unit (the whole chunk, or one run) ends with exactly
-//! one outcome: its words, or a record in `AlignmentResult::unaligned`
-//! naming why it has none (skipped, refused, nothing alignable, no word
+//! one outcome in its `AlignmentResult`: its words, or `Unaligned` with
+//! the reason it has none (skipped, refused, nothing alignable, no word
 //! surviving the speech gates, or a recoverable failure). An empty word
 //! list never stands in for a reason.
 

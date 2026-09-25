@@ -38,7 +38,7 @@ use smol_str::{SmolStr, format_smolstr};
 use tokenizers::Tokenizer;
 
 use crate::{
-  core::AlignmentResult,
+  core::{UnalignedCause, UnitOutcome},
   runner::aligner::{
     algorithm::{
       compose::{build_speech_frames, compose_words, effective_samples_per_frame},
@@ -655,7 +655,7 @@ pub struct PreparedChunk<'a> {
   /// `None` for the two short-circuits `Aligner::align` has always
   /// had: normalisation produced empty text, or tokenisation produced
   /// zero alignable tokens. The encoder should be skipped entirely and
-  /// the result is an empty `AlignmentResult`.
+  /// the unit is `Unaligned(NoAlignableText)`.
   inner: Option<PreparedInner<'a>>,
 }
 
@@ -946,10 +946,10 @@ impl AlignerCore {
     // `NormalizationError::EmptyText` (punctuation-only or
     // whitespace-only ASR output) is *not* an error here — it
     // mirrors the empty-tokens short-circuit below. Returning a
-    // TRIVIAL chunk (→ `Ok(empty AlignmentResult)`) lets the cached
+    // TRIVIAL chunk (→ `Unaligned(NoAlignableText)`) lets the cached
     // ASR transcript surface as `Transcript { text, words: [] }`
     // instead of `Event::Error`. Otherwise this would be a data-loss
-    // path that contradicts the `AlignmentResult` contract.
+    // path that contradicts the alignment result's contract.
     let normalized = match self.normalizer.normalize(text) {
       Ok(nt) => nt,
       Err(NormalizationError::EmptyText) => {
@@ -1091,7 +1091,7 @@ impl AlignerCore {
     chunk_first_sample_in_stream: u64,
     samples_to_output_range: F,
     abort_flag: &AtomicBool,
-  ) -> Result<Composed, WorkFailure>
+  ) -> Result<UnitOutcome, WorkFailure>
   where
     F: Fn(u64, u64) -> TimeRange,
   {
@@ -1129,7 +1129,7 @@ impl AlignerCore {
     let Some(prepared) = prepared.inner else {
       // Trivial chunk: `prepare` short-circuited (empty normalised
       // text or zero alignable tokens). No encoder output to consume.
-      return Ok(Composed::NoAlignableText);
+      return Ok(UnitOutcome::Unaligned(UnalignedCause::NoAlignableText));
     };
     let tokenized = &prepared.tokenized;
 
@@ -1322,54 +1322,7 @@ impl AlignerCore {
       self.min_speech_coverage,
       self.max_intra_silent_run,
     );
-    Ok(Composed::from_words(composed.into_words()))
-  }
-}
-
-/// What alignment made of one text: its words, or why there are none.
-///
-/// The one form a front end's result takes before it is public, so an
-/// empty word list cannot leave the core without its reason: the variant
-/// that carries words is built only from a non-empty list
-/// ([`Composed::from_words`]).
-#[derive(Debug)]
-pub(crate) enum Composed {
-  /// The aligned words; never empty.
-  Words(Vec<crate::types::Word>),
-  /// Nothing in the text was alignable: it normalised to nothing, or
-  /// every character in it was a punctuation mark nobody reads aloud.
-  NoAlignableText,
-  /// The text aligned, and the speech gates dropped every word: no
-  /// word's span held enough speech, or each held too long a silence.
-  NoSurvivingWords,
-}
-
-impl Composed {
-  /// The words alignment kept, or [`Composed::NoSurvivingWords`] when
-  /// it kept none.
-  pub(crate) fn from_words(words: Vec<crate::types::Word>) -> Self {
-    if words.is_empty() {
-      Self::NoSurvivingWords
-    } else {
-      Self::Words(words)
-    }
-  }
-
-  /// The public result: the words, or no words and one record naming
-  /// the reason, in `language` for the whole text.
-  pub(crate) fn into_result(self, language: &Lang) -> AlignmentResult {
-    use crate::core::{Unaligned, UnalignedCause};
-
-    let cause = match self {
-      Self::Words(words) => return AlignmentResult::new(words),
-      Self::NoAlignableText => UnalignedCause::NoAlignableText,
-      Self::NoSurvivingWords => UnalignedCause::NoSurvivingWords,
-    };
-    AlignmentResult::new(Vec::new()).with_unaligned(vec![Unaligned::new(
-      None,
-      language.clone(),
-      cause,
-    )])
+    Ok(UnitOutcome::from_words(composed))
   }
 }
 

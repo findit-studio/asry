@@ -138,18 +138,15 @@ fn too_short_chunk_recovers_to_empty_result() {
   );
 
   assert!(
-    result.words().is_empty(),
-    "a dropped alignment contributes no words; got {:?}",
-    result.words()
-  );
-  assert!(
     matches!(
-      result.unaligned(),
-      [record] if record.run_index().is_none()
-        && matches!(record.cause(), UnalignedCause::Failed(AlignmentError::NoAlignmentPath(_)))
+      result.units().collect::<Vec<_>>().as_slice(),
+      [(
+        crate::core::AlignmentUnit::Whole,
+        UnitOutcome::Unaligned(UnalignedCause::Failed(AlignmentError::NoAlignmentPath(_)))
+      )]
     ),
-    "the recovered failure is named, never a bare empty list; got {:?}",
-    result.unaligned()
+    "the whole text's one outcome names the recovered failure, never a bare empty list; got \
+     {result:?}"
   );
 
   // Input sanity, NOT a preservation proof: `run_one_alignment` borrows
@@ -416,6 +413,8 @@ fn clip_sub_segments_offsets_into_run_local_space() {
 /// see monotone PTS — that's the public contract.
 #[test]
 fn sort_words_by_pts_orders_overlapping_runs() {
+  use crate::core::sort_words_by_pts;
+
   use core::num::NonZeroI32;
   use mediatime::Timebase;
   let tb = Timebase::new(1, NonZeroI32::new(16_000).unwrap());
@@ -449,6 +448,8 @@ fn sort_words_by_pts_orders_overlapping_runs() {
 /// but keeps the output deterministic for debug/log readers.
 #[test]
 fn sort_words_by_pts_breaks_ties_by_end_pts() {
+  use crate::core::sort_words_by_pts;
+
   use core::num::NonZeroI32;
   use mediatime::Timebase;
   let tb = Timebase::new(1, NonZeroI32::new(16_000).unwrap());
@@ -749,81 +750,6 @@ fn a_registry_swapped_between_detection_and_dispatch_is_refused() {
       other => panic!("{fallback:?}: A's resolution is no resolution for B; got {other:?}"),
     }
   }
-}
-
-/// **Exactly one terminal outcome per unit.** Aligned words, a skip, a
-/// refusal, text with nothing alignable, words the speech gates all
-/// dropped, and a recoverable failure: every unit that gave no words is
-/// named once with its run and language, and every aligned word is kept.
-#[test]
-fn every_unit_has_exactly_one_named_outcome() {
-  use crate::runner::aligner::core::Composed;
-
-  let word = |text: &str, start: i64| {
-    Word::new(
-      SmolStr::new(text),
-      TimeRange::new(
-        start,
-        start + 10,
-        mediatime::Timebase::new(1, core::num::NonZeroI32::new(1_000).unwrap()),
-      ),
-      0.9,
-    )
-  };
-  assert!(matches!(
-    UnitOutcome::from(Composed::from_words(Vec::new())),
-    UnitOutcome::Unaligned(UnalignedCause::NoSurvivingWords)
-  ));
-  assert!(matches!(
-    UnitOutcome::from(Composed::NoAlignableText),
-    UnitOutcome::Unaligned(UnalignedCause::NoAlignableText)
-  ));
-
-  let failed =
-    AlignmentError::NoAlignmentPath(AlignmentFailure::new(SmolStr::new("too short"), Lang::En));
-  let causes = [
-    UnalignedCause::Skipped,
-    UnalignedCause::Refused,
-    UnalignedCause::NoAlignableText,
-    UnalignedCause::NoSurvivingWords,
-    UnalignedCause::Failed(failed),
-  ];
-  let mut units = vec![Unit {
-    run_index: Some(0),
-    language: Lang::En,
-    outcome: UnitOutcome::from(Composed::from_words(vec![word("b", 20), word("a", 0)])),
-  }];
-  for (i, cause) in causes.into_iter().enumerate() {
-    units.push(Unit {
-      run_index: Some(i + 1),
-      language: Lang::Ko,
-      outcome: UnitOutcome::Unaligned(cause),
-    });
-  }
-
-  let result = account(units);
-  let words: Vec<&str> = result.words().iter().map(|w| w.text()).collect();
-  assert_eq!(words, ["a", "b"], "aligned words kept, in time order");
-  let named: Vec<(Option<usize>, &Lang)> = result
-    .unaligned()
-    .iter()
-    .map(|u| (u.run_index(), u.language()))
-    .collect();
-  assert_eq!(
-    named,
-    [
-      (Some(1), &Lang::Ko),
-      (Some(2), &Lang::Ko),
-      (Some(3), &Lang::Ko),
-      (Some(4), &Lang::Ko),
-      (Some(5), &Lang::Ko),
-    ],
-    "each unit that gave no words is named once"
-  );
-  assert!(matches!(
-    result.unaligned()[4].cause(),
-    UnalignedCause::Failed(AlignmentError::NoAlignmentPath(_))
-  ));
 }
 
 #[test]

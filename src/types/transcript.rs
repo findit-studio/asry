@@ -79,8 +79,9 @@ impl Transcript {
   /// alignment was disabled, the chunk's language has no
   /// registered aligner with `AlignmentFallback::SkipChunk`, or
   /// some words landed in silence-masked regions and were dropped.
-  /// The alignment result the caller received names a skipped,
-  /// refused or failed unit in `AlignmentResult::unaligned`.
+  /// The alignment result the caller received gives each unit
+  /// its outcome, naming a skipped, refused or failed one as
+  /// `UnitOutcome::Unaligned`.
   pub fn words(&self) -> &[Word] {
     &self.words
   }

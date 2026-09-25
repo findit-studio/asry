@@ -8,9 +8,12 @@ mod event;
 pub mod oov;
 mod transcriber;
 
+pub(crate) use command::alignment_units;
+#[cfg(all(test, feature = "alignment"))]
+pub(crate) use command::sort_words_by_pts;
 pub use command::{
-  AlignmentResult, AlignmentUnit, AsrParams, AsrParamsOverride, AsrResult, Command,
-  SamplingStrategy, Unaligned, UnalignedCause,
+  AlignedWords, AlignmentResult, AlignmentUnit, AsrParams, AsrParamsOverride, AsrResult, Command,
+  SamplingStrategy, UnalignedCause, UnitOutcome,
 };
 pub use event::Event;
 pub use oov::{

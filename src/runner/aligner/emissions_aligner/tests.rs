@@ -1102,8 +1102,8 @@ fn a_resolution_binds_to_the_text_and_aligner_that_detected_it() {
 }
 
 /// **A text with nothing alignable says so.** Marks the normalizer strips
-/// and marks tokenization drops leave no token: the result has no words
-/// and exactly one record, `NoAlignableText`, never a bare empty list.
+/// and marks tokenization drops leave no token: the text's one outcome is
+/// `Unaligned(NoAlignableText)`, never a bare empty list.
 #[test]
 fn a_punctuation_only_text_is_named_no_alignable_text() {
   use crate::core::UnalignedCause;
@@ -1138,20 +1138,17 @@ fn a_punctuation_only_text_is_named_no_alignable_text() {
     assert!(result.words().is_empty(), "{text:?}");
     assert!(
       matches!(
-        result.unaligned(),
-        [record] if matches!(record.cause(), UnalignedCause::NoAlignableText)
-          && record.run_index().is_none()
-          && record.language() == &Lang::En
+        result,
+        UnitOutcome::Unaligned(UnalignedCause::NoAlignableText)
       ),
-      "{text:?}: {:?}",
-      result.unaligned()
+      "{text:?}: {result:?}"
     );
   }
 }
 
 /// **A text whose words the speech gates all drop says so.** With no
-/// speech anywhere every word's span is silence: no words, and exactly one
-/// record, `NoSurvivingWords`.
+/// speech anywhere every word's span is silence: the text's one outcome is
+/// `Unaligned(NoSurvivingWords)`.
 #[test]
 fn a_fully_masked_text_is_named_no_surviving_words() {
   use crate::core::UnalignedCause;
@@ -1177,10 +1174,9 @@ fn a_fully_masked_text_is_named_no_surviving_words() {
   assert!(result.words().is_empty());
   assert!(
     matches!(
-      result.unaligned(),
-      [record] if matches!(record.cause(), UnalignedCause::NoSurvivingWords)
+      result,
+      UnitOutcome::Unaligned(UnalignedCause::NoSurvivingWords)
     ),
-    "{:?}",
-    result.unaligned()
+    "{result:?}"
   );
 }
