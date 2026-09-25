@@ -999,33 +999,40 @@ fn a_pipe_in_the_text_is_an_oov_event_not_a_separator() {
   );
 }
 
-/// **A `-` in a word is a dropped mark, never the blank.** On the base960h
-/// table `-` spells the CTC blank. A normalizer that keeps `well-known` as
-/// one word (the Latin ones split it at the hyphen) used to hand the blank's
-/// column to the hyphen as a target. The blank is reserved, so the `-` is a
-/// dash the table cannot spell, a mark nobody reads aloud: dropped, with no
-/// event, and `well-known` aligns as one word from its letters.
+/// **A mark inside a word never splits it, and a `-` in a word is a dropped
+/// mark, never the blank.** Under the stock English normalizer, and under a
+/// whitespace-only one, `well-known` and `km/h` are one word each: their
+/// tokens are their letters, with no separator between them. On the
+/// base960h table `-` spells the CTC blank, which is reserved, so the `-` is
+/// a dash the table cannot spell, a mark nobody reads aloud: dropped, with
+/// no event, like the `/`. Each aligns as one word, its surface as written.
 #[test]
-fn a_hyphen_in_a_word_is_dropped_not_the_blank() {
-  let a = base960h(NO_UNK_TOKENIZER_JSON, Some(Box::new(WhitespaceNormalizer)));
-  assert!(
-    a.detect_oov("well-known")
-      .expect("detect_oov")
-      .events()
-      .is_empty()
-  );
-  let prepared = a
-    .prepare(
-      &vec![0.2_f32; 16_000],
-      &SpeechSpans::all_speech(),
-      "well-known",
-      resolution(&a, "well-known"),
-      &AtomicBool::new(false),
-    )
-    .expect("prepare");
-  assert_eq!(prepared.token_ids(), [15, 2, 12, 12, 23, 6, 5, 15, 6]);
-  let outcome = align_uniformly(&a, "well-known", resolution(&a, "well-known"));
-  assert_eq!(word_texts(&outcome), ["well-known"]);
+fn a_mark_inside_a_word_never_splits_it() {
+  let stock = base960h(NO_UNK_TOKENIZER_JSON, None);
+  let whitespace = base960h(NO_UNK_TOKENIZER_JSON, Some(Box::new(WhitespaceNormalizer)));
+  for a in [&stock, &whitespace] {
+    for (text, letters) in [
+      ("well-known", &[15, 2, 12, 12, 23, 6, 5, 15, 6][..]),
+      ("km/h", &[23, 14, 8][..]),
+    ] {
+      assert!(
+        a.detect_oov(text).expect("detect_oov").events().is_empty(),
+        "{text:?}"
+      );
+      let prepared = a
+        .prepare(
+          &vec![0.2_f32; 16_000],
+          &SpeechSpans::all_speech(),
+          text,
+          resolution(a, text),
+          &AtomicBool::new(false),
+        )
+        .expect("prepare");
+      assert_eq!(prepared.token_ids(), letters, "{text:?}");
+      let outcome = align_uniformly(a, text, resolution(a, text));
+      assert_eq!(word_texts(&outcome), [text]);
+    }
+  }
 }
 
 /// **A one-character special the tokenizer declares is never a target.**

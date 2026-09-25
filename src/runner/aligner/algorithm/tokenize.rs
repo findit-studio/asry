@@ -1912,8 +1912,9 @@ mod tests {
   /// **Punctuated text yields no event for its marks, under every policy.**
   /// A mark nobody reads aloud has no acoustic realization: the English
   /// normalizer strips the ones at a word's edge without padding the word,
-  /// and tokenization drops the rest. The fail-closed policy finds nothing
-  /// to refuse, and every policy tokenizes exactly the words.
+  /// keeps the ones inside a word in that word (`well-known` is one word),
+  /// and tokenization drops them. The fail-closed policy finds nothing to
+  /// refuse, and every policy tokenizes exactly the words.
   #[test]
   fn punctuated_text_yields_no_event_for_its_marks_under_every_policy() {
     let tok = bundled_tokenizer();
@@ -1923,7 +1924,7 @@ mod tests {
     let (_, words) = prepare_tokens(
       &tok,
       &english,
-      "hello she said isn't it really well known yes usa",
+      "hello she said isn't it really wellknown yes usa",
       &Lang::En,
       crate::core::fail_closed_all_policy,
     );
