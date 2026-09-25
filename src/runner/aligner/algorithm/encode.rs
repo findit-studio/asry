@@ -35,8 +35,8 @@ use crate::types::{AlignmentError, AlignmentFailure, Lang, WorkFailure};
 // keeps the (1, T) reshape semantically identical without forcing a
 // cross-version `ndarray` bridge or an unused direct dependency.
 
-/// The shape/indexing arm of [`LogProbsError`] — the
-/// [`LogProbsError::Shape`] payload [`LogProbsTV::new`] returns when
+/// The shape/indexing arm of `LogProbsError` — the
+/// `LogProbsError::Shape` payload [`LogProbsTV::new`] returns when
 /// it rejects the `(t, v, data.len())` triple: either `t * v !=
 /// data.len()` (the flat buffer's length doesn't match the declared
 /// `(T, V)` shape, including the overflow case where `t * v` doesn't
@@ -134,8 +134,8 @@ impl core::fmt::Display for LogProbsValueClass {
   }
 }
 
-/// The value-domain arm of [`LogProbsError`] — the
-/// [`LogProbsError::Value`] payload [`LogProbsTV::new`] returns when
+/// The value-domain arm of `LogProbsError` — the
+/// `LogProbsError::Value` payload [`LogProbsTV::new`] returns when
 /// `data` holds a value outside the log-probability domain (finite ∧
 /// `≤ 0`). Locates the first offending element by `frame` (row) and
 /// `vocab_index` (column) and records its [`LogProbsValueClass`]

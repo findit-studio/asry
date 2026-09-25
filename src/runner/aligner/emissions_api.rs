@@ -170,7 +170,7 @@ pub enum SpanError {
   ///
   /// A `0/den` timebase carries no time, and `mediatime::Timebase::new`
   /// permits it (only the denominator is `NonZeroI32`). Rescaling *to* it
-  /// divides by zero — a successful non-empty [`OutputClock::range`] would
+  /// divides by zero — a successful non-empty `OutputClock::range` would
   /// PANIC; rescaling *from* it collapses every range to `0..0`, which
   /// silently masks ALL speech. asry already rejects a zero-numerator
   /// timebase at its other API boundaries
@@ -445,7 +445,7 @@ impl OutputClock {
   ///
   /// [`SpanError::ZeroNumeratorTimebase`] if `timebase` has a zero
   /// numerator. `mediatime::Timebase::new` permits `0/den`, and
-  /// [`range`](Self::range) rescales *to* this timebase — a `0` numerator
+  /// `range` rescales *to* this timebase — a `0` numerator
   /// there is a division by zero, so a later successful, non-empty
   /// `finish` would PANIC. Rejecting at construction turns that into a
   /// typed error the caller acts on up front, and makes `range`

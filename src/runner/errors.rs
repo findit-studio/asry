@@ -10,9 +10,8 @@ use crate::types::TranscriberError;
 ///
 /// Distinguished from [`crate::WorkFailure`], which is per-chunk
 /// inference failure surfaced asynchronously via `Event::Error`.
-/// `RunnerError` is returned synchronously from
-/// [`crate::runner::ManagedTranscriber::process_packet`],
-/// `handle_eof`, `drain`, the builder's `build`, and (with the
+/// `RunnerError` is returned synchronously when a runner component
+/// is built: [`crate::runner::WhisperAsrSource::new`] and (with the
 /// `alignment` feature) `Aligner::from_paths`.
 #[derive(Debug, thiserror::Error)]
 pub enum RunnerError {

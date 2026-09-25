@@ -191,7 +191,7 @@ fn boundary_fail_closed(position: &str) -> EmissionsError {
 )]
 /// Sans-I/O OOV detection — runs the same per-character
 /// iteration as [`tokenize_with_word_map`] but emits an
-/// [`OovEvent`] for each char that call will need a decision
+/// [`OovEvent`](crate::core::OovEvent) for each char that call will need a decision
 /// for, instead of making a policy decision.
 ///
 /// **Order invariant.** Events are emitted in the order
@@ -213,7 +213,7 @@ fn boundary_fail_closed(position: &str) -> EmissionsError {
 /// **Membership is a vocabulary lookup; this function never encodes.** A
 /// character, after the `uppercase_input` projection, is in the alphabet
 /// exactly when the vocabulary has an entry for it
-/// ([`Tokenizer::token_to_id`]) that is not `unk_token_id`. Every other
+/// (`Tokenizer::token_to_id`) that is not `unk_token_id`. Every other
 /// spoken character is surfaced as
 /// [`OovKind::Symbol`](crate::core::OovKind::Symbol) at its char and word
 /// index. `Tokenizer::encode` is never called: a `WordLevel` model whose

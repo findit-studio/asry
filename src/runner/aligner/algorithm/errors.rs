@@ -82,7 +82,7 @@ pub enum EmissionsError {
   /// The `(t, v, data.len())` triple is inconsistent: `t * v !=
   /// data.len()`, `t * v` overflows `usize`, or `v == 0`. Produced
   /// by [`LogProbsTV::new`](super::encode::LogProbsTV::new) and by
-  /// [`log_softmax_with_finite_guard`](super::encode::log_softmax_with_finite_guard).
+  /// the encoder's finite-guarded log-softmax.
   #[error(transparent)]
   Shape(LogProbsShapeError),
 
@@ -96,8 +96,8 @@ pub enum EmissionsError {
   /// A numeric step produced a non-finite intermediate that is not
   /// attributable to a single input element — e.g. a caller-supplied
   /// encoder logit was non-finite, or a log-softmax normaliser /
-  /// output went non-finite. Produced by
-  /// [`log_softmax_with_finite_guard`](super::encode::log_softmax_with_finite_guard).
+  /// output went non-finite. Produced by the encoder's
+  /// finite-guarded log-softmax.
   #[error("numeric failure: {0}")]
   Numeric(EmissionsFailure),
 
@@ -189,9 +189,8 @@ pub enum EmissionsError {
   NoAlignmentPath(EmissionsFailure),
 
   /// A seam memory budget would be exceeded: the reconstructed CTC
-  /// path (one point per emissions frame) is larger than
-  /// [`align_emissions`](super::trellis_beam::align_emissions) will
-  /// allocate. Rejected *before* the trellis/path allocation so a
+  /// path (one point per emissions frame) is larger than the
+  /// alignment DP will allocate. Rejected *before* the trellis/path allocation so a
   /// degenerate single-token, huge-`T` lattice fails fast instead of
   /// allocating hundreds of megabytes.
   #[error("path budget exceeded: {0}")]

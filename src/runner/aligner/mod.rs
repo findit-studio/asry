@@ -69,7 +69,8 @@ pub use aligner::Aligner;
 /// reach, just static slices of `(&str, u32)` pairs and
 /// pre-resolved special-token ids.
 ///
-/// See [`wav2vec2_base_960h`] for the exposed constants.
+/// See [`wav2vec2_base_960h`](bundled::wav2vec2_base_960h) for the
+/// exposed constants.
 pub mod bundled {
   /// Bundled vocab + special-token ids for
   /// `facebook/wav2vec2-base-960h` (= the canonical English
@@ -77,9 +78,11 @@ pub mod bundled {
   /// torchaudio's `WAV2VEC2_ASR_BASE_960H`).
   ///
   /// Constants populated by `build.rs` codegen. Out-of-tree
-  /// consumers can use [`VOCAB`], [`PAD_TOKEN_ID`],
-  /// [`UNK_TOKEN_ID`], and [`DELIMITER_TOKEN_ID`] directly —
-  /// no JSON parse needed at runtime.
+  /// consumers can use [`VOCAB`](wav2vec2_base_960h::VOCAB),
+  /// [`PAD_TOKEN_ID`](wav2vec2_base_960h::PAD_TOKEN_ID),
+  /// [`UNK_TOKEN_ID`](wav2vec2_base_960h::UNK_TOKEN_ID), and
+  /// [`DELIMITER_TOKEN_ID`](wav2vec2_base_960h::DELIMITER_TOKEN_ID)
+  /// directly — no JSON parse needed at runtime.
   pub mod wav2vec2_base_960h {
     include!(concat!(env!("OUT_DIR"), "/wav2vec2_base_960h_tokens.rs"));
 

@@ -670,15 +670,15 @@ pub(crate) struct AlignerCore {
 /// A chunk that has been through steps 0-2 and is ready for an
 /// encoder — the capability token the seam hands out.
 ///
-/// Constructible **only** by [`AlignerCore::prepare`]. That is the
+/// Constructible **only** by the aligner core's `prepare`. That is the
 /// whole point: it carries the masked + zero-padded encoder buffer and
 /// the geometry derived from it, so a caller cannot hand `finish` a
 /// sample count, a frame count, or a stride that disagrees with the
 /// audio the encoder actually saw. Every extent in here is a slice
 /// length, not a caller integer.
 ///
-/// It also carries the identity of the aligner that minted it (see
-/// [`AlignerId`]), which `finish` checks. A chunk prepared by one
+/// It also carries the identity of the aligner that minted it, which
+/// `finish` checks. A chunk prepared by one
 /// aligner and finished by another is rejected rather than aligned
 /// against the wrong vocabulary.
 pub struct PreparedChunk<'a> {

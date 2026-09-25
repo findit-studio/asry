@@ -81,7 +81,7 @@ impl Run {
   /// underlying segment's timing source (DTW-derived or segment
   /// envelope); see [`Self::bounds_source`].
   ///
-  /// **Coordinate contract** ([medium]):
+  /// **Coordinate contract:**
   /// values are **chunk-local** — origin at the start of the
   /// chunk's audio, NOT stream-absolute. The runner's alignment
   /// path
@@ -90,7 +90,7 @@ impl Run {
   /// silently produces zero-word per-run alignment (a stderr
   /// warning fires when bounds land outside the chunk window).
   /// Pluggable [`crate::AsrSource`] implementations populating
-  /// [`crate::types::AsrResult::runs`] must respect this
+  /// [`crate::core::AsrResult::runs`] must respect this
   /// contract.
   #[must_use]
   pub const fn audio_t0_ms(&self) -> i64 {
@@ -207,8 +207,8 @@ impl Run {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum BoundsSource {
-  /// Bounds are min/max of [`SegmentLike::token_dtw_timestamps`]
-  /// across the run's tokens. Every token in the run had a
+  /// Bounds are min/max of the DTW timestamps of the run's
+  /// [`SegmentLike::tokens`]. Every token in the run had a
   /// concrete DTW timestamp.
   Dtw,
   /// At least one token in the run had `t_dtw == None`; the run

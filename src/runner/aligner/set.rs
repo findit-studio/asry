@@ -49,7 +49,7 @@ pub enum AlignmentLookup<'a> {
 /// Registry of `Aligner`s. Owned by `ManagedTranscriber`; shared
 /// with the alignment worker via `Arc<AlignmentSet>`.
 ///
-/// Fields are private; construct via [`AlignmentSetBuilder`].
+/// Fields are private; construct via [`AlignmentSetBuilder`](crate::AlignmentSetBuilder).
 /// Lookup is `&self` so the worker can hold a long-lived borrow
 /// without blocking other workers (the `Mutex<Aligner>` inside
 /// is the per-language lock).

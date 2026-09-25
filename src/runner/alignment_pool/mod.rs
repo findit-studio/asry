@@ -101,7 +101,7 @@ pub struct AlignWorkItem {
   runs: Vec<Run>,
   /// Watchdog flag. The worker checks this between pipeline
   /// stages; if true, it returns
-  /// [`WorkFailure::WorkerHangTimeout`] without continuing.
+  /// [`WorkFailure::WorkerHang`] without continuing.
   abort_flag: Arc<AtomicBool>,
   /// Chunk's first 16 kHz sample index in stream coordinates.
   /// Used by the aligner to map wav2vec2 frame indices back
@@ -318,7 +318,7 @@ impl AlignWorkItem {
 /// `job.abort_flag`. The aligner polls `abort_flag` at coarse
 /// pipeline boundaries (silence mask, normalise, encode,
 /// trellis, compose) and bails with
-/// [`WorkFailure::WorkerHangTimeout`] when the flag flips.
+/// [`WorkFailure::WorkerHang`] when the flag flips.
 /// True ORT mid-inference cancellation requires the caller to
 /// hold a `RunOptions` handle and call `terminate()` from
 /// another thread; had this wired via

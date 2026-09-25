@@ -775,7 +775,7 @@ pub enum Command {
   /// alignment work. Result returns via
   /// [`super::Transcriber::handle_alignment`].
   ///
-  /// **Coordinate-space contract.** /// [high]: `sub_segments` here is in the caller's **output
+  /// **Coordinate-space contract.** `sub_segments` here is in the caller's **output
   /// timebase** (the timebase of the first `handle_samples`
   /// `Timestamp`). For human readers / downstream consumers
   /// this is the "natural" form. **The aligner does NOT accept

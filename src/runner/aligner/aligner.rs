@@ -104,7 +104,7 @@ const fn nonzero_hop(value: u32) -> NonZeroU32 {
 /// single alignment worker can drive any language without copying.
 ///
 /// The ONNX front end of the sandwich: everything that is *not* the
-/// encoder lives in [`AlignerCore`], which `EmissionsAligner` contains
+/// encoder lives in `AlignerCore`, which `EmissionsAligner` contains
 /// too. Both front ends therefore run one implementation of the
 /// preprocessing, the validators, and the composition, and neither can
 /// drift from the other.
@@ -377,7 +377,7 @@ impl Aligner {
   /// SIGINT), call [`Self::align_chunk_with_abort`] with
   /// caller-owned handles.
   ///
-  /// Inputs match [`Self::align`] minus the
+  /// Inputs match [`Self::align_chunk_with_abort`] minus the
   /// `abort_flag` / `run_options` infrastructure. See that
   /// method's doc-comment for argument semantics.
   ///

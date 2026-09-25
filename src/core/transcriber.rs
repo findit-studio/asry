@@ -155,7 +155,7 @@ pub const MAX_IN_FLIGHT: usize = 4_096;
 /// [`crate::core::buffer::SampleBuffer::append`] additionally
 /// rejects any `delta_samples` whose addition would wrap, but
 /// capping the public knob keeps the configuration intent
-/// honest. ([high].)
+/// honest.
 pub const MAX_GAP_TOLERANCE_SAMPLES: u64 = MAX_BUFFER_CAP_SAMPLES as u64;
 
 impl TranscriberOptions {
@@ -243,7 +243,7 @@ impl TranscriberOptions {
   // --- Mutating setters ----------------------------------------
 
   /// Set [`Self::chunk_size`]. Panics if `value` exceeds
-  /// [`MAX_CHUNK_SIZE`] ( /// per-chunk RAM is unbounded otherwise).
+  /// `MAX_CHUNK_SIZE` (600 s); per-chunk RAM is unbounded otherwise.
   pub fn set_chunk_size(&mut self, value: Duration) {
     assert!(
       value <= MAX_CHUNK_SIZE,
@@ -253,7 +253,7 @@ impl TranscriberOptions {
   }
 
   /// Set [`Self::buffer_cap_samples`]. Panics if `value`
-  /// exceeds [`MAX_BUFFER_CAP_SAMPLES`].
+  /// exceeds `MAX_BUFFER_CAP_SAMPLES` (one hour at 16 kHz).
   pub fn set_buffer_cap_samples(&mut self, value: usize) {
     assert!(
       value <= MAX_BUFFER_CAP_SAMPLES,
@@ -263,7 +263,7 @@ impl TranscriberOptions {
   }
 
   /// Set [`Self::gap_tolerance_samples`]. Panics if `value`
-  /// exceeds [`MAX_GAP_TOLERANCE_SAMPLES`].
+  /// exceeds `MAX_GAP_TOLERANCE_SAMPLES` (one hour at 16 kHz).
   pub fn set_gap_tolerance_samples(&mut self, value: u64) {
     assert!(
       value <= MAX_GAP_TOLERANCE_SAMPLES,
@@ -278,7 +278,7 @@ impl TranscriberOptions {
   }
 
   /// Set [`Self::max_in_flight`]. Panics if `value` exceeds
-  /// [`MAX_IN_FLIGHT`].
+  /// `MAX_IN_FLIGHT` (4096).
   pub fn set_max_in_flight(&mut self, value: usize) {
     assert!(
       value <= MAX_IN_FLIGHT,
@@ -305,7 +305,7 @@ impl TranscriberOptions {
   // --- Builder-style (consuming) -------------------------------
 
   /// Builder-style override for [`Self::chunk_size`]. Panics
-  /// if `value` exceeds [`MAX_CHUNK_SIZE`] .
+  /// if `value` exceeds `MAX_CHUNK_SIZE` (600 s).
   pub fn with_chunk_size(mut self, value: Duration) -> Self {
     assert!(
       value <= MAX_CHUNK_SIZE,
@@ -316,7 +316,8 @@ impl TranscriberOptions {
   }
 
   /// Builder-style override for [`Self::buffer_cap_samples`].
-  /// Panics if `value` exceeds [`MAX_BUFFER_CAP_SAMPLES`].
+  /// Panics if `value` exceeds `MAX_BUFFER_CAP_SAMPLES` (one hour
+  /// at 16 kHz).
   pub fn with_buffer_cap_samples(mut self, value: usize) -> Self {
     assert!(
       value <= MAX_BUFFER_CAP_SAMPLES,
@@ -327,8 +328,8 @@ impl TranscriberOptions {
   }
 
   /// Builder-style override for [`Self::gap_tolerance_samples`].
-  /// Panics if `value` exceeds [`MAX_GAP_TOLERANCE_SAMPLES`]
-  /// ([high]).
+  /// Panics if `value` exceeds `MAX_GAP_TOLERANCE_SAMPLES` (one
+  /// hour at 16 kHz).
   pub fn with_gap_tolerance_samples(mut self, value: u64) -> Self {
     assert!(
       value <= MAX_GAP_TOLERANCE_SAMPLES,
@@ -345,8 +346,7 @@ impl TranscriberOptions {
   }
 
   /// Builder-style override for [`Self::max_in_flight`].
-  /// Panics if `value` exceeds [`MAX_IN_FLIGHT`] (Codex
-  /// [medium]).
+  /// Panics if `value` exceeds `MAX_IN_FLIGHT` (4096).
   pub fn with_max_in_flight(mut self, value: usize) -> Self {
     assert!(
       value <= MAX_IN_FLIGHT,
@@ -593,9 +593,9 @@ impl Transcriber {
   /// mapping the chunk's pre-restart sample indices through the
   /// post-restart PTS origin and emitting word ranges far
   /// outside the transcript's own range. The per-chunk form
-  /// snapshots the anchor pair at extract time (see
-  /// [`super::dispatch::ChunkRecord::output_tb`]) so the rebuilt
-  /// closure stays in the chunk's own epoch.
+  /// snapshots the anchor pair at extract time (the chunk
+  /// record's output timebase) so the rebuilt closure stays in the
+  /// chunk's own epoch.
   #[cfg(feature = "alignment")]
   pub fn chunk_samples_to_output_range_fn(
     &self,

@@ -130,7 +130,7 @@ fn load_error(err: AlignerCoreLoadError) -> EmissionsError {
 /// Holds everything `Aligner` holds except the `ort::Session` — the same
 /// tokenizer, the same normalizer, the same guards, the same validators,
 /// the same composition. Not a parallel implementation: literally the
-/// same [`AlignerCore`]. And, like the ORT path, it is cancellable
+/// same `AlignerCore`. And, like the ORT path, it is cancellable
 /// throughout: both [`prepare`](Self::prepare) and [`finish`](Self::finish)
 /// thread the caller's abort flag straight into that core, so a watchdog
 /// that fires mid-`prepare` stops it before the O(n) scan / mask /
@@ -301,7 +301,7 @@ impl EmissionsAligner {
   /// Steps 3-9. **Consumes `prepared`**, so a chunk cannot be finished
   /// twice.
   ///
-  /// Runs [`validate_stride_extent`] and [`validate_vocab_dim`] — neither
+  /// Runs the stride-extent and vocab-width checks — neither
   /// of which the emissions seam has ever run — then the pinned
   /// trellis → beam → merge_repeats → merge_words, then derives
   /// `samples_per_frame` ONCE and feeds it to both the speech-frame mask
