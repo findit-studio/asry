@@ -135,9 +135,8 @@ BREAKING
     `transcriber.complete(..)`; for a failure that is not one unit's own,
     `request.failed(failure)` and `complete`.
   - `Transcriber::handle_alignment` is gone: use `complete`, which returns
-    `Result<(), RefusedCompletion>`; `?` converts a refusal into its
-    `TranscriberError` or a `RunnerError`. `handle_failure` takes ASR
-    failures only, and refuses a chunk awaiting alignment as the new
+    `Result<(), RefusedCompletion>`. `handle_failure` takes ASR failures
+    only, and refuses a chunk awaiting alignment as the new
     `TranscriberError::AwaitsCompletion`.
   - Removed: `AlignmentResult`, `AlignmentTicket`,
     `AlignWorkItem::from_run_alignment` and
@@ -157,24 +156,53 @@ BREAKING
     `AlignmentError` and `AlignmentFailure` serialize too.
   - `TranscriberError` has the new variants `ForeignAlignment` and
     `AwaitsCompletion`; an exhaustive `match` needs an arm for each.
-- **A chunk's emissions are made through its preparation, and `finish`
-  pairs them with no other.** `EmissionsAligner::finish` took any prepared
-  chunk with any `&Emissions` of a matching shape, so two chunks of one
-  aligner could trade tensors, each chunk's tokens aligned to the other
-  chunk's audio. Each `prepare` now mints a preparation identity, which
-  its `PreparedChunk` carries. Emissions are made only through the chunk
-  whose encoder output they are (`prepared.emissions_from_log_probs(t, v,
-  data)`, `prepared.emissions_from_logits(t, v, raw)`,
-  `prepared.emissions_from_logits_slice(t, v, raw)`) and carry the same
-  identity. `finish` consumes them and refuses emissions made through
+- **No error path destroys the completion that answers an alignment
+  command.** A pool job whose OOV detection failed (a normalisation error)
+  held the only request its command could be answered with and offered no
+  way to answer it, so the chunk awaited alignment for good and held back
+  every chunk after it; and `?` on a `RefusedCompletion` converted it into
+  a `TranscriberError` or a `RunnerError`, dropping the completion. Now
+  `AlignWorkItem::failed(failure)` answers a job's command with a failure,
+  so a detection failure resolves the chunk to its `Event::Error`; the
+  lossy conversions are gone; `RunnerError::RefusedCompletion` carries a
+  refused completion whole, so `?` keeps it retrievable
+  (`into_completion`); and `RefusedCompletion::discard_completion` drops
+  it by name.
+
+  Migration:
+  - Pool: on `Err(failure)` from `AlignmentSet::detect_oov(&job)`, answer
+    with `job.failed(failure)` and `transcriber.complete(..)` in place of
+    propagating the error with `?`.
+  - `?` from `Transcriber::complete` into a `RunnerError` now gives
+    `RunnerError::RefusedCompletion(refused)`, not
+    `RunnerError::Transcriber(..)`; match the new variant, and take the
+    completion back with `refused.into_completion()`. Into a
+    `TranscriberError` there is no conversion: call
+    `refused.discard_completion()` where dropping it is meant.
+- **A chunk's encoder runs through its preparation, and `finish` pairs its
+  emissions with no other chunk.** `EmissionsAligner::finish` took any
+  prepared chunk with any `&Emissions` of a matching shape, so two chunks
+  of one aligner could trade tensors, each chunk's tokens aligned to the
+  other chunk's audio. Each `prepare` now mints a preparation identity,
+  which its `PreparedChunk` carries, and the chunk's encoder runs through
+  it: `prepared.encode_with(|input| model(input))` hands the encoder
+  exactly the chunk's prepared input and builds the chunk's `Emissions`
+  from the new `EncoderOutput` it returns (`LogProbs` or `Logits`, named by
+  the model's final op, with the same checks as before), so the emissions
+  carry the preparation's identity by construction and no emissions are
+  made from a free tensor. The encoder's own error type is kept (any `E`
+  an `EmissionsError` converts into). A trivial chunk's encoder is not
+  called. `finish` consumes the emissions and refuses ones made through
   another chunk as the new `EmissionsError::PreparationMismatch`, by name,
   before it reads a frame, trivial chunks included.
 
   Migration:
   - `Emissions::from_log_probs(t, v, data)` becomes
-    `prepared.emissions_from_log_probs(t, v, data)`, and likewise for
-    `from_logits` and `from_logits_slice`: the same checks, through the
-    chunk the encoder read.
+    `prepared.encode_with(|input| Ok(EncoderOutput::LogProbs { frames: t,
+    vocab: v, data }))`, with the model run on `input` inside the closure,
+    and likewise `from_logits` and `from_logits_slice` become
+    `EncoderOutput::Logits`. The closure's error type `E` needs
+    `From<EmissionsError>`.
   - `finish(prepared, &emissions, clock, abort)` becomes
     `finish(prepared, emissions, clock, abort)`.
 - **A Latin normalizer never splits a word at a mark inside it.**
@@ -185,13 +213,19 @@ BREAKING
   output lost the word as written. Now each is one word, its surface as
   written, and tokenization drops the mark where the vocabulary cannot
   spell it (`km/h` tokenizes as `K M H`, `two—three` as one word too). The
-  one segmentation rule left is the French and Italian clitic apostrophe
-  (`l'eau` → `l'` + `eau`). The surfaces (`original_words`) partition each
-  whitespace-bounded word, so joined in order they give back every word of
-  the text that holds a word to align.
+  one segmentation rule left splits a recognised French or Italian clitic
+  off the word it begins (`l'eau` → `l'` + `eau`), from a stated list per
+  language (French: `l' d' j' m' n' s' t' c' qu' jusqu' lorsqu' puisqu'
+  quoiqu'`; Italian: `l' un' dell' all' dall' nell' sull' coll' pell' d' c'
+  m' t' s' v' n' quell' quest' bell' sant'`). Every other apostrophe stays
+  inside its word: `aujourd'hui` and `rock'n'roll` were split at each
+  apostrophe and are one word each now. The surfaces (`original_words`)
+  partition each whitespace-bounded word, so joined in order they give
+  back every word of the text that holds a word to align.
 
   Migration: none in code. A consumer that counted the halves of a
-  hyphenated, slashed or dashed word as two words gets one word.
+  hyphenated, slashed or dashed word, or of a French or Italian word with
+  an apostrophe that is not a listed clitic, as two words gets one word.
 - **`EmissionsAlignerBuilder` states the word delimiter, the letter case and
   the receptive field instead of taking them from English wav2vec2 or the
   vocabulary.** The builder always used `|` as the word delimiter and
@@ -241,6 +275,15 @@ FIXED
   reach the delimiter's column. Both front ends and `AlignmentSet`
   detection follow the rule. A model with special tokens declares them in
   its tokenizer JSON as special added tokens.
+
+  A wildcard never takes a reserved column either. A wildcard (a character
+  the policy aligns though the vocabulary cannot spell it) scored the best
+  column but the blank, so where the unknown token's or the delimiter's
+  column led a frame, the wildcard took it. The trellis and the beam now
+  score a wildcard with the best column that is not reserved, through an
+  allowed-column mask (`ReservedIds::wildcard_columns`). The
+  `bench-internals` functions `get_trellis`, `backtrack_beam` and
+  `align_to_word_segments` take the mask.
 - **The unknown token is the one the tokenizer declares.** The reserved
   ids took the unknown token from its spelling: the first of `<unk>` and
   `[UNK]` the vocabulary held. A tokenizer declaring another
