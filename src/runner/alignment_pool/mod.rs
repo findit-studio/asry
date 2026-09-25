@@ -396,6 +396,21 @@ fn align_unit(
 ) -> Result<(UnitAlignment, UnitJob), WorkFailure> {
   let language = job.language().clone();
   let language = &language;
+  // The resolution and the job are the same unit's: both come from the
+  // request in unit order. Checked by name before any lookup.
+  if unit.unit() != job.unit() {
+    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+      AlignmentFailure::new(
+        format_smolstr!(
+          "the resolution of unit {:?} was offered to the job of unit {:?}; a unit's \
+ decisions apply to that unit alone",
+          unit.unit(),
+          job.unit(),
+        ),
+        language.clone(),
+      ),
+    )));
+  }
   let aligner = match set.lookup(language) {
     AlignmentLookup::Hit { aligner, .. } | AlignmentLookup::AnyFallback { aligner } => aligner,
     AlignmentLookup::Miss { fallback } => {
