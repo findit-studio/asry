@@ -35,7 +35,7 @@ use core::{
 use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
-  core::{OovDetection, OovResolution, UnalignedCause, UnitOutcome},
+  core::{OovDetection, OovResolution, UnalignedCause, UnitAlignment},
   runner::aligner::{
     algorithm::{
       compose::DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -343,11 +343,13 @@ impl EmissionsAligner {
   /// another chunk are refused by name before a frame is read, whatever
   /// their shape.
   ///
-  /// Returns the text's one [`UnitOutcome`]: its aligned words, or
+  /// Returns the text's one [`UnitAlignment`]: its aligned words, or
   /// `Unaligned` with the reason it has none (`NoAlignableText` for a
   /// trivial chunk, `NoSurvivingWords` when the speech gates kept no
-  /// word). To hand it to a `Transcriber`, wrap it with the ticket its
-  /// `Command::Alignment` carried: `AlignmentResult::whole(ticket, outcome)`.
+  /// word). To hand it to a `Transcriber`, answer the unit's slot with it
+  /// (`slot.answer(alignment)`, the slot taken from the command's
+  /// `AlignmentRequest`), then complete the request with its outcomes
+  /// (`request.aligned(outcomes)`, then `Transcriber::complete`).
   ///
   /// Runs the stride-extent and vocab-width checks — neither
   /// of which the emissions seam has ever run — then the pinned
@@ -379,7 +381,7 @@ impl EmissionsAligner {
     emissions: Emissions,
     clock: OutputClock,
     abort_flag: &AtomicBool,
-  ) -> Result<UnitOutcome, EmissionsError> {
+  ) -> Result<UnitAlignment, EmissionsError> {
     // ——— The chunk must be OURS ———
     //
     // Ahead of everything else, including the trivial short-circuit: a
@@ -427,7 +429,7 @@ impl EmissionsAligner {
     // validate the emissions against. Short-circuit exactly as the ORT
     // path does.
     if prepared.is_trivial() {
-      return Ok(UnitOutcome::Unaligned(UnalignedCause::NoAlignableText));
+      return Ok(UnitAlignment::Unaligned(UnalignedCause::NoAlignableText));
     }
 
     // ——— The two checks the seam has NEVER run ———

@@ -51,9 +51,9 @@ pub use types::{
 };
 
 pub use core::{
-  AlignedWords, AlignmentReport, AlignmentResult, AlignmentTicket, AlignmentUnit, AsrParams,
+  AlignedWords, AlignmentCompletion, AlignmentReport, AlignmentRequest, AlignmentUnit, AsrParams,
   AsrParamsOverride, AsrResult, Command, Event, LanguagePolicy, SamplingStrategy, Transcriber,
-  TranscriberOptions, UnalignedCause, UnitOutcome,
+  TranscriberOptions, UnaccountedOutcomes, UnalignedCause, UnitAlignment, UnitOutcome, UnitSlot,
 };
 
 // Reachable under `runner` (whisper.cpp ASR) OR `emissions` (the
@@ -155,7 +155,7 @@ pub use ort;
 pub mod emissions {
   pub use crate::{
     core::{
-      AlignedWords, AlignmentReport, AlignmentUnit, UnalignedCause, UnitOutcome,
+      AlignedWords, AlignmentReport, AlignmentUnit, UnalignedCause, UnitAlignment,
       oov::{
         OovDecision, OovDetection, OovEvent, OovKind, OovResolution, ResolvedOov,
         default_oov_policy, fail_closed_all_policy, wildcard_all_policy,

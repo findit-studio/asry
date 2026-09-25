@@ -672,7 +672,7 @@ fn finish_refuses_emissions_made_through_another_chunk() {
     .expect("well-formed");
   assert!(matches!(
     a.finish(first, own, clock(), &AtomicBool::new(false)),
-    Ok(UnitOutcome::Aligned(_))
+    Ok(UnitAlignment::Aligned(_))
   ));
 }
 
@@ -987,7 +987,7 @@ fn base960h(json: &str, normalizer: Option<DynTextNormalizer>) -> EmissionsAlign
 
 /// `text`'s one outcome on `a`, through `prepare` and `finish`, from
 /// uniform emissions over 16 000 samples.
-fn align_uniformly(a: &EmissionsAligner, text: &str, resolution: OovResolution) -> UnitOutcome {
+fn align_uniformly(a: &EmissionsAligner, text: &str, resolution: OovResolution) -> UnitAlignment {
   let prepared = a
     .prepare(
       &vec![0.2_f32; 16_000],
@@ -1007,7 +1007,7 @@ fn align_uniformly(a: &EmissionsAligner, text: &str, resolution: OovResolution) 
 }
 
 /// The texts of `outcome`'s words.
-fn word_texts(outcome: &UnitOutcome) -> Vec<&str> {
+fn word_texts(outcome: &UnitAlignment) -> Vec<&str> {
   outcome
     .words()
     .iter()
@@ -1539,7 +1539,7 @@ fn a_punctuation_only_text_is_named_no_alignable_text() {
     assert!(
       matches!(
         result,
-        UnitOutcome::Unaligned(UnalignedCause::NoAlignableText)
+        UnitAlignment::Unaligned(UnalignedCause::NoAlignableText)
       ),
       "{text:?}: {result:?}"
     );
@@ -1577,7 +1577,7 @@ fn a_fully_masked_text_is_named_no_surviving_words() {
   assert!(
     matches!(
       result,
-      UnitOutcome::Unaligned(UnalignedCause::NoSurvivingWords)
+      UnitAlignment::Unaligned(UnalignedCause::NoSurvivingWords)
     ),
     "{result:?}"
   );
@@ -1785,7 +1785,7 @@ fn the_frame_count_is_checked_against_the_declared_front_end() {
 
   for (field, stride, t) in [(640, 160, 97), (400, 320, 49)] {
     match finish(field, stride, t) {
-      Ok(UnitOutcome::Aligned(words)) => assert_eq!(
+      Ok(UnitAlignment::Aligned(words)) => assert_eq!(
         words
           .words()
           .iter()

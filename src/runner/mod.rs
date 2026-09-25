@@ -16,8 +16,8 @@
 //! - [`crate::core::Transcriber`] — the existing Sans-I/O
 //!   state machine; pull commands via `poll_command()`,
 //!   dispatch them inline, push results back via
-//!   `handle_asr` / `handle_alignment` /
-//!   `handle_failure`.
+//!   `handle_asr` / `handle_failure` for ASR, and `complete` for
+//!   alignment.
 //!
 //! Sync users (CLI tools, batch indexers) drive the pump on
 //! one thread. The full ASR + alignment loop, using
@@ -54,21 +54,13 @@
 //!       ))?;
 //!       transcriber.handle_asr(chunk_id, result)?;
 //!     }
-//!     Command::Alignment { chunk_id, samples, sub_segments: _,
-//!                              text, language, runs, ticket } => {
-//!       // `AlignWorkItem::from_run_alignment` flips the
-//!       // command's output-timebase `sub_segments` into
-//!       // chunk-local 1/16000 (the form `Aligner::align`
-//!       // requires) and pulls the chunk anchor + bridge from
-//!       // `Transcriber`. Returns `None` only if the chunk
-//!       // already drained — recoverable.
-//!       // The job carries the command's ticket: the result is
-//!       // built with it, and the transcriber accepts no result
-//!       // built with another.
-//!       let job = AlignWorkItem::from_run_alignment(
-//!         &transcriber, ticket, samples, text, language,
-//!         runs, abort_flag.clone(),
-//!       ).expect("chunk in flight");
+//!     Command::Alignment(request) => {
+//!       // The job is built from the request alone: its payload,
+//!       // its ticket and unit slots, and the chunk's place in the
+//!       // stream. `AlignWorkItem::new` flips the sub-segments
+//!       // into chunk-local 1/16000 (the form `Aligner::align`
+//!       // requires) and builds the output-time bridge.
+//!       let job = AlignWorkItem::new(request, abort_flag.clone());
 //!       // Sans-I/O OOV resolution: detect every unit of THIS
 //!       // job (its whole text, or each run), then decide. The
 //!       // resolution is bound to this job and this set, and
@@ -79,8 +71,11 @@
 //!       // Fresh `RunOptions` per chunk so a watchdog's
 //!       // `terminate()` for chunk N does not poison chunk N+1.
 //!       let run_options = RunOptions::new().unwrap();
-//!       let aligned = run_one_alignment(&alignment_set, job, resolution, &run_options)?;
-//!       transcriber.handle_alignment(chunk_id, aligned)?;
+//!       // Success or failure, the job answers through its request:
+//!       // the completion carries the command's ticket, and the
+//!       // transcriber takes no other.
+//!       let completion = run_one_alignment(&alignment_set, job, resolution, &run_options);
+//!       transcriber.complete(completion)?;
 //!     }
 //!   }
 //! }

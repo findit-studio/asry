@@ -8,7 +8,7 @@ use ort::session::{RunOptions, Session};
 use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
-  core::{UnalignedCause, UnitOutcome},
+  core::{UnalignedCause, UnitAlignment},
   runner::{
     RunnerError,
     aligner::{
@@ -412,7 +412,7 @@ impl Aligner {
     text: &str,
     chunk_first_sample_in_stream: u64,
     samples_to_output_range: F,
-  ) -> Result<UnitOutcome, WorkFailure>
+  ) -> Result<UnitAlignment, WorkFailure>
   where
     F: Fn(u64, u64) -> TimeRange,
   {
@@ -486,7 +486,7 @@ impl Aligner {
     // The caller's decisions for `text`: this aligner's
     // `detect_oov(text)`, decided. Consumed, so it applies once.
     resolution: crate::core::OovResolution,
-  ) -> Result<UnitOutcome, WorkFailure>
+  ) -> Result<UnitAlignment, WorkFailure>
   where
     F: Fn(u64, u64) -> TimeRange,
   {
@@ -565,7 +565,7 @@ impl Aligner {
     // run). Validating against the fallback aligner's `Lang` instead
     // would reject every correct `AnyFallback` payload.
     expected_decision_language: &Lang,
-  ) -> Result<UnitOutcome, WorkFailure>
+  ) -> Result<UnitAlignment, WorkFailure>
   where
     F: Fn(u64, u64) -> TimeRange,
   {
@@ -591,7 +591,7 @@ impl Aligner {
     // `words: []` rather than an `Event::Error` — alignment is
     // optional, not a data-loss path.
     if prepared.is_trivial() {
-      return Ok(UnitOutcome::Unaligned(UnalignedCause::NoAlignableText));
+      return Ok(UnitAlignment::Unaligned(UnalignedCause::NoAlignableText));
     }
 
     // Steps 3-4: the ONE hole in the sandwich. `encoder_input()` is
@@ -885,7 +885,7 @@ mod tests {
     assert!(
       matches!(
         result,
-        UnitOutcome::Unaligned(UnalignedCause::NoAlignableText)
+        UnitAlignment::Unaligned(UnalignedCause::NoAlignableText)
       ),
       "empty normalisation must yield no words, saying why; got {result:?}"
     );
@@ -1080,7 +1080,7 @@ mod tests {
     assert!(
       matches!(
         result,
-        UnitOutcome::Unaligned(UnalignedCause::NoAlignableText)
+        UnitAlignment::Unaligned(UnalignedCause::NoAlignableText)
       ),
       "{result:?}"
     );
@@ -1143,7 +1143,7 @@ mod tests {
     assert!(
       matches!(
         result,
-        UnitOutcome::Unaligned(UnalignedCause::NoAlignableText)
+        UnitAlignment::Unaligned(UnalignedCause::NoAlignableText)
       ),
       "{result:?}"
     );
@@ -1213,7 +1213,7 @@ mod tests {
     assert!(
       matches!(
         result,
-        UnitOutcome::Unaligned(UnalignedCause::NoAlignableText)
+        UnitAlignment::Unaligned(UnalignedCause::NoAlignableText)
       ),
       "{result:?}"
     );
@@ -1283,7 +1283,7 @@ mod tests {
     assert!(
       matches!(
         result,
-        UnitOutcome::Unaligned(UnalignedCause::NoAlignableText)
+        UnitAlignment::Unaligned(UnalignedCause::NoAlignableText)
       ),
       "{lang:?} aligner empty-text must yield no words, saying why; got {result:?}"
     );

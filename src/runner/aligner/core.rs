@@ -39,7 +39,7 @@ use smol_str::{SmolStr, format_smolstr};
 use tokenizers::Tokenizer;
 
 use crate::{
-  core::{UnalignedCause, UnitOutcome},
+  core::{UnalignedCause, UnitAlignment},
   runner::aligner::{
     algorithm::{
       compose::{build_speech_frames, compose_words, effective_samples_per_frame},
@@ -1226,7 +1226,7 @@ impl AlignerCore {
     chunk_first_sample_in_stream: u64,
     samples_to_output_range: F,
     abort_flag: &AtomicBool,
-  ) -> Result<UnitOutcome, WorkFailure>
+  ) -> Result<UnitAlignment, WorkFailure>
   where
     F: Fn(u64, u64) -> TimeRange,
   {
@@ -1264,7 +1264,7 @@ impl AlignerCore {
     let Some(prepared) = prepared.inner else {
       // Trivial chunk: `prepare` short-circuited (empty normalised
       // text or zero alignable tokens). No encoder output to consume.
-      return Ok(UnitOutcome::Unaligned(UnalignedCause::NoAlignableText));
+      return Ok(UnitAlignment::Unaligned(UnalignedCause::NoAlignableText));
     };
     let tokenized = &prepared.tokenized;
 
@@ -1456,7 +1456,7 @@ impl AlignerCore {
       self.min_speech_coverage,
       self.max_intra_silent_run,
     );
-    Ok(UnitOutcome::from_words(composed))
+    Ok(UnitAlignment::from_words(composed))
   }
 }
 

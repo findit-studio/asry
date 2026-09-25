@@ -32,8 +32,8 @@ use ort::session::RunOptions;
 use crate::{
   align::{Run, script_dispatch::runs_reproduce_text},
   core::{
-    AlignmentResult, AlignmentTicket, OovDecision, OovResolution, ResolvedOov, UnalignedCause,
-    UnitOutcome,
+    AlignmentCompletion, AlignmentRequest, OovDecision, OovResolution, ResolvedOov, UnalignedCause,
+    UnitAlignment, UnitOutcome, UnitSlot,
   },
   runner::aligner::{Aligner, AlignmentFallback, AlignmentLookup, AlignmentSet},
   types::{
@@ -47,72 +47,37 @@ mod job;
 pub(crate) use job::JobId;
 pub use job::{JobDetection, JobResolution};
 
-/// One unit of alignment work — the bundle of caller inputs
-/// the per-chunk dispatcher consumes.
+/// One unit of alignment work: an [`AlignmentRequest`] and what the pool
+/// needs to run it, built from the request alone.
 ///
-/// bumped from `pub(super)`
-/// to `pub` so external Sans-I/O drivers can construct one
-/// from a [`crate::core::Command::Alignment`] and feed it
-/// to [`run_one_alignment`]. Field shape mirrors what the
-/// dispatcher needs end-to-end:
+/// [`AlignWorkItem::new`] takes the request by value, as it came out of
+/// [`crate::core::Command::Alignment`], with the caller-owned abort flag.
+/// Everything else is the request's: its payload (samples, text, language,
+/// runs), its ticket and unit slots, and the chunk's place in the stream
+/// the transcriber recorded with it. The coordinate flip of the
+/// sub-segments to chunk-local 1/16000 and the output-time bridge are made
+/// here, from the request, so no field of another command can join it.
 ///
-/// - `samples`, `sub_segments`, `text`, `language`, `runs`
-/// come straight from `Alignment`. `sub_segments` must
-/// be in chunk-local 1/16000 timebase
-/// ([`crate::core::Transcriber::chunk_sub_segments_samples`]
-/// exposes the right form, offset by
-/// [`crate::core::Transcriber::chunk_first_sample`]).
-/// - `chunk_first_sample_in_stream` from
-/// [`crate::core::Transcriber::chunk_first_sample`].
-/// - `samples_to_output_range` from
-/// [`crate::core::Transcriber::chunk_samples_to_output_range_fn`].
-/// - `abort_flag` is caller-owned; flipping it from any
-/// thread cancels the in-flight alignment at the next
-/// pipeline boundary (silence mask, normalise, encode,
-/// trellis, compose).
+/// - `abort_flag` is caller-owned; flipping it from any thread cancels the
+///   in-flight alignment at the next pipeline boundary (silence mask,
+///   normalise, encode, trellis, compose).
 ///
-/// **Cancellation contract.** This struct owns the abort
-/// flag but **not** ORT termination — `Aligner::align`
-/// reuses a per-call `RunOptions` constructed internally
-/// inside [`run_one_alignment`]. Setting `abort_flag` true
-/// surfaces at the next pipeline boundary; mid-ORT
-/// cancellation (interrupting `Session::run_with_options`)
-/// requires the caller to construct their own `RunOptions`
-/// and call [`crate::Aligner::align_chunk_with_abort`]
-/// directly instead of routing through `run_one_alignment`.
-/// removed the
-/// `align_timeout` field — the dispatcher never enforced it
-/// (no internal watchdog), and keeping it as
-/// "informational telemetry" misled callers into thinking a
-/// timeout would fire.
+/// **Cancellation contract.** This struct owns the abort flag but **not**
+/// ORT termination — [`run_one_alignment`] takes the caller's `RunOptions`,
+/// so a runtime-owned watchdog can call `run_options.terminate()` to unwind
+/// in-flight inference.
 pub struct AlignWorkItem {
   /// This work item's own identity, minted when it is built: what the
   /// job's OOV detection is bound to.
   id: JobId,
-  /// The capability of the `Command::Alignment` this job answers, which
-  /// names its chunk: the job's result is built with it.
-  ticket: AlignmentTicket,
-  /// Chunk audio (16 kHz f32 mono); shared via `Arc` with the
-  /// core.
-  samples: Arc<[f32]>,
+  /// The command this job answers: its payload, ticket and unit slots.
+  request: AlignmentRequest,
   /// Sub-VAD-segments inside the chunk, in chunk-local 16 kHz
   /// sample-index space (encoded as TimeRanges with timebase
-  /// 1/16000 so `start_pts() == start_sample`). The runner
-  /// converts from output-timebase before enqueueing.
+  /// 1/16000 so `start_pts() == start_sample`).
   sub_segments: Vec<TimeRange>,
-  /// Whisper's transcribed text for this chunk.
-  text: SmolStr,
-  /// Detected language for this chunk.
-  language: Lang,
-  /// Script-dispatcher per-language runs over the transcript,
-  /// computed by the whisper worker just after `state.full(...)`.
-  /// Empty when the dispatcher was not run (no segments, or a
-  /// caller injecting `AsrResult` directly without populating
-  /// `AsrResult::runs`); the worker then falls back to a single
-  /// whole-chunk alignment keyed on [`Self::language`].
-  runs: Vec<Run>,
   /// Watchdog flag. The worker checks this between pipeline
-  /// stages; if true, it returns
+  /// stages; if true, it answers the request with
   /// [`WorkFailure::WorkerHang`] without continuing.
   abort_flag: Arc<AtomicBool>,
   /// Chunk's first 16 kHz sample index in stream coordinates.
@@ -121,78 +86,28 @@ pub struct AlignWorkItem {
   /// output-timebase via the `samples_to_output_range` closure.
   chunk_first_sample_in_stream: u64,
   /// Bridge from stream sample indices to output-timebase
-  /// `TimeRange`s. Pre-bound by the runner to the core's
-  /// `SampleBuffer::samples_to_output_range`.
+  /// `TimeRange`s, in the chunk's own epoch.
   samples_to_output_range: Arc<dyn Fn(u64, u64) -> TimeRange + Send + Sync>,
 }
 
 impl AlignWorkItem {
-  /// Construct an `AlignWorkItem` from a
-  /// [`crate::core::Command::Alignment`] payload + the
-  /// `Transcriber` chunk-metadata accessors. Handles the
-  /// **coordinate-space flip** from output-timebase
-  /// `sub_segments` to chunk-local 1/16000 the aligner needs;
-  /// flagged the previous
-  /// hand-rolled conversion as a footgun (callers who forwarded
-  /// `command.sub_segments` straight to `AlignWorkItem`'s
-  /// field would hit a hard error from `clip_sub_segments`).
-  ///
-  /// Returns `None` if the chunk identity is no longer in
-  /// flight on `transcriber` (already drained / failed) — this
-  /// is the only failure mode; pass it back as a recoverable
-  /// `Backpressure` from the caller's pump if needed.
-  ///
-  /// Inputs map 1:1 to the `Alignment` variant's fields plus
-  /// the caller-owned `abort_flag`. `ticket` is the command's own: the
-  /// job's [`AlignmentResult`] is built with it, and it names the chunk.
+  /// The pool job of `request`, built from the request alone.
   ///
   /// Each work item has an identity of its own. Detect its OOV
   /// characters with [`AlignmentSet::detect_oov(&job)`](AlignmentSet::detect_oov),
   /// decide the [`JobDetection`], and hand the [`JobResolution`] to
   /// [`run_one_alignment`] with this job: the resolution is bound to this
   /// work item, not merely to its chunk id or text.
-  #[allow(
-    clippy::too_many_arguments,
-    reason = "mirrors `Command::Alignment` fields + caller-owned abort_flag; \
- destructured-pattern callers naturally line them up positionally"
-  )]
-  pub fn from_run_alignment(
-    transcriber: &crate::core::Transcriber,
-    ticket: AlignmentTicket,
-    samples: Arc<[f32]>,
-    text: SmolStr,
-    language: Lang,
-    runs: Vec<Run>,
-    abort_flag: Arc<AtomicBool>,
-  ) -> Option<Self> {
-    use core::num::NonZeroI32;
-    let chunk_id = ticket.chunk_id();
-    let chunk_first = transcriber.chunk_first_sample(chunk_id)?;
-    let raw_subs = transcriber.chunk_sub_segments_samples(chunk_id)?;
-    let bridge = transcriber.chunk_samples_to_output_range_fn(chunk_id)?;
-    let tb_16k = mediatime::Timebase::new(1, NonZeroI32::new(16_000).unwrap());
-    let aligner_subs: Vec<TimeRange> = raw_subs
-      .iter()
-      .map(|(s, e)| {
-        TimeRange::new(
-          (*s as i64) - (chunk_first as i64),
-          (*e as i64) - (chunk_first as i64),
-          tb_16k,
-        )
-      })
-      .collect();
-    Some(Self {
+  #[must_use]
+  pub fn new(request: AlignmentRequest, abort_flag: Arc<AtomicBool>) -> Self {
+    Self {
       id: JobId::next(),
-      ticket,
-      samples,
-      sub_segments: aligner_subs,
-      text,
-      language,
-      runs,
+      sub_segments: request.chunk_local_sub_segments(),
       abort_flag,
-      chunk_first_sample_in_stream: chunk_first,
-      samples_to_output_range: bridge,
-    })
+      chunk_first_sample_in_stream: request.chunk_first_sample(),
+      samples_to_output_range: request.samples_to_output_range(),
+      request,
+    }
   }
 
   /// This work item's own identity.
@@ -203,13 +118,13 @@ impl AlignWorkItem {
   /// Identity of the chunk this alignment fulfils.
   #[must_use]
   pub const fn chunk_id(&self) -> ChunkId {
-    self.ticket.chunk_id()
+    self.request.chunk_id()
   }
 
   /// Chunk audio (16 kHz f32 mono).
   #[must_use]
-  pub fn samples(&self) -> &Arc<[f32]> {
-    &self.samples
+  pub const fn samples(&self) -> &Arc<[f32]> {
+    self.request.samples()
   }
 
   /// Sub-VAD-segments inside the chunk, in chunk-local 16 kHz
@@ -221,20 +136,20 @@ impl AlignWorkItem {
 
   /// Whisper's transcribed text for this chunk.
   #[must_use]
-  pub fn text(&self) -> &SmolStr {
-    &self.text
+  pub const fn text(&self) -> &SmolStr {
+    self.request.text()
   }
 
   /// Detected language for this chunk.
   #[must_use]
   pub const fn language(&self) -> &Lang {
-    &self.language
+    self.request.language()
   }
 
   /// Script-dispatcher per-language runs over the transcript.
   #[must_use]
   pub fn runs(&self) -> &[Run] {
-    &self.runs
+    self.request.runs()
   }
 
   /// Watchdog flag the worker checks between pipeline stages.
@@ -257,88 +172,78 @@ impl AlignWorkItem {
   }
 }
 
-// Worker-emitted alignment result. Crate-private.
-
-// Returned by [`AlignmentPool::shutdown`] when one or more
-// workers failed to wind down within the supplied timeout.
-// `count` is the number of detached threads; each holds an
-// `Aligner` (ONNX session + model memory) until its in-flight
-// inference returns naturally.
-
-/// Drive one alignment from start to finish.
+/// Drive one [`AlignWorkItem`] to its completion against the supplied
+/// [`AlignmentSet`].
 ///
-/// Looks up the language's aligner (or falls back to `Any` /
-/// fallback policy), runs `Aligner::align` under the lock, and
-/// returns the per-chunk result.
+/// Looks up each unit's aligner (the language's, else `Any`, else the
+/// set's fallback policy) and runs `Aligner::align` under its lock. If a
+/// registered aligner fails, that failure stands: `Any` is consulted only
+/// on a registry miss.
 ///
-/// Strictness contract: if the registered Lang(L) aligner returns
-/// `WorkFailure::AlignmentFailed`, that failure is returned as-is
-/// — `Any` is *not* consulted. The worker only consults `Any` on
-/// registry miss.
-/// Drive one chunk's alignment to completion. Sync; the
-/// caller owns thread management and cancellation via
-/// `job.abort_flag`. The aligner polls `abort_flag` at coarse
-/// pipeline boundaries (silence mask, normalise, encode,
-/// trellis, compose) and bails with
-/// [`WorkFailure::WorkerHang`] when the flag flips.
-/// True ORT mid-inference cancellation requires the caller to
-/// hold a `RunOptions` handle and call `terminate()` from
-/// another thread; had this wired via
-/// an internal watchdog thread, but the round-1.0 Sans-I/O
-/// pivot moved threading out of asry — callers who need
-/// it construct their own watchdog around `Aligner::align`.
-/// Drive one [`AlignWorkItem`] end-to-end against the
-/// supplied [`AlignmentSet`]. Caller passes the
-/// [`RunOptions`] handle so a runtime-owned watchdog (or any
-/// external thread) can call `run_options.terminate()` to
-/// unwind in-flight ORT inference; the aligner additionally
-/// polls `job.abort_flag` between pipeline stages.
-///
-/// made the helper public.
-/// hoisted `RunOptions` out of the
-/// internal scope so callers can actually cancel mid-ONNX. A
-/// single shared `RunOptions` is used across every run in a
-/// multi-run chunk — calling `terminate()` cancels whichever
-/// run is currently in `Session::run_with_options`, and the
-/// post-call `abort_flag` check stops dispatching the
-/// remaining peer runs.
+/// Sync; the caller owns threads and cancellation. The aligner polls
+/// `job.abort_flag` at coarse pipeline boundaries (silence mask, normalise,
+/// encode, trellis, compose) and between runs. The caller's `run_options`
+/// lets a runtime-owned watchdog call `terminate()` to unwind in-flight ORT
+/// inference; one `RunOptions` serves every run of a multi-run chunk.
 ///
 /// `resolution` is [`AlignmentSet::detect_oov(job)`](AlignmentSet::detect_oov)
-/// decided. It is refused as
+/// decided. Unless it was detected for this very work item (its `ChunkId`
+/// with it) through this very set, it is refused as
 /// [`AlignmentError::Tokenization`] before any aligner lookup or
-/// tokenization unless it was detected for this very work item (its
-/// `ChunkId` with it) through this very set, and it is consumed, so it
-/// applies once.
+/// tokenization, and it is consumed, so it applies once.
 ///
-/// `job` is consumed too: the result is built with the ticket of the
-/// command the job answers, so a job yields at most one result.
+/// `job` is consumed too, and it answers its request either way: each
+/// unit's outcome, made from the request's own slot for it
+/// ([`AlignmentRequest::aligned`]), or a failure that is not one unit's own
+/// ([`AlignmentRequest::failed`]): a backend or configuration fault, an
+/// abort, a refused resolution, or a registry miss under
+/// `AlignmentFallback::Error`. Hand the [`AlignmentCompletion`] to
+/// [`Transcriber::complete`](crate::core::Transcriber::complete).
 pub fn run_one_alignment(
   set: &AlignmentSet,
   job: AlignWorkItem,
   resolution: JobResolution,
   run_options: &RunOptions,
-) -> Result<AlignmentResult, WorkFailure> {
-  let outcomes = align_job(set, &job, resolution, run_options)?;
-  Ok(match outcomes {
-    JobOutcomes::Whole(outcome) => AlignmentResult::whole(job.ticket, outcome),
-    JobOutcomes::Runs(outcomes) => AlignmentResult::runs(job.ticket, outcomes),
+) -> AlignmentCompletion {
+  answer_job(job, |job, slots| {
+    align_job(set, job, slots, resolution, run_options)
   })
 }
 
-/// The outcomes of one job's alignment units: its whole text's, or each
-/// run's, in run order.
-enum JobOutcomes {
-  Whole(UnitOutcome),
-  Runs(Vec<UnitOutcome>),
+/// Answer `job`'s request with what `align` makes of its unit slots: the
+/// outcomes, each made from its unit's slot, or a failure. Either way the
+/// completion is built by the job's own request.
+fn answer_job(
+  mut job: AlignWorkItem,
+  align: impl FnOnce(&AlignWorkItem, Vec<UnitSlot>) -> Result<Vec<UnitOutcome>, WorkFailure>,
+) -> AlignmentCompletion {
+  let slots = job.request.take_slots();
+  let answered = align(&job, slots);
+  let AlignWorkItem { request, .. } = job;
+  match answered {
+    Ok(outcomes) => request.aligned(outcomes).unwrap_or_else(|refused| {
+      // Unreachable: the job answers each slot of its request, in order,
+      // with that unit's outcome. A refusal still answers the command.
+      let message = format_smolstr!("{refused}");
+      let (request, _) = refused.into_parts();
+      let language = request.language().clone();
+      request.failed(WorkFailure::Alignment(AlignmentError::Tokenization(
+        AlignmentFailure::new(message, language),
+      )))
+    }),
+    Err(failure) => request.failed(failure),
+  }
 }
 
-/// [`run_one_alignment`]'s work, up to the result it builds.
+/// [`run_one_alignment`]'s work, up to the outcomes it answers the
+/// request with: one per unit, each made from that unit's slot, in order.
 fn align_job(
   set: &AlignmentSet,
   job: &AlignWorkItem,
+  slots: Vec<UnitSlot>,
   resolution: JobResolution,
   run_options: &RunOptions,
-) -> Result<JobOutcomes, WorkFailure> {
+) -> Result<Vec<UnitOutcome>, WorkFailure> {
   let started_at = Instant::now();
 
   // pre-entry abort gate. The
@@ -359,7 +264,7 @@ fn align_job(
   // they must be the text. `Command::Alignment` only ever carries
   // runs that reproduce its text, so this refuses a hand-built work
   // item.
-  validate_runs_reproduce_text(&job.runs, &job.text, &job.language)?;
+  validate_runs_reproduce_text(job.runs(), job.text(), job.language())?;
 
   // The resolution must have been detected for this very work item,
   // through this very set: checked before any lookup or tokenization, so
@@ -367,6 +272,20 @@ fn align_job(
   // and run layout) or through another registry never reaches a unit. It
   // is consumed here, so it applies once.
   let units = resolution.into_units_for(job, set.id())?;
+  // One slot per unit, as the request minted them: taken once, here.
+  if slots.len() != units.len() {
+    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+      AlignmentFailure::new(
+        format_smolstr!(
+          "the job's request holds {} unit slots for {} units; each unit is answered from its \
+ own slot, once",
+          slots.len(),
+          units.len(),
+        ),
+        job.language().clone(),
+      ),
+    )));
+  }
 
   // do NOT clear caller-armed
   // termination. Round 22 unconditionally called
@@ -393,23 +312,24 @@ fn align_job(
   // outcome, so the dispatch emits `Transcript { text, words: [] }`
   // instead of `Event::Error`. `WorkerHangTimeout`, configuration
   // failures and `AlignmentFallback::Error` stay fatal.
-  let outcome = if job.runs.is_empty() {
-    // `into_units_for` returned exactly the job's one unit.
-    let unit = units
-      .into_iter()
-      .next()
-      .expect("a job without runs has exactly one unit");
-    align_unit(set, &job.language, &unit, |aligner, decisions| {
+  let outcome = if job.runs().is_empty() {
+    // `into_units_for` returned exactly the job's one unit, and the request
+    // minted exactly its one slot.
+    let mut pairs = units.iter().zip(slots);
+    let Some((unit, slot)) = pairs.next() else {
+      return Ok(Vec::new());
+    };
+    align_unit(set, job.language(), unit, |aligner, decisions| {
       run_under_lock(aligner, job, run_options, &job.abort_flag, decisions)
     })
-    .map(|outcome| {
-      if let UnitOutcome::Unaligned(cause) = &outcome {
-        log_unaligned(job.chunk_id(), None, &job.language, cause);
+    .map(|alignment| {
+      if let UnitAlignment::Unaligned(cause) = &alignment {
+        log_unaligned(job.chunk_id(), None, job.language(), cause);
       }
-      JobOutcomes::Whole(outcome)
+      vec![slot.answer(alignment)]
     })
   } else {
-    dispatch_runs(set, job, units, run_options).map(JobOutcomes::Runs)
+    dispatch_runs(set, job, units, slots, run_options)
   };
 
   match outcome {
@@ -440,12 +360,12 @@ fn align_unit(
   set: &AlignmentSet,
   language: &Lang,
   unit: &OovResolution,
-  align: impl FnOnce(&mut Aligner, &[ResolvedOov]) -> Result<UnitOutcome, WorkFailure>,
-) -> Result<UnitOutcome, WorkFailure> {
+  align: impl FnOnce(&mut Aligner, &[ResolvedOov]) -> Result<UnitAlignment, WorkFailure>,
+) -> Result<UnitAlignment, WorkFailure> {
   let aligner = match set.lookup(language) {
     AlignmentLookup::Hit { aligner, .. } | AlignmentLookup::AnyFallback { aligner } => aligner,
     AlignmentLookup::Miss { fallback } => {
-      return resolve_not_inspected(unit, fallback, language).map(UnitOutcome::Unaligned);
+      return resolve_not_inspected(unit, fallback, language).map(UnitAlignment::Unaligned);
     }
   };
   // A prior alignment that panicked while holding the lock left it
@@ -470,7 +390,7 @@ fn align_unit(
   match align(&mut guard, decisions) {
     Ok(outcome) => Ok(outcome),
     Err(WorkFailure::Alignment(err)) if alignment_error_is_recoverable(&err) => {
-      Ok(UnitOutcome::Unaligned(UnalignedCause::Failed(err)))
+      Ok(UnitAlignment::Unaligned(UnalignedCause::Failed(err)))
     }
     Err(failure) => Err(failure),
   }
@@ -632,23 +552,23 @@ fn run_under_lock(
   run_options: &RunOptions,
   abort_flag: &AtomicBool,
   decisions: &[ResolvedOov],
-) -> Result<UnitOutcome, WorkFailure> {
+) -> Result<UnitAlignment, WorkFailure> {
   let bound = job.samples_to_output_range.clone();
   // The key is the REQUESTED language, not `aligner.language()`: a
   // registry miss may have landed this chunk on the multilingual
   // `AlignerKey::Any` aligner, whose own `Lang` is a registry detail. The
-  // unit's events carry `job.language`, as detection relabelled them, and
-  // the core re-checks that key where BOTH front ends run it.
+  // unit's events carry the job's language, as detection relabelled them,
+  // and the core re-checks that key where BOTH front ends run it.
   aligner.align(
-    &job.samples,
+    job.samples(),
     &job.sub_segments,
-    job.text.as_str(),
+    job.text().as_str(),
     job.chunk_first_sample_in_stream,
     move |a, b| (bound)(a, b),
     abort_flag,
     run_options,
     decisions,
-    &job.language,
+    job.language(),
   )
 }
 
@@ -738,7 +658,7 @@ impl BoundsSourceCounters {
 /// [`OovKind::NotInspected`](crate::core::OovKind::NotInspected) event
 /// refuses it, or hands it to the fallback, which skips it
 /// (`SkipChunk`) or fails the job (`Error`). The result names a refused
-/// or skipped run as its [`UnitOutcome::Unaligned`] outcome, and a run whose
+/// or skipped run as its [`UnitAlignment::Unaligned`] outcome, and a run whose
 /// alignment fails recoverably too.
 ///
 /// **Telemetry.** Logs one `script_dispatch chunk=...` line per
@@ -765,14 +685,18 @@ fn dispatch_runs(
   set: &AlignmentSet,
   job: &AlignWorkItem,
   resolutions: Vec<OovResolution>,
+  slots: Vec<UnitSlot>,
   run_options: &RunOptions,
 ) -> Result<Vec<UnitOutcome>, WorkFailure> {
   let mut counters = BoundsSourceCounters::default();
-  let mut outcomes: Vec<UnitOutcome> = Vec::with_capacity(job.runs.len());
+  let mut outcomes: Vec<UnitOutcome> = Vec::with_capacity(job.runs().len());
   let dispatch_started_at = Instant::now();
 
-  // `into_units_for` returned one resolution per run, in run order.
-  for ((run_idx, run), resolution) in job.runs.iter().enumerate().zip(&resolutions) {
+  // `into_units_for` returned one resolution per run, in run order, and
+  // the request minted one slot per run, in run order.
+  for (((run_idx, run), resolution), slot) in
+    job.runs().iter().enumerate().zip(&resolutions).zip(slots)
+  {
     // between-run abort gate.
     // The shared `RunOptions` lets an external watchdog
     // terminate the run currently in flight, but a cancellation
@@ -795,7 +719,7 @@ fn dispatch_runs(
       // converted to chunk-local sample indices at 16 kHz; the
       // wholeclip sentinel falls back to the full chunk.
       let (slice_lo, slice_hi) =
-        run_audio_slice(run, job.samples.len(), job.chunk_first_sample_in_stream);
+        run_audio_slice(run, job.samples().len(), job.chunk_first_sample_in_stream);
       // Slice sub_segments to those that overlap the run's audio
       // window. The aligner clamps out-of-range PTS internally,
       // but pre-filtering keeps the silence mask sharp.
@@ -817,7 +741,7 @@ fn dispatch_runs(
       run_one_per_run(
         aligner,
         run,
-        &job.samples[slice_lo..slice_hi],
+        &job.samples()[slice_lo..slice_hi],
         &run_subs,
         run_first_sample_in_stream,
         job.samples_to_output_range.clone(),
@@ -834,17 +758,17 @@ fn dispatch_runs(
       // reverse-mapping from text/timing. The aligner itself doesn't
       // know the run language; we attach it here at the dispatch
       // boundary.
-      UnitOutcome::Aligned(words) => {
-        UnitOutcome::Aligned(words.map(|word| word.with_language(Some(run.language().clone()))))
+      UnitAlignment::Aligned(words) => {
+        UnitAlignment::Aligned(words.map(|word| word.with_language(Some(run.language().clone()))))
       }
-      UnitOutcome::Unaligned(cause) => {
+      UnitAlignment::Unaligned(cause) => {
         counters.observe_unaligned();
         log_unaligned(job.chunk_id(), Some(run_idx), run.language(), &cause);
-        UnitOutcome::Unaligned(cause)
+        UnitAlignment::Unaligned(cause)
       }
     };
-    // Exactly one outcome per run, at the run's index.
-    outcomes.push(outcome);
+    // Exactly one outcome per run, made from the run's own slot.
+    outcomes.push(slot.answer(outcome));
     // A `Wholeclip` run aligns against the full chunk audio, which
     // over-counts duration but keeps every dispatched language's
     // words; `AlignmentResult::into_words` restores the public
@@ -999,7 +923,7 @@ fn run_one_per_run(
   run_options: &RunOptions,
   // The decisions for THIS run's text, as detection found its events.
   oov_decisions: &[ResolvedOov],
-) -> Result<UnitOutcome, WorkFailure> {
+) -> Result<UnitAlignment, WorkFailure> {
   let bound = samples_to_output_range.clone();
   // Per-run key: `run.language()`, the language THIS run's events carry,
   // as detection relabelled them. Not `aligner.language()` — the run may

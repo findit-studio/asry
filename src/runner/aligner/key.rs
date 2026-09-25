@@ -41,7 +41,7 @@ pub enum AlignmentFallback {
   /// clean: detection reports it as one `OovKind::NotInspected`
   /// event, a caller's `FailClosed` decision for that event turns
   /// the skip into a refusal, and the alignment result names the
-  /// unit's outcome either way (`UnitOutcome::Unaligned`).
+  /// unit's outcome either way (`UnitAlignment::Unaligned`).
   #[default]
   SkipChunk,
   /// Emit `Event::Error` with

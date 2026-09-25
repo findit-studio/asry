@@ -358,7 +358,7 @@ impl LogProbsTV {
   /// the caller — the two internal producers of log-probabilities.
   ///
   /// `pub(crate)`, and it must stay that way. Both callers earn the
-  /// skip: `encode_log_softmax` and `Emissions::from_logits` each run
+  /// skip: `encode_log_softmax` and `PreparedChunk::emissions_from_logits` each run
   /// [`log_softmax_with_finite_guard`], whose output is finite and
   /// `<= 0` **by construction** (`lp = (x − max) − ln Σ exp(x − max)`;
   /// the `max` element contributes `exp(0) = 1`, so `ln Σ >= 0` and

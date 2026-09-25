@@ -227,7 +227,7 @@ pub(crate) mod for_test {
       range,
       Lang::En,
       SmolStr::new(text),
-      AlignmentReport::Whole(crate::core::UnitOutcome::from_words(words)),
+      AlignmentReport::Whole(crate::core::UnitAlignment::from_words(words)),
       -0.5,
       0.05,
       0.0,

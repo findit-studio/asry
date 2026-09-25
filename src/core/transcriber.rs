@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
   core::{
     buffer::SampleBuffer,
-    command::{AlignmentResult, AsrParams, AsrParamsOverride, AsrResult, Command},
+    command::{AlignmentCompletion, AsrParams, AsrParamsOverride, AsrResult, Command},
     cut::Cut,
     dispatch::Dispatch,
     event::Event,
@@ -976,32 +976,27 @@ impl Transcriber {
     Ok(())
   }
 
-  /// Inject the result of a `Command::Alignment`.
+  /// Complete a `Command::Alignment`: the one entry point for alignment
+  /// work, success or failure.
   ///
-  /// The result must be built with the [`AlignmentTicket`](crate::core::AlignmentTicket)
-  /// that chunk's command carried, and must give each of the chunk's
-  /// alignment units exactly one outcome: [`AlignmentResult::whole`] when
-  /// the command carried no runs, [`AlignmentResult::runs`] with one
-  /// outcome per run, in order, when it did. The transcript then carries
-  /// every aligned word, in time order.
+  /// The completion is built only by the command's own
+  /// [`AlignmentRequest`](crate::core::AlignmentRequest):
+  /// [`aligned`](crate::core::AlignmentRequest::aligned) with each unit's
+  /// outcome, or [`failed`](crate::core::AlignmentRequest::failed). It names
+  /// its chunk, whose transcript then keeps each unit's outcome, its words
+  /// in time order; a failure becomes the chunk's `Event::Error`. The
+  /// completion is consumed, so it is delivered once.
   ///
-  /// The result is consumed, so it is delivered once.
+  /// Errors, each checked before any state changes:
+  /// - `ForeignAlignment` if the completion answers a command another
+  ///   transcriber issued, or another command than the one its chunk
+  ///   awaits.
+  /// - `UnknownChunk(chunk_id)` if its chunk is not awaiting alignment.
   ///
-  /// Errors:
-  /// - `UnknownChunk(chunk_id)` if `chunk_id` is not awaiting alignment.
-  /// - `ForeignAlignment` if the result was built with another command's
-  ///   ticket: it answers another chunk, or a command of another
-  ///   transcriber. Checked before any outcome is read.
-  /// - `UnaccountedAlignment` if the result's units are not the chunk's.
-  ///
-  /// A refused result is dropped with its ticket, and the chunk stays
-  /// awaiting alignment until `handle_failure` resolves it.
-  pub fn handle_alignment(
-    &mut self,
-    chunk_id: ChunkId,
-    result: AlignmentResult,
-  ) -> Result<(), TranscriberError> {
-    self.dispatch.handle_alignment(chunk_id, result)?;
+  /// A refused completion is dropped: it answers no command of this
+  /// transcriber's awaited chunks, which are unchanged.
+  pub fn complete(&mut self, completion: AlignmentCompletion) -> Result<(), TranscriberError> {
+    self.dispatch.complete(completion)?;
     self.dispatch.after_inject(
       &mut self.buffer,
       self.cut.pending_start(),
@@ -1010,11 +1005,16 @@ impl Transcriber {
     Ok(())
   }
 
-  /// Inject a per-chunk failure.
+  /// Inject the failure of a `Command::Asr`.
+  ///
+  /// An alignment failure is not delivered here: it answers through its
+  /// command's request ([`AlignmentRequest::failed`](crate::core::AlignmentRequest::failed),
+  /// then [`complete`](Self::complete)), which binds it to the command.
   ///
   /// Errors:
   /// - `UnknownChunk(chunk_id)` if `chunk_id` is not in flight or
-  /// is in flight but not awaiting any worker result.
+  /// is in flight but not awaiting a worker result.
+  /// - `AwaitsCompletion(chunk_id)` if the chunk awaits alignment.
   pub fn handle_failure(
     &mut self,
     chunk_id: ChunkId,
