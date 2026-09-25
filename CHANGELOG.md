@@ -1,13 +1,13 @@
-# UNRELEASED
-
 ## 0.2.0
 
 CHANGED
 
-- **`mediatime` `0.1` → `0.3`.** mediatime is a public dependency —
+- **`mediatime` `0.1` → `0.4`.** mediatime is a public dependency —
   `TimeRange`, `Timebase` and `Timestamp` are re-exported from the crate
   root and carry every range asry emits — so its breakage is asry's
-  breakage, and the crate version goes to `0.2.0` for it.
+  breakage, and the crate version goes to `0.2.0` for it. The breaking
+  step is `0.3`, described below; `0.4` only adds an unsigned `Duration`
+  and leaves the three re-exported types as `0.3` made them.
   - **`Timebase` is signed.** `num: u32 → i32` and
     `den: NonZeroU32 → NonZeroI32`, matching ffmpeg's `AVRational`.
     Every `Timebase::new(1, NonZeroU32::new(…))` construction site moves
@@ -73,6 +73,12 @@ CHANGED
     numerator bridge (`i32::try_from(hop).unwrap_or(i32::MAX)`) rather
     than a wrapping `as` cast that would build a negative numerator and
     panic in `Timebase::new`.
+
+- **`ort` `=2.0.0-rc.12` → `=2.0.0-rc.13`.** Under the `alignment` feature
+  asry re-exports `ort` as `asry::ort`, so ort's release is part of asry's
+  public API there; this release's version bump covers it. Still an exact
+  pin.
+- **`LICENSE-MIT` names the findit-studio Developers** as its holder.
 
 FIXED
 
