@@ -23,7 +23,13 @@ pub(crate) fn is_silent_mark(c: char) -> bool {
 /// Arabic percent sign and the fullwidth forms of the first four.
 ///
 /// A mark read aloud only in context stays silent: the `.` of `3.5`, the `,` of the German `4,9`,
-/// the `/` of `km/h`.
+/// the `/` of `km/h`. That is sound at asry's output granularity, the word. A mark inside a word
+/// is spoken, when it is, inside that word's span: the "point" of `3.5` lies between the `3` and
+/// the `5`, whose tokens bound the word, so dropping the mark cannot move a word boundary.
+/// Surfacing it as an OOV event instead would make a fail-closed policy refuse words it can align,
+/// such as `3.5` on a vocabulary that spells digits. A word made only of such marks (a standalone
+/// `/`) has no token to bound it: it is accounted like any word that aligns nothing, and a unit
+/// holding nothing else is `UnalignedCause::NoAlignableText`.
 pub(crate) const READ_ALOUD: [char; 13] = [
   '#', '%', '&', '@', '\u{A7}', '\u{B6}', '\u{66A}', '\u{2030}', '\u{2031}', '\u{FF03}',
   '\u{FF05}', '\u{FF06}', '\u{FF20}',
