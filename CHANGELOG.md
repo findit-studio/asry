@@ -1,3 +1,117 @@
+# UNRELEASED
+
+FIXED
+
+- **A punctuation mark nobody reads aloud is dropped: never a wildcard,
+  never an OOV event.** A mark has no acoustic realization, so it is no
+  alignment target, yet alignment made one of it three ways: the Latin
+  normalizers (`LatinNormalizer`, `EnglishNormalizer`) reported every mark
+  they stripped from a word's edge as wildcard padding, one
+  `OovKind::BoundaryPunct` event each; a `.` inside a word was an
+  `OovKind::InternalPunct` event; and any other mark the vocabulary cannot
+  spell (a guillemet, an ellipsis, the comma of `4,9`, a Chinese `《`) was an
+  `OovKind::Symbol` event, which `default_oov_decisions` refuses.
+  `fail_closed_all_decisions` therefore refused every punctuated sentence,
+  and the default policy refused every chunk carrying such a mark. Now a
+  character of Unicode general category P* (Unicode 16.0) that is not read
+  aloud and that the vocabulary does not spell is dropped from detection
+  and tokenization (`detect_oov`, `prepare`, `Aligner::align_chunk`) under
+  every policy: no token, no wildcard, no event.
+  - **Spoken characters stay the policy's.** A letter, a digit, a symbol
+    (`$`, `<`, `©`) or a mark read aloud (`#`, `%`, `&`, `@`, `§`, `¶`, `٪`,
+    `‰`, `‱` and the fullwidth `＃`, `％`, `＆`, `＠`) that the vocabulary
+    cannot spell is still an `OovKind::Symbol` event, and
+    `fail_closed_all_decisions` still refuses it by name. A mark read aloud
+    only in context stays silent: the `.` of `3.5`, the `,` of `4,9`.
+  - **A mark the vocabulary spells is a token**, as the apostrophe of
+    `don't` is against wav2vec2-base-960h. That now includes a `.`, which
+    was a wildcard whatever the vocabulary held.
+  - **Token streams change for punctuated text.** `U.S.A` tokenizes as
+    `U S A` (was `U * S * A`), `"hello,"` as `hello` (was a wildcard
+    before and two after), and a word made only of dropped marks yields no
+    token, so no aligned word. An event's `char_index` still counts a
+    dropped mark, so it indexes the normalized text as before.
+  - **asry no longer produces `OovKind::InternalPunct`**, and produces
+    `OovKind::BoundaryPunct` only for a custom `TextNormalizer` that
+    reports `WildcardBoundary` padding: the built-in normalizers report
+    none. Both kinds, `WildcardBoundary` and `NormalizedText::with_wildcards`
+    are unchanged.
+- **A curly apostrophe inside a word folds to `'`.** The Latin normalizers
+  write `’` (U+2019) inside a word as `'` in the normalized text, so
+  `don’t` tokenizes as `don't` and keeps its apostrophe where the
+  vocabulary spells one; before, it was a character wav2vec2-base-960h
+  cannot spell. The French and Italian clitic split folds it too
+  (`l’eau` → `l'` + `eau`). `original_words` keeps the text as written.
+- **Every spoken character reaches OOV detection on the per-run alignment
+  road.** `dispatch_segments` made no run for a segment without a
+  concrete-script character (a standalone `4`, `&` or `50%`), and the
+  per-run road aligns the runs and nothing else. Whenever another segment
+  of the chunk made a run, such a segment was never detected: no policy
+  decided it, `fail_closed_all_decisions` could not refuse it, and no word
+  aligned it. Now:
+  - **Such a segment is a run of its own**, in the language of the nearest
+    run before it (leading the chunk, of its first run), as a carry
+    character inside a segment takes its run's language. A chunk none of
+    whose segments has a concrete-script character still yields no runs and
+    is aligned whole.
+  - **Runs reach alignment only when they reproduce the text.** The
+    transcriber puts an ASR result's runs on `Command::Alignment` only when
+    their texts, concatenated in order, are its text exactly, apart from
+    whitespace at the start and end of the whole transcript; otherwise the
+    command carries no runs and the chunk is aligned whole. Anything looser
+    would let a run align what the transcript does not say: moved whitespace
+    changes word boundaries (`"ab c"` read as `"a bc"`), and punctuation a
+    vocabulary spells is a token (`"dont"` read as `"don't"`). This also
+    covers runs from a custom `AsrSource`.
+  - **`run_one_alignment` refuses a per-run `AlignWorkItem` whose runs do not
+    reproduce its text**, with `AlignmentError::Tokenization`, instead of
+    aligning something other than the transcript.
+- **A text no aligner can read is never reported clean.**
+  `AlignmentSet::detect_oov` and `detect_oov_per_run` answered a language
+  with no registered aligner (and no `AlignerKey::Any` fallback) with an
+  empty event list, the answer for a text read and found spelled whole. A
+  refusing policy therefore never saw such a text, and
+  `AlignmentFallback::SkipChunk` skipped it without a word. Now:
+  - **Detection reports it as exactly one `OovKind::NotInspected` event** in
+    its language (a new variant of the non-exhaustive `OovKind`), and the
+    caller's policy decides it like any other event, before any fallback.
+    `fail_closed_all_decisions` refuses the text whatever the registry's
+    fallback (under `AlignmentFallback::Error` too, where it used to fail
+    the chunk with `LanguageUnsupported`); `default_oov_decisions` and
+    `wildcard_all_decisions` decide `Wildcard`, which hands it to the
+    fallback: `SkipChunk` skips it, `Error` fails the chunk as before. A
+    custom policy decides it in its catch-all arm.
+  - **A unit no aligner can read needs exactly that one decision.**
+    Dispatching it with no decision (an empty batch, or no decisions at
+    all) is refused as `AlignmentError::Tokenization`, never read as a
+    skip.
+- **Every alignment unit ends with exactly one named outcome.**
+  `AlignmentResult::unaligned` (new, with `Unaligned` and `UnalignedCause`)
+  names every unit that contributed no words, the whole chunk or a run by
+  its index, with its language and cause: skipped, refused, no alignable
+  text (it normalised to nothing, or held only silent marks), no surviving
+  words (the speech gates dropped them all), or a recoverable alignment
+  failure such as a policy refusing a spoken character. `run_one_alignment`
+  fills it on both roads, one outcome per unit by construction, and
+  `Aligner::align_chunk`, `Aligner::align_chunk_with_abort` and
+  `EmissionsAligner::finish` name an empty result's reason the same way.
+  An empty word list no longer stands in for a reason.
+- **A decision applies only to the unit it was detected for.** Positional
+  identity compared kinds and indices only, so two units with the same
+  event layout could swap or replay each other's decisions, and a decision
+  detected through one registry passed wherever its layout matched another.
+  Detection now stamps every event with the exact text it read, the aligner
+  that read it, and, through an `AlignmentSet`, the registry and run. The
+  stamp is private, so only detection writes it, and equality ignores it.
+  `run_one_alignment` refuses a decision stamped for another registry, run
+  or text before any lookup, and `prepare` (on `Aligner` and
+  `EmissionsAligner`) refuses one stamped for another text or aligner
+  before tokenizing. An event built with `OovEvent::new` carries no stamp,
+  so a decision made for it is refused: decisions come from detection.
+  Decide a whole-chunk job with `AlignmentSet::detect_oov`'s events and a
+  job with runs with `detect_oov_per_run`'s, both on the set that
+  dispatches it.
+
 ## 0.2.0
 
 CHANGED

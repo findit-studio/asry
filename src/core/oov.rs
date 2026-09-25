@@ -54,6 +54,49 @@
 //! wildcard digits, consult an ops dashboard, etc.). The
 //! default policy lives in caller-side helper functions in
 //! this module, not inside the library's hot path.
+//!
+//! ## What detection promises
+//!
+//! Every spoken character of a transcript reaches detection under the
+//! caller's policy, on whichever road the chunk takes: the whole text,
+//! or script-dispatched runs, which reproduce the text exactly. A
+//! punctuation mark nobody reads aloud is the one character dropped
+//! unread: it has no acoustic realization.
+//!
+//! The one exemption is a text in a language with no registered aligner
+//! (and no `AlignerKey::Any` fallback): nothing can read it. Such a text
+//! is never reported as an empty event list, which would claim it
+//! clean. It is exactly one [`OovKind::NotInspected`] event, which the
+//! caller's policy decides like any other, before any fallback:
+//! [`OovDecision::FailClosed`] refuses the text whatever the registry's
+//! fallback, and [`OovDecision::Wildcard`] hands it to the registry's
+//! `AlignmentFallback` (`SkipChunk` skips it, `Error` fails the chunk).
+//! A unit dispatched with no decision for that event is refused, never
+//! read as a skip.
+//!
+//! ## What a decision is bound to
+//!
+//! A decision applies to the unit its event was detected in and nowhere
+//! else. Detection stamps every event with the exact text it read, the
+//! aligner that read it, and, through an `AlignmentSet`, the registry and
+//! run. A front end refuses a decision stamped for another text, aligner,
+//! registry or run, or not stamped at all (an event built with
+//! [`OovEvent::new`]), before it looks up an aligner or tokenizes. Two
+//! units with the same event layout therefore cannot swap or replay
+//! decisions, and a registry swapped in between detection and dispatch
+//! cannot inherit the old one's answers.
+//!
+//! ## Every unit ends named
+//!
+//! Every alignment unit (the whole chunk, or one run) ends with exactly
+//! one outcome: its words, or a record in `AlignmentResult::unaligned`
+//! naming why it has none (skipped, refused, nothing alignable, no word
+//! surviving the speech gates, or a recoverable failure). An empty word
+//! list never stands in for a reason.
+
+use core::num::NonZeroU64;
+
+use smol_str::SmolStr;
 
 use crate::types::Lang;
 
@@ -71,26 +114,45 @@ use crate::types::Lang;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OovKind {
-  /// Semantic OOV: the tokenizer encountered a char (digit,
-  /// letter, pronounced symbol) that the wav2vec2 vocab
-  /// doesn't have. Carries the offending char for per-class
-  /// policy (e.g. wildcard alphanumeric, fail-closed `&`).
+  /// Semantic OOV: the tokenizer encountered a spoken char
+  /// (digit, letter, symbol, or a mark read aloud such as `%`
+  /// or `&`) that the wav2vec2 vocab doesn't have. Carries the
+  /// offending char for per-class policy (e.g. wildcard
+  /// alphanumeric, fail-closed `&`).
+  ///
+  /// Never a punctuation mark nobody reads aloud: one the vocab
+  /// cannot spell has no acoustic realization, and tokenization
+  /// drops it before any policy decides.
   Symbol(char),
-  /// Boundary-punctuation wildcard: the per-language
-  /// normaliser stripped a leading or trailing punct char
-  /// during normalisation; the tokenizer mechanically pads
-  /// the word with a wildcard at the same position to
-  /// preserve CTC alignment count. The original char is
-  /// already gone by the time this event is emitted.
+  /// Boundary-punctuation wildcard: a normaliser reported a
+  /// `WildcardBoundary` count for a word, asking tokenization
+  /// to pad a leading or trailing position with a wildcard.
+  /// The original char is already gone by the time this event
+  /// is emitted. asry's own normalisers report no padding (a
+  /// mark they strip leaves nothing behind), so this kind
+  /// comes only from a custom normaliser.
   BoundaryPunct,
-  /// Internal-punctuation wildcard: a `.` (or other
-  /// `is_skippable_internal_punct` char) appears inside a
-  /// word; asry emits a wildcard at the source position
-  /// so dotted acronyms like `U.S.A` align as `U * S * A`.
-  /// Carries the offending char for callers that want to
-  /// distinguish (e.g. allow `.` but fail other internal
-  /// punct).
+  /// Internal-punctuation wildcard, which asry no longer
+  /// produces: tokenization drops a punctuation mark nobody
+  /// reads aloud wherever it stands, so `U.S.A` aligns as its
+  /// three letters, and a mark the vocab spells is a token.
+  /// Kept so a policy that names it still compiles.
   InternalPunct(char),
+  /// Nothing inspected the text: no aligner is registered for
+  /// the event's language (and no `AlignerKey::Any` fallback), so
+  /// none of its characters was read. `AlignmentSet::detect_oov`
+  /// reports such a text as exactly this one event, at char and
+  /// word index 0, never as an empty list, which would claim the
+  /// text clean.
+  ///
+  /// A policy decides it like any other event.
+  /// [`OovDecision::FailClosed`] refuses the text;
+  /// [`OovDecision::Wildcard`] lets the registry's
+  /// `AlignmentFallback` act: `SkipChunk` skips the text, `Error`
+  /// fails the chunk with `LanguageUnsupported`. A skipped or
+  /// refused text is named, with its language, in
+  /// `AlignmentResult::unaligned`.
+  NotInspected,
 }
 
 /// One wildcard-generating position detected during
@@ -100,15 +162,26 @@ pub enum OovKind {
 /// caller produces a matching [`OovDecision`] for each event
 /// (in the same order) and threads it into the alignment work
 /// item via `AlignWorkItem.oov_decisions`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **An event is bound to the unit detection read.** Detection
+/// stamps each event it reports with the exact text it read, the
+/// aligner that read it (none on a registry miss), and, through an
+/// `AlignmentSet`, the registry and run. The stamp is private, so
+/// only detection can write it, and every front end refuses a
+/// decision whose event was detected for another text, aligner,
+/// registry or run, or was not detected at all (built with
+/// [`OovEvent::new`]). Equality ignores it: two events are equal
+/// when their kind, positions and language are.
+#[derive(Debug, Clone)]
 pub struct OovEvent {
   /// What kind of wildcard-generating position this is —
   /// semantic OOV vs. structural (boundary / internal-punct).
   kind: OovKind,
   /// Zero-based char index in the chunk's normalised text.
   /// Boundary-punct events index the word's leading/trailing
-  /// position (post-normalisation); internal-punct events
-  /// index the source position of the punct char.
+  /// position (post-normalisation). A dropped punctuation mark
+  /// still counts, so every index points into the normalised
+  /// text as given.
   char_index: usize,
   /// Zero-based word index (separator-counted) the position
   /// belongs to. Useful for callers that want per-word
@@ -118,10 +191,39 @@ pub struct OovEvent {
   /// this (e.g. wildcard-all under `Lang::En` but fail-closed
   /// under `Lang::Ko`).
   language: Lang,
+  /// The unit detection read, or `None` for an event built by
+  /// hand, which no front end accepts in a decision.
+  origin: Option<Origin>,
 }
+
+/// The unit an event was detected in: the exact text read, the
+/// aligner that read it (`None` when no aligner could), and the
+/// registry and run when detection went through an `AlignmentSet`.
+#[derive(Clone, Debug)]
+struct Origin {
+  text: SmolStr,
+  reader: Option<NonZeroU64>,
+  registry: Option<NonZeroU64>,
+  run_index: Option<usize>,
+}
+
+impl PartialEq for OovEvent {
+  fn eq(&self, other: &Self) -> bool {
+    self.kind == other.kind
+      && self.char_index == other.char_index
+      && self.word_index == other.word_index
+      && self.language == other.language
+  }
+}
+
+impl Eq for OovEvent {}
 
 impl OovEvent {
   /// Construct from positional fields + language stamp.
+  ///
+  /// An event built here was not detected: it carries no unit, and
+  /// every front end refuses a decision made for it. Decisions come
+  /// from the events detection reports.
   #[must_use]
   pub const fn new(kind: OovKind, char_index: usize, word_index: usize, language: Lang) -> Self {
     Self {
@@ -129,7 +231,78 @@ impl OovEvent {
       char_index,
       word_index,
       language,
+      origin: None,
     }
+  }
+
+  /// Stamp this event as read in `text` by the aligner `reader`.
+  pub(crate) fn read_in(mut self, text: &str, reader: NonZeroU64) -> Self {
+    self.origin = Some(Origin {
+      text: SmolStr::new(text),
+      reader: Some(reader),
+      registry: None,
+      run_index: None,
+    });
+    self
+  }
+
+  /// The one event of a text no aligner could read, detected
+  /// through `registry`.
+  pub(crate) fn not_inspected(text: &str, language: Lang, registry: NonZeroU64) -> Self {
+    Self {
+      kind: OovKind::NotInspected,
+      char_index: 0,
+      word_index: 0,
+      language,
+      origin: Some(Origin {
+        text: SmolStr::new(text),
+        reader: None,
+        registry: Some(registry),
+        run_index: None,
+      }),
+    }
+  }
+
+  /// Stamp the registry detection went through, and the run it read
+  /// (`None` for the whole chunk). An event detection did not stamp
+  /// stays unstamped.
+  pub(crate) fn through_registry(&mut self, registry: NonZeroU64, run_index: Option<usize>) {
+    if let Some(origin) = &mut self.origin {
+      origin.registry = Some(registry);
+      origin.run_index = run_index;
+    }
+  }
+
+  /// Whether detection stamped this event as read in exactly `text`
+  /// by the aligner `reader`.
+  pub(crate) fn read_by(&self, text: &str, reader: NonZeroU64) -> bool {
+    self
+      .origin
+      .as_ref()
+      .is_some_and(|origin| origin.reader == Some(reader) && origin.text == text)
+  }
+
+  /// Whether detection stamped this event for exactly `text`, as run
+  /// `run_index` (`None` for the whole chunk), through `registry`.
+  pub(crate) fn detected_for(
+    &self,
+    text: &str,
+    run_index: Option<usize>,
+    registry: NonZeroU64,
+  ) -> bool {
+    self.origin.as_ref().is_some_and(|origin| {
+      origin.registry == Some(registry) && origin.run_index == run_index && origin.text == text
+    })
+  }
+
+  /// Whether this is the event of a text no aligner could read, as
+  /// detection stamped it.
+  pub(crate) fn is_unread(&self) -> bool {
+    self.kind == OovKind::NotInspected
+      && self
+        .origin
+        .as_ref()
+        .is_some_and(|origin| origin.reader.is_none())
   }
 
   /// What kind of wildcard-generating position this is.
@@ -167,12 +340,13 @@ impl OovEvent {
   /// Convenience accessor: the offending char when the kind
   /// is `Symbol` or `InternalPunct`. Returns `None` for
   /// `BoundaryPunct` (the original char was stripped during
-  /// normalisation and is no longer recoverable).
+  /// normalisation and is no longer recoverable) and for
+  /// `NotInspected` (no character was read).
   #[must_use]
   pub fn char(&self) -> Option<char> {
     match self.kind {
       OovKind::Symbol(c) | OovKind::InternalPunct(c) => Some(c),
-      OovKind::BoundaryPunct => None,
+      OovKind::BoundaryPunct | OovKind::NotInspected => None,
     }
   }
 
@@ -217,6 +391,10 @@ pub enum OovDecision {
   /// highest log-probability at each frame. Continuous
   /// alignment at the cost of plausible-but-wrong timing on
   /// pronounced symbols.
+  ///
+  /// For an [`OovKind::NotInspected`] event there is no position
+  /// to fill: the decision declines to refuse the text, and the
+  /// registry's `AlignmentFallback` decides it.
   Wildcard,
   /// Drop the word alignment entirely. On the `alignment` pool
   /// path the cached ASR transcript still ships in the resulting
@@ -227,6 +405,10 @@ pub enum OovDecision {
   /// gets `EmissionsError::SemanticOutOfVocab` back from
   /// `tokenize_with_word_map` and owns whatever text it tokenised.
   /// Honest at the cost of dropped timing.
+  ///
+  /// For an [`OovKind::NotInspected`] event it refuses the text no
+  /// aligner could read: no word comes from it, and the alignment
+  /// result names it as refused.
   FailClosed,
 }
 
@@ -288,11 +470,19 @@ impl ResolvedOov {
 
 /// Default Sans-I/O policy:
 /// * Semantic OOV: alphanumeric / apostrophe → wildcard;
-/// pronounced symbol → fail-closed.
+/// any other spoken char (a symbol, a mark read aloud such as
+/// `&` or `%`) → fail-closed.
 /// * Boundary-punct + internal-punct (structural wildcards):
-/// wildcard. They reflect tokenizer mechanics, not caller
-/// text — failing-closed on `U.S.A.`'s internal `.` would
-/// cripple normal English alignment.
+/// wildcard. Padding a normaliser asked for reflects its
+/// mechanics, not something said.
+///
+/// * Not inspected: wildcard, which leaves a text no aligner can read
+/// to the registry's `AlignmentFallback` (`SkipChunk` skips it, as it
+/// always has).
+///
+/// A punctuation mark nobody reads aloud never reaches a policy:
+/// tokenization drops it, so punctuated text carries no event for
+/// its marks under this policy or any other.
 ///
 /// Encodes the "WhisperX-style alphanumeric, fail-closed-on-
 /// pronounced" behaviour asry shipped before the
@@ -316,6 +506,8 @@ pub fn default_oov_decisions(events: &[OovEvent]) -> Vec<ResolvedOov> {
         }
         // Structural wildcards: keep historical behaviour.
         OovKind::BoundaryPunct | OovKind::InternalPunct(_) => OovDecision::Wildcard,
+        // Nothing read the text: the registry's fallback decides it.
+        OovKind::NotInspected => OovDecision::Wildcard,
       };
       ResolvedOov {
         event: ev.clone(),
@@ -342,7 +534,9 @@ pub fn wildcard_all_decisions(events: &[OovEvent]) -> Vec<ResolvedOov> {
 
 /// Strictest: every OOV → fail-closed. Use for workflows where
 /// even one wildcard alignment is too much (e.g. legal /
-/// medical transcription pipelines that read PII aloud).
+/// medical transcription pipelines that read PII aloud). A text
+/// no aligner can read ([`OovKind::NotInspected`]) is refused
+/// too, by name, rather than skipped.
 #[must_use]
 pub fn fail_closed_all_decisions(events: &[OovEvent]) -> Vec<ResolvedOov> {
   events
@@ -359,30 +553,15 @@ mod tests {
   use super::*;
 
   fn ev(c: char) -> OovEvent {
-    OovEvent {
-      kind: OovKind::Symbol(c),
-      char_index: 0,
-      word_index: 0,
-      language: Lang::En,
-    }
+    OovEvent::new(OovKind::Symbol(c), 0, 0, Lang::En)
   }
 
   fn boundary_ev() -> OovEvent {
-    OovEvent {
-      kind: OovKind::BoundaryPunct,
-      char_index: 0,
-      word_index: 0,
-      language: Lang::En,
-    }
+    OovEvent::new(OovKind::BoundaryPunct, 0, 0, Lang::En)
   }
 
   fn internal_ev(c: char) -> OovEvent {
-    OovEvent {
-      kind: OovKind::InternalPunct(c),
-      char_index: 0,
-      word_index: 0,
-      language: Lang::En,
-    }
+    OovEvent::new(OovKind::InternalPunct(c), 0, 0, Lang::En)
   }
 
   fn decisions_only(resolved: &[ResolvedOov]) -> Vec<OovDecision> {
@@ -482,6 +661,84 @@ mod tests {
         OovDecision::FailClosed,
         OovDecision::FailClosed,
       ],
+    );
+  }
+
+  /// **Detection binds an event to the unit it read.** The stamp is
+  /// invisible to equality, so an event compares as it always has, and it
+  /// answers only for the exact text, aligner, registry and run detection
+  /// read. An event built by hand is bound to nothing.
+  #[test]
+  fn an_event_is_bound_to_the_unit_detection_read() {
+    let aligner = NonZeroU64::new(7).expect("7 != 0");
+    let other_aligner = NonZeroU64::new(8).expect("8 != 0");
+    let registry = NonZeroU64::new(3).expect("3 != 0");
+    let other_registry = NonZeroU64::new(4).expect("4 != 0");
+
+    let built = OovEvent::new(OovKind::Symbol('&'), 1, 0, Lang::En);
+    let mut detected = built.clone().read_in("a&b", aligner);
+    assert_eq!(detected, built, "equality ignores the stamp");
+    assert!(detected.read_by("a&b", aligner));
+    assert!(!detected.read_by("c&d", aligner), "another text");
+    assert!(!detected.read_by("a&b", other_aligner), "another aligner");
+    assert!(
+      !built.read_by("a&b", aligner),
+      "a hand-built event is bound to nothing"
+    );
+
+    assert!(
+      !detected.detected_for("a&b", None, registry),
+      "no registry yet"
+    );
+    detected.through_registry(registry, Some(2));
+    assert!(detected.detected_for("a&b", Some(2), registry));
+    assert!(
+      !detected.detected_for("a&b", Some(1), registry),
+      "another run"
+    );
+    assert!(
+      !detected.detected_for("a&b", None, registry),
+      "the whole chunk"
+    );
+    assert!(
+      !detected.detected_for("a&b", Some(2), other_registry),
+      "another registry"
+    );
+    assert!(
+      !detected.detected_for("c&d", Some(2), registry),
+      "another text"
+    );
+    assert!(!detected.is_unread(), "an aligner read it");
+
+    let mut built = built;
+    built.through_registry(registry, Some(2));
+    assert!(
+      !built.detected_for("a&b", Some(2), registry),
+      "stays unbound"
+    );
+  }
+
+  /// A text nothing inspected is decided like any other event: the
+  /// strict policy refuses it, and the default and wildcard policies leave
+  /// it to the registry's fallback. It names no character.
+  #[test]
+  fn every_policy_decides_a_text_nothing_inspected() {
+    let registry = NonZeroU64::new(1).expect("1 != 0");
+    let not_inspected = OovEvent::not_inspected("4", Lang::Ko, registry);
+    assert_eq!(not_inspected.char(), None);
+    assert!(not_inspected.is_unread());
+    let events = [not_inspected];
+    assert_eq!(
+      decisions_only(&fail_closed_all_decisions(&events)),
+      vec![OovDecision::FailClosed]
+    );
+    assert_eq!(
+      decisions_only(&default_oov_decisions(&events)),
+      vec![OovDecision::Wildcard]
+    );
+    assert_eq!(
+      decisions_only(&wildcard_all_decisions(&events)),
+      vec![OovDecision::Wildcard]
     );
   }
 

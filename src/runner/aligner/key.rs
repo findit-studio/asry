@@ -36,6 +36,12 @@ pub enum AlignmentFallback {
   /// The indexing pipeline never blocks on alignment
   /// unavailability; downstream consumers see the text without
   /// per-word ranges.
+  ///
+  /// Nothing reads the skipped text, so it is not a text found
+  /// clean: detection reports it as one `OovKind::NotInspected`
+  /// event, a caller's `FailClosed` decision for that event turns
+  /// the skip into a refusal, and the alignment result names the
+  /// unit either way in `AlignmentResult::unaligned`.
   #[default]
   SkipChunk,
   /// Emit `Event::Error` with

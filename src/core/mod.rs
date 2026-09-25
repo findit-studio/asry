@@ -9,7 +9,8 @@ pub mod oov;
 mod transcriber;
 
 pub use command::{
-  AlignmentResult, AsrParams, AsrParamsOverride, AsrResult, Command, SamplingStrategy,
+  AlignmentResult, AsrParams, AsrParamsOverride, AsrResult, Command, SamplingStrategy, Unaligned,
+  UnalignedCause,
 };
 pub use event::Event;
 pub use oov::{

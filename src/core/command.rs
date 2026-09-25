@@ -497,6 +497,13 @@ impl Default for SamplingStrategy {
 /// it falls back to whole-chunk alignment using
 /// [`AsrResult::language`], identical to the pre-script-dispatch
 /// behaviour.
+///
+/// Runs reach alignment only when their texts, in order, hold
+/// exactly the spoken characters of [`AsrResult::text`] (whitespace
+/// and punctuation marks nobody reads aloud aside): the per-run road
+/// aligns the runs and nothing else, so a character outside every
+/// run would escape OOV detection. Runs that do not cover the text
+/// are not forwarded, and the chunk is aligned whole.
 #[derive(Clone, Debug)]
 pub struct AsrResult {
   text: SmolStr,
@@ -579,22 +586,47 @@ impl AsrResult {
 /// valid result (e.g., when whisper text was empty or normalisation
 /// produced an empty string). Fields are private; use
 /// [`AlignmentResult::new`] and accessors.
+///
+/// Every alignment unit (the whole chunk, or one script-dispatched
+/// run) either contributes words or is named in [`Self::unaligned`]
+/// with the reason it contributed none: nothing could read it, a policy
+/// refused it, it held nothing alignable, the speech gates kept none of
+/// its words, or its alignment failed recoverably. An empty `words`
+/// never stands in for a reason.
 #[derive(Clone, Debug)]
 #[cfg(feature = "alignment")]
 pub struct AlignmentResult {
   words: Vec<crate::types::Word>,
+  unaligned: Vec<Unaligned>,
 }
 
 #[cfg(feature = "alignment")]
 impl AlignmentResult {
   /// Construct from a list of per-word alignment entries.
   pub fn new(words: Vec<crate::types::Word>) -> Self {
-    Self { words }
+    Self {
+      words,
+      unaligned: Vec::new(),
+    }
+  }
+
+  /// Builder-style: record the alignment units that contributed no
+  /// words, and why.
+  #[must_use]
+  pub fn with_unaligned(mut self, unaligned: Vec<Unaligned>) -> Self {
+    self.unaligned = unaligned;
+    self
   }
 
   /// Per-word alignment entries.
   pub fn words(&self) -> &[crate::types::Word] {
     &self.words
+  }
+
+  /// The alignment units that contributed no words, and why, in the
+  /// order they were dispatched. Empty when every unit was aligned.
+  pub fn unaligned(&self) -> &[Unaligned] {
+    &self.unaligned
   }
 
   /// Consume the result, returning ownership of the words vector.
@@ -609,6 +641,7 @@ impl AlignmentResult {
 #[cfg(not(feature = "alignment"))]
 pub struct AlignmentResult {
   words: Vec<crate::types::Word>,
+  unaligned: Vec<Unaligned>,
 }
 
 #[cfg(not(feature = "alignment"))]
@@ -616,7 +649,18 @@ impl AlignmentResult {
   /// Construct from a list of per-word alignment entries (always
   /// empty without the `alignment` feature).
   pub fn new(words: Vec<crate::types::Word>) -> Self {
-    Self { words }
+    Self {
+      words,
+      unaligned: Vec::new(),
+    }
+  }
+
+  /// Builder-style: record the alignment units that contributed no
+  /// words, and why.
+  #[must_use]
+  pub fn with_unaligned(mut self, unaligned: Vec<Unaligned>) -> Self {
+    self.unaligned = unaligned;
+    self
   }
 
   /// Per-word alignment entries (always empty without the
@@ -625,10 +669,87 @@ impl AlignmentResult {
     &self.words
   }
 
+  /// The alignment units that contributed no words, and why.
+  pub fn unaligned(&self) -> &[Unaligned] {
+    &self.unaligned
+  }
+
   /// Consume the result, returning ownership of the words vector.
   pub fn into_words(self) -> Vec<crate::types::Word> {
     self.words
   }
+}
+
+/// An alignment unit that contributed no words to an
+/// [`AlignmentResult`], and why: the whole chunk, or one
+/// script-dispatched run.
+#[derive(Clone, Debug)]
+pub struct Unaligned {
+  run_index: Option<usize>,
+  language: Lang,
+  cause: UnalignedCause,
+}
+
+impl Unaligned {
+  /// Construct from the unit (`None` for the whole chunk, or the
+  /// index of the run in `Command::Alignment::runs`), its language,
+  /// and the cause.
+  #[must_use]
+  pub const fn new(run_index: Option<usize>, language: Lang, cause: UnalignedCause) -> Self {
+    Self {
+      run_index,
+      language,
+      cause,
+    }
+  }
+
+  /// The run this record is about, by its index in
+  /// `Command::Alignment::runs`; `None` for the whole chunk.
+  #[must_use]
+  pub const fn run_index(&self) -> Option<usize> {
+    self.run_index
+  }
+
+  /// The unit's language: the chunk's, or the run's.
+  #[must_use]
+  pub const fn language(&self) -> &Lang {
+    &self.language
+  }
+
+  /// Why the unit contributed no words.
+  #[must_use]
+  pub const fn cause(&self) -> &UnalignedCause {
+    &self.cause
+  }
+}
+
+/// Why an alignment unit contributed no words.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum UnalignedCause {
+  /// No aligner is registered for the unit's language, so nothing
+  /// read its text, and the registry's `AlignmentFallback::SkipChunk`
+  /// skipped it: the caller's policy did not refuse its
+  /// [`OovKind::NotInspected`](crate::core::OovKind::NotInspected)
+  /// event.
+  Skipped,
+  /// No aligner is registered for the unit's language, so nothing
+  /// read its text, and the caller's policy refused it:
+  /// `OovDecision::FailClosed` on its
+  /// [`OovKind::NotInspected`](crate::core::OovKind::NotInspected)
+  /// event.
+  Refused,
+  /// An aligner read the unit and found nothing to align: its text
+  /// normalised to nothing, or held only punctuation marks nobody reads
+  /// aloud.
+  NoAlignableText,
+  /// The unit aligned, and the speech gates kept none of its words: no
+  /// word's span held enough speech, or each held too long a silence.
+  NoSurvivingWords,
+  /// An aligner read the unit and its alignment failed recoverably
+  /// (a policy refusing a spoken character, no CTC path): the failure,
+  /// as the aligner reported it.
+  Failed(crate::types::AlignmentError),
 }
 
 /// A directive the runner consumes.
@@ -697,10 +818,13 @@ pub enum Command {
     /// Detected language.
     language: Lang,
     /// Script-dispatcher per-language runs derived from the
-    /// whisper segments. Empty when the runner did not populate
-    /// it (legacy single-language path); the alignment worker
-    /// then falls back to whole-chunk alignment keyed on
-    /// `language`.
+    /// whisper segments. They cover every spoken character of
+    /// `text` (whitespace and punctuation marks nobody reads aloud
+    /// aside): the transcriber forwards an ASR result's runs only
+    /// when they do. Empty when the runner did not populate them
+    /// (legacy single-language path) or when they did not cover
+    /// the text; the alignment worker then falls back to
+    /// whole-chunk alignment keyed on `language`.
     runs: Vec<crate::align::Run>,
   },
 }

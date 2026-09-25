@@ -232,6 +232,41 @@ pub(crate) fn validate_decision_languages(
   Ok(())
 }
 
+/// Validate that every supplied decision was made for an event this
+/// aligner detected in exactly `text`.
+///
+/// Positional identity ([`OovEvent::matches_position`](crate::core::OovEvent::matches_position))
+/// compares kinds and indices only, so two texts with the same event
+/// layout (`"a&b"` and `"c&d"`) would accept each other's decisions, and
+/// a decision detected by another aligner (another registry's, or before
+/// a registry swap) would pass wherever its layout matched. Detection
+/// stamps each event with the text it read and the aligner that read it;
+/// a decision whose event carries another text, another aligner, or no
+/// stamp at all (an event built by hand) is refused before tokenization.
+pub(crate) fn validate_decision_origins(
+  oov_decisions: &[crate::core::ResolvedOov],
+  text: &str,
+  reader: NonZeroU64,
+  language: &Lang,
+) -> Result<(), WorkFailure> {
+  for (i, resolved) in oov_decisions.iter().enumerate() {
+    if !resolved.event().read_by(text, reader) {
+      return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+        AlignmentFailure::new(
+          format_smolstr!(
+            "oov_decisions[{i}] was not detected by this aligner in this text: its event was \
+ detected in another text or by another aligner, or was built by hand. Decisions bind to \
+ the unit their events were detected in; recompute them via `detect_oov(text)` on this \
+ aligner and a policy helper from `crate::core::oov`."
+          ),
+          language.clone(),
+        ),
+      )));
+    }
+  }
+  Ok(())
+}
+
 /// Coerce a user-supplied speech-coverage threshold into the
 /// valid `[0.0, 1.0]` range. NaN resets to the default.
 ///
@@ -572,6 +607,11 @@ impl AlignerId {
     // hand out id 0 twice.
     Self(NonZeroU64::new(raw).expect("AlignerId counter overflowed u64"))
   }
+
+  /// The raw id, as detection stamps it on the events it reports.
+  pub(crate) const fn get(self) -> NonZeroU64 {
+    self.0
+  }
 }
 
 /// Everything an aligner owns **except** the encoder.
@@ -824,7 +864,7 @@ impl AlignerCore {
     // `detect_oov_events` returns the backend-neutral `EmissionsError`;
     // re-map it to the pool `WorkFailure` at this orchestration
     // boundary so the aligner's public error type is unchanged.
-    detect_oov_events(
+    let events = detect_oov_events(
       &self.tokenizer,
       normalized.normalized(),
       n_words,
@@ -833,7 +873,15 @@ impl AlignerCore {
       &self.language,
       normalized.wildcard_boundary_per_word(),
     )
-    .map_err(|e| e.into_work_failure(&self.language))
+    .map_err(|e| e.into_work_failure(&self.language))?;
+    // Bind every event to the text this aligner read: `prepare` accepts
+    // a decision only for the text and the aligner it was detected in.
+    Ok(
+      events
+        .into_iter()
+        .map(|event| event.read_in(text, self.id.get()))
+        .collect(),
+    )
   }
 
   /// Steps 0-2 of the alignment pipeline, up to (but not including)
@@ -863,6 +911,7 @@ impl AlignerCore {
     // when a watchdog has already fired, and the diagnostic is worth more
     // than a timeout.
     validate_decision_languages(oov_decisions, expected_decision_language)?;
+    validate_decision_origins(oov_decisions, text, self.id.get(), &self.language)?;
 
     if abort_flag.load(Ordering::Relaxed) {
       return Err(timed_out());
@@ -1053,7 +1102,7 @@ impl AlignerCore {
     chunk_first_sample_in_stream: u64,
     samples_to_output_range: F,
     abort_flag: &AtomicBool,
-  ) -> Result<AlignmentResult, WorkFailure>
+  ) -> Result<Composed, WorkFailure>
   where
     F: Fn(u64, u64) -> TimeRange,
   {
@@ -1091,7 +1140,7 @@ impl AlignerCore {
     let Some(prepared) = prepared.inner else {
       // Trivial chunk: `prepare` short-circuited (empty normalised
       // text or zero alignable tokens). No encoder output to consume.
-      return Ok(AlignmentResult::new(Vec::new()));
+      return Ok(Composed::NoAlignableText);
     };
     let tokenized = &prepared.tokenized;
 
@@ -1271,7 +1320,7 @@ impl AlignerCore {
       real_n_samples,
       &prepared.speech,
     );
-    Ok(compose_words(
+    let composed = compose_words(
       &word_segments,
       prepared.normalized.original_words(),
       &speech_frames,
@@ -1283,7 +1332,55 @@ impl AlignerCore {
       samples_to_output_range,
       self.min_speech_coverage,
       self.max_intra_silent_run,
-    ))
+    );
+    Ok(Composed::from_words(composed.into_words()))
+  }
+}
+
+/// What alignment made of one text: its words, or why there are none.
+///
+/// The one form a front end's result takes before it is public, so an
+/// empty word list cannot leave the core without its reason: the variant
+/// that carries words is built only from a non-empty list
+/// ([`Composed::from_words`]).
+#[derive(Debug)]
+pub(crate) enum Composed {
+  /// The aligned words; never empty.
+  Words(Vec<crate::types::Word>),
+  /// Nothing in the text was alignable: it normalised to nothing, or
+  /// every character in it was a punctuation mark nobody reads aloud.
+  NoAlignableText,
+  /// The text aligned, and the speech gates dropped every word: no
+  /// word's span held enough speech, or each held too long a silence.
+  NoSurvivingWords,
+}
+
+impl Composed {
+  /// The words alignment kept, or [`Composed::NoSurvivingWords`] when
+  /// it kept none.
+  pub(crate) fn from_words(words: Vec<crate::types::Word>) -> Self {
+    if words.is_empty() {
+      Self::NoSurvivingWords
+    } else {
+      Self::Words(words)
+    }
+  }
+
+  /// The public result: the words, or no words and one record naming
+  /// the reason, in `language` for the whole text.
+  pub(crate) fn into_result(self, language: &Lang) -> AlignmentResult {
+    use crate::core::{Unaligned, UnalignedCause};
+
+    let cause = match self {
+      Self::Words(words) => return AlignmentResult::new(words),
+      Self::NoAlignableText => UnalignedCause::NoAlignableText,
+      Self::NoSurvivingWords => UnalignedCause::NoSurvivingWords,
+    };
+    AlignmentResult::new(Vec::new()).with_unaligned(vec![Unaligned::new(
+      None,
+      language.clone(),
+      cause,
+    )])
   }
 }
 

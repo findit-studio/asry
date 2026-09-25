@@ -43,9 +43,9 @@ use crate::{
       errors::{EmissionsError, EmissionsFailure},
     },
     core::{
-      AlignerCore, AlignerCoreLoadError, PreparedChunk, capture_vocab_size, detect_blank_token_id,
-      detect_unk_token_id, detect_vocab_uppercase_only, load_tokenizer_bytes_with_compat,
-      validate_word_delimiter_present,
+      AlignerCore, AlignerCoreLoadError, Composed, PreparedChunk, capture_vocab_size,
+      detect_blank_token_id, detect_unk_token_id, detect_vocab_uppercase_only,
+      load_tokenizer_bytes_with_compat, validate_word_delimiter_present,
     },
     emissions_api::{Emissions, OutputClock, SpeechCoverage, SpeechSpans},
     normalizer::DynTextNormalizer,
@@ -209,7 +209,9 @@ impl EmissionsAligner {
   ///
   /// Resolve the events with [`default_oov_decisions`], [`wildcard_all_decisions`],
   /// [`fail_closed_all_decisions`], or your own policy, then hand the
-  /// result to [`prepare`](Self::prepare).
+  /// result to [`prepare`](Self::prepare) with the same text: each event
+  /// is bound to `text` and to this aligner, and `prepare` refuses a
+  /// decision made for another text or by another aligner.
   ///
   /// Note what is NOT an argument: the tokenizer, the word count, the
   /// uppercase flag, the unk id, the boundary map. Every one of those was
@@ -352,7 +354,7 @@ impl EmissionsAligner {
     // validate the emissions against. Short-circuit exactly as the ORT
     // path does.
     if prepared.is_trivial() {
-      return Ok(AlignmentResult::new(Vec::new()));
+      return Ok(Composed::NoAlignableText.into_result(self.core.language()));
     }
 
     // ——— The two checks the seam has NEVER run ———
@@ -391,6 +393,7 @@ impl EmissionsAligner {
         |start, end| clock.range(start, end),
         abort_flag,
       )
+      .map(|composed| composed.into_result(self.core.language()))
       .map_err(|e| to_emissions_error(e, Stage::Finish))
   }
 }

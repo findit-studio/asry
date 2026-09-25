@@ -16,13 +16,12 @@
 //!    Asry wildcards alphanumeric OOV chars, matching WhisperX
 //!    on every test that doesn't involve a non-alphanumeric
 //!    pronounced symbol.
-//! 2. **Relaxed policy (test 7):** gated behind
-//!    `#[cfg(feature = "whisperx-strict-tokenizer")]`. Test 7
-//!    (`test_issue_1372_digits_comma_no_timestamps`) uses `"4,9"`
-//!    where the comma is a non-alphanumeric pronounced char.
-//!    Default asry drops the chunk; the strict-tokenizer
-//!    feature relaxes that policy to wildcard the comma instead,
-//!    matching WhisperX 1:1.
+//! 2. **Both policies (test 7):** test 7
+//!    (`test_issue_1372_digits_comma_no_timestamps`) uses `"4,9"`.
+//!    The comma is a punctuation mark nobody reads aloud, dropped
+//!    under every policy, so the word aligns under
+//!    `wildcard_all_decisions` (WhisperX 1:1) and asry's default
+//!    alike.
 //!
 //! ## Why `bench-internals` / `__bench`
 //!
@@ -422,33 +421,38 @@ fn known_neighbour_score_is_positive_around_unknown() {
 // =====================================================================
 
 /// **Test 7** (regression for whisperX issue #1372): `"4,9"` (digits
-/// + comma) must align under WhisperX semantics.
+/// + comma) must align.
 ///
-/// Asry's default policy drops the chunk because `,` is a non-
-/// alphanumeric pronounced char (the German speaker pronounces it
-/// "Komma"). Calling `tokenize_with_word_map` with
-/// `wildcard_all_decisions` opts into WhisperX's `*` placeholder
-/// behaviour 1:1 — the comma wildcards instead of dropping.
+/// The comma is a mark read aloud only in context (the German "Komma"),
+/// so it is a punctuation mark nobody reads aloud: tokenization drops it
+/// under every policy, and the two digits are wildcards. The word aligns
+/// under `wildcard_all_decisions` (WhisperX's `*` placeholder 1:1) and
+/// under asry's default policy alike; the default used to refuse the
+/// chunk over the comma.
 #[test]
 fn issue_1372_digits_comma_no_timestamps() {
   // 200 frames — WhisperX's regression reproducer uses the
   // same higher frame count because the German sentence is
-  // long. Use `wildcard_all_decisions` to opt into WhisperX's
-  // `*` placeholder behaviour for the pronounced comma.
-  let result = run_align_with_policy(
-    "halt mit 4,9 nicht ins parlament",
-    200,
-    DEFAULT_DURATION_S,
+  // long.
+  for policy in [
     asry::core::wildcard_all_decisions,
-  );
-  let by_word: std::collections::HashMap<&str, &AlignedWord> =
-    result.iter().map(|w| (w.word.as_str(), w)).collect();
-  let target = by_word.get("4,9").unwrap_or_else(|| {
-    panic!(
-      "'4,9' must align under wildcard_all_decisions; got {:?}",
-      result.iter().map(|w| &w.word).collect::<Vec<_>>()
-    )
-  });
-  assert!(target.start_s < target.end_s, "'4,9': start < end");
-  assert!(target.score >= 0.0, "'4,9': score must be present");
+    asry::core::default_oov_decisions,
+  ] {
+    let result = run_align_with_policy(
+      "halt mit 4,9 nicht ins parlament",
+      200,
+      DEFAULT_DURATION_S,
+      policy,
+    );
+    let by_word: std::collections::HashMap<&str, &AlignedWord> =
+      result.iter().map(|w| (w.word.as_str(), w)).collect();
+    let target = by_word.get("4,9").unwrap_or_else(|| {
+      panic!(
+        "'4,9' must align; got {:?}",
+        result.iter().map(|w| &w.word).collect::<Vec<_>>()
+      )
+    });
+    assert!(target.start_s < target.end_s, "'4,9': start < end");
+    assert!(target.score >= 0.0, "'4,9': score must be present");
+  }
 }

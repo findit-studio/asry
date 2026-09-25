@@ -232,8 +232,8 @@ the OOV policy is per-test runtime data (no Cargo feature):
 cargo test --features alignment,bench-internals --test whisperx_unit_parity
 # 8/8 — tests 1-6 + 8 use `default_oov_decisions` (asry
 # default); test 7 (`4,9` digits-comma WhisperX issue #1372)
-# uses `wildcard_all_decisions` to opt into WhisperX 1:1
-# behaviour for pronounced symbols.
+# aligns under `wildcard_all_decisions` (WhisperX 1:1) and the
+# default alike, since the comma is a mark nobody reads aloud.
 ```
 
 These tests port WhisperX's

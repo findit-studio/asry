@@ -826,3 +826,294 @@ fn a_character_the_vocabulary_cannot_spell_is_an_oov_event() {
     "the policy's refusal, not a tokenization failure; got {err:?}"
   );
 }
+
+// ——————————————— Punctuation is never an alignment target ———————————————
+
+/// A sentence as a recogniser writes it carries no event for its marks, so
+/// every policy prepares it, the fail-closed one included. The spoken `&`
+/// is still an event, and the fail-closed policy still refuses it by name.
+#[test]
+fn punctuated_text_prepares_under_every_policy() {
+  use crate::core::{fail_closed_all_decisions, wildcard_all_decisions};
+
+  let a = aligner();
+  let samples = vec![0.2_f32; 16_000];
+  let speech = SpeechSpans::all_speech();
+  let abort = AtomicBool::new(false);
+
+  let text = "\u{201C}Hello,\u{201D} she said \u{2014} isn\u{2019}t it (really) well-known? \
+              \u{AB}Yes\u{2026}\u{BB} *U.S.A.*";
+  let events = a.detect_oov(text).expect("detect_oov");
+  assert!(events.is_empty(), "no mark is an event; got {events:?}");
+  for decisions in [
+    default_oov_decisions(&events),
+    wildcard_all_decisions(&events),
+    fail_closed_all_decisions(&events),
+  ] {
+    let prepared = a
+      .prepare(&samples, &speech, text, &decisions, &abort)
+      .expect("every policy prepares punctuated text");
+    assert!(!prepared.is_trivial());
+  }
+
+  let events = a
+    .detect_oov("They sold AT&T, then left.")
+    .expect("detect_oov");
+  assert_eq!(
+    events.iter().map(OovEvent::char).collect::<Vec<_>>(),
+    [Some('&')],
+    "only the spoken character is an event"
+  );
+  let Err(EmissionsError::SemanticOutOfVocab(failure)) = a.prepare(
+    &samples,
+    &speech,
+    "They sold AT&T, then left.",
+    &fail_closed_all_decisions(&events),
+    &abort,
+  ) else {
+    panic!("the fail-closed policy refuses the spoken `&`");
+  };
+  assert!(
+    failure.message().contains("'&'"),
+    "the refusal names it: {}",
+    failure.message()
+  );
+}
+
+/// **A spoken segment with no concrete-script character reaches detection
+/// under every policy.** Separate `hello` and `4` / `&` / `50%` segments
+/// dispatch into two runs that cover the transcript, so on the per-run road
+/// the second segment's spoken characters are OOV events like any others:
+/// the wildcard policy prepares them, and a refusing policy refuses the
+/// first one it refuses, by name. The second segment used to make no run,
+/// and no policy ever saw it.
+#[test]
+fn a_spoken_segment_without_a_script_reaches_detection_under_every_policy() {
+  use crate::{
+    align::{
+      SegmentLike, dispatch_segments,
+      script_dispatch::{TokenInfo, runs_reproduce_text},
+    },
+    core::{OovDecision, fail_closed_all_decisions, wildcard_all_decisions},
+  };
+
+  /// An OOV policy: one decision per event, in order.
+  type Policy = fn(&[OovEvent]) -> Vec<ResolvedOov>;
+
+  struct Segment(&'static str, i64, i64);
+  impl SegmentLike for Segment {
+    fn text(&self) -> &str {
+      self.0
+    }
+    fn t0(&self) -> i64 {
+      self.1
+    }
+    fn t1(&self) -> i64 {
+      self.2
+    }
+    fn tokens(&self) -> Vec<TokenInfo> {
+      Vec::new()
+    }
+  }
+
+  let a = aligner();
+  let samples = vec![0.2_f32; 16_000];
+  let speech = SpeechSpans::all_speech();
+  let abort = AtomicBool::new(false);
+  let policies: [Policy; 3] = [
+    default_oov_decisions,
+    wildcard_all_decisions,
+    fail_closed_all_decisions,
+  ];
+
+  for (spoken, decided) in [
+    ("4", vec![Some('4')]),
+    ("&", vec![Some('&')]),
+    ("50%", vec![Some('5'), Some('0'), Some('%')]),
+  ] {
+    let segments = [Segment("hello", 0, 50), Segment(spoken, 50, 100)];
+    let transcript: String = segments.iter().map(|segment| segment.0).collect();
+    let runs = dispatch_segments(&segments, Some(Lang::En));
+    assert!(
+      runs_reproduce_text(&runs, &transcript),
+      "{spoken:?}: {runs:?}"
+    );
+    let [hello, second] = runs.as_slice() else {
+      panic!("{spoken:?}: one run per segment; got {runs:?}");
+    };
+    assert_eq!((hello.text(), second.text()), ("hello", spoken));
+
+    let events = a.detect_oov(second.text()).expect("detect_oov");
+    assert_eq!(
+      events.iter().map(OovEvent::char).collect::<Vec<_>>(),
+      decided,
+      "{spoken:?}"
+    );
+    for policy in policies {
+      let decisions = policy(&events);
+      let refused = decisions
+        .iter()
+        .find(|resolved| resolved.decision() == OovDecision::FailClosed)
+        .and_then(|resolved| resolved.event().char());
+      match a.prepare(&samples, &speech, second.text(), &decisions, &abort) {
+        Ok(prepared) => {
+          assert_eq!(
+            refused, None,
+            "{spoken:?}: prepared though the policy refused"
+          );
+          assert!(!prepared.is_trivial(), "{spoken:?}");
+        }
+        Err(EmissionsError::SemanticOutOfVocab(failure)) => {
+          let ch = refused.expect("refused only where the policy refuses");
+          assert!(
+            failure.message().contains(&format!("{ch:?}")),
+            "{spoken:?}: the refusal names {ch:?}: {}",
+            failure.message()
+          );
+        }
+        Err(other) => panic!("{spoken:?}: {other:?}"),
+      }
+    }
+  }
+}
+
+// ————————————— Decisions bind to the unit they were detected in —————————————
+
+/// **A decision applies only to the text and the aligner that detected
+/// it.** Two texts with the same event layout (`&` at the same char and
+/// word index) cannot use each other's decisions; another aligner's
+/// decisions are refused even for the same text; a hand-built event is
+/// refused. The detected payload passes.
+#[test]
+fn a_decision_binds_to_the_text_and_aligner_that_detected_it() {
+  use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov, wildcard_all_decisions};
+
+  let a = aligner();
+  let b = EmissionsAligner::builder(Lang::En, PERMUTED_TOKENIZER_JSON.as_bytes())
+    .build()
+    .expect("build");
+  let samples = vec![0.2_f32; 16_000];
+  let speech = SpeechSpans::all_speech();
+  let abort = AtomicBool::new(false);
+
+  let sold = wildcard_all_decisions(&a.detect_oov("sold at&t").expect("detect_oov"));
+  let told = wildcard_all_decisions(&a.detect_oov("told at&t").expect("detect_oov"));
+  assert_eq!(sold, told, "the same layout: equal as positional payloads");
+  a.prepare(&samples, &speech, "sold at&t", &sold, &abort)
+    .expect("an aligner accepts the decisions it detected for this text");
+
+  let built = vec![ResolvedOov::new(
+    OovEvent::new(OovKind::Symbol('&'), 7, 1, Lang::En),
+    OovDecision::Wildcard,
+  )];
+  for (what, result) in [
+    (
+      "another text, same layout",
+      a.prepare(&samples, &speech, "told at&t", &sold, &abort),
+    ),
+    (
+      "another aligner, same text",
+      b.prepare(&samples, &speech, "sold at&t", &sold, &abort),
+    ),
+    (
+      "an event built by hand",
+      a.prepare(&samples, &speech, "sold at&t", &built, &abort),
+    ),
+  ] {
+    match result {
+      Err(EmissionsError::Tokenization(failure)) => assert!(
+        failure
+          .message()
+          .contains("was not detected by this aligner in this text"),
+        "{what}: {}",
+        failure.message()
+      ),
+      Err(other) => panic!("{what}: expected a Tokenization refusal; got {other:?}"),
+      Ok(_) => panic!("{what}: accepted"),
+    }
+  }
+}
+
+/// **A text with nothing alignable says so.** Marks the normalizer strips
+/// and marks tokenization drops leave no token: the result has no words
+/// and exactly one record, `NoAlignableText`, never a bare empty list.
+#[test]
+fn a_punctuation_only_text_is_named_no_alignable_text() {
+  use crate::core::UnalignedCause;
+
+  let a = aligner();
+  let samples = vec![0.2_f32; 16_000];
+  for text in ["!!!...", "\u{AB}\u{2026}\u{BB} *"] {
+    assert!(
+      a.detect_oov(text).expect("detect_oov").is_empty(),
+      "{text:?}"
+    );
+    let prepared = a
+      .prepare(
+        &samples,
+        &SpeechSpans::all_speech(),
+        text,
+        &[],
+        &AtomicBool::new(false),
+      )
+      .expect("prepare");
+    assert!(prepared.is_trivial(), "{text:?}");
+    let emissions = Emissions::from_log_probs(
+      1,
+      NonZeroUsize::new(VOCAB_SIZE).expect("32 != 0"),
+      vec![-1.0; VOCAB_SIZE],
+    )
+    .expect("ok");
+    let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
+    let result = a
+      .finish(prepared, &emissions, clock, &AtomicBool::new(false))
+      .expect("finish");
+    assert!(result.words().is_empty(), "{text:?}");
+    assert!(
+      matches!(
+        result.unaligned(),
+        [record] if matches!(record.cause(), UnalignedCause::NoAlignableText)
+          && record.run_index().is_none()
+          && record.language() == &Lang::En
+      ),
+      "{text:?}: {:?}",
+      result.unaligned()
+    );
+  }
+}
+
+/// **A text whose words the speech gates all drop says so.** With no
+/// speech anywhere every word's span is silence: no words, and exactly one
+/// record, `NoSurvivingWords`.
+#[test]
+fn a_fully_masked_text_is_named_no_surviving_words() {
+  use crate::core::UnalignedCause;
+
+  let a = aligner();
+  let samples = vec![0.2_f32; 16_000];
+  let prepared = a
+    .prepare(
+      &samples,
+      &SpeechSpans::new([]),
+      "hello world",
+      &[],
+      &AtomicBool::new(false),
+    )
+    .expect("prepare");
+  assert!(!prepared.is_trivial());
+  let (t, logits) = fake_encoder(&prepared, 320);
+  let emissions = Emissions::from_logits(t, a.vocab_size(), logits).expect("ok");
+  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
+  let result = a
+    .finish(prepared, &emissions, clock, &AtomicBool::new(false))
+    .expect("finish");
+  assert!(result.words().is_empty());
+  assert!(
+    matches!(
+      result.unaligned(),
+      [record] if matches!(record.cause(), UnalignedCause::NoSurvivingWords)
+    ),
+    "{:?}",
+    result.unaligned()
+  );
+}

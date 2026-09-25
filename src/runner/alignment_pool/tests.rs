@@ -36,9 +36,10 @@ fn data_dependent_failures_are_recoverable() {
 }
 
 /// The pool layer's half of the too-short-chunk contract: a real
-/// aligner's real `NoAlignmentPath` is absorbed into `Ok(empty)`
-/// rather than escaping as an error. This test proves only that the
-/// pool *returns* the recovered empty result; the emission-side
+/// aligner's real `NoAlignmentPath` is absorbed into an `Ok` result
+/// with no words and one record naming that failure, rather than
+/// escaping as an error. This test proves only that the pool
+/// *returns* the recovered result; the emission-side
 /// guarantee — that the dispatcher then rebuilds a `Transcript` still
 /// carrying the ASR text — is a separate contract, pinned by
 /// `core::dispatch::tests::empty_alignment_result_preserves_asr_text_and_emits_no_error`.
@@ -62,9 +63,9 @@ fn data_dependent_failures_are_recoverable() {
 /// `Err(NoAlignmentPath)`. The two together are the whole contract —
 /// the aligner reports honestly that no CTC path exists, and the pool
 /// decides that this particular failure is not worth a chunk over.
-/// Neither test alone would catch an `Ok(empty)` short-circuit smuggled
-/// into the aligner: this one would still pass, because it cannot see
-/// *why* the words vec is empty. That is what the paired test is for.
+/// This one also reads *why* the words vec is empty from the unit's
+/// record, so a short-circuit smuggled into the aligner (a zero-word
+/// `Ok` in place of the error) fails it as well.
 #[test]
 #[cfg_attr(
   not(asry_w2v_en),
@@ -82,13 +83,12 @@ fn too_short_chunk_recovers_to_empty_result() {
   const ASR_TEXT: &str = "hello world";
 
   let set = AlignmentSetBuilder::new()
-    // `Error`, deliberately, rather than the `SkipChunk` default: under
-    // `SkipChunk` a registry MISS *also* returns `Ok(empty)`, which is
-    // byte-identical to the recovery under test — so a broken
-    // registration would let this test pass without an aligner ever
-    // running. With `Error`, a miss surfaces as `LanguageUnsupported`
-    // and fails the `expect` below. The `Ok(empty)` this test accepts
-    // can only have come from a real alignment attempt.
+    // `Error`, deliberately, rather than the `SkipChunk` default, so a
+    // registry MISS can never pass for the recovery under test: a miss
+    // with no decision is refused, and one with a `Wildcard` decision
+    // surfaces `LanguageUnsupported`, so either fails the `expect`
+    // below. The `Ok` this test accepts can only have come from a real
+    // alignment attempt, and its record names what that attempt met.
     .with_fallback(AlignmentFallback::Error)
     .register(
       AlignerKey::Lang(Lang::En),
@@ -127,7 +127,8 @@ fn too_short_chunk_recovers_to_empty_result() {
   let run_options = RunOptions::new().expect("RunOptions::new");
 
   let result = run_one_alignment(&set, &job, &run_options).expect(
-    "`NoAlignmentPath` is classified recoverable, so the pool must absorb it into Ok(empty). \
+    "`NoAlignmentPath` is classified recoverable, so the pool must absorb it into an Ok result \
+     with no words and a record naming the failure. \
      An Err here would reach `handle_failure` upstream and turn a chunk carrying a perfectly \
      good ASR transcript into Event::Error — alignment is best-effort, never destructive.",
   );
@@ -136,6 +137,15 @@ fn too_short_chunk_recovers_to_empty_result() {
     result.words().is_empty(),
     "a dropped alignment contributes no words; got {:?}",
     result.words()
+  );
+  assert!(
+    matches!(
+      result.unaligned(),
+      [record] if record.run_index().is_none()
+        && matches!(record.cause(), UnalignedCause::Failed(AlignmentError::NoAlignmentPath(_)))
+    ),
+    "the recovered failure is named, never a bare empty list; got {:?}",
+    result.unaligned()
   );
 
   // Input sanity, NOT a preservation proof: `run_one_alignment` borrows
@@ -688,6 +698,341 @@ fn validate_oov_decision_languages_per_run_mismatch_rejects() {
     ),
     other => panic!("expected TokenizationFailed; got {other:?}"),
   }
+}
+
+/// The per-run road aligns the runs' texts only, so a per-run job whose
+/// runs do not reproduce its text is refused loudly: a character left
+/// out would reach no OOV detection, and a run that differs would align
+/// words the transcript does not hold. A job with no runs takes the
+/// whole-text road and passes, as does one whose runs reproduce the text.
+#[test]
+fn a_per_run_job_whose_runs_do_not_reproduce_its_text_is_refused() {
+  use crate::align::BoundsSource;
+
+  let run = |text: &str| {
+    Run::new(
+      Lang::En,
+      SmolStr::new(text),
+      0,
+      1_000,
+      0,
+      BoundsSource::Segment,
+    )
+  };
+  let text = "hello 4, & 50%.";
+  assert!(validate_runs_reproduce_text(&[], text, &Lang::En).is_ok());
+  assert!(
+    validate_runs_reproduce_text(&[run("hello"), run(" 4, & 50%.")], text, &Lang::En).is_ok()
+  );
+  for (runs, text) in [
+    (vec![run("hello")], text),
+    (vec![run("hello"), run(" 4")], text),
+    (vec![run("hello"), run(" 4, 50%.")], text),
+    (vec![run("hello"), run(" 4, & 50%")], text),
+    (vec![run("a bc")], "ab c"),
+    (vec![run("don't")], "dont"),
+  ] {
+    match validate_runs_reproduce_text(&runs, text, &Lang::En) {
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(failure))) => assert!(
+        failure.message().contains("do not reproduce"),
+        "{}",
+        failure.message()
+      ),
+      other => panic!("{text:?}: expected a Tokenization refusal; got {other:?}"),
+    }
+  }
+}
+
+/// A per-run job over `runs`, with `oov_decisions`, for the validators.
+fn per_run_job(runs: Vec<Run>, oov_decisions: Vec<Vec<ResolvedOov>>) -> AlignWorkItem {
+  use core::num::NonZeroI32;
+
+  use mediatime::Timebase;
+
+  let text: String = runs.iter().map(Run::text).collect();
+  AlignWorkItem {
+    chunk_id: ChunkId::from_raw(0),
+    samples: Arc::from(vec![0.0_f32; 1_600]),
+    sub_segments: Vec::new(),
+    text: SmolStr::new(text),
+    language: Lang::Ko,
+    runs,
+    abort_flag: Arc::new(AtomicBool::new(false)),
+    chunk_first_sample_in_stream: 0,
+    samples_to_output_range: Arc::new(|start, end| {
+      TimeRange::new(
+        start as i64,
+        end as i64,
+        Timebase::new(1, NonZeroI32::new(16_000).unwrap()),
+      )
+    }),
+    oov_decisions,
+  }
+}
+
+/// A Korean run, which the test registries have no aligner for.
+fn korean_run(text: &str, source_segment_idx: i32) -> Run {
+  Run::new(
+    Lang::Ko,
+    SmolStr::new(text),
+    0,
+    100,
+    source_segment_idx,
+    crate::align::BoundsSource::Segment,
+  )
+}
+
+/// A registry with no aligner, missing every language.
+fn empty_registry(fallback: AlignmentFallback) -> AlignmentSet {
+  crate::runner::aligner::AlignmentSetBuilder::new()
+    .with_fallback(fallback)
+    .build()
+}
+
+/// **A unit no aligner can read is resolved policy first.** Its one
+/// `NotInspected` decision decides it before the registry's fallback:
+/// `FailClosed` refuses it under `SkipChunk` and `Error` alike, and only
+/// `Wildcard` reaches the fallback (`SkipChunk` skips, `Error` fails the
+/// job with `LanguageUnsupported`). No decision at all is refused, never
+/// read as a skip, and so is a decision made for a text an aligner read.
+#[test]
+fn a_unit_no_aligner_can_read_is_resolved_policy_first() {
+  use crate::core::{default_oov_decisions, fail_closed_all_decisions};
+
+  let set = empty_registry(AlignmentFallback::SkipChunk);
+  let events = set
+    .detect_oov_per_run(&[korean_run(" 4", 0)])
+    .expect("detect_oov_per_run");
+  let refused = fail_closed_all_decisions(&events[0]);
+  let wildcard = default_oov_decisions(&events[0]);
+
+  for fallback in [AlignmentFallback::SkipChunk, AlignmentFallback::Error] {
+    assert!(
+      matches!(
+        resolve_not_inspected(&refused, fallback, &Lang::Ko),
+        Ok(UnalignedCause::Refused)
+      ),
+      "{fallback:?}: FailClosed refuses before any fallback"
+    );
+  }
+  assert!(matches!(
+    resolve_not_inspected(&wildcard, AlignmentFallback::SkipChunk, &Lang::Ko),
+    Ok(UnalignedCause::Skipped)
+  ));
+  assert!(matches!(
+    resolve_not_inspected(&wildcard, AlignmentFallback::Error, &Lang::Ko),
+    Err(WorkFailure::LanguageUnsupported(_))
+  ));
+
+  for fallback in [AlignmentFallback::SkipChunk, AlignmentFallback::Error] {
+    match resolve_not_inspected(&[], fallback, &Lang::Ko) {
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(failure))) => assert!(
+        failure.message().contains("exactly one decision"),
+        "{}",
+        failure.message()
+      ),
+      other => panic!("{fallback:?}: an empty batch is refused; got {other:?}"),
+    }
+  }
+
+  let read = crate::core::OovEvent::new(crate::core::OovKind::Symbol('4'), 1, 0, Lang::Ko)
+    .read_in(" 4", core::num::NonZeroU64::new(9).expect("9 != 0"));
+  let read = fail_closed_all_decisions(&[read]);
+  assert!(matches!(
+    resolve_not_inspected(&read, AlignmentFallback::SkipChunk, &Lang::Ko),
+    Err(WorkFailure::Alignment(AlignmentError::Tokenization(_)))
+  ));
+}
+
+/// **A decision applies only to the unit it was detected for.** Two runs
+/// with the same text and layout, or with different texts and the same
+/// layout, cannot swap or replay each other's decisions; a decision
+/// detected through another registry (one swapped in between detection
+/// and dispatch) is refused; and a decision built by hand is refused.
+/// The matching payload passes.
+#[test]
+fn a_decision_applies_only_to_the_unit_it_was_detected_for() {
+  use crate::core::fail_closed_all_decisions;
+
+  let a = empty_registry(AlignmentFallback::SkipChunk);
+  let b = empty_registry(AlignmentFallback::SkipChunk);
+  let refused = |message: &str| message.contains("was not detected for this unit");
+
+  for texts in [[" 4", " 4"], [" a&b", " c&d"]] {
+    let runs = vec![korean_run(texts[0], 0), korean_run(texts[1], 1)];
+    let decisions: Vec<Vec<ResolvedOov>> = a
+      .detect_oov_per_run(&runs)
+      .expect("detect_oov_per_run")
+      .iter()
+      .map(|events| fail_closed_all_decisions(events))
+      .collect();
+
+    let job = per_run_job(runs.clone(), decisions.clone());
+    assert!(
+      validate_decision_units(a.id(), &job).is_ok(),
+      "{texts:?}: the matching payload passes"
+    );
+
+    let swapped = per_run_job(
+      runs.clone(),
+      vec![decisions[1].clone(), decisions[0].clone()],
+    );
+    let replayed = per_run_job(
+      runs.clone(),
+      vec![decisions[0].clone(), decisions[0].clone()],
+    );
+    for (name, job, registry) in [
+      ("swapped", &swapped, a.id()),
+      ("replayed", &replayed, a.id()),
+      ("another registry", &job, b.id()),
+    ] {
+      match validate_decision_units(registry, job) {
+        Err(WorkFailure::Alignment(AlignmentError::Tokenization(failure))) => {
+          assert!(
+            refused(failure.message()),
+            "{texts:?} {name}: {}",
+            failure.message()
+          )
+        }
+        other => panic!("{texts:?} {name}: expected a refusal; got {other:?}"),
+      }
+    }
+  }
+
+  let runs = vec![korean_run(" 4", 0)];
+  let built = fail_closed_all_decisions(&[crate::core::OovEvent::new(
+    crate::core::OovKind::NotInspected,
+    0,
+    0,
+    Lang::Ko,
+  )]);
+  assert!(matches!(
+    validate_decision_units(a.id(), &per_run_job(runs, vec![built])),
+    Err(WorkFailure::Alignment(AlignmentError::Tokenization(_)))
+  ));
+}
+
+/// **A registry swapped in between detection and dispatch is refused.**
+/// A text registry A reads clean has no event, so its batch is empty; a
+/// registry B that cannot read the text must not take that absence for a
+/// decision, so the unit is refused before any aligner runs, under either
+/// fallback. A decision A made for a text it could not read is refused by
+/// B before any lookup.
+#[test]
+fn a_registry_swapped_between_detection_and_dispatch_is_refused() {
+  use crate::core::default_oov_decisions;
+
+  for fallback in [AlignmentFallback::SkipChunk, AlignmentFallback::Error] {
+    let b = empty_registry(fallback);
+    let clean_on_a: Vec<ResolvedOov> = Vec::new();
+    match align_unit(&b, &Lang::Ko, &clean_on_a, |_| {
+      panic!("no aligner may run for a unit B cannot read")
+    }) {
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(failure))) => assert!(
+        failure.message().contains("exactly one decision"),
+        "{fallback:?}: {}",
+        failure.message()
+      ),
+      other => panic!("{fallback:?}: a clean batch from A is no decision for B; got {other:?}"),
+    }
+
+    let a = empty_registry(fallback);
+    let runs = vec![korean_run(" 4", 0)];
+    let from_a: Vec<Vec<ResolvedOov>> = a
+      .detect_oov_per_run(&runs)
+      .expect("detect_oov_per_run")
+      .iter()
+      .map(|events| default_oov_decisions(events))
+      .collect();
+    let job = per_run_job(runs, from_a);
+    assert!(
+      validate_decision_units(a.id(), &job).is_ok(),
+      "{fallback:?}: A's own payload passes on A"
+    );
+    match validate_decision_units(b.id(), &job) {
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(failure))) => assert!(
+        failure.message().contains("was not detected for this unit"),
+        "{fallback:?}: {}",
+        failure.message()
+      ),
+      other => panic!("{fallback:?}: A's decision is no decision for B; got {other:?}"),
+    }
+  }
+}
+
+/// **Exactly one terminal outcome per unit.** Aligned words, a skip, a
+/// refusal, text with nothing alignable, words the speech gates all
+/// dropped, and a recoverable failure: every unit that gave no words is
+/// named once with its run and language, and every aligned word is kept.
+#[test]
+fn every_unit_has_exactly_one_named_outcome() {
+  use crate::runner::aligner::core::Composed;
+
+  let word = |text: &str, start: i64| {
+    Word::new(
+      SmolStr::new(text),
+      TimeRange::new(
+        start,
+        start + 10,
+        mediatime::Timebase::new(1, core::num::NonZeroI32::new(1_000).unwrap()),
+      ),
+      0.9,
+    )
+  };
+  assert!(matches!(
+    UnitOutcome::from(Composed::from_words(Vec::new())),
+    UnitOutcome::Unaligned(UnalignedCause::NoSurvivingWords)
+  ));
+  assert!(matches!(
+    UnitOutcome::from(Composed::NoAlignableText),
+    UnitOutcome::Unaligned(UnalignedCause::NoAlignableText)
+  ));
+
+  let failed =
+    AlignmentError::NoAlignmentPath(AlignmentFailure::new(SmolStr::new("too short"), Lang::En));
+  let causes = [
+    UnalignedCause::Skipped,
+    UnalignedCause::Refused,
+    UnalignedCause::NoAlignableText,
+    UnalignedCause::NoSurvivingWords,
+    UnalignedCause::Failed(failed),
+  ];
+  let mut units = vec![Unit {
+    run_index: Some(0),
+    language: Lang::En,
+    outcome: UnitOutcome::from(Composed::from_words(vec![word("b", 20), word("a", 0)])),
+  }];
+  for (i, cause) in causes.into_iter().enumerate() {
+    units.push(Unit {
+      run_index: Some(i + 1),
+      language: Lang::Ko,
+      outcome: UnitOutcome::Unaligned(cause),
+    });
+  }
+
+  let result = account(units);
+  let words: Vec<&str> = result.words().iter().map(|w| w.text()).collect();
+  assert_eq!(words, ["a", "b"], "aligned words kept, in time order");
+  let named: Vec<(Option<usize>, &Lang)> = result
+    .unaligned()
+    .iter()
+    .map(|u| (u.run_index(), u.language()))
+    .collect();
+  assert_eq!(
+    named,
+    [
+      (Some(1), &Lang::Ko),
+      (Some(2), &Lang::Ko),
+      (Some(3), &Lang::Ko),
+      (Some(4), &Lang::Ko),
+      (Some(5), &Lang::Ko),
+    ],
+    "each unit that gave no words is named once"
+  );
+  assert!(matches!(
+    result.unaligned()[4].cause(),
+    UnalignedCause::Failed(AlignmentError::NoAlignmentPath(_))
+  ));
 }
 
 /// An empty outer vec ("no OOV expected") is accepted —

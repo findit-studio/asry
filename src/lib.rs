@@ -51,7 +51,7 @@ pub use types::{
 
 pub use core::{
   AlignmentResult, AsrParams, AsrParamsOverride, AsrResult, Command, Event, LanguagePolicy,
-  SamplingStrategy, Transcriber, TranscriberOptions,
+  SamplingStrategy, Transcriber, TranscriberOptions, Unaligned, UnalignedCause,
 };
 
 // Reachable under `runner` (whisper.cpp ASR) OR `emissions` (the

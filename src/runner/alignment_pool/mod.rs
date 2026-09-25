@@ -24,15 +24,15 @@ use std::{
 use mediatime::TimeRange;
 use smol_str::{SmolStr, format_smolstr};
 
-use core::sync::atomic::Ordering;
+use core::{num::NonZeroU64, sync::atomic::Ordering};
 use std::{sync::Mutex, time::Instant};
 
 use ort::session::RunOptions;
 
 use crate::{
-  align::Run,
-  core::{AlignmentResult, ResolvedOov},
-  runner::aligner::{Aligner, AlignmentFallback, AlignmentLookup, AlignmentSet},
+  align::{Run, script_dispatch::runs_reproduce_text},
+  core::{AlignmentResult, OovDecision, ResolvedOov, Unaligned, UnalignedCause},
+  runner::aligner::{Aligner, AlignmentFallback, AlignmentLookup, AlignmentSet, core::Composed},
   types::{
     AlignmentError, AlignmentFailure, ChunkId, Lang, LanguageUnsupportedForAlignment, Word,
     WorkFailure, WorkerHangTimeout, WorkerKind,
@@ -117,9 +117,9 @@ pub struct AlignWorkItem {
   /// * If [`Self::runs`] is non-empty (script-dispatched
   /// code-switch path): one entry per run, in run order.
   /// `oov_decisions[i]` applies to `runs[i].text()` and
-  /// must be in the order
-  /// [`AlignmentSet::detect_oov`](crate::AlignmentSet::detect_oov)
-  /// would have produced events for that run.
+  /// decides, in order, the events
+  /// [`AlignmentSet::detect_oov_per_run`](crate::AlignmentSet::detect_oov_per_run)
+  /// reported for that run.
   /// * If [`Self::runs`] is empty (whole-chunk fallback):
   /// exactly one entry whose decisions apply to the
   /// chunk's full `text`.
@@ -127,9 +127,23 @@ pub struct AlignWorkItem {
   /// shape: the runner falls back to `&[]` for both
   /// chunk-level and per-run alignment paths (encountering
   /// any OOV then raises `TokenizationFailed`).
+  /// * A unit no aligner can read takes exactly the one decision
+  /// for its `OovKind::NotInspected` event: `FailClosed` refuses
+  /// it, `Wildcard` hands it to the registry's
+  /// `AlignmentFallback`. No decision is refused, never read as a
+  /// skip. The result names the unit in
+  /// [`AlignmentResult::unaligned`].
+  /// * Every decision is bound to the unit it was detected for
+  /// (its text, its run, and the `AlignmentSet` that detected
+  /// it): detect through the set that dispatches the job, and
+  /// keep each run's decisions at that run's index. A decision
+  /// detected for another unit, through another set, or built
+  /// by hand is refused before any lookup.
   ///
   /// The caller computes this via
-  /// [`AlignmentSet::detect_oov`] per unit + a policy helper
+  /// [`AlignmentSet::detect_oov`] for the whole chunk, or
+  /// [`AlignmentSet::detect_oov_per_run`] for its runs, on the set
+  /// that dispatches the job, + a policy helper
   /// from [`crate::core::oov`]
   /// (`default_oov_decisions` / `wildcard_all_decisions` /
   /// `fail_closed_all_decisions` / a custom closure over the
@@ -388,6 +402,12 @@ pub fn run_one_alignment(
     )));
   }
 
+  // The per-run road aligns the runs' texts and nothing else, so
+  // they must be the text. `Command::Alignment` only ever carries
+  // runs that reproduce its text, so this refuses a hand-built work
+  // item.
+  validate_runs_reproduce_text(&job.runs, &job.text, &job.language)?;
+
   // positional
   // identity (`OovEvent::matches_position`) deliberately
   // ignores `language` so `AlignerKey::Any` fallback works.
@@ -416,92 +436,274 @@ pub fn run_one_alignment(
   // primary cancellation surface; `RunOptions::terminate` is
   // the ORT mid-call escape hatch the caller owns end-to-end.
 
+  // Every decision must have been detected for the unit it is applied
+  // to, through this registry. Checked before any lookup or
+  // tokenization, so a decision from another registry, another run or
+  // another chunk never reaches a unit it was not made for.
+  validate_decision_units(set.id(), job)?;
+
+  // Exactly one terminal outcome per unit: its words, or the named
+  // reason it has none. A failure that is not the unit's own (a
+  // backend fault, a stale payload, an abort) fails the whole job.
+  //
+  // An alignment-stage failure that is data-dependent (`NoAlignmentPath`
+  // from a too-short chunk, a policy refusing a spoken character) is not
+  // a reason to discard the cached ASR transcript: it becomes the unit's
+  // outcome, so the dispatch emits `Transcript { text, words: [] }`
+  // instead of `Event::Error`. `WorkerHangTimeout`, configuration
+  // failures and `AlignmentFallback::Error` stay fatal.
   let outcome = if job.runs.is_empty() {
-    match set.lookup(&job.language) {
-      AlignmentLookup::Hit { aligner, .. } => {
-        run_under_lock(aligner, job, run_options, &job.abort_flag)
+    let decisions = job.oov_decisions.first().map_or(&[][..], Vec::as_slice);
+    align_unit(set, &job.language, decisions, |aligner| {
+      run_under_lock(aligner, job, run_options, &job.abort_flag)
+    })
+    .map(|outcome| {
+      if let UnitOutcome::Unaligned(cause) = &outcome {
+        log_unaligned(job.chunk_id, None, &job.language, cause);
       }
-      AlignmentLookup::AnyFallback { aligner } => {
-        run_under_lock(aligner, job, run_options, &job.abort_flag)
-      }
-      AlignmentLookup::Miss { fallback } => match fallback {
-        AlignmentFallback::SkipChunk => Ok(AlignmentResult::new(Vec::new())),
-        AlignmentFallback::Error => Err(WorkFailure::LanguageUnsupported(
-          LanguageUnsupportedForAlignment::new(job.language.clone()),
-        )),
-      },
-    }
+      account(vec![Unit {
+        run_index: None,
+        language: job.language.clone(),
+        outcome,
+      }])
+    })
   } else {
     dispatch_runs(set, job, run_options)
   };
 
-  // An alignment-stage failure is NOT a reason to discard the
-  // cached ASR transcript. Without this, a `NoAlignmentPath`
-  // from a too-short chunk or a 32 M-cell budget overflow would
-  // propagate to `handle_failure` upstream, turning the chunk
-  // into `Event::Error` and dropping the (perfectly valid) ASR
-  // text. Convert recoverable alignment-stage failures to an
-  // empty `AlignmentResult` so the dispatch emits
-  // `Transcript { text, words: [] }` instead — alignment is
-  // best-effort, not destructive.
-  //
-  // `WorkerHangTimeout` and the abort-flag race above stay fatal
-  // because they signal a worker liveness problem the runner
-  // needs to know about. Configuration / setup failures
-  // (`LanguageUnsupportedForAlignment` produced by
-  // `AlignmentFallback::Error`) also stay fatal — those are
-  // intentional opt-in errors from the registry policy, not
-  // recoverable alignment-compute failures.
   match outcome {
-    Ok(_) => outcome,
-    Err(ref f) if alignment_failure_is_recoverable(f) => {
-      // emit an observable
-      // diagnostic when alignment is dropped silently. Without
-      // this, recoverable failures (semantic-OOV chunks,
-      // NoAlignmentPath, EmptyText) collapse to
-      // `Transcript { text, words: [] }` with no surface
-      // signal — operators can't distinguish "alignment
-      // succeeded with zero words" from "alignment was
-      // dropped". One stderr line per recovery, keyed by
-      // chunk_id + failure kind.
-      if let WorkFailure::Alignment(err) = f {
-        // Drop the failure `message` from the log line —
-        // `SemanticOutOfVocab` currently embeds the offending
-        // char, which is transcript content. The variant
-        // discriminant already conveys the cause class; full
-        // diagnostic strings stay accessible to callers via
-        // the typed `WorkFailure` they own.
-        let language = match err {
-          AlignmentError::ModelInference(p)
-          | AlignmentError::Tokenization(p)
-          | AlignmentError::Normalization(p)
-          | AlignmentError::NoAlignmentPath(p)
-          | AlignmentError::EmptyText(p)
-          | AlignmentError::SemanticOutOfVocab(p)
-          | AlignmentError::Aborted(p) => p.language(),
-        };
-        eprintln!(
-          "asry alignment recovered chunk={:?} kind={err:?} language={language:?}",
-          job.chunk_id,
-        );
-      }
-      Ok(AlignmentResult::new(Vec::new()))
-    }
-    // // canonicalise `WorkerHangTimeout::elapsed`. Inner code
+    // canonicalise `WorkerHangTimeout::elapsed`. Inner code
     // (`Aligner::align`'s `timed_out` closure,
     // `classify_encode_abort` for ORT-cancel) hard-codes
     // `Duration::ZERO` because it doesn't own an `Instant`.
     // The worker DOES — overwrite unconditionally so
     // operators don't see misleading zero-elapsed timeout
-    // metrics for real cancellations. The abort-cancel
-    // path surfaced as `WorkerHangTimeout { elapsed: 0 }`,
-    // breaking any recovery / alert logic keyed on duration.
+    // metrics for real cancellations.
     Err(WorkFailure::WorkerHang(timeout)) => Err(WorkFailure::WorkerHang(WorkerHangTimeout::new(
       timeout.kind(),
       started_at.elapsed(),
     ))),
-    Err(_) => outcome,
+    other => other,
   }
+}
+
+/// Refuse every decision that was not detected for the unit it is
+/// applied to: its event must carry this registry, this run (or the
+/// whole chunk), and exactly this unit's text, as detection stamped it.
+///
+/// Positional identity compares kinds and indices only, so without this
+/// two units with the same event layout (two runs of one chunk, or two
+/// chunks) could swap or replay each other's decisions, and a decision
+/// detected through another registry (one swapped in between detection
+/// and dispatch) would be applied where it was never made. An event
+/// built by hand carries no unit and is refused too.
+fn validate_decision_units(registry: NonZeroU64, job: &AlignWorkItem) -> Result<(), WorkFailure> {
+  let units: Vec<(Option<usize>, &str, &Lang)> = if job.runs.is_empty() {
+    vec![(None, job.text.as_str(), &job.language)]
+  } else {
+    job
+      .runs
+      .iter()
+      .enumerate()
+      .map(|(run_index, run)| (Some(run_index), run.text(), run.language()))
+      .collect()
+  };
+  for ((unit, (run_index, text, language)), decisions) in
+    units.into_iter().enumerate().zip(&job.oov_decisions)
+  {
+    for (i, resolved) in decisions.iter().enumerate() {
+      if !resolved.event().detected_for(text, run_index, registry) {
+        return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+          AlignmentFailure::new(
+            format_smolstr!(
+              "AlignWorkItem::oov_decisions[{unit}][{i}] was not detected for this unit: \
+ its event was detected in another text, another run, or through another AlignmentSet, \
+ or was built by hand. Decisions bind to the unit their events were detected in; \
+ recompute them via `AlignmentSet::detect_oov` / `detect_oov_per_run` on THIS set for \
+ THIS chunk."
+            ),
+            language.clone(),
+          ),
+        )));
+      }
+    }
+  }
+  Ok(())
+}
+
+/// The one terminal outcome of an alignment unit.
+#[derive(Debug)]
+enum UnitOutcome {
+  /// Words aligned from the unit; never empty.
+  Aligned(Vec<Word>),
+  /// No word came from the unit, and why.
+  Unaligned(UnalignedCause),
+}
+
+impl From<Composed> for UnitOutcome {
+  fn from(composed: Composed) -> Self {
+    match composed {
+      Composed::Words(words) => Self::Aligned(words),
+      Composed::NoAlignableText => Self::Unaligned(UnalignedCause::NoAlignableText),
+      Composed::NoSurvivingWords => Self::Unaligned(UnalignedCause::NoSurvivingWords),
+    }
+  }
+}
+
+/// An alignment unit and its terminal outcome.
+struct Unit {
+  run_index: Option<usize>,
+  language: Lang,
+  outcome: UnitOutcome,
+}
+
+/// The job's result, built from exactly one outcome per unit: each
+/// unit's words, or its record naming why it has none.
+fn account(units: Vec<Unit>) -> AlignmentResult {
+  let mut words = Vec::new();
+  let mut unaligned = Vec::new();
+  for unit in units {
+    match unit.outcome {
+      UnitOutcome::Aligned(unit_words) => words.extend(unit_words),
+      UnitOutcome::Unaligned(cause) => {
+        unaligned.push(Unaligned::new(unit.run_index, unit.language, cause));
+      }
+    }
+  }
+  // enforce the `Transcript::words()` time-order invariant for
+  // multi-run chunks. See [`sort_words_by_pts`] for the rationale.
+  sort_words_by_pts(&mut words);
+  AlignmentResult::new(words).with_unaligned(unaligned)
+}
+
+/// Align one unit in `language`, or say why it gives no words: exactly
+/// one outcome, or an error that fails the job.
+///
+/// A unit no aligner can read is resolved by its decisions first
+/// ([`resolve_not_inspected`]). A unit an aligner reads is aligned by
+/// `align`; a data-dependent failure becomes the unit's outcome.
+fn align_unit(
+  set: &AlignmentSet,
+  language: &Lang,
+  decisions: &[ResolvedOov],
+  align: impl FnOnce(&Mutex<Aligner>) -> Result<Composed, WorkFailure>,
+) -> Result<UnitOutcome, WorkFailure> {
+  let aligner = match set.lookup(language) {
+    AlignmentLookup::Hit { aligner, .. } | AlignmentLookup::AnyFallback { aligner } => aligner,
+    AlignmentLookup::Miss { fallback } => {
+      return resolve_not_inspected(decisions, fallback, language).map(UnitOutcome::Unaligned);
+    }
+  };
+  match align(aligner) {
+    Ok(composed) => Ok(UnitOutcome::from(composed)),
+    Err(WorkFailure::Alignment(err)) if alignment_error_is_recoverable(&err) => {
+      Ok(UnitOutcome::Unaligned(UnalignedCause::Failed(err)))
+    }
+    Err(failure) => Err(failure),
+  }
+}
+
+/// Resolve a unit no aligner can read, policy first.
+///
+/// Its decisions must be exactly the caller's one decision for its
+/// [`OovKind::NotInspected`](crate::core::OovKind::NotInspected) event, which [`validate_decision_units`]
+/// has already bound to this unit and registry. `FailClosed` refuses the
+/// unit whatever the registry's fallback; `Wildcard` hands it to the
+/// fallback: `SkipChunk` skips it, `Error` fails the job with
+/// `LanguageUnsupported`. No decision, or a decision made for a text an
+/// aligner read, is refused as `Tokenization`: a missing decision never
+/// stands in for a skip.
+fn resolve_not_inspected(
+  decisions: &[ResolvedOov],
+  fallback: AlignmentFallback,
+  language: &Lang,
+) -> Result<UnalignedCause, WorkFailure> {
+  let refused = |message: SmolStr| {
+    WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(
+      message,
+      language.clone(),
+    )))
+  };
+  let [resolved] = decisions else {
+    return Err(refused(format_smolstr!(
+      "no aligner can read this unit, so it needs exactly one decision, for its \
+ OovKind::NotInspected event; got {}. Detect it via `AlignmentSet::detect_oov` / \
+ `detect_oov_per_run` on the set that dispatches it, and decide that event.",
+      decisions.len(),
+    )));
+  };
+  if !resolved.event().is_unread() {
+    return Err(refused(SmolStr::new_static(
+      "no aligner can read this unit, but its decision was made for a text an aligner \
+ read: the registry changed between detection and dispatch, or the decision belongs to \
+ another unit. Detect it again on the set that dispatches it.",
+    )));
+  }
+  match resolved.decision() {
+    OovDecision::FailClosed => Ok(UnalignedCause::Refused),
+    OovDecision::Wildcard => match fallback {
+      AlignmentFallback::SkipChunk => Ok(UnalignedCause::Skipped),
+      AlignmentFallback::Error => Err(WorkFailure::LanguageUnsupported(
+        LanguageUnsupportedForAlignment::new(language.clone()),
+      )),
+    },
+  }
+}
+
+/// One stderr line per unit that gave no words, keyed by chunk, run and
+/// language. It names the cause's kind only (a failure's variant, not
+/// its message), so no transcript content reaches the log.
+fn log_unaligned(
+  chunk_id: ChunkId,
+  run_index: Option<usize>,
+  language: &Lang,
+  cause: &UnalignedCause,
+) {
+  let kind = match cause {
+    UnalignedCause::Skipped => "skipped",
+    UnalignedCause::Refused => "refused",
+    UnalignedCause::NoAlignableText => "no_alignable_text",
+    UnalignedCause::NoSurvivingWords => "no_surviving_words",
+    UnalignedCause::Failed(AlignmentError::NoAlignmentPath(_)) => "failed:no_alignment_path",
+    UnalignedCause::Failed(AlignmentError::EmptyText(_)) => "failed:empty_text",
+    UnalignedCause::Failed(AlignmentError::SemanticOutOfVocab(_)) => "failed:semantic_out_of_vocab",
+    UnalignedCause::Failed(_) => "failed",
+  };
+  eprintln!(
+    "asry alignment unaligned chunk={chunk_id:?} run={run_index:?} language={language:?} cause={kind}"
+  );
+}
+
+/// Refuse a per-run job whose runs do not reproduce its text: their
+/// texts, concatenated in order, must be `text` apart from its outer
+/// whitespace (see [`runs_reproduce_text`]).
+///
+/// The per-run road aligns the runs and nothing else. A spoken
+/// character outside every run would escape OOV detection, and a run
+/// that differs from the text (moved whitespace, spelled punctuation
+/// added or dropped) would align words the transcript does not hold.
+/// Since the caller resolved its decisions per run, the job cannot be
+/// re-routed onto the whole-text road here; it fails loudly instead. A
+/// job with no runs takes the whole-text road and always passes.
+fn validate_runs_reproduce_text(
+  runs: &[Run],
+  text: &str,
+  language: &Lang,
+) -> Result<(), WorkFailure> {
+  if runs.is_empty() || runs_reproduce_text(runs, text) {
+    return Ok(());
+  }
+  Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+    AlignmentFailure::new(
+      SmolStr::new_static(
+        "AlignWorkItem::runs do not reproduce AlignWorkItem::text; the per-run road \
+ aligns the runs' texts only, so it may be taken only when they are the text. Forward \
+ the runs `Command::Alignment` carries, which reproduce its text, or pass no runs to \
+ align the whole text.",
+      ),
+      language.clone(),
+    ),
+  )))
 }
 
 /// validate that
@@ -630,13 +832,17 @@ fn validate_oov_decision_languages(
 /// - `AsrFailed` — logically impossible on the alignment path;
 /// surface as a bug rather than swallow.
 fn alignment_failure_is_recoverable(failure: &WorkFailure) -> bool {
+  matches!(failure, WorkFailure::Alignment(err) if alignment_error_is_recoverable(err))
+}
+
+/// The alignment errors [`alignment_failure_is_recoverable`] keeps the
+/// ASR transcript for.
+fn alignment_error_is_recoverable(err: &AlignmentError) -> bool {
   matches!(
-    failure,
-    WorkFailure::Alignment(
-      AlignmentError::NoAlignmentPath(_)
-        | AlignmentError::EmptyText(_)
-        | AlignmentError::SemanticOutOfVocab(_)
-    )
+    err,
+    AlignmentError::NoAlignmentPath(_)
+      | AlignmentError::EmptyText(_)
+      | AlignmentError::SemanticOutOfVocab(_)
   )
 }
 
@@ -648,7 +854,7 @@ fn run_under_lock(
   job: &AlignWorkItem,
   run_options: &RunOptions,
   abort_flag: &AtomicBool,
-) -> Result<AlignmentResult, WorkFailure> {
+) -> Result<Composed, WorkFailure> {
   let mut guard = match aligner.lock() {
     Ok(g) => g,
     Err(poisoned) => {
@@ -772,14 +978,12 @@ impl BoundsSourceCounters {
 /// case where they extend past the run window (out-of-range
 /// positions get clamped inside `Aligner::align`).
 ///
-/// **Fallback for unaligned languages.** When neither a
-/// `Lang(L)` aligner nor an `Any` aligner is registered, AND
-/// the configured fallback is `SkipChunk`, we synthesise a
-/// single pseudo-[`crate::types::Word`] covering the run's
-/// `(audio_t0_ms, audio_t1_ms)` with `score = 0.0` and the
-/// run's verbatim text. This preserves the run's place in the
-/// output stream (downstream consumers can render it as
-/// non-aligned text) instead of dropping it. The
+/// **Runs no aligner can read.** When neither a `Lang(L)` aligner
+/// nor an `Any` aligner is registered and the configured fallback is
+/// `SkipChunk`, the run contributes no word: the caller's decision for
+/// its [`OovKind::NotInspected`](crate::core::OovKind::NotInspected) event refuses or skips it, and the
+/// result names it in [`AlignmentResult::unaligned`]. A run whose
+/// alignment fails recoverably is named there too. The
 /// `AlignmentFallback::Error` policy still surfaces an error.
 ///
 /// **Telemetry.** Logs one `script_dispatch chunk=...` line per
@@ -808,7 +1012,7 @@ fn dispatch_runs(
   run_options: &RunOptions,
 ) -> Result<AlignmentResult, WorkFailure> {
   let mut counters = BoundsSourceCounters::default();
-  let mut all_words: Vec<Word> = Vec::new();
+  let mut units: Vec<Unit> = Vec::with_capacity(job.runs.len());
   let dispatch_started_at = Instant::now();
 
   for (run_idx, run) in job.runs.iter().enumerate() {
@@ -829,175 +1033,88 @@ fn dispatch_runs(
 
     counters.observe_bounds(run.bounds_source());
 
-    // Resolve the audio slice for this run. Bounds in ms get
-    // converted to chunk-local sample indices at 16 kHz; the
-    // wholeclip sentinel falls back to the full chunk.
-    let (slice_lo, slice_hi) =
-      run_audio_slice(run, job.samples.len(), job.chunk_first_sample_in_stream);
-
-    let lookup = set.lookup(run.language());
-    let aligner_lock = match lookup {
-      AlignmentLookup::Hit { aligner, .. } => Some(aligner),
-      AlignmentLookup::AnyFallback { aligner } => Some(aligner),
-      AlignmentLookup::Miss { fallback } => match fallback {
-        AlignmentFallback::SkipChunk => {
-          // `SkipChunk` is
-          // documented as producing empty `Transcript.words()`
-          // (the no-runs path returns `Ok(empty)`).  // the per-run dispatch path emitted a timed
-          // pseudo-word for each missing language, which
-          // downstream consumers could mistake for aligned
-          // word timing — silently violating the documented
-          // empty-words contract. Now we just count the run
-          // as unaligned and skip it (no word emitted), so
-          // both paths agree on `SkipChunk` semantics.
-          counters.observe_unaligned();
-          None
-        }
-        AlignmentFallback::Error => {
-          emit_telemetry(job.chunk_id, &counters);
-          return Err(WorkFailure::LanguageUnsupported(
-            LanguageUnsupportedForAlignment::new(run.language().clone()),
-          ));
-        }
-      },
-    };
-
-    let Some(aligner) = aligner_lock else {
-      continue;
-    };
-
-    // Slice sub_segments to those that overlap the run's audio
-    // window. The aligner clamps out-of-range PTS internally,
-    // but pre-filtering keeps the silence mask sharp.
-    let run_subs = clip_sub_segments(&job.sub_segments, slice_lo, slice_hi, run.language())
-      .inspect_err(|_| {
-        emit_telemetry(job.chunk_id, &counters);
-      })?;
-    let run_samples = &job.samples[slice_lo..slice_hi];
-
-    // Per-run `chunk_first_sample_in_stream`: the parent chunk's
-    // first sample plus this run's offset inside the chunk. The
-    // aligner uses this to convert frame indices back into
-    // stream sample space, which downstream
-    // `samples_to_output_range` then maps to caller timebase.
-    let run_first_sample_in_stream = job
-      .chunk_first_sample_in_stream
-      .saturating_add(slice_lo as u64);
-
-    // a SHARED `RunOptions`
-    // across all runs in a chunk. The caller supplies it via
-    // `run_one_alignment(..., run_options)` so an external
-    // watchdog can call `terminate()` and stop whichever run
-    // is currently in flight; the post-call `abort_flag`
-    // check below then prevents subsequent runs from starting.
-    // Round-5's "fresh per run" isolation is sacrificed to make
-    // cancellation actually work end-to-end — the trade-off is
-    // acceptable because the aligner mutex serialises ORT
-    // calls within a chunk anyway.
-    // thread the
-    // caller's per-run OOV decisions through. `oov_decisions`
-    // is `Vec<Vec<OovDecision>>` indexed by run; a missing
-    // entry (caller pre-sized too small / left empty) falls
-    // back to `&[]` which raises `TokenizationFailed` if the
-    // run hits any OOV — loud diagnostic for the caller, not
-    // silent default-policy substitution.
+    // The caller's per-run OOV decisions. `oov_decisions` is
+    // indexed by run; a missing entry (caller pre-sized too small /
+    // left empty) falls back to `&[]`, which raises
+    // `TokenizationFailed` if the run hits any OOV, and refuses a
+    // run no aligner can read: a loud diagnostic for the caller,
+    // never a silent default policy.
     let run_oov_decisions = job
       .oov_decisions
       .get(run_idx)
       .map(|v| v.as_slice())
       .unwrap_or(&[]);
-    let outcome = run_one_per_run(
-      aligner,
-      run,
-      run_samples,
-      &run_subs,
-      run_first_sample_in_stream,
-      job.samples_to_output_range.clone(),
-      &job.abort_flag,
-      run_options,
-      run_oov_decisions,
-    );
-    match outcome {
-      Ok(result) => {
-        let run_lang = run.language().clone();
-        for word in result.into_words() {
-          // tag every dispatched word
-          // with its run's language so downstream consumers can
-          // route per-word output without reverse-mapping from
-          // text/timing. The aligner itself doesn't know the run
-          // language; we attach it here at the dispatch boundary.
-          all_words.push(word.with_language(Some(run_lang.clone())));
-        }
+
+    // Exactly one outcome for this run: pushed below, or the job fails.
+    let outcome = align_unit(set, run.language(), run_oov_decisions, |aligner| {
+      // Resolve the audio slice for this run. Bounds in ms get
+      // converted to chunk-local sample indices at 16 kHz; the
+      // wholeclip sentinel falls back to the full chunk.
+      let (slice_lo, slice_hi) =
+        run_audio_slice(run, job.samples.len(), job.chunk_first_sample_in_stream);
+      // Slice sub_segments to those that overlap the run's audio
+      // window. The aligner clamps out-of-range PTS internally,
+      // but pre-filtering keeps the silence mask sharp.
+      let run_subs = clip_sub_segments(&job.sub_segments, slice_lo, slice_hi, run.language())?;
+      // Per-run `chunk_first_sample_in_stream`: the parent chunk's
+      // first sample plus this run's offset inside the chunk. The
+      // aligner uses this to convert frame indices back into
+      // stream sample space, which downstream
+      // `samples_to_output_range` then maps to caller timebase.
+      let run_first_sample_in_stream = job
+        .chunk_first_sample_in_stream
+        .saturating_add(slice_lo as u64);
+      // a SHARED `RunOptions` across all runs in a chunk. The caller
+      // supplies it via `run_one_alignment(..., run_options)` so an
+      // external watchdog can call `terminate()` and stop whichever
+      // run is currently in flight; the abort gate above then
+      // prevents subsequent runs from starting. The aligner mutex
+      // serialises ORT calls within a chunk anyway.
+      run_one_per_run(
+        aligner,
+        run,
+        &job.samples[slice_lo..slice_hi],
+        &run_subs,
+        run_first_sample_in_stream,
+        job.samples_to_output_range.clone(),
+        &job.abort_flag,
+        run_options,
+        run_oov_decisions,
+      )
+    })
+    .inspect_err(|_| emit_telemetry(job.chunk_id, &counters))?;
+
+    let outcome = match outcome {
+      // tag every dispatched word with its run's language so
+      // downstream consumers can route per-word output without
+      // reverse-mapping from text/timing. The aligner itself doesn't
+      // know the run language; we attach it here at the dispatch
+      // boundary.
+      UnitOutcome::Aligned(words) => UnitOutcome::Aligned(
+        words
+          .into_iter()
+          .map(|word| word.with_language(Some(run.language().clone())))
+          .collect(),
+      ),
+      UnitOutcome::Unaligned(cause) => {
+        counters.observe_unaligned();
+        log_unaligned(job.chunk_id, Some(run_idx), run.language(), &cause);
+        UnitOutcome::Unaligned(cause)
       }
-      Err(failure) => {
-        // Per-run failures: data-dependent kinds
-        // (NoAlignmentPath, EmptyText, SemanticOutOfVocab) stay
-        // recoverable so a single bad run doesn't sink the
-        // whole chunk. Backend / configuration failures
-        // propagate.
-        if alignment_failure_is_recoverable(&failure) {
-          // per-run recoverable
-          // drops collapse silently — `dispatch_runs` returns
-          // `Ok(...)` with the surviving runs' words, so the
-          // top-level `run_one_alignment` recovery logger never
-          // fires for the dropped run. Operators previously
-          // could not distinguish "this run aligned with zero
-          // words" from "this run was dropped by policy". Emit
-          // a one-line diagnostic per dropped run keyed by
-          // chunk_id, run language, bounds source, and failure
-          // kind. do NOT log
-          // `run.text()` — that's transcript content (PII /
-          // secrets risk on failure paths where retention
-          // policies are often weaker). Log a bounded char
-          // count instead so operators can correlate without
-          // leaking the user's speech into stderr.
-          if let WorkFailure::Alignment(err) = &failure {
-            let language = match err {
-              AlignmentError::ModelInference(p)
-              | AlignmentError::Tokenization(p)
-              | AlignmentError::Normalization(p)
-              | AlignmentError::NoAlignmentPath(p)
-              | AlignmentError::EmptyText(p)
-              | AlignmentError::SemanticOutOfVocab(p)
-              | AlignmentError::Aborted(p) => p.language(),
-            };
-            let run_chars = run.text().chars().count();
-            eprintln!(
-              "asry alignment recovered chunk={:?} run_language={:?} run_bounds={:?} \
- run_chars={run_chars} kind={err:?} dropped_failure_language={language:?}",
-              job.chunk_id,
-              run.language(),
-              run.bounds_source(),
-            );
-          }
-          counters.observe_unaligned();
-          continue;
-        }
-        emit_telemetry(job.chunk_id, &counters);
-        return Err(failure);
-      }
-    }
-    // the previous code
-    // unconditionally `break`ed after a `Wholeclip` run, which
-    // dropped every later registered-language run from the same
-    // chunk. `Wholeclip` is the dispatcher's fallback when both
-    // DTW and segment timing are unavailable, so a mixed-script
-    // chunk that lands here would emit only the FIRST run's
-    // words and silently lose the rest. We now keep iterating;
-    // each `Wholeclip` run aligns against the full chunk audio,
-    // which over-counts duration but preserves word output for
-    // every dispatched language. The post-loop sort below
-    // restores the public `Transcript::words()` time-order
-    // contract across multi-run output.
+    };
+    units.push(Unit {
+      run_index: Some(run_idx),
+      language: run.language().clone(),
+      outcome,
+    });
+    // A `Wholeclip` run aligns against the full chunk audio, which
+    // over-counts duration but keeps every dispatched language's
+    // words; `account` restores the public `Transcript::words()`
+    // time order across multi-run output.
   }
 
-  // enforce the
-  // `Transcript::words()` time-order invariant for multi-run
-  // chunks. See [`sort_words_by_pts`] for the rationale.
-  sort_words_by_pts(&mut all_words);
-
   emit_telemetry(job.chunk_id, &counters);
-  Ok(AlignmentResult::new(all_words))
+  Ok(account(units))
 }
 
 /// Stable-sort a multi-run word stream by start PTS (then end
@@ -1170,7 +1287,7 @@ fn run_one_per_run(
   // `dispatch_runs` indexes this slice from
   // `job.oov_decisions[run_idx]`.
   oov_decisions: &[ResolvedOov],
-) -> Result<AlignmentResult, WorkFailure> {
+) -> Result<Composed, WorkFailure> {
   let mut guard = match aligner.lock() {
     Ok(g) => g,
     Err(poisoned) => poisoned.into_inner(),

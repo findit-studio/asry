@@ -13,7 +13,7 @@ use crate::{
     RunnerError,
     aligner::{
       core::{
-        AlignerCore, AlignerCoreLoadError, capture_vocab_size, detect_blank_token_id,
+        AlignerCore, AlignerCoreLoadError, Composed, capture_vocab_size, detect_blank_token_id,
         detect_unk_token_id, detect_vocab_uppercase_only, load_tokenizer_with_compat,
         validate_word_delimiter_present,
       },
@@ -232,6 +232,10 @@ impl Aligner {
   /// the decisions back as data. No callbacks, no traits the
   /// library holds.
   ///
+  /// Each event is bound to `text` and to this aligner:
+  /// [`Self::align_chunk_with_abort`] refuses a decision made for
+  /// an event detected in another text or by another aligner.
+  ///
   /// Returns an empty vec for in-vocab text. A character the
   /// vocabulary cannot spell is an event, never an error:
   /// detection looks each character up in the vocabulary and
@@ -414,17 +418,19 @@ impl Aligner {
     // exactly the point — there is no call path into the core that does
     // not state one.
     let expected = self.core.language().clone();
-    self.align(
-      samples,
-      sub_segments,
-      text,
-      chunk_first_sample_in_stream,
-      samples_to_output_range,
-      &abort_flag,
-      &run_options,
-      &oov_decisions,
-      &expected,
-    )
+    self
+      .align(
+        samples,
+        sub_segments,
+        text,
+        chunk_first_sample_in_stream,
+        samples_to_output_range,
+        &abort_flag,
+        &run_options,
+        &oov_decisions,
+        &expected,
+      )
+      .map(|composed| composed.into_result(&expected))
   }
 
   /// Cancellable alignment entrypoint: caller owns the
@@ -476,17 +482,19 @@ impl Aligner {
     // in `AlignerCore::prepare` now (so the emissions front end gets it
     // too); this call site's only job is to name the right key.
     let expected = self.core.language().clone();
-    self.align(
-      samples,
-      sub_segments,
-      text,
-      chunk_first_sample_in_stream,
-      samples_to_output_range,
-      abort_flag,
-      run_options,
-      oov_decisions,
-      &expected,
-    )
+    self
+      .align(
+        samples,
+        sub_segments,
+        text,
+        chunk_first_sample_in_stream,
+        samples_to_output_range,
+        abort_flag,
+        run_options,
+        oov_decisions,
+        &expected,
+      )
+      .map(|composed| composed.into_result(&expected))
   }
 
   /// Crate-private alignment entrypoint.
@@ -542,7 +550,7 @@ impl Aligner {
     // run). Validating against the fallback aligner's `Lang` instead
     // would reject every correct `AnyFallback` payload.
     expected_decision_language: &Lang,
-  ) -> Result<AlignmentResult, WorkFailure>
+  ) -> Result<Composed, WorkFailure>
   where
     F: Fn(u64, u64) -> TimeRange,
   {
@@ -568,7 +576,7 @@ impl Aligner {
     // `words: []` rather than an `Event::Error` — alignment is
     // optional, not a data-loss path.
     if prepared.is_trivial() {
-      return Ok(AlignmentResult::new(Vec::new()));
+      return Ok(Composed::NoAlignableText);
     }
 
     // Steps 3-4: the ONE hole in the sandwich. `encoder_input()` is
@@ -839,7 +847,7 @@ mod tests {
     let run_options = ort::session::RunOptions::new().expect("RunOptions::new");
 
     // Punctuation-only input → EnglishNormalizer returns
-    // `EmptyText`; align must surface as Ok(empty), not Err.
+    // `EmptyText`; align must surface as Ok(NoAlignableText), not Err.
     let result = aligner
       .align(
         &samples,
@@ -860,9 +868,8 @@ mod tests {
       )
       .expect("EmptyText must short-circuit to Ok, not propagate as AlignmentFailed");
     assert!(
-      result.words().is_empty(),
-      "empty normalisation must yield zero words; got {:?}",
-      result.words()
+      matches!(result, Composed::NoAlignableText),
+      "empty normalisation must yield no words, saying why; got {result:?}"
     );
   }
 
@@ -883,16 +890,17 @@ mod tests {
   /// and it is the *general* guard (`t < num_tokens`), not a
   /// special case for short audio.
   ///
-  /// `Ok(empty)` — "aligned successfully, zero words" — is the answer
-  /// one layer **up**. `NoAlignmentPath` is classified *recoverable*
-  /// by `alignment_pool`, which names "a too-short chunk" as its
-  /// canonical cause, converts it to an empty `AlignmentResult`, keeps
-  /// the ASR transcript, and logs the drop. See
+  /// A zero-word `Ok` is the answer one layer **up**.
+  /// `NoAlignmentPath` is classified *recoverable* by
+  /// `alignment_pool`, which names "a too-short chunk" as its
+  /// canonical cause, converts it to an `AlignmentResult` with no
+  /// words and a record naming the failure, keeps the ASR transcript,
+  /// and logs the drop. See
   /// `alignment_pool::tests::too_short_chunk_recovers_to_empty_result`,
   /// which pins that half against this exact input.
   ///
   /// Collapsing the two would be a regression, not a simplification:
-  /// an `Ok(empty)` manufactured *inside* the aligner is
+  /// a zero-word `Ok` manufactured *inside* the aligner is
   /// indistinguishable from a genuine zero-word alignment, so the pool
   /// could no longer tell "alignment was dropped" from "alignment
   /// found nothing" — the very distinction it goes out of its way to
@@ -1051,7 +1059,7 @@ mod tests {
         &Lang::Ja,
       )
       .expect("Ja aligner empty-text must short-circuit Ok");
-    assert!(result.words().is_empty());
+    assert!(matches!(result, Composed::NoAlignableText), "{result:?}");
   }
 
   /// Smoke test: load the Chinese wav2vec2 fixture. Mirrors the
@@ -1108,7 +1116,7 @@ mod tests {
         &Lang::Zh,
       )
       .expect("Zh aligner empty-text must short-circuit Ok");
-    assert!(result.words().is_empty());
+    assert!(matches!(result, Composed::NoAlignableText), "{result:?}");
   }
 
   /// Smoke test: load the Korean wav2vec2 fixture. Mirrors the
@@ -1172,7 +1180,7 @@ mod tests {
         &Lang::Ko,
       )
       .expect("Ko aligner empty-text must short-circuit Ok");
-    assert!(result.words().is_empty());
+    assert!(matches!(result, Composed::NoAlignableText), "{result:?}");
   }
 
   /// Helper for the Latin-language smoke tests below. Loads the
@@ -1237,8 +1245,8 @@ mod tests {
       )
       .expect("Latin aligner empty-text must short-circuit Ok");
     assert!(
-      result.words().is_empty(),
-      "{lang:?} aligner empty-text must yield zero words"
+      matches!(result, Composed::NoAlignableText),
+      "{lang:?} aligner empty-text must yield no words, saying why; got {result:?}"
     );
   }
 

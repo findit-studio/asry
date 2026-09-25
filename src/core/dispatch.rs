@@ -8,6 +8,7 @@ use std::{
 use mediatime::TimeRange;
 
 use crate::{
+  align::script_dispatch::runs_reproduce_text,
   core::{
     buffer::SampleBuffer,
     command::{AsrParams, AsrResult, Command},
@@ -610,13 +611,22 @@ impl Dispatch {
       // overwrite the Ready transcript.
       record.asr_result = Some(result.clone());
       record.phase = ChunkPhase::AwaitingAlignment;
+      // The per-run road aligns the runs' texts and nothing else, so
+      // the runs travel only when they reproduce the text exactly.
+      // Otherwise the chunk takes the whole-text road, where OOV
+      // detection reads every character of the text itself.
+      let runs = if runs_reproduce_text(result.runs(), result.text()) {
+        result.runs().to_vec()
+      } else {
+        Vec::new()
+      };
       self.pending_commands.push_back(Command::Alignment {
         chunk_id,
         samples: record.samples.clone(),
         sub_segments: record.sub_segments.clone(),
         text: result.text().clone(),
         language: result.language().clone(),
-        runs: result.runs().to_vec(),
+        runs,
       });
     } else {
       // Build the Transcript with empty words.
@@ -1221,7 +1231,7 @@ mod tests {
   /// transcript, or routed the empty result to `Event::Error` would
   /// actually show up. The pool-layer recovery test
   /// (`runner::alignment_pool::tests::too_short_chunk_recovers_to_empty_result`)
-  /// can only prove the recovery returns `Ok(empty)`; it borrows the
+  /// can only prove the recovery returns a zero-word `Ok`; it borrows the
   /// immutable work item and cannot observe what the dispatcher builds
   /// from it.
   #[test]
@@ -1282,6 +1292,63 @@ mod tests {
       }
       Event::Error { error, .. } => {
         panic!("an empty alignment must never route the chunk to Event::Error; got {error:?}")
+      }
+    }
+  }
+
+  /// **An ASR result's runs reach alignment only when they reproduce its
+  /// text.** The per-run road aligns the runs' texts and nothing else, so
+  /// runs that leave a character out (a segment that made no run), move
+  /// whitespace, drop a mark, or say something the text does not are not
+  /// forwarded: the command carries no runs, and the chunk is aligned
+  /// whole, where OOV detection reads every character of the text itself.
+  #[test]
+  fn alignment_command_carries_runs_only_when_they_reproduce_the_text() {
+    use crate::align::{BoundsSource, Run};
+
+    let run = |text: &str| {
+      Run::new(
+        Lang::En,
+        SmolStr::new(text),
+        0,
+        1_000,
+        0,
+        BoundsSource::Segment,
+      )
+    };
+    let cases = [
+      (vec![run("hello"), run(" 4, & 50%.")], true),
+      (vec![run(" hello"), run(" 4, & 50%. ")], true),
+      (vec![run("hello"), run(" 4, & 50%")], false),
+      (vec![run("hello")], false),
+      (vec![run("hello"), run(" 4")], false),
+      (vec![run("hello 4,"), run(" &50%.")], false),
+      (vec![run("hello"), run(" 4, & 50%. 6")], false),
+      (Vec::new(), false),
+    ];
+    for (runs, forwarded) in cases {
+      let texts: Vec<String> = runs.iter().map(|run| String::from(run.text())).collect();
+      let mut d = Dispatch::new(
+        AsrParams::default(),
+        /* word_alignment = */ true,
+        /* max_in_flight = */ 4,
+        LanguagePolicy::Auto,
+      );
+      let b = make_buffer_with_samples(10_000);
+      d.on_emit(fake_chunk(0, 2_000), ChunkId::from_raw(0), &b);
+      d.handle_asr(
+        ChunkId::from_raw(0),
+        AsrResult::new(SmolStr::new("hello 4, & 50%."), Lang::En, -0.5, 0.05, 0.0).with_runs(runs),
+      )
+      .expect("a non-empty ASR result under word_alignment asks for alignment");
+      let Some(Command::Alignment { runs: carried, .. }) = d.pending_commands.pop_back() else {
+        panic!("the ASR result queues an alignment command");
+      };
+      let carried: Vec<&str> = carried.iter().map(Run::text).collect();
+      if forwarded {
+        assert_eq!(carried, texts, "covering runs travel unchanged");
+      } else {
+        assert!(carried.is_empty(), "{texts:?}: got {carried:?}");
       }
     }
   }
