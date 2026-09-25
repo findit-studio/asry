@@ -89,8 +89,9 @@ impl TokenizedText {
 /// takes only the separators tokenization itself puts between normalized
 /// words.
 ///
-/// The specials are the tokenizer's own statement, read from its
-/// `added_tokens`; nothing is inferred from a token's spelling.
+/// The unknown token and the specials are the tokenizer's own statement,
+/// read from its model's `unk_token` and its `added_tokens`; nothing is
+/// inferred from a token's spelling.
 #[derive(Clone, Debug)]
 pub struct ReservedIds(Vec<u32>);
 
@@ -772,7 +773,9 @@ mod tests {
     align::punctuation::READ_ALOUD,
     core::{OovEvent, OovKind},
     runner::aligner::{
-      core::{detect_unk_token_id, detect_vocab_uppercase_only, load_tokenizer_bytes_with_compat},
+      core::{
+        declared_unk_token_id, detect_vocab_uppercase_only, load_tokenizer_bytes_with_compat,
+      },
       normalizer::{TextNormalizer, WildcardBoundary},
       normalizers::{ChineseNormalizer, LatinNormalizer},
     },
@@ -824,7 +827,7 @@ mod tests {
       tok,
       crate::runner::aligner::core::detect_blank_token_id(tok).unwrap_or(u32::MAX),
       "|",
-      detect_unk_token_id(tok),
+      declared_unk_token_id(tok),
     )
   }
 
@@ -1163,7 +1166,7 @@ mod tests {
     .expect("tokenisation must succeed with uppercase projection");
 
     assert_eq!(result.token_ids.len(), 5);
-    let unk_i32 = detect_unk_token_id(&tok).expect("<unk>") as i32;
+    let unk_i32 = declared_unk_token_id(&tok).expect("<unk>") as i32;
     assert!(
       result.token_ids.iter().all(|&id| id != unk_i32),
       "no <unk> ids; got {:?}",
@@ -1615,7 +1618,7 @@ mod tests {
       tok.encode("4", false).is_err(),
       "precondition: this vocabulary cannot encode a character outside it"
     );
-    assert_eq!(detect_unk_token_id(&tok), None);
+    assert_eq!(declared_unk_token_id(&tok), None);
     let unk = &reserved(&tok);
 
     let events = detect_oov_events(&tok, "b4d", 1, true, unk, &Lang::En, &[])
@@ -1780,7 +1783,7 @@ mod tests {
     ];
     for (name, tok) in &vocabularies {
       assert!(
-        detect_unk_token_id(tok).is_some(),
+        declared_unk_token_id(tok).is_some(),
         "{name}: holds its unknown token"
       );
       let unk = &reserved(tok);

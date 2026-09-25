@@ -44,7 +44,7 @@ use crate::{
     },
     core::{
       AlignerCore, AlignerCoreLoadError, PreparedChunk, WAV2VEC2_RECEPTIVE_FIELD_SAMPLES,
-      WAV2VEC2_WORD_DELIMITER, capture_vocab_size, detect_blank_token_id, detect_unk_token_id,
+      WAV2VEC2_WORD_DELIMITER, capture_vocab_size, declared_unk_token_id, detect_blank_token_id,
       load_tokenizer_bytes_with_compat, validate_word_delimiter_present,
     },
     emissions_api::{Emissions, OutputClock, SpeechCoverage, SpeechSpans},
@@ -479,9 +479,9 @@ pub enum LetterCase {
 }
 
 /// Builder for [`EmissionsAligner`]. Runs the same construction guards
-/// `Aligner::from_paths` does — blank-id detection, unk id, the
-/// vocab-size capture, and word-delimiter validation against the
-/// normalizer.
+/// `Aligner::from_paths` does — blank-id detection, the unknown token the
+/// tokenizer declares, the vocab-size capture, and word-delimiter
+/// validation against the normalizer.
 ///
 /// # What the caller states
 ///
@@ -498,10 +498,11 @@ pub enum LetterCase {
 /// # Reserved ids
 ///
 /// No transcript character is looked up to the CTC blank, the word
-/// delimiter, the unknown token, or a token the tokenizer JSON declares
-/// special (`added_tokens[].special`): a character whose lookup lands on
-/// one is one the vocabulary does not spell, so a mark nobody reads aloud
-/// is dropped and anything else is an OOV event for the caller's policy.
+/// delimiter, the unknown token the tokenizer JSON declares (its model's
+/// `unk_token`, however it is spelled), or a token it declares special
+/// (`added_tokens[].special`): a character whose lookup lands on one is
+/// one the vocabulary does not spell, so a mark nobody reads aloud is
+/// dropped and anything else is an OOV event for the caller's policy.
 /// Only the separators tokenization puts between words reach the
 /// delimiter's column. A model with special tokens declares them in its
 /// tokenizer JSON as special added tokens.
@@ -629,7 +630,7 @@ impl EmissionsAlignerBuilder {
       })?,
     };
 
-    let unk_token_id = detect_unk_token_id(&tokenizer);
+    let unk_token_id = declared_unk_token_id(&tokenizer);
 
     validate_word_delimiter_present(
       &tokenizer,

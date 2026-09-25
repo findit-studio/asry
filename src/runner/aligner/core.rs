@@ -3,9 +3,10 @@
 //!
 //! Every guard in this file runs **before** the first sample reaches
 //! an encoder, and none of them needs `ort`: they read a HuggingFace
-//! `tokenizer.json`, resolve the CTC blank / `<unk>` ids, probe the
-//! vocab's casing convention, capture its size, and check that a
-//! word-delimiter-using normaliser actually has a `|` to work with.
+//! `tokenizer.json`, resolve the CTC blank id and the unknown token the
+//! tokenizer declares, probe the vocab's casing convention, capture its
+//! size, and check that a word-delimiter-using normaliser actually has a
+//! `|` to work with.
 //!
 //! They were only reachable under `alignment` because they were
 //! textually inside `aligner.rs`, which owns an `ort::Session`. That
@@ -106,17 +107,45 @@ pub(crate) fn detect_blank_token_id(tok: &Tokenizer) -> Option<u32> {
   None
 }
 
-/// Resolve the `<unk>` / `[UNK]` token id, when the tokenizer exposes
-/// one. `tokenize_with_word_map` uses it to reject out-of-vocab word
-/// tokens up-front rather than feeding `<unk>` ids into the CTC graph
-/// and silently producing garbage alignments.
+/// The id of the unknown token the tokenizer declares: its model's
+/// `unk_token` (a Unigram model's `unk_id`), looked up in its vocabulary.
+/// `None` when the model declares none, or its vocabulary does not hold
+/// the one it declares.
 ///
-/// Tries the SentencePiece-style `<unk>` first, then the BERT-style
-/// `[UNK]` — the kresnik Korean wav2vec2 checkpoint uses the latter.
-pub(crate) fn detect_unk_token_id(tok: &Tokenizer) -> Option<u32> {
-  tok
-    .token_to_id("<unk>")
-    .or_else(|| tok.token_to_id("[UNK]"))
+/// The tokenizer's own statement, never an inference from a token's
+/// spelling: an entry spelled `<unk>` or `[UNK]` is an ordinary token
+/// unless the model declares it, and a declared unknown token is one
+/// however it is spelled, a single character (`�`) too. It is reserved
+/// ([`ReservedIds`]), so no transcript character is aligned to it.
+pub(crate) fn declared_unk_token_id(tok: &Tokenizer) -> Option<u32> {
+  use tokenizers::models::ModelWrapper;
+  let declared = match tok.get_model() {
+    ModelWrapper::WordLevel(model) => Some(model.unk_token.as_str()),
+    ModelWrapper::WordPiece(model) => Some(model.unk_token.as_str()),
+    ModelWrapper::BPE(model) => model.unk_token.as_deref(),
+    // A Unigram model declares its unknown token by id, a field
+    // `tokenizers` keeps private: read it from the model's serialization.
+    ModelWrapper::Unigram(_) => return declared_unigram_unk_id(tok),
+  };
+  declared.and_then(|token| tok.token_to_id(token))
+}
+
+/// The `unk_id` a Unigram model declares, read from the tokenizer's own
+/// serialization of it. `None` when it declares none (`null`).
+fn declared_unigram_unk_id(tok: &Tokenizer) -> Option<u32> {
+  let json = tok.to_string(false).ok()?;
+  let bytes = json.as_bytes();
+  let open = find_top_level_object_value_open(bytes, b"model")?;
+  let close = find_matching_close_brace(bytes, open)?;
+  let value = top_level_key_value(bytes, open + 1, close, b"unk_id")?;
+  let digits = bytes[value..close]
+    .iter()
+    .take_while(|byte| byte.is_ascii_digit())
+    .count();
+  core::str::from_utf8(&bytes[value..value + digits])
+    .ok()?
+    .parse()
+    .ok()
 }
 
 /// Whether the tokenizer's vocab covers ASCII uppercase but not
@@ -499,6 +528,13 @@ fn find_matching_close_brace(bytes: &[u8], open: usize) -> Option<usize> {
 /// present as a JSON key (string immediately followed by `:`) at
 /// the top level of this object.
 fn has_top_level_key(bytes: &[u8], start: usize, end: usize, key: &[u8]) -> bool {
+  top_level_key_value(bytes, start, end, key).is_some()
+}
+
+/// Where the value of the named key starts, when [`has_top_level_key`]
+/// finds it in `bytes[start..end]`: the first byte after its `:` and any
+/// whitespace.
+fn top_level_key_value(bytes: &[u8], start: usize, end: usize, key: &[u8]) -> Option<usize> {
   let mut in_string = false;
   let mut escape = false;
   let mut depth = 0_i32;
@@ -528,7 +564,11 @@ fn has_top_level_key(bytes: &[u8], start: usize, end: usize, key: &[u8]) -> bool
             j += 1;
           }
           if j < end && bytes[j] == b':' {
-            return true;
+            j += 1;
+            while j < end && (bytes[j] as char).is_ascii_whitespace() {
+              j += 1;
+            }
+            return Some(j);
           }
         }
         in_string = true;
@@ -539,7 +579,7 @@ fn has_top_level_key(bytes: &[u8], start: usize, end: usize, key: &[u8]) -> bool
     }
     i += 1;
   }
-  false
+  None
 }
 
 /// The identity of one `AlignerCore` instance.
@@ -1845,25 +1885,45 @@ mod tests {
     assert_eq!(detect_blank_token_id(&tok), Some(1204));
   }
 
+  /// **The unknown token is the one the model declares.** kresnik's
+  /// WordLevel model declares `[UNK]`, at 1203. A table that spells `<unk>`
+  /// and `[UNK]` but declares `?` has `?` as its unknown token: the
+  /// spellings are ordinary entries. A Unigram model declares its unknown
+  /// token by id, and a model that declares none, or declares one its
+  /// vocabulary does not hold, has none.
   #[test]
-  fn unk_fallback_resolves_bracket_unk() {
-    // Mirror of the `unk_token_id` resolution in
-    // `Aligner::from_paths` (lines 121-123): try `<unk>` first,
-    // then `[UNK]`. A vocab missing `<unk>` but exposing
-    // `[UNK]` (BERT convention) must resolve to the latter.
-    let tok = tokenizer_kresnik_shape();
-    let unk = tok
-      .token_to_id("<unk>")
-      .or_else(|| tok.token_to_id("[UNK]"));
-    assert_eq!(unk, Some(1203));
-  }
+  fn the_unknown_token_is_the_one_the_model_declares() {
+    assert_eq!(
+      declared_unk_token_id(&tokenizer_kresnik_shape()),
+      Some(1203)
+    );
 
-  /// The extracted resolver agrees with the inline logic above —
-  /// it IS that logic, now with one definition instead of two.
-  #[test]
-  fn detect_unk_token_id_resolves_bracket_unk() {
-    let tok = tokenizer_kresnik_shape();
-    assert_eq!(detect_unk_token_id(&tok), Some(1203));
+    let word_level = |unk: &str| {
+      let json = format!(
+        r#"{{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": null, "pre_tokenizer": null, "post_processor": null,
+            "decoder": null, "model": {{"type": "WordLevel",
+            "vocab": {{"<pad>": 0, "<unk>": 1, "[UNK]": 2, "?": 3, "A": 4}},
+            "unk_token": "{unk}"}}}}"#
+      );
+      Tokenizer::from_bytes(json.as_bytes()).expect("parse")
+    };
+    assert_eq!(declared_unk_token_id(&word_level("?")), Some(3));
+    assert_eq!(declared_unk_token_id(&word_level("[UNK]")), Some(2));
+    assert_eq!(declared_unk_token_id(&word_level("<none>")), None);
+
+    let unigram = |unk_id: &str| {
+      let json = format!(
+        r#"{{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": null, "pre_tokenizer": null, "post_processor": null,
+            "decoder": null, "model": {{"type": "Unigram", "unk_id": {unk_id},
+            "vocab": [["<pad>", 0.0], ["<unk>", 0.0], ["B", 0.0], ["A", -1.0]],
+            "byte_fallback": false}}}}"#
+      );
+      Tokenizer::from_bytes(json.as_bytes()).expect("parse")
+    };
+    assert_eq!(declared_unk_token_id(&unigram("2")), Some(2));
+    assert_eq!(declared_unk_token_id(&unigram("null")), None);
   }
 
   #[test]
@@ -1927,7 +1987,7 @@ mod tests {
     let tok = load_tokenizer_bytes_with_compat(raw, "<test>").expect("compat shim must patch");
     assert_eq!(tok.token_to_id("A"), Some(5));
     assert_eq!(detect_blank_token_id(&tok), Some(0));
-    assert_eq!(detect_unk_token_id(&tok), Some(3));
+    assert_eq!(declared_unk_token_id(&tok), Some(3));
   }
 
   /// Garbage in, typed error out — and the diagnostic names the

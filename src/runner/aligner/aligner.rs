@@ -14,7 +14,7 @@ use crate::{
     aligner::{
       core::{
         AlignerCore, AlignerCoreLoadError, WAV2VEC2_RECEPTIVE_FIELD_SAMPLES,
-        WAV2VEC2_WORD_DELIMITER, capture_vocab_size, detect_blank_token_id, detect_unk_token_id,
+        WAV2VEC2_WORD_DELIMITER, capture_vocab_size, declared_unk_token_id, detect_blank_token_id,
         detect_vocab_uppercase_only, load_tokenizer_with_compat, validate_word_delimiter_present,
       },
       emissions_api::{SpanError, SpeechCoverage, SpeechSpans},
@@ -164,7 +164,7 @@ impl Aligner {
           "tokenizer has no <pad> / [PAD] entry; cannot determine CTC blank token"
         ),
       })?;
-    let unk_token_id = detect_unk_token_id(&tokenizer);
+    let unk_token_id = declared_unk_token_id(&tokenizer);
     // wav2vec2-base-960h's vocab is uppercase-only; en/de/fr CTC
     // checkpoints typically follow the same convention.
     let vocab_uppercase_only = detect_vocab_uppercase_only(&tokenizer);

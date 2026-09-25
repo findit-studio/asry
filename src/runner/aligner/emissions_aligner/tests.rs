@@ -1084,6 +1084,76 @@ fn a_declared_special_is_never_a_target() {
   assert_eq!(tokens(&ordinary), [4, 1, 29, 1, 21]);
 }
 
+/// **The unknown token is the one the tokenizer declares, whatever its
+/// spelling, and never a target.** A WordLevel table that declares the
+/// one-character `\u{FFFD}` its `unk_token` reserves it: a `\u{FFFD}` in the
+/// text is a symbol the table cannot spell, one OOV event, a wildcard under
+/// the wildcard policy and refused by name under the default one, never the
+/// unknown token's column. On the same table declaring another unknown
+/// token, the same character is an ordinary token.
+#[test]
+fn the_declared_unknown_token_is_never_a_target() {
+  use crate::{core::OovKind, runner::aligner::algorithm::trellis_beam::WILDCARD_TOKEN_ID};
+
+  let table = |unk: &str| {
+    NO_UNK_TOKENIZER_JSON
+      .replacen("\"Z\": 28", "\"Z\": 28, \"\u{FFFD}\": 29", 1)
+      .replacen(
+        "\"unk_token\": \"<unk>\"",
+        &format!("\"unk_token\": \"{unk}\""),
+        1,
+      )
+  };
+  let text = "a\u{FFFD}b";
+  let tokens = |a: &EmissionsAligner| {
+    a.prepare(
+      &vec![0.2_f32; 16_000],
+      &SpeechSpans::all_speech(),
+      text,
+      a.detect_oov(text)
+        .expect("detect_oov")
+        .decide(wildcard_all_policy),
+      &AtomicBool::new(false),
+    )
+    .expect("the wildcard policy prepares it")
+    .token_ids()
+    .to_vec()
+  };
+
+  let declared = base960h(&table("\u{FFFD}"), None);
+  assert_eq!(
+    declared
+      .detect_oov(text)
+      .expect("detect_oov")
+      .events()
+      .to_vec(),
+    vec![OovEvent::new(OovKind::Symbol('\u{FFFD}'), 1, 0, Lang::En)]
+  );
+  assert_eq!(tokens(&declared), [4, WILDCARD_TOKEN_ID, 21]);
+  let Err(EmissionsError::SemanticOutOfVocab(_)) = declared.prepare(
+    &vec![0.2_f32; 16_000],
+    &SpeechSpans::all_speech(),
+    text,
+    declared
+      .detect_oov(text)
+      .expect("detect_oov")
+      .decide(default_oov_policy),
+    &AtomicBool::new(false),
+  ) else {
+    panic!("the default policy refuses the declared unknown token's spelling");
+  };
+
+  let undeclared = base960h(&table("<unk>"), None);
+  assert!(
+    undeclared
+      .detect_oov(text)
+      .expect("detect_oov")
+      .events()
+      .is_empty()
+  );
+  assert_eq!(tokens(&undeclared), [4, 29, 21]);
+}
+
 /// **The separators tokenization inserts are unchanged.** Between two
 /// normalized words the delimiter's token still goes in, and it is the
 /// only way the delimiter's column is reached.
