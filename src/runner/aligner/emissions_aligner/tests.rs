@@ -1101,16 +1101,52 @@ fn a_resolution_binds_to_the_text_and_aligner_that_detected_it() {
   }
 }
 
+/// A normalizer that lowercases and splits on whitespace only, so every
+/// mark stays inside its word, as a caller's own normalizer may leave it.
+struct WhitespaceNormalizer;
+
+impl TextNormalizer for WhitespaceNormalizer {
+  fn normalize<'a>(&self, text: &'a str) -> Result<NormalizedText<'a>, NormalizationError> {
+    let words: Vec<&'a str> = text.split_whitespace().collect();
+    if words.is_empty() {
+      return Err(NormalizationError::EmptyText);
+    }
+    let normalized = words
+      .iter()
+      .map(|word| word.to_lowercase())
+      .collect::<Vec<_>>()
+      .join(" ");
+    Ok(NormalizedText::new(
+      normalized,
+      words.into_iter().map(std::borrow::Cow::Borrowed).collect(),
+    ))
+  }
+
+  fn use_word_delimiter(&self) -> bool {
+    true
+  }
+}
+
 /// **A text with nothing alignable says so.** Marks the normalizer strips
 /// and marks tokenization drops leave no token: the text's one outcome is
-/// `Unaligned(NoAlignableText)`, never a bare empty list.
+/// `Unaligned(NoAlignableText)`, never a bare empty list. That includes a
+/// word made only of marks nobody reads aloud, a standalone `/` or `.`:
+/// the Latin normalizer makes no word of it, and a normalizer that keeps
+/// it as a word leaves that word no token.
 #[test]
 fn a_punctuation_only_text_is_named_no_alignable_text() {
   use crate::core::UnalignedCause;
 
-  let a = aligner();
+  let latin = aligner();
+  let whitespace = EmissionsAligner::builder(Lang::En, TOKENIZER_JSON.as_bytes())
+    .normalizer(Box::new(WhitespaceNormalizer))
+    .build()
+    .expect("builds");
   let samples = vec![0.2_f32; 16_000];
-  for text in ["!!!...", "\u{AB}\u{2026}\u{BB} *"] {
+  for (a, text) in [&latin, &whitespace]
+    .into_iter()
+    .flat_map(|a| ["!!!...", "\u{AB}\u{2026}\u{BB} *", "/", ".", "/ ."].map(|text| (a, text)))
+  {
     assert!(
       a.detect_oov(text).expect("detect_oov").events().is_empty(),
       "{text:?}"
@@ -1120,7 +1156,7 @@ fn a_punctuation_only_text_is_named_no_alignable_text() {
         &samples,
         &SpeechSpans::all_speech(),
         text,
-        resolution(&a, text),
+        resolution(a, text),
         &AtomicBool::new(false),
       )
       .expect("prepare");

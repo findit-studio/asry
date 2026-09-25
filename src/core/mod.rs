@@ -12,8 +12,8 @@ pub(crate) use command::alignment_units;
 #[cfg(all(test, feature = "alignment"))]
 pub(crate) use command::sort_words_by_pts;
 pub use command::{
-  AlignedWords, AlignmentResult, AlignmentTicket, AlignmentUnit, AsrParams, AsrParamsOverride,
-  AsrResult, Command, SamplingStrategy, UnalignedCause, UnitOutcome,
+  AlignedWords, AlignmentReport, AlignmentResult, AlignmentTicket, AlignmentUnit, AsrParams,
+  AsrParamsOverride, AsrResult, Command, SamplingStrategy, UnalignedCause, UnitOutcome,
 };
 pub use event::Event;
 pub use oov::{

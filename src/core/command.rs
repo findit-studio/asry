@@ -606,15 +606,37 @@ pub enum AlignmentUnit {
 /// A unit that aligned no word is [`UnitOutcome::Unaligned`], with its
 /// reason, so an empty list never stands in for one.
 #[derive(Clone, Debug)]
-pub struct AlignedWords(Vec<Word>);
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
+pub struct AlignedWords(
+  #[cfg_attr(
+    feature = "serde",
+    serde(deserialize_with = "deserialize_aligned_words")
+  )]
+  Vec<Word>,
+);
+
+/// Deserialize an [`AlignedWords`] list: never empty, in time order.
+#[cfg(feature = "serde")]
+fn deserialize_aligned_words<'de, D>(deserializer: D) -> Result<Vec<Word>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  use serde::de::Error as _;
+  let words = Vec::<Word>::deserialize(deserializer)?;
+  AlignedWords::new(words)
+    .map(AlignedWords::into_words)
+    .ok_or_else(|| D::Error::custom("aligned words are never empty"))
+}
 
 impl AlignedWords {
-  /// The words, or `None` when there are none.
+  /// The words, in time order (stably sorted by start, then end), or
+  /// `None` when there are none.
   #[must_use]
-  pub fn new(words: Vec<Word>) -> Option<Self> {
+  pub fn new(mut words: Vec<Word>) -> Option<Self> {
     if words.is_empty() {
       None
     } else {
+      sort_words_by_pts(&mut words);
       Some(Self(words))
     }
   }
@@ -640,6 +662,11 @@ impl AlignedWords {
 /// What one alignment unit came to: its words, or the reason it has
 /// none.
 #[derive(Clone, Debug)]
+#[cfg_attr(
+  feature = "serde",
+  derive(Serialize, Deserialize),
+  serde(rename_all = "snake_case")
+)]
 pub enum UnitOutcome {
   /// The unit aligned these words.
   Aligned(AlignedWords),
@@ -756,9 +783,9 @@ impl AlignmentTicket {
 pub struct AlignmentResult {
   /// The capability of the command this result answers.
   ticket: AlignmentTicket,
-  /// A whole-text result; `outcomes` then holds exactly one.
-  whole: bool,
-  outcomes: Vec<UnitOutcome>,
+  /// The outcomes: [`AlignmentReport::Whole`] or [`AlignmentReport::Runs`],
+  /// never [`AlignmentReport::NotAttempted`].
+  report: AlignmentReport,
 }
 
 impl AlignmentResult {
@@ -768,8 +795,7 @@ impl AlignmentResult {
   pub fn whole(ticket: AlignmentTicket, outcome: UnitOutcome) -> Self {
     Self {
       ticket,
-      whole: true,
-      outcomes: vec![outcome],
+      report: AlignmentReport::Whole(outcome),
     }
   }
 
@@ -780,9 +806,20 @@ impl AlignmentResult {
   pub fn runs(ticket: AlignmentTicket, outcomes: Vec<UnitOutcome>) -> Self {
     Self {
       ticket,
-      whole: false,
-      outcomes,
+      report: AlignmentReport::Runs(outcomes),
     }
+  }
+
+  /// The outcomes, as the transcript that accepts this result keeps them.
+  #[must_use]
+  pub const fn report(&self) -> &AlignmentReport {
+    &self.report
+  }
+
+  /// Take the outcomes, as the transcript that accepts this result keeps
+  /// them.
+  pub(crate) fn into_report(self) -> AlignmentReport {
+    self.report
   }
 
   /// The chunk whose alignment command this result answers.
@@ -798,40 +835,30 @@ impl AlignmentResult {
 
   /// Each alignment unit with its outcome, in unit order.
   pub fn units(&self) -> impl ExactSizeIterator<Item = (AlignmentUnit, &UnitOutcome)> + '_ {
-    let whole = self.whole;
-    self
-      .outcomes
-      .iter()
-      .enumerate()
-      .map(move |(index, outcome)| {
-        let unit = if whole {
-          AlignmentUnit::Whole
-        } else {
-          AlignmentUnit::Run(index)
-        };
-        (unit, outcome)
-      })
+    self.report.units()
   }
 
   /// The units that contributed no words, each with its reason, in unit
   /// order. Empty when every unit aligned.
   pub fn unaligned(&self) -> impl Iterator<Item = (AlignmentUnit, &UnalignedCause)> + '_ {
-    self
-      .units()
-      .filter_map(|(unit, outcome)| outcome.cause().map(|cause| (unit, cause)))
+    self.report.unaligned()
   }
 
-  /// Every aligned word, in unit order.
-  pub fn words(&self) -> impl Iterator<Item = &Word> + '_ {
-    self.outcomes.iter().flat_map(UnitOutcome::words)
+  /// Every aligned word, in time order across units.
+  pub fn words(&self) -> impl ExactSizeIterator<Item = &Word> + '_ {
+    self.report.words()
   }
 
   /// Take every aligned word, in time order across units: the order
-  /// `Transcript::words` keeps.
+  /// `Transcript::words` gives.
   #[must_use]
   pub fn into_words(self) -> Vec<Word> {
-    let mut words: Vec<Word> = self
-      .outcomes
+    let outcomes = match self.report {
+      AlignmentReport::NotAttempted => Vec::new(),
+      AlignmentReport::Whole(outcome) => vec![outcome],
+      AlignmentReport::Runs(outcomes) => outcomes,
+    };
+    let mut words: Vec<Word> = outcomes
       .into_iter()
       .filter_map(|outcome| match outcome {
         UnitOutcome::Aligned(words) => Some(words.into_words()),
@@ -847,10 +874,10 @@ impl AlignmentResult {
   /// command carried `runs` runs exactly one outcome: the whole text
   /// when `runs` is 0, else runs `0..runs`.
   pub(crate) fn accounts_for(&self, runs: usize) -> bool {
-    if runs == 0 {
-      self.whole
-    } else {
-      !self.whole && self.outcomes.len() == runs
+    match &self.report {
+      AlignmentReport::Whole(_) => runs == 0,
+      AlignmentReport::Runs(outcomes) => runs != 0 && outcomes.len() == runs,
+      AlignmentReport::NotAttempted => false,
     }
   }
 
@@ -859,6 +886,130 @@ impl AlignmentResult {
     self.units().map(|(unit, _)| unit).collect()
   }
 }
+
+/// What word alignment made of one chunk: not attempted, or one outcome
+/// per alignment unit.
+///
+/// A [`Transcript`](crate::types::Transcript) keeps its chunk's report, so
+/// the terminal event says why a chunk has no words, unit by unit:
+/// [`NotAttempted`](Self::NotAttempted) when no alignment was asked for,
+/// else each unit's [`UnitOutcome`], naming its [`UnalignedCause`] when it
+/// has none. The transcript's words are read from the report
+/// ([`words`](Self::words)); they are never kept instead of it.
+#[derive(Clone, Debug)]
+#[cfg_attr(
+  feature = "serde",
+  derive(Serialize, Deserialize),
+  serde(rename_all = "snake_case")
+)]
+pub enum AlignmentReport {
+  /// No alignment was attempted: the transcriber does not align words,
+  /// or the chunk's text was empty.
+  NotAttempted,
+  /// The chunk's whole text was aligned as one unit: its outcome.
+  Whole(UnitOutcome),
+  /// The chunk was aligned run by run: each run's outcome, in the order
+  /// of `Command::Alignment::runs`.
+  Runs(Vec<UnitOutcome>),
+}
+
+impl AlignmentReport {
+  /// The outcomes, in unit order: none when no alignment was attempted.
+  fn outcomes(&self) -> &[UnitOutcome] {
+    match self {
+      Self::NotAttempted => &[],
+      Self::Whole(outcome) => core::slice::from_ref(outcome),
+      Self::Runs(outcomes) => outcomes,
+    }
+  }
+
+  /// Each alignment unit with its outcome, in unit order. Empty when no
+  /// alignment was attempted.
+  pub fn units(&self) -> impl ExactSizeIterator<Item = (AlignmentUnit, &UnitOutcome)> + '_ {
+    let whole = matches!(self, Self::Whole(_));
+    self
+      .outcomes()
+      .iter()
+      .enumerate()
+      .map(move |(index, outcome)| {
+        let unit = if whole {
+          AlignmentUnit::Whole
+        } else {
+          AlignmentUnit::Run(index)
+        };
+        (unit, outcome)
+      })
+  }
+
+  /// The units that contributed no words, each with its reason, in unit
+  /// order. Empty when every unit aligned, and when no alignment was
+  /// attempted.
+  pub fn unaligned(&self) -> impl Iterator<Item = (AlignmentUnit, &UnalignedCause)> + '_ {
+    self
+      .units()
+      .filter_map(|(unit, outcome)| outcome.cause().map(|cause| (unit, cause)))
+  }
+
+  /// Every aligned word, in time order across units: stably by start,
+  /// then end, a tie going to the earlier unit.
+  pub fn words(&self) -> impl ExactSizeIterator<Item = &Word> + '_ {
+    TimeOrdered::new(self.outcomes())
+  }
+}
+
+/// The words of several units, each unit's in time order, merged into
+/// one time order: the order a stable sort of the units' words,
+/// concatenated in unit order, gives.
+struct TimeOrdered<'a> {
+  /// Each unit's words not yet yielded.
+  units: smallvec::SmallVec<[&'a [Word]; 4]>,
+  remaining: usize,
+}
+
+impl<'a> TimeOrdered<'a> {
+  fn new(outcomes: &'a [UnitOutcome]) -> Self {
+    let units: smallvec::SmallVec<[&'a [Word]; 4]> = outcomes
+      .iter()
+      .map(UnitOutcome::words)
+      .filter(|words| !words.is_empty())
+      .collect();
+    let remaining = units.iter().map(|words| words.len()).sum();
+    Self { units, remaining }
+  }
+}
+
+impl<'a> Iterator for TimeOrdered<'a> {
+  type Item = &'a Word;
+
+  fn next(&mut self) -> Option<&'a Word> {
+    let key = |word: &Word| {
+      let range = word.range();
+      (range.start_pts(), range.end_pts())
+    };
+    // The unit whose next word comes first; the earlier unit on a tie.
+    let mut first: Option<usize> = None;
+    for (index, words) in self.units.iter().enumerate() {
+      let Some(word) = words.first() else {
+        continue;
+      };
+      if first.is_none_or(|best| key(word) < key(&self.units[best][0])) {
+        first = Some(index);
+      }
+    }
+    let index = first?;
+    let words: &'a [Word] = self.units[index];
+    let (word, rest) = words.split_first()?;
+    self.units[index] = rest;
+    self.remaining -= 1;
+    Some(word)
+  }
+
+  fn size_hint(&self) -> (usize, Option<usize>) {
+    (self.remaining, Some(self.remaining))
+  }
+}
+
+impl ExactSizeIterator for TimeOrdered<'_> {}
 
 /// The alignment units of a chunk whose command carried `runs` runs: its
 /// whole text when there are none, else each run.
@@ -887,6 +1038,11 @@ pub(crate) fn sort_words_by_pts(words: &mut [Word]) {
 
 /// Why an alignment unit contributed no words.
 #[derive(Clone, Debug)]
+#[cfg_attr(
+  feature = "serde",
+  derive(Serialize, Deserialize),
+  serde(rename_all = "snake_case")
+)]
 #[non_exhaustive]
 pub enum UnalignedCause {
   /// No aligner is registered for the unit's language, so nothing
@@ -1252,9 +1408,10 @@ mod tests {
     ));
     assert_eq!(
       result.words().map(Word::text).collect::<Vec<_>>(),
-      ["b", "a"],
-      "unit order"
+      ["a", "b"],
+      "time order"
     );
+    assert_eq!(result.words().len(), 2);
     assert_eq!(
       result
         .into_words()
@@ -1264,6 +1421,22 @@ mod tests {
       ["a", "b"],
       "time order"
     );
+
+    // The report's words are the stable sort of the units' words,
+    // concatenated in unit order: a unit's own words are sorted, and a tie
+    // goes to the earlier unit.
+    let report = AlignmentReport::Runs(vec![
+      UnitOutcome::from_words(vec![word("late", 30), word("tie-0", 10)]),
+      UnitOutcome::Unaligned(UnalignedCause::NoAlignableText),
+      UnitOutcome::from_words(vec![word("tie-2", 10), word("first", 0)]),
+    ]);
+    assert_eq!(
+      report.words().map(Word::text).collect::<Vec<_>>(),
+      ["first", "tie-0", "tie-2", "late"]
+    );
+    assert_eq!(report.words().len(), 4);
+    assert_eq!(AlignmentReport::NotAttempted.words().len(), 0);
+    assert_eq!(AlignmentReport::NotAttempted.units().len(), 0);
 
     let whole = AlignmentResult::whole(
       AlignmentTicket::mint(ChunkId::from_raw(3)),

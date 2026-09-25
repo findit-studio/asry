@@ -374,6 +374,11 @@ impl AsrFailure {
 /// them, instead of forcing a SemVer-major bump each time one
 /// lands.
 #[derive(Clone, Debug, thiserror::Error)]
+#[cfg_attr(
+  feature = "serde",
+  derive(serde::Serialize, serde::Deserialize),
+  serde(rename_all = "snake_case")
+)]
 #[non_exhaustive]
 pub enum AlignmentError {
   /// wav2vec2 ONNX inference failed.
@@ -408,6 +413,7 @@ pub enum AlignmentError {
 
 /// Diagnostic payload shared across [`AlignmentError`] variants.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[error("language={language:?} message={message}")]
 pub struct AlignmentFailure {
   message: SmolStr,

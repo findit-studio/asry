@@ -11,7 +11,7 @@ use crate::{
   align::script_dispatch::runs_reproduce_text,
   core::{
     buffer::SampleBuffer,
-    command::{AlignmentTicket, AsrParams, AsrResult, Command},
+    command::{AlignmentReport, AlignmentTicket, AsrParams, AsrResult, Command},
     cut::{MergedChunk, SampleRange, SubOrigin},
     event::Event,
     transcriber::LanguagePolicy,
@@ -555,8 +555,9 @@ impl Dispatch {
   }
 
   /// Inject an ASR result for the given chunk. The dispatch state
-  /// machine builds the `Transcript` (with empty `words` if
-  /// alignment is off) and either marks the chunk Ready, or — if
+  /// machine builds the `Transcript` (its alignment
+  /// `AlignmentReport::NotAttempted` if alignment is off) and either
+  /// marks the chunk Ready, or — if
   /// alignment is on AND the result has non-empty text —
   /// transitions to AwaitingAlignment and queues a Alignment
   /// command. Caller must invoke `after_inject(&mut buffer)` to
@@ -641,12 +642,13 @@ impl Dispatch {
         ticket,
       });
     } else {
-      // Build the Transcript with empty words.
+      // No alignment is asked for: word alignment is off, or there is no
+      // text to align.
       let transcript = Transcript::new(
         record.range,
         result.language().clone(),
         result.text().clone(),
-        Vec::new(),
+        AlignmentReport::NotAttempted,
         result.avg_logprob(),
         result.no_speech_prob(),
         result.temperature(),
@@ -660,7 +662,8 @@ impl Dispatch {
 
   /// Inject the alignment result for a chunk awaiting alignment.
   /// Consumes the cached `AsrResult` to build the final
-  /// `Transcript`.
+  /// `Transcript`, which keeps the result's outcomes as its alignment
+  /// report.
   ///
   /// Phase contract: only chunks in `AwaitingAlignment` accept an
   /// alignment result. Calling on a chunk in any other phase
@@ -712,7 +715,7 @@ impl Dispatch {
       record.range,
       asr.language().clone(),
       asr.text().clone(),
-      result.into_words(),
+      result.into_report(),
       asr.avg_logprob(),
       asr.no_speech_prob(),
       asr.temperature(),
@@ -1360,10 +1363,21 @@ mod tests {
           ASR_TEXT,
           "the ASR transcript text must survive an empty alignment intact",
         );
-        assert!(
-          t.words().is_empty(),
+        assert_eq!(
+          t.words().len(),
+          0,
           "a dropped alignment contributes no words; got {:?}",
-          t.words(),
+          t.alignment(),
+        );
+        assert!(
+          matches!(
+            t.alignment(),
+            crate::core::AlignmentReport::Whole(crate::core::UnitOutcome::Unaligned(
+              crate::core::UnalignedCause::NoSurvivingWords
+            ))
+          ),
+          "the transcript names why it has no words; got {:?}",
+          t.alignment(),
         );
       }
       Event::Error { error, .. } => {
@@ -1532,7 +1546,7 @@ mod tests {
       d.after_inject(&mut b, None, u64::MAX);
       match d.pending_events.front() {
         Some(Event::Transcript(t)) => {
-          let words: Vec<&str> = t.words().iter().map(Word::text).collect();
+          let words: Vec<&str> = t.words().map(Word::text).collect();
           assert_eq!(words, ["hello", "world"], "words in time order");
         }
         other => panic!("expected the transcript; got {other:?}"),
@@ -1631,6 +1645,168 @@ mod tests {
         "got {:?}",
         d.pending_events
       );
+    }
+  }
+
+  /// **Each unit's outcome reaches the terminal event, distinctly.** The
+  /// transcript keeps the alignment report its result carried: a chunk
+  /// aligned whole reports its one outcome, and one aligned run by run
+  /// reports each run's, in run order. Aligned words, `Skipped`,
+  /// `Refused`, `NoAlignableText` (a run holding only a standalone `/`),
+  /// `NoSurvivingWords` and a recovered failure each arrive as themselves,
+  /// never as a bare empty word list; the transcript's words are read from
+  /// the report, in time order. A chunk nobody asked to align (word
+  /// alignment off, or an empty text) reports `NotAttempted`, which is none
+  /// of those causes.
+  #[test]
+  fn each_unit_outcome_reaches_the_terminal_event() {
+    use crate::{
+      align::{BoundsSource, Run},
+      core::{AlignedWords, AlignmentReport, AlignmentResult, UnalignedCause, UnitOutcome},
+      types::{AlignmentError, AlignmentFailure, Word},
+    };
+
+    let word = |text: &str, start: i64| {
+      Word::new(
+        SmolStr::new(text),
+        TimeRange::new(start, start + 10, tb()),
+        0.9,
+      )
+    };
+    let failed = || {
+      UnalignedCause::Failed(AlignmentError::NoAlignmentPath(AlignmentFailure::new(
+        SmolStr::new("too short"),
+        Lang::En,
+      )))
+    };
+    let causes = || {
+      [
+        UnalignedCause::Skipped,
+        UnalignedCause::Refused,
+        UnalignedCause::NoAlignableText,
+        UnalignedCause::NoSurvivingWords,
+        failed(),
+      ]
+    };
+    let name = |cause: &UnalignedCause| match cause {
+      UnalignedCause::Skipped => "skipped",
+      UnalignedCause::Refused => "refused",
+      UnalignedCause::NoAlignableText => "no_alignable_text",
+      UnalignedCause::NoSurvivingWords => "no_surviving_words",
+      UnalignedCause::Failed(AlignmentError::NoAlignmentPath(_)) => "failed:no_alignment_path",
+      _ => "other",
+    };
+    let emitted = |d: &mut Dispatch, b: &mut SampleBuffer| {
+      d.after_inject(b, None, u64::MAX);
+      match d.pending_events.pop_front() {
+        Some(Event::Transcript(t)) => t,
+        other => panic!("expected the transcript; got {other:?}"),
+      }
+    };
+
+    // Whole text: each cause, and aligned words, arrive as themselves.
+    for cause in causes() {
+      let expected = name(&cause);
+      let mut d = aligning_dispatch();
+      let mut b = make_buffer_with_samples(10_000);
+      let ticket = await_alignment(&mut d, &b, 0, "hello world", Vec::new());
+      d.handle_alignment(
+        ChunkId::from_raw(0),
+        AlignmentResult::whole(ticket, UnitOutcome::Unaligned(cause)),
+      )
+      .expect("the chunk's own result");
+      let t = emitted(&mut d, &mut b);
+      assert_eq!(t.text(), "hello world");
+      assert_eq!(t.words().len(), 0);
+      match t.alignment() {
+        AlignmentReport::Whole(UnitOutcome::Unaligned(got)) => {
+          assert_eq!(name(got), expected, "the cause arrives as itself")
+        }
+        other => panic!("{expected}: got {other:?}"),
+      }
+    }
+
+    // Run by run: `hello`, then a run holding only a standalone `/`, which
+    // no aligner can make a word of, then `world`.
+    let run = |text: &str| {
+      Run::new(
+        Lang::En,
+        SmolStr::new(text),
+        0,
+        1_000,
+        0,
+        BoundsSource::Segment,
+      )
+    };
+    let mut d = aligning_dispatch();
+    let mut b = make_buffer_with_samples(10_000);
+    let ticket = await_alignment(
+      &mut d,
+      &b,
+      0,
+      "hello / world",
+      vec![run("hello"), run(" /"), run(" world")],
+    );
+    d.handle_alignment(
+      ChunkId::from_raw(0),
+      AlignmentResult::runs(
+        ticket,
+        vec![
+          UnitOutcome::Aligned(AlignedWords::new(vec![word("hello", 0)]).expect("a word")),
+          UnitOutcome::Unaligned(UnalignedCause::NoAlignableText),
+          UnitOutcome::Aligned(AlignedWords::new(vec![word("world", 20)]).expect("a word")),
+        ],
+      ),
+    )
+    .expect("the chunk's own result");
+    let t = emitted(&mut d, &mut b);
+    let report: Vec<(crate::core::AlignmentUnit, &str)> = t
+      .alignment()
+      .units()
+      .map(|(unit, outcome)| {
+        (
+          unit,
+          match outcome {
+            UnitOutcome::Aligned(_) => "aligned",
+            UnitOutcome::Unaligned(cause) => name(cause),
+          },
+        )
+      })
+      .collect();
+    assert_eq!(
+      report,
+      [
+        (crate::core::AlignmentUnit::Run(0), "aligned"),
+        (crate::core::AlignmentUnit::Run(1), "no_alignable_text"),
+        (crate::core::AlignmentUnit::Run(2), "aligned"),
+      ],
+      "the standalone mark's run is accounted, by name"
+    );
+    assert_eq!(
+      t.words().map(Word::text).collect::<Vec<_>>(),
+      ["hello", "world"],
+      "the words are the report's, in time order"
+    );
+
+    // Nobody asked to align: word alignment off, or an empty text.
+    for (word_alignment, text) in [(false, "hello world"), (true, "")] {
+      let mut d = Dispatch::new(
+        AsrParams::default(),
+        word_alignment,
+        /* max_in_flight = */ 4,
+        LanguagePolicy::Auto,
+      );
+      let mut b = make_buffer_with_samples(10_000);
+      d.on_emit(fake_chunk(0, 2_000), ChunkId::from_raw(0), &b);
+      d.handle_asr(ChunkId::from_raw(0), fake_asr_result(text))
+        .expect("the ASR result resolves the chunk");
+      let t = emitted(&mut d, &mut b);
+      assert!(
+        matches!(t.alignment(), AlignmentReport::NotAttempted),
+        "{word_alignment} {text:?}: got {:?}",
+        t.alignment()
+      );
+      assert_eq!(t.alignment().units().len(), 0);
     }
   }
 

@@ -184,7 +184,7 @@ while let Some(cmd) = transcriber.poll_command() {
   }
 }
 while let Some(_event) = transcriber.poll_event() {
-  /* Transcript.words() carries word-level alignment */
+  /* Transcript::alignment() reports each unit's outcome; words() reads its words */
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```

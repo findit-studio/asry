@@ -75,8 +75,7 @@ BREAKING
     `AlignmentResult::runs(ticket, outcomes)` (run `i`'s outcome at `i`), so
     no unit is missing from it or answered twice. `units()` yields each unit
     with its outcome, `unaligned()` the units without words and their
-    reasons, `words()` every word in unit order, and `into_words()` every
-    word in time order.
+    reasons, and `words()` and `into_words()` every word in time order.
   - **A result answers only the command whose ticket built it.**
     `Command::Alignment` carries an `AlignmentTicket`, minted with the
     command; its identity is unique within the process and the chunk's
@@ -98,6 +97,18 @@ BREAKING
   - `run_one_alignment` builds one outcome per unit on both roads, and
     `Aligner::align_chunk`, `Aligner::align_chunk_with_abort` and
     `EmissionsAligner::finish` return the aligned text's `UnitOutcome`.
+  - **The `Transcript` keeps the report.** `Transcript::alignment()`
+    returns the chunk's `AlignmentReport`: `NotAttempted` when no alignment
+    was asked for (word alignment is off, or the text was empty),
+    `Whole(outcome)` for a chunk aligned whole, `Runs(outcomes)` for one
+    aligned run by run. So the terminal event says why a chunk has no
+    words, unit by unit: `NotAttempted` and each `UnalignedCause` arrive
+    distinctly, where they all used to arrive as the same empty word list.
+    `Transcript::words()` reads the words from the report, in time order
+    across units (a tie goes to the earlier unit); they are not kept
+    beside it. `AlignmentResult::report()` is the report a result carries.
+  - `AlignedWords::new` sorts its words into time order, stably by start,
+    then end.
 
   Migration:
   - Take the `ticket` from `Command::Alignment` along with its other fields.
@@ -111,8 +122,15 @@ BREAKING
     UnitOutcome::Unaligned(cause), UnitOutcome::Aligned))` for a whole-text
     chunk, `AlignmentResult::runs(ticket, ..)` with one outcome per run
     otherwise.
-  - `result.words()` is an iterator now; `into_words()` still returns every
-    word, in time order.
+  - `result.words()` is an iterator now, in time order; `into_words()`
+    still returns every word, in time order.
+  - `Transcript::words()` is an iterator in time order (it was a slice):
+    collect it, `transcript.words().collect::<Vec<_>>()`, where a slice is
+    needed. Read `Transcript::alignment()` for why a unit has no words.
+  - With `feature = "serde"`, a `Transcript` serializes its `alignment`
+    report in place of `words`; `AlignmentReport`, `UnitOutcome`,
+    `AlignedWords` (refusing an empty list), `UnalignedCause`,
+    `AlignmentError` and `AlignmentFailure` serialize too.
   - The direct front ends return a `UnitOutcome`: read its words with
     `outcome.words()`, or wrap it in `AlignmentResult::whole(ticket, ..)` for
     a `Transcriber`.
