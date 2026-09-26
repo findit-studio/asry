@@ -8,6 +8,8 @@ mod event;
 pub mod oov;
 mod transcriber;
 
+#[cfg(feature = "alignment")]
+pub(crate) use command::panic_failure;
 #[cfg(all(test, feature = "alignment"))]
 pub(crate) use command::sort_words_by_pts;
 pub use command::{

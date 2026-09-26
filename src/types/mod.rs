@@ -9,9 +9,9 @@ mod vad_segment;
 pub use chunk_id::ChunkId;
 pub use errors::{
   AlignmentError, AlignmentFailure, AsrError, AsrFailure, Backpressure, ForeignAlignment,
-  GapExceedsTolerance, InconsistentTimebase, InvalidTimebase, LanguageUnsupportedForAlignment,
-  PtsRegression, PushKind, TranscriberError, UnaccountedAlignment, VadAheadOfAudio, WorkFailure,
-  WorkerHangTimeout, WorkerKind,
+  GapExceedsTolerance, InconsistentTimebase, IntoWorkFailure, InvalidTimebase,
+  LanguageUnsupportedForAlignment, PtsRegression, PushKind, TranscriberError, UnaccountedAlignment,
+  VadAheadOfAudio, WorkFailure, WorkerHangTimeout, WorkerKind,
 };
 pub use lang::Lang;
 pub use transcript::{Transcript, Word};

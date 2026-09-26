@@ -215,6 +215,9 @@ pub(crate) struct Dispatch {
   /// This transcriber's identity, carried by every alignment request it
   /// issues: what names a completion of another transcriber's command.
   pub id: core::num::NonZeroU64,
+  /// Where the tickets of this transcriber's alignment commands report
+  /// themselves when they drop unanswered.
+  pub abandoned: std::sync::Arc<crate::core::command::Abandoned>,
   /// Chunks emitted by Cut that haven't yet been promoted to
   /// `in_flight`. Stored as `ExtractedChunk` (audio already
   /// pulled from the live buffer) so they survive `handle_restart`'s
@@ -307,6 +310,7 @@ impl Dispatch {
     Self {
       // Unreachable: exhausting this needs 2^64 transcribers.
       id: core::num::NonZeroU64::new(id).expect("transcriber counter overflowed u64"),
+      abandoned: std::sync::Arc::default(),
       cut_pending: VecDeque::new(),
       in_flight: BTreeMap::new(),
       next_emit_chunk_id: ChunkId::from_raw(0),
@@ -636,7 +640,7 @@ impl Dispatch {
       } else {
         Vec::new()
       };
-      let ticket = AlignmentTicket::mint(chunk_id, self.id);
+      let ticket = AlignmentTicket::mint(chunk_id, self.id, Some(self.abandoned.clone()));
       record.alignment_ticket = Some(ticket.id());
       self
         .pending_commands
@@ -695,6 +699,8 @@ impl Dispatch {
     }
     let (ticket, answer) = completion.into_parts();
     let chunk_id = ticket.chunk_id();
+    // Answered: the ticket drops without reporting its command abandoned.
+    ticket.settle();
     let record = self
       .in_flight
       .get_mut(&chunk_id)
@@ -732,6 +738,41 @@ impl Dispatch {
   /// request is `ForeignAlignment`, naming whether another transcriber
   /// issued its command. A chunk not awaiting alignment is `UnknownChunk`
   /// (or `ForeignAlignment`, when another transcriber issued the command).
+  /// Answer every alignment command whose ticket dropped unanswered: its
+  /// chunk, still awaiting alignment under that very ticket, fails with
+  /// `AlignmentError::Abandoned`. A report for a chunk that no longer awaits
+  /// that ticket is stale and changes nothing. Returns whether a chunk
+  /// failed.
+  pub(crate) fn settle_abandoned(&mut self) -> bool {
+    let mut settled = false;
+    for (chunk_id, ticket) in self.abandoned.take() {
+      let Some(record) = self.in_flight.get_mut(&chunk_id) else {
+        continue;
+      };
+      if !matches!(record.phase, ChunkPhase::AwaitingAlignment)
+        || record.alignment_ticket != Some(ticket)
+      {
+        continue;
+      }
+      let Some(asr) = record.asr_result.take() else {
+        continue;
+      };
+      record.phase = ChunkPhase::FailedReady {
+        failure: WorkFailure::Alignment(crate::types::AlignmentError::Abandoned(
+          crate::types::AlignmentFailure::new(
+            smol_str::SmolStr::new_static(
+              "the alignment command was dropped before a completion answered it: its \
+ request, or its completion, went out of scope unanswered",
+            ),
+            asr.language().clone(),
+          ),
+        )),
+      };
+      settled = true;
+    }
+    settled
+  }
+
   fn accepts(&self, completion: &AlignmentCompletion) -> Result<(), TranscriberError> {
     let ticket = completion.ticket();
     let chunk_id = ticket.chunk_id();

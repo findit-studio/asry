@@ -351,6 +351,27 @@ pub enum WorkFailure {
   WorkerHang(WorkerHangTimeout),
 }
 
+/// An error that fails a whole alignment command: what a unit's aligner
+/// returns when it cannot answer the unit, as the command's
+/// [`WorkFailure`] for a unit in `language`.
+///
+/// [`AlignmentRequest::align_units`](crate::core::AlignmentRequest::align_units)
+/// answers the command with it when a unit fails. It is implemented for
+/// [`WorkFailure`] (as it is) and, with the `emissions` feature, for
+/// `EmissionsError` (`EmissionsError::into_work_failure`); a caller's own
+/// error type implements it to answer the command in its own terms.
+pub trait IntoWorkFailure {
+  /// This error as the failure that answers the command, for a unit in
+  /// `language`.
+  fn into_work_failure(self, language: &Lang) -> WorkFailure;
+}
+
+impl IntoWorkFailure for WorkFailure {
+  fn into_work_failure(self, _language: &Lang) -> WorkFailure {
+    self
+  }
+}
+
 /// ASR-side per-chunk failures. Variant identifies the cause; the
 /// payload carries the diagnostic message.
 #[derive(Clone, Debug, thiserror::Error)]
@@ -434,6 +455,13 @@ pub enum AlignmentError {
   /// context to attach).
   #[error("alignment aborted before completing: {0}")]
   Aborted(AlignmentFailure),
+  /// The alignment command was dropped before a completion answered it:
+  /// its request, or its completion, went out of scope unanswered (a `?`,
+  /// a panic, a discarded refusal, a dropped pool job). The transcriber
+  /// that issued it answers the chunk with this at its next call, so the
+  /// chunk never waits for a completion no one can build.
+  #[error("alignment command abandoned: {0}")]
+  Abandoned(AlignmentFailure),
 }
 
 /// Diagnostic payload shared across [`AlignmentError`] variants.

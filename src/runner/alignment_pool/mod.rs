@@ -33,7 +33,7 @@ use crate::{
   align::{Run, script_dispatch::runs_reproduce_text},
   core::{
     AlignmentCompletion, AlignmentRequest, OovDecision, OovResolution, UnalignedCause,
-    UnitAlignment, UnitJob, UnitOutcome,
+    UnitAlignment, UnitJob, UnitOutcome, panic_failure,
   },
   runner::aligner::{AlignmentFallback, AlignmentLookup, AlignmentSet},
   types::{
@@ -238,19 +238,7 @@ fn answer_job(
   // failure, so the chunk resolves to its `Event::Error` instead of
   // waiting for a completion no one can build any more.
   let answered = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| align(&job, units)))
-    .unwrap_or_else(|panic| {
-      let message = panic
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("a panic with no message");
-      Err(WorkFailure::Alignment(AlignmentError::ModelInference(
-        AlignmentFailure::new(
-          format_smolstr!("the alignment job panicked: {message}"),
-          job.language().clone(),
-        ),
-      )))
-    });
+    .unwrap_or_else(|panic| Err(panic_failure(panic.as_ref(), job.language().clone())));
   let AlignWorkItem { request, .. } = job;
   match answered {
     Ok(outcomes) => request.aligned(outcomes).unwrap_or_else(|refused| {

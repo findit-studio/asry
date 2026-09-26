@@ -500,12 +500,30 @@ impl Transcriber {
   /// Pop the front command, consulting `unpoll_command`'s parked
   /// slot first.
   pub fn poll_command(&mut self) -> Option<Command> {
+    self.settle_abandoned();
     self.dispatch.poll_command()
   }
 
   /// Pop the front event.
+  ///
+  /// An alignment command whose request or completion was dropped
+  /// unanswered is answered here first: its chunk's terminal event is its
+  /// `Event::Error`, `AlignmentError::Abandoned`.
   pub fn poll_event(&mut self) -> Option<Event> {
+    self.settle_abandoned();
     self.dispatch.poll_event()
+  }
+
+  /// Fail every chunk whose alignment command was abandoned (its ticket
+  /// dropped unanswered), and move what that frees along.
+  fn settle_abandoned(&mut self) {
+    if self.dispatch.settle_abandoned() {
+      self.dispatch.after_inject(
+        &mut self.buffer,
+        self.cut.pending_start(),
+        self.vad_watermark,
+      );
+    }
   }
 
   /// Re-park the front of the command queue. **Visibility:
@@ -997,6 +1015,7 @@ impl Transcriber {
   ///   awaits.
   /// - `UnknownChunk(chunk_id)` if its chunk is not awaiting alignment.
   pub fn complete(&mut self, completion: AlignmentCompletion) -> Result<(), RefusedCompletion> {
+    self.settle_abandoned();
     self.dispatch.complete(completion)?;
     self.dispatch.after_inject(
       &mut self.buffer,
@@ -1114,6 +1133,107 @@ mod tests {
   use super::*;
   use crate::types::VadSegment;
   use core::num::NonZeroI32;
+  use smol_str::SmolStr;
+
+  /// A transcriber holding one second of audio whose one chunk awaits
+  /// alignment of `text`, and the command's request.
+  fn awaiting_alignment(text: &str) -> (Transcriber, crate::core::AlignmentRequest) {
+    let mut t = Transcriber::new(TranscriberOptions::default().with_word_alignment(true));
+    let tb = Timebase::new(1, NonZeroI32::new(16_000).expect("16000 != 0"));
+    t.handle_samples(Timestamp::new(0, tb), &vec![0.1_f32; 16_000])
+      .expect("samples");
+    t.handle_vad_segment(VadSegment::new(0, 16_000))
+      .expect("a VAD segment over the audio");
+    t.handle_eof().expect("eof");
+    let Some(Command::Asr { chunk_id, .. }) = t.poll_command() else {
+      panic!("the chunk asks for ASR");
+    };
+    t.handle_asr(
+      chunk_id,
+      AsrResult::new(SmolStr::new(text), Lang::En, -0.5, 0.05, 0.0),
+    )
+    .expect("a non-empty ASR result under word alignment");
+    let Some(Command::Alignment(request)) = t.poll_command() else {
+      panic!("the chunk asks for alignment");
+    };
+    (t, request)
+  }
+
+  /// The chunk's terminal event, which must name its command abandoned.
+  fn abandoned(t: &mut Transcriber) {
+    match t.poll_event() {
+      Some(Event::Error {
+        error: WorkFailure::Alignment(crate::types::AlignmentError::Abandoned(failure)),
+        ..
+      }) => assert!(
+        failure
+          .message()
+          .contains("dropped before a completion answered it"),
+        "{}",
+        failure.message()
+      ),
+      other => panic!("an abandoned command fails its chunk by name; got {other:?}"),
+    }
+    assert_eq!(t.in_flight_chunk_count(), 0);
+  }
+
+  /// **A command dropped unanswered answers its chunk.** Its ticket
+  /// reports it to the transcriber that issued it, and at that
+  /// transcriber's next call the chunk's terminal event is its
+  /// `Event::Error`, `AlignmentError::Abandoned`: a request a `?` drops, a
+  /// completion that is never delivered, and a refused completion discarded
+  /// by name alike. A command answered by its completion reports nothing.
+  #[test]
+  fn a_command_dropped_unanswered_answers_its_chunk() {
+    fn drive(request: crate::core::AlignmentRequest) -> Result<(), WorkFailure> {
+      let _owned = request;
+      Err(WorkFailure::Alignment(
+        crate::types::AlignmentError::ModelInference(crate::types::AlignmentFailure::new(
+          SmolStr::new_static("a backend fault"),
+          Lang::En,
+        )),
+      ))?;
+      Ok(())
+    }
+    let failure = || {
+      WorkFailure::LanguageUnsupported(crate::types::LanguageUnsupportedForAlignment::new(Lang::En))
+    };
+
+    // A `?` drops the request.
+    let (mut t, request) = awaiting_alignment("hello");
+    drive(request).expect_err("the driver fails");
+    abandoned(&mut t);
+
+    // A completion built but never delivered.
+    let (mut t, request) = awaiting_alignment("hello");
+    drop(request.failed(failure()));
+    abandoned(&mut t);
+
+    // A refused completion discarded by name: its issuer answers the chunk.
+    let (mut a, from_a) = awaiting_alignment("hello");
+    let (mut z, from_z) = awaiting_alignment("hello");
+    let refused = z
+      .complete(from_a.failed(failure()))
+      .expect_err("another transcriber's completion is refused");
+    assert!(matches!(
+      refused.discard_completion(),
+      TranscriberError::ForeignAlignment(_)
+    ));
+    abandoned(&mut a);
+
+    // A command its completion answers reports nothing.
+    z.complete(from_z.failed(failure()))
+      .expect("its own command");
+    match z.poll_event() {
+      Some(Event::Error { error, .. }) => assert!(
+        matches!(error, WorkFailure::LanguageUnsupported(_)),
+        "{error:?}"
+      ),
+      other => panic!("expected the command's own failure; got {other:?}"),
+    }
+    assert!(z.poll_event().is_none());
+    assert_eq!(z.in_flight_chunk_count(), 0);
+  }
 
   fn tb_48k() -> Timebase {
     Timebase::new(1, NonZeroI32::new(48_000).unwrap())

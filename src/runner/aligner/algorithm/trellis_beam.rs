@@ -1246,7 +1246,9 @@ fn into_emissions_error(err: WorkFailure) -> EmissionsError {
       AlignmentError::Tokenization(f) => EmissionsError::Tokenization(neutral(f)),
       AlignmentError::NoAlignmentPath(f) => EmissionsError::NoAlignmentPath(neutral(f)),
       AlignmentError::SemanticOutOfVocab(f) => EmissionsError::SemanticOutOfVocab(neutral(f)),
-      AlignmentError::Aborted(f) => EmissionsError::Aborted(neutral(f)),
+      AlignmentError::Aborted(f) | AlignmentError::Abandoned(f) => {
+        EmissionsError::Aborted(neutral(f))
+      }
       AlignmentError::Normalization(f) | AlignmentError::EmptyText(f) => {
         EmissionsError::Tokenization(neutral(f))
       }

@@ -252,10 +252,13 @@ impl EmissionsError {
   /// budget guard stays `NoAlignmentPath`, and abort stays
   /// `Aborted`. The inner diagnostic message is carried through
   /// verbatim.
-  pub(crate) fn into_work_failure(
-    self,
-    language: &crate::types::Lang,
-  ) -> crate::types::WorkFailure {
+  ///
+  /// Public so a caller that answers an alignment command after an
+  /// emissions failure (`AlignmentRequest::failed`) states it in the
+  /// command's terms; `AlignmentRequest::align_units` applies it through
+  /// [`IntoWorkFailure`](crate::types::IntoWorkFailure).
+  #[must_use]
+  pub fn into_work_failure(self, language: &crate::types::Lang) -> crate::types::WorkFailure {
     use crate::types::{AlignmentError, AlignmentFailure, WorkFailure};
 
     let failure = |message: SmolStr| AlignmentFailure::new(message, language.clone());
@@ -278,6 +281,12 @@ impl EmissionsError {
       Self::Aborted(f) => AlignmentError::Aborted(failure(f.message)),
     };
     WorkFailure::Alignment(inner)
+  }
+}
+
+impl crate::types::IntoWorkFailure for EmissionsError {
+  fn into_work_failure(self, language: &crate::types::Lang) -> crate::types::WorkFailure {
+    EmissionsError::into_work_failure(self, language)
   }
 }
 

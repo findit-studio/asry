@@ -95,7 +95,9 @@ fn to_emissions_error(err: WorkFailure, stage: Stage) -> EmissionsError {
       }
       AlignmentError::SemanticOutOfVocab(ref f) => EmissionsError::SemanticOutOfVocab(neutral(f)),
       AlignmentError::NoAlignmentPath(ref f) => EmissionsError::NoAlignmentPath(neutral(f)),
-      AlignmentError::Aborted(ref f) => EmissionsError::Aborted(neutral(f)),
+      AlignmentError::Aborted(ref f) | AlignmentError::Abandoned(ref f) => {
+        EmissionsError::Aborted(neutral(f))
+      }
     },
     // No worker and no pool behind a bare call: the only way the core
     // raises this is the cooperative `abort_flag`.
@@ -613,7 +615,8 @@ fn work_failure_message(err: WorkFailure) -> EmissionsFailure {
       | AlignmentError::NoAlignmentPath(f)
       | AlignmentError::EmptyText(f)
       | AlignmentError::SemanticOutOfVocab(f)
-      | AlignmentError::Aborted(f),
+      | AlignmentError::Aborted(f)
+      | AlignmentError::Abandoned(f),
     ) => EmissionsFailure::new(f.message().clone()),
     other => EmissionsFailure::new(format_smolstr!("{other:?}")),
   }

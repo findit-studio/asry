@@ -1085,6 +1085,96 @@ fn a_unit_job_takes_only_the_detection_made_for_it() {
     .expect("its own command");
 }
 
+/// **Every road of the direct driver answers its chunk.** `align_units`
+/// owns the request until it answers. A fatal encoder error, taken out of
+/// the unit with `?`, fails the command with its `WorkFailure`; a panic
+/// fails it too, naming the panic; outcomes answer it. Each completion
+/// resolves its chunk, so no error on the direct road leaves a chunk
+/// awaiting alignment.
+#[test]
+fn every_road_of_the_direct_driver_answers_its_chunk() {
+  use crate::{
+    core::{Event, UnitOutcome},
+    types::{AlignmentError, WorkFailure},
+  };
+
+  let a = aligner();
+  let encoder = |input: &[f32]| {
+    let t = input.len() / 320;
+    let mut raw = vec![0.0_f32; t * VOCAB_SIZE];
+    for frame in 0..t {
+      raw[frame * VOCAB_SIZE] = 1.0;
+      raw[frame * VOCAB_SIZE + 5 + (frame % (VOCAB_SIZE - 5))] = 2.0;
+    }
+    Ok::<_, EmissionsError>(EncoderOutput::Logits {
+      frames: t,
+      vocab: a.vocab_size(),
+      data: raw,
+    })
+  };
+  let broken = |_: &[f32]| -> Result<EncoderOutput, EmissionsError> {
+    Err(EmissionsError::Numeric(EmissionsFailure::new(
+      "the encoder failed".into(),
+    )))
+  };
+
+  // A fatal encoder error, out of the unit with `?`.
+  let (mut t, request) = transcriber_awaiting_alignment("hello", Vec::new());
+  let completion = request.align_units(|job| {
+    let resolution = a.detect_oov_unit(&job)?.decide(default_oov_policy);
+    a.align_unit(job, resolution, broken, &AtomicBool::new(false))
+  });
+  match completion.failure() {
+    Some(WorkFailure::Alignment(AlignmentError::ModelInference(failure))) => assert!(
+      failure.message().contains("the encoder failed"),
+      "{}",
+      failure.message()
+    ),
+    other => panic!("a fatal encoder error fails the command; got {other:?}"),
+  }
+  t.complete(completion).expect("its own command");
+  assert!(matches!(t.poll_event(), Some(Event::Error { .. })));
+  assert_eq!(t.in_flight_chunk_count(), 0);
+
+  // A panic in the unit's alignment.
+  let (mut t, request) = transcriber_awaiting_alignment("hello", Vec::new());
+  let completion = request
+    .align_units(|_| -> Result<UnitOutcome, EmissionsError> { panic!("the encoder crashed") });
+  match completion.failure() {
+    Some(WorkFailure::Alignment(AlignmentError::ModelInference(failure))) => assert!(
+      failure.message().contains("the encoder crashed"),
+      "{}",
+      failure.message()
+    ),
+    other => panic!("a panic fails the command; got {other:?}"),
+  }
+  t.complete(completion).expect("its own command");
+  assert!(matches!(t.poll_event(), Some(Event::Error { .. })));
+
+  // Every unit answered: the transcript, run by run.
+  let run = |text: &str, t0_ms: i64, t1_ms: i64| {
+    crate::align::Run::new(
+      Lang::En,
+      smol_str::SmolStr::new(text),
+      t0_ms,
+      t1_ms,
+      0,
+      crate::align::BoundsSource::Segment,
+    )
+  };
+  let (mut t, request) = transcriber_awaiting_alignment(
+    "hello world",
+    vec![run("hello", 0, 500), run(" world", 500, 1_000)],
+  );
+  let completion = request.align_units(|job| {
+    let resolution = a.detect_oov_unit(&job)?.decide(default_oov_policy);
+    a.align_unit(job, resolution, encoder, &AtomicBool::new(false))
+  });
+  assert!(completion.report().is_some(), "{:?}", completion.failure());
+  t.complete(completion).expect("its own command");
+  assert!(matches!(t.poll_event(), Some(Event::Transcript(_))));
+}
+
 /// `finish` CONSUMES `prepared`, so a chunk cannot be finished twice.
 /// (Compile-time; this test documents it — uncommenting the second call
 /// below is a borrow-check error.)

@@ -703,23 +703,67 @@ impl UnitAlignment {
   }
 }
 
+/// The alignment commands whose ticket dropped before a completion
+/// answered them, each reported by the ticket itself as it drops, for the
+/// transcriber that issued it to answer at its next call.
+#[derive(Debug, Default)]
+pub(crate) struct Abandoned(std::sync::Mutex<Vec<(ChunkId, NonZeroU64)>>);
+
+impl Abandoned {
+  /// The command of the ticket `ticket`, for `chunk_id`, was abandoned.
+  fn report(&self, chunk_id: ChunkId, ticket: NonZeroU64) {
+    self
+      .0
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+      .push((chunk_id, ticket));
+  }
+
+  /// Take every report made so far.
+  pub(crate) fn take(&self) -> Vec<(ChunkId, NonZeroU64)> {
+    core::mem::take(
+      &mut *self
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+  }
+}
+
 /// The capability to answer one `Command::Alignment`: its own identity,
 /// the chunk it asks about, and the transcriber that issued it.
 ///
 /// The transcriber mints one with each alignment command and keeps its
-/// identity with the chunk; the command's [`AlignmentRequest`] owns it. Its
-/// identity is never reused within a process.
+/// identity with the chunk; the command's [`AlignmentRequest`] owns it, and
+/// then the [`AlignmentCompletion`] the request builds. Its identity is
+/// never reused within a process.
+///
+/// A ticket that drops before its command is answered reports itself to
+/// the transcriber that issued it, which answers the chunk with
+/// `AlignmentError::Abandoned` at its next call: a request or completion
+/// that goes out of scope unanswered (a `?`, a panic, a discarded refusal,
+/// a pool job dropped with its queue) cannot leave its chunk awaiting
+/// alignment.
 #[derive(Debug)]
 pub(crate) struct AlignmentTicket {
   id: NonZeroU64,
   chunk_id: ChunkId,
   transcriber: NonZeroU64,
+  /// Where the ticket reports itself if it drops unanswered: its issuing
+  /// transcriber's. `None` once the command is answered, and for a ticket
+  /// minted without a transcriber.
+  issuer: Option<Arc<Abandoned>>,
 }
 
 impl AlignmentTicket {
   /// Mint the ticket of a new alignment command for `chunk_id`, issued by
-  /// the transcriber `transcriber`.
-  pub(crate) fn mint(chunk_id: ChunkId, transcriber: NonZeroU64) -> Self {
+  /// the transcriber `transcriber`, which reads its abandonment in
+  /// `issuer`.
+  pub(crate) fn mint(
+    chunk_id: ChunkId,
+    transcriber: NonZeroU64,
+    issuer: Option<Arc<Abandoned>>,
+  ) -> Self {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     let raw = COUNTER.fetch_add(1, Ordering::Relaxed);
     Self {
@@ -727,7 +771,13 @@ impl AlignmentTicket {
       id: NonZeroU64::new(raw).expect("AlignmentTicket counter overflowed u64"),
       chunk_id,
       transcriber,
+      issuer,
     }
+  }
+
+  /// The command is answered: the ticket drops without reporting.
+  pub(crate) fn settle(mut self) {
+    self.issuer = None;
   }
 
   /// The chunk whose alignment command this ticket answers.
@@ -743,6 +793,14 @@ impl AlignmentTicket {
   /// The identity of the transcriber that issued the command.
   pub(crate) const fn transcriber(&self) -> NonZeroU64 {
     self.transcriber
+  }
+}
+
+impl Drop for AlignmentTicket {
+  fn drop(&mut self) {
+    if let Some(issuer) = self.issuer.take() {
+      issuer.report(self.chunk_id, self.id);
+    }
   }
 }
 
@@ -1144,6 +1202,51 @@ impl AlignmentRequest {
     })
   }
 
+  /// Answer the command by aligning each unit with `align`, in unit order:
+  /// the road on which every outcome, error or panic answers the command.
+  ///
+  /// `align` gets each unit's job and returns the unit's outcome, made by
+  /// an aligner consuming the job (`Aligner::align_unit`,
+  /// `EmissionsAligner::align_unit`) or by [`UnitJob::skip`], or an error,
+  /// which its [`IntoWorkFailure`](crate::types::IntoWorkFailure) states as
+  /// the command's failure. The request owns the command until it answers,
+  /// so the completion always comes back, whatever `align` does:
+  /// - every unit answered by its own job, in order: the completion carries
+  ///   the outcomes, as [`aligned`](Self::aligned) builds it;
+  /// - an error, from a `?` in `align` or returned: the command fails with
+  ///   it, as [`failed`](Self::failed) builds it, and the units after it
+  ///   are not aligned;
+  /// - a panic in `align`: the command fails with
+  ///   `AlignmentError::ModelInference`, naming the panic;
+  /// - outcomes that do not account for the units, or units already taken
+  ///   ([`take_units`](Self::take_units)): the command fails with
+  ///   `AlignmentError::Tokenization`, naming the units.
+  pub fn align_units<E: crate::types::IntoWorkFailure>(
+    mut self,
+    mut align: impl FnMut(UnitJob) -> Result<UnitOutcome, E>,
+  ) -> AlignmentCompletion {
+    let jobs = self.take_units();
+    let mut outcomes = Vec::with_capacity(jobs.len());
+    for job in jobs {
+      let language = job.language().clone();
+      match std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| align(job))) {
+        Ok(Ok(outcome)) => outcomes.push(outcome),
+        Ok(Err(error)) => return self.failed(error.into_work_failure(&language)),
+        Err(panic) => return self.failed(panic_failure(panic.as_ref(), language)),
+      }
+    }
+    self.aligned(outcomes).unwrap_or_else(|refused| {
+      let message = smol_str::format_smolstr!("{refused}");
+      let (request, _) = refused.into_parts();
+      let language = request.language().clone();
+      request.failed(WorkFailure::Alignment(
+        crate::types::AlignmentError::Tokenization(crate::types::AlignmentFailure::new(
+          message, language,
+        )),
+      ))
+    })
+  }
+
   /// Answer the command with a failure that is not one unit's own: a
   /// backend or configuration fault, an abort, or a registry miss under
   /// `AlignmentFallback::Error`. The chunk's terminal event is its
@@ -1198,7 +1301,7 @@ impl AlignmentRequest {
     runs: Vec<crate::align::Run>,
   ) -> Self {
     Self::new(
-      AlignmentTicket::mint(chunk_id, transcriber),
+      AlignmentTicket::mint(chunk_id, transcriber, None),
       samples,
       Vec::new(),
       text,
@@ -1346,6 +1449,22 @@ pub(crate) fn clip_sub_segments(
     }
   }
   Ok(out)
+}
+
+/// The failure a panic in an alignment job answers its command with:
+/// `AlignmentError::ModelInference`, naming the panic's message.
+pub(crate) fn panic_failure(panic: &(dyn core::any::Any + Send), language: Lang) -> WorkFailure {
+  let message = panic
+    .downcast_ref::<&str>()
+    .copied()
+    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+    .unwrap_or("a panic with no message");
+  WorkFailure::Alignment(crate::types::AlignmentError::ModelInference(
+    crate::types::AlignmentFailure::new(
+      smol_str::format_smolstr!("the alignment job panicked: {message}"),
+      language,
+    ),
+  ))
 }
 
 /// Outcomes [`AlignmentRequest::aligned`] refused: they are not exactly the
@@ -1496,7 +1615,9 @@ impl RefusedCompletion {
   }
 
   /// Why the completion was refused, dropping the completion: its command
-  /// can then never be answered, and its chunk awaits alignment for good.
+  /// is then answered as abandoned, and its chunk's terminal event is its
+  /// `Event::Error` (`AlignmentError::Abandoned`), at its transcriber's
+  /// next call.
   #[must_use = "the completion is dropped; keep the refusal at least"]
   pub fn discard_completion(self) -> crate::types::TranscriberError {
     self.0.error
