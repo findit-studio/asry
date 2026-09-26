@@ -86,9 +86,17 @@ BREAKING
     consumes the unit's job and aligns the job's own text against the
     job's own audio (`Aligner::align_unit`, or `EmissionsAligner::align_unit`,
     which runs your encoder on the unit's prepared input), or by
-    `UnitJob::skip()` (`Unaligned(Skipped)`). A data-dependent failure (no
-    alignment path, a character the policy refused) is the unit's
-    `Unaligned(Failed(..))`, as on the pool. No public operation joins a
+    `UnitJob::skip()` (`Unaligned(Skipped)`). Its OOV decisions are the
+    ones that aligner detected for that very job
+    (`detect_oov_unit(&job)`), bound to the job, the unit and its requested
+    language, the key the decisions are checked on; `align_unit` refuses
+    any other resolution, a text's (`detect_oov`) included. A job in
+    another language than the aligner's is refused, unless the aligner
+    reads it as the multilingual fallback by name
+    (`detect_oov_unit_as_fallback`). A data-dependent failure (no alignment
+    path, a character the policy refused) is the unit's
+    `Unaligned(Failed(..))`, as on the pool, and a run's words carry the
+    run's language on every road. No public operation joins a
     `UnitAlignment` computed elsewhere to a unit, and neither a job nor an
     outcome can be cloned, so each unit is answered once, by what was
     computed from it.
@@ -114,6 +122,17 @@ BREAKING
     and `discard_completion()` drops it by name. A failure completion
     becomes the chunk's `Event::Error`. `complete` consumes an accepted
     completion, so a command is answered once.
+  - **A command is always answered.** `request.align_units(|job| ..)` owns
+    the request until it answers: each unit's outcome, an error (a `?`
+    in the closure included, stated as the command's `WorkFailure` through
+    the new `IntoWorkFailure`, which `WorkFailure` and `EmissionsError`
+    implement; `EmissionsError::into_work_failure` is public) or a panic
+    answers the command, so the completion always comes back. A command
+    dropped unanswered, its request or its completion (a `?`, a panic, a
+    discarded refusal, a pool job dropped with its queue), is answered
+    too: the transcriber that issued it fails the chunk with the new
+    `AlignmentError::Abandoned` at its next `poll_command`, `poll_event`
+    or `complete`.
   - **Pool.** `AlignWorkItem::new(request, abort_flag)` builds a job from
     the request alone, and `run_one_alignment` answers the job's request on
     success and on failure, a panic in the job included, returning its
@@ -142,17 +161,18 @@ BREAKING
     `run_one_alignment` returns an `AlignmentCompletion` (it returned
     `Result<AlignmentResult, WorkFailure>`): hand it to
     `transcriber.complete(completion)` whether the job succeeded or failed.
-  - A driver with its own aligner: take the unit jobs
-    (`request.take_units()`), each with its unit's own text, language and
-    audio, and have the aligner consume each one:
-    `aligner.align_unit(job, resolution, &abort, &run_options)` (ORT) or
+  - A driver with its own aligner answers the command with
+    `request.align_units(|job| { let resolution =
+    aligner.detect_oov_unit(&job)?.decide(policy); aligner.align_unit(job,
+    resolution, &abort, &run_options) })` (ORT), or with
     `emissions_aligner.align_unit(job, resolution, |input| model(input),
-    &abort)` (your encoder), with `resolution` that aligner's
-    `detect_oov(job.text())`, decided. Each returns the unit's
-    `UnitOutcome`; then `request.aligned(outcomes)` and
-    `transcriber.complete(..)`. A unit the driver does not align is
-    `job.skip()`. For a failure that is not one unit's own,
-    `request.failed(failure)` and `complete`.
+    &abort)` (your encoder), then `transcriber.complete(completion)`. A
+    unit the driver does not align is `job.skip()`. (`take_units()` and
+    `request.aligned(outcomes)` remain for a driver that assembles the
+    outcomes itself; `request.failed(failure)` answers a failure that is
+    not one unit's own.)
+  - `AlignmentError` has the new variant `Abandoned`, the terminal event
+    of a command dropped unanswered.
   - `Transcriber::handle_alignment` is gone: use `complete`, which returns
     `Result<(), RefusedCompletion>`; `?` into a `RunnerError` gives
     `RunnerError::RefusedCompletion`. `handle_failure` takes ASR failures

@@ -232,7 +232,9 @@ impl Aligner {
   /// [`crate::core::oov`] (or a closure), then hand the
   /// [`OovResolution`] to [`Self::align_chunk_with_abort`] with the same
   /// text, which refuses a resolution detected in another text or by
-  /// another aligner.
+  /// another aligner. A unit of a `Transcriber`'s alignment command is
+  /// detected with [`detect_oov_unit`](Self::detect_oov_unit) instead:
+  /// [`align_unit`](Self::align_unit) takes no text's resolution.
   ///
   /// No events for in-vocab text. A character the vocabulary cannot
   /// spell is an event, never an error: detection looks each character

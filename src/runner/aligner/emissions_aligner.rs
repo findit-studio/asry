@@ -240,7 +240,10 @@ impl EmissionsAligner {
   /// [`wildcard_all_policy`], [`fail_closed_all_policy`], or your own
   /// closure, then hand the [`OovResolution`] to
   /// [`prepare`](Self::prepare) with the same text: `prepare` refuses a
-  /// resolution detected in another text or by another aligner.
+  /// resolution detected in another text or by another aligner. A unit of
+  /// a `Transcriber`'s alignment command is detected with
+  /// [`detect_oov_unit`](Self::detect_oov_unit) instead:
+  /// [`align_unit`](Self::align_unit) takes no text's resolution.
   ///
   /// Note what is NOT an argument: the tokenizer, the word count, the
   /// uppercase flag, the unk id, the boundary map. Every one of those was

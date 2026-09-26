@@ -136,6 +136,8 @@ pub use ort;
 /// | supply `V = 0`, a `T` that OOMs, or a non-log-probability | a chunk's [`Emissions`](emissions::Emissions) are made through its [`PreparedChunk`](emissions::PreparedChunk)'s `encode_with`, the one door, and it checks all three |
 /// | stamp another chunk's encoder output as this chunk's emissions | `encode_with` hands your encoder this chunk's prepared input and builds the emissions from what it returns; no emissions are made from a free tensor |
 /// | answer a unit of a `Transcriber`'s command with an alignment computed for another unit | a unit is answered only by [`EmissionsAligner::align_unit`](emissions::EmissionsAligner::align_unit) consuming its [`UnitJob`], from the job's own text and audio |
+/// | apply decisions made for another unit, or in another language | `align_unit` takes only the resolution [`detect_oov_unit`](emissions::EmissionsAligner::detect_oov_unit) made for that very job, keyed on its requested language |
+/// | strand a command with a `?`, a panic or a dropped request | [`AlignmentRequest::align_units`](crate::AlignmentRequest::align_units) answers the command on every road, and a command dropped unanswered fails its chunk as `AlignmentError::Abandoned` |
 /// | finish a chunk with another chunk's emissions of the same shape | emissions carry the identity of the preparation they were made through, and `finish` refuses any other by name |
 /// | disagree with asry about the sample count, frame count, or stride | asry derives all three from slices that physically exist |
 /// | run a CTC head whose width disagrees with the tokenizer | `finish` validates it — the check this seam has NEVER run |
