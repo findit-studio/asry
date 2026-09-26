@@ -904,6 +904,62 @@ fn a_pool_completion_answers_only_its_own_command() {
   }
 }
 
+/// **The pool and the direct road answer a run with the same outcome.**
+/// Both answer a unit through its job's one answer boundary, which stamps a
+/// run's words with the run's language: the pool's answering step and a
+/// driver answering the same run with the same alignment give equal
+/// outcomes, words and language alike.
+#[test]
+fn a_run_outcome_is_the_same_on_the_pool_and_direct_roads() {
+  use crate::core::{AlignedWords, AlignmentReport, UnitAlignment};
+
+  let tb = mediatime::Timebase::new(1, core::num::NonZeroI32::new(16_000).expect("16000 != 0"));
+  let aligned = || {
+    UnitAlignment::Aligned(
+      AlignedWords::new(vec![crate::types::Word::new(
+        SmolStr::new("hello"),
+        TimeRange::new(0, 10, tb),
+        0.9,
+      )])
+      .expect("a word"),
+    )
+  };
+  let runs = || vec![korean_run("hello", 0), korean_run(" world", 1)];
+  let words = |report: Option<&AlignmentReport>| -> Vec<crate::types::Word> {
+    match report {
+      Some(AlignmentReport::Runs(units)) => units
+        .iter()
+        .flat_map(|unit| unit.words().to_vec())
+        .collect(),
+      other => panic!("expected each run's outcome; got {other:?}"),
+    }
+  };
+
+  let (_pool_transcriber, request) = transcriber_awaiting_alignment("hello world", runs());
+  let job = AlignWorkItem::new(request, Arc::new(AtomicBool::new(false)));
+  let pooled = answer_job(job, |_, units| {
+    Ok(
+      units
+        .into_iter()
+        .map(|unit| unit.answer(aligned()))
+        .collect(),
+    )
+  });
+
+  let (_direct_transcriber, mut request) = transcriber_awaiting_alignment("hello world", runs());
+  let outcomes = request
+    .take_units()
+    .into_iter()
+    .map(|unit| unit.answer(aligned()))
+    .collect();
+  let direct = request.aligned(outcomes).expect("its own units, in order");
+
+  let (pooled, direct) = (words(pooled.report()), words(direct.report()));
+  // `Word` has no `PartialEq`: its `Debug` form names every field.
+  assert_eq!(format!("{pooled:?}"), format!("{direct:?}"));
+  assert!(pooled.iter().all(|word| word.language() == Some(&Lang::Ko)));
+}
+
 /// **A persistent normalisation failure answers the chunk.** When a job's
 /// OOV detection fails, the job still owns its request, and
 /// `AlignWorkItem::failed` answers the command with that failure: delivered,

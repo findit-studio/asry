@@ -749,23 +749,13 @@ fn dispatch_runs(
     let (outcome, unit) = align_unit(set, resolution, unit, &job.abort_flag, run_options)
       .inspect_err(|_| emit_telemetry(job.chunk_id(), &counters))?;
 
-    let outcome = match outcome {
-      // tag every dispatched word with its run's language so
-      // downstream consumers can route per-word output without
-      // reverse-mapping from text/timing. The aligner itself doesn't
-      // know the run language; we attach it here at the dispatch
-      // boundary.
-      UnitAlignment::Aligned(words) => {
-        UnitAlignment::Aligned(words.map(|word| word.with_language(Some(run.language().clone()))))
-      }
-      UnitAlignment::Unaligned(cause) => {
-        counters.observe_unaligned();
-        log_unaligned(job.chunk_id(), Some(run_idx), run.language(), &cause);
-        UnitAlignment::Unaligned(cause)
-      }
-    };
+    if let UnitAlignment::Unaligned(cause) = &outcome {
+      counters.observe_unaligned();
+      log_unaligned(job.chunk_id(), Some(run_idx), run.language(), cause);
+    }
     // Exactly one outcome per run, made by consuming the run's own job,
-    // with what was aligned from it.
+    // with what was aligned from it. The answer stamps the run's language
+    // on its words, as it does on every road.
     outcomes.push(unit.answer(outcome));
     // A `Wholeclip` run aligns against the full chunk audio, which
     // over-counts duration but keeps every dispatched language's

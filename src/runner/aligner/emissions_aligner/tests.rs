@@ -915,6 +915,14 @@ fn a_unit_is_answered_by_an_aligner_consuming_its_job() {
   );
   assert!(matches!(outcomes[0].alignment(), UnitAlignment::Aligned(_)));
   assert!(
+    outcomes[0]
+      .alignment()
+      .words()
+      .iter()
+      .all(|word| word.language() == Some(&Lang::En)),
+    "a run's words carry the run's language on the direct road too"
+  );
+  assert!(
     matches!(
       outcomes[1].alignment(),
       UnitAlignment::Unaligned(UnalignedCause::Failed(_))

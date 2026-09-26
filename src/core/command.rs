@@ -834,8 +834,18 @@ impl UnitJob {
   }
 
   /// Answer the unit with `alignment`, which the caller computed from this
-  /// very job.
+  /// very job: the one boundary every road answers a unit through.
+  ///
+  /// A run's words carry the run's language, whichever road aligned them;
+  /// the whole text's words carry none, as the chunk has one language.
   pub(crate) fn answer(self, alignment: UnitAlignment) -> UnitOutcome {
+    let alignment = match (self.unit, alignment) {
+      (AlignmentUnit::Run(_), UnitAlignment::Aligned(words)) => {
+        let language = &self.language;
+        UnitAlignment::Aligned(words.map(|word| word.with_language(Some(language.clone()))))
+      }
+      (_, alignment) => alignment,
+    };
     UnitOutcome {
       ticket: self.ticket,
       unit: self.unit,
@@ -2001,6 +2011,67 @@ mod tests {
       whole.units().map(|(unit, _)| unit).collect::<Vec<_>>(),
       [AlignmentUnit::Whole]
     );
+  }
+
+  /// **A run's words carry the run's language, whichever road answers it.**
+  /// The unit's answer is the one boundary every road goes through: a run
+  /// job's aligned words are stamped with the run's language there, and the
+  /// whole text's are left without one.
+  #[test]
+  fn a_run_outcome_carries_the_run_language() {
+    let transcriber = NonZeroU64::new(1).expect("1 != 0");
+    let tb = mediatime::Timebase::new(1, core::num::NonZeroI32::new(16_000).expect("16000 != 0"));
+    let words = || {
+      AlignedWords::new(vec![Word::new(
+        SmolStr::new("hello"),
+        TimeRange::new(0, 10, tb),
+        0.9,
+      )])
+      .expect("a word")
+    };
+    let run = |language: Lang, text: &str| {
+      crate::align::Run::new(
+        language,
+        SmolStr::new(text),
+        0,
+        50,
+        0,
+        crate::align::BoundsSource::Segment,
+      )
+    };
+    let mut request = AlignmentRequest::for_test(
+      ChunkId::from_raw(1),
+      transcriber,
+      Arc::from(vec![0.0_f32; 1_600]),
+      SmolStr::new("hello 안녕"),
+      Lang::En,
+      vec![run(Lang::En, "hello"), run(Lang::Ko, " 안녕")],
+    );
+    let outcomes: Vec<UnitOutcome> = request
+      .take_units()
+      .into_iter()
+      .map(|job| job.answer(UnitAlignment::Aligned(words())))
+      .collect();
+    let languages: Vec<Option<&Lang>> = outcomes
+      .iter()
+      .map(|outcome| outcome.alignment().words()[0].language())
+      .collect();
+    assert_eq!(languages, [Some(&Lang::En), Some(&Lang::Ko)]);
+
+    let mut whole = AlignmentRequest::for_test(
+      ChunkId::from_raw(2),
+      transcriber,
+      Arc::from(vec![0.0_f32; 1_600]),
+      SmolStr::new("hello"),
+      Lang::En,
+      Vec::new(),
+    );
+    let outcome = whole
+      .take_units()
+      .pop()
+      .expect("the whole text's job")
+      .answer(UnitAlignment::Aligned(words()));
+    assert_eq!(outcome.alignment().words()[0].language(), None);
   }
 
   /// **A request hands out one job per unit, with the unit's own text and
