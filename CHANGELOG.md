@@ -305,6 +305,21 @@ FIXED
   allowed-column mask (`ReservedIds::wildcard_columns`). The
   `bench-internals` functions `get_trellis`, `backtrack_beam` and
   `align_to_word_segments` take the mask.
+
+  And every token is scored at its entry, the first included. The
+  WhisperX recurrence scores a column's entry with the token it enters
+  and never scores column 0's, so the first token's posterior never
+  entered the lattice: a leading wildcard (`4 hello`, or a lone `4`) was
+  scored through no column at all, and the first token absorbed the
+  unit's leading silence. The alignment now puts an explicit start state,
+  the transcript's empty prefix, ahead of the first token
+  (`align_to_word_segments`), so the first token's entry is scored like
+  every other, a wildcard through its mask, and the leading blanks belong
+  to no token. Behaviour: a unit's first word starts where its first
+  character is spoken, not at the unit's first frame, which departs from
+  WhisperX's timing for the first word; and a unit needs one frame more
+  than it has tokens (a unit with exactly as many frames as tokens is
+  `NoAlignmentPath`, a recoverable outcome).
 - **The unknown token is the one the tokenizer declares.** The reserved
   ids took the unknown token from its spelling: the first of `<unk>` and
   `[UNK]` the vocabulary held. A tokenizer declaring another
