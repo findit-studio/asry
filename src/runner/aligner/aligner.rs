@@ -256,6 +256,43 @@ impl Aligner {
     ))
   }
 
+  /// Detect out-of-vocabulary characters in one unit of an alignment
+  /// request, in the unit's own language: the one detection
+  /// [`align_unit`](Self::align_unit) takes for that job.
+  ///
+  /// The detection is bound to the job (the unit of its request) and to
+  /// this aligner, and its events carry the job's requested language, the
+  /// key its policy decides on.
+  ///
+  /// # Errors
+  ///
+  /// [`AlignmentError::Tokenization`](crate::types::AlignmentError::Tokenization)
+  /// for a job in another language than this aligner's: a unit is aligned
+  /// by an aligner of its language, or read as the multilingual fallback
+  /// by name ([`detect_oov_unit_as_fallback`](Self::detect_oov_unit_as_fallback));
+  /// `AlignmentError::Normalization` if the normalizer rejects the text.
+  pub fn detect_oov_unit(
+    &self,
+    job: &crate::core::UnitJob,
+  ) -> Result<crate::core::OovDetection, crate::types::WorkFailure> {
+    self.core.detect_job(job, false)
+  }
+
+  /// As [`detect_oov_unit`](Self::detect_oov_unit), with this aligner read
+  /// as the multilingual fallback for a unit in any language, as the pool
+  /// reads a unit with its `AlignerKey::Any` aligner: the events carry the
+  /// unit's requested language.
+  ///
+  /// # Errors
+  ///
+  /// `AlignmentError::Normalization` if the normalizer rejects the text.
+  pub fn detect_oov_unit_as_fallback(
+    &self,
+    job: &crate::core::UnitJob,
+  ) -> Result<crate::core::OovDetection, crate::types::WorkFailure> {
+    self.core.detect_job(job, true)
+  }
+
   /// This aligner's identity, as a detection it made is bound to it.
   pub(crate) const fn id(&self) -> core::num::NonZeroU64 {
     self.core.id().get()
@@ -516,8 +553,11 @@ impl Aligner {
   /// job's own audio, answering the unit with what came of it.
   ///
   /// `job` is one of the command's `AlignmentRequest::take_units()`, and
-  /// `resolution` is this aligner's [`detect_oov(job.text())`](Self::detect_oov),
-  /// decided. The job carries its unit's text, audio (the chunk's, or the
+  /// `resolution` is this aligner's
+  /// [`detect_oov_unit(&job)`](Self::detect_oov_unit) (or
+  /// [`detect_oov_unit_as_fallback`](Self::detect_oov_unit_as_fallback)),
+  /// decided: bound to the job, the unit and its requested language, it is
+  /// the only resolution this method takes. The job carries its unit's text, audio (the chunk's, or the
   /// run's slice of it), sub-VAD-segments and place in the stream, so the
   /// outcome answers the unit it was computed from, and
   /// `AlignmentRequest::aligned` accepts it for that unit only.
@@ -528,8 +568,8 @@ impl Aligner {
   ///
   /// # Errors
   ///
-  /// Any other failure: a resolution this aligner did not detect in the
-  /// job's text ([`AlignmentError::Tokenization`](crate::types::AlignmentError::Tokenization)),
+  /// Any other failure: a resolution this aligner did not detect for this
+  /// job ([`AlignmentError::Tokenization`](crate::types::AlignmentError::Tokenization)),
   /// a backend or configuration fault, or an abort. The job is consumed;
   /// answer the command with `request.failed(failure)`.
   pub fn align_unit(
@@ -539,11 +579,11 @@ impl Aligner {
     abort_flag: &core::sync::atomic::AtomicBool,
     run_options: &RunOptions,
   ) -> Result<crate::core::UnitOutcome, WorkFailure> {
-    // The resolution must be this aligner's detection of this very text,
-    // checked before anything is tokenized.
-    let decisions = self.core.accept(&resolution, job.text())?;
-    // A direct detection stamps this aligner's own language on its events.
-    let expected = self.core.language().clone();
+    // The resolution must be this aligner's detection of this very job,
+    // checked before anything is tokenized, and its decisions are keyed on
+    // the job's requested language, never this aligner's.
+    let decisions = self.core.accept_job(&resolution, &job)?;
+    let expected = job.language().clone();
     let alignment = match self.align_job(&job, decisions, &expected, abort_flag, run_options) {
       Ok(alignment) => alignment,
       Err(WorkFailure::Alignment(err))

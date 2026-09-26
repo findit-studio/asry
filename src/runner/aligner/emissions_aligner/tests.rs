@@ -866,7 +866,7 @@ fn a_unit_is_answered_by_an_aligner_consuming_its_job() {
   assert_eq!((job.unit(), job.text()), (AlignmentUnit::Whole, "hello"));
   assert_eq!(job.samples(), &request.samples()[..]);
   let resolution = a
-    .detect_oov(job.text())
+    .detect_oov_unit(&job)
     .expect("detect")
     .decide(default_oov_policy);
   let outcome = a
@@ -901,7 +901,7 @@ fn a_unit_is_answered_by_an_aligner_consuming_its_job() {
     assert_eq!(job.text(), text);
     assert_eq!(job.samples().len(), 8_000);
     let resolution = a
-      .detect_oov(job.text())
+      .detect_oov_unit(&job)
       .expect("detect")
       .decide(fail_closed_all_policy);
     outcomes.push(
@@ -933,6 +933,156 @@ fn a_unit_is_answered_by_an_aligner_consuming_its_job() {
   t.complete(request.aligned(outcomes).expect("its own units, in order"))
     .expect("its own command");
   assert!(matches!(t.poll_event(), Some(Event::Transcript(_))));
+}
+
+/// **A unit job takes only the detection made for it, in its own
+/// language.** `align_unit` takes a resolution only when this aligner
+/// detected it for that very job (`detect_oov_unit`), in the job's
+/// requested language:
+/// - two jobs with the same text, of two requests or two runs of one
+///   request, cannot trade resolutions decided under different policies;
+/// - a resolution of the job's text (`detect_oov`), or one another aligner
+///   detected for the job, is refused;
+/// - a Korean run is refused by an English aligner, unless it is read as
+///   the multilingual fallback by name, when its events and its words carry
+///   Korean.
+#[test]
+fn a_unit_job_takes_only_the_detection_made_for_it() {
+  use crate::core::UnitJob;
+
+  let a = aligner();
+  let encoder = |input: &[f32]| {
+    let t = input.len() / 320;
+    let mut raw = vec![0.0_f32; t * VOCAB_SIZE];
+    for frame in 0..t {
+      raw[frame * VOCAB_SIZE] = 1.0;
+      raw[frame * VOCAB_SIZE + 5 + (frame % (VOCAB_SIZE - 5))] = 2.0;
+    }
+    Ok::<_, EmissionsError>(EncoderOutput::Logits {
+      frames: t,
+      vocab: a.vocab_size(),
+      data: raw,
+    })
+  };
+  let refused = |outcome: Result<crate::core::UnitOutcome, EmissionsError>| match outcome {
+    Err(EmissionsError::Tokenization(failure)) => assert!(
+      failure.message().contains("not detected for this unit job"),
+      "{}",
+      failure.message()
+    ),
+    other => panic!("another job's resolution is refused by name; got {other:?}"),
+  };
+  let job = |text: &str| -> UnitJob {
+    let (_, mut request) = transcriber_awaiting_alignment(text, Vec::new());
+    request.take_units().pop().expect("the whole text's job")
+  };
+
+  // Two requests, one text: the resolutions do not trade.
+  let (first, second) = (job("w9rld"), job("w9rld"));
+  let wildcard = a
+    .detect_oov_unit(&first)
+    .expect("detect")
+    .decide(wildcard_all_policy);
+  let fail_closed = a
+    .detect_oov_unit(&second)
+    .expect("detect")
+    .decide(fail_closed_all_policy);
+  refused(a.align_unit(first, fail_closed, encoder, &AtomicBool::new(false)));
+  refused(a.align_unit(second, wildcard, encoder, &AtomicBool::new(false)));
+
+  // Two runs of one request with one text: nor do theirs.
+  let run = |text: &str, t0_ms: i64, t1_ms: i64| {
+    crate::align::Run::new(
+      Lang::En,
+      smol_str::SmolStr::new(text),
+      t0_ms,
+      t1_ms,
+      0,
+      crate::align::BoundsSource::Segment,
+    )
+  };
+  let (_, mut request) = transcriber_awaiting_alignment(
+    "hello hello",
+    vec![run("hello", 0, 500), run(" hello", 500, 1_000)],
+  );
+  let mut jobs = request.take_units();
+  let (run_1, run_0) = (jobs.pop().expect("run 1"), jobs.pop().expect("run 0"));
+  let of_run_0 = a
+    .detect_oov_unit(&run_0)
+    .expect("detect")
+    .decide(default_oov_policy);
+  refused(a.align_unit(run_1, of_run_0, encoder, &AtomicBool::new(false)));
+
+  // The job's text detected on its own, or the job detected by another
+  // aligner, is refused too; the job's own detection aligns it.
+  let own = job("hello");
+  let of_text = a
+    .detect_oov(own.text())
+    .expect("detect")
+    .decide(default_oov_policy);
+  refused(a.align_unit(own, of_text, encoder, &AtomicBool::new(false)));
+  let other = aligner();
+  let own = job("hello");
+  let by_other = other
+    .detect_oov_unit(&own)
+    .expect("detect")
+    .decide(default_oov_policy);
+  refused(a.align_unit(own, by_other, encoder, &AtomicBool::new(false)));
+  let own = job("hello");
+  let resolution = a
+    .detect_oov_unit(&own)
+    .expect("detect")
+    .decide(default_oov_policy);
+  assert!(matches!(
+    a.align_unit(own, resolution, encoder, &AtomicBool::new(false))
+      .expect("its own detection")
+      .alignment(),
+    UnitAlignment::Aligned(_)
+  ));
+
+  // A Korean run on an English aligner: refused, unless read as the
+  // fallback by name.
+  let korean = |text: &str| {
+    crate::align::Run::new(
+      Lang::Ko,
+      smol_str::SmolStr::new(text),
+      0,
+      1_000,
+      0,
+      crate::align::BoundsSource::Segment,
+    )
+  };
+  let (mut t, mut request) = transcriber_awaiting_alignment("hello", vec![korean("hello")]);
+  let korean_job = request.take_units().pop().expect("the run's job");
+  match a.detect_oov_unit(&korean_job) {
+    Err(EmissionsError::Tokenization(failure)) => assert!(
+      failure.message().contains("the unit's language"),
+      "{}",
+      failure.message()
+    ),
+    other => panic!("an English aligner refuses a Korean run; got {other:?}"),
+  }
+  let detection = a
+    .detect_oov_unit_as_fallback(&korean_job)
+    .expect("read as the fallback by name");
+  assert_eq!(detection.language(), &Lang::Ko);
+  let outcome = a
+    .align_unit(
+      korean_job,
+      detection.decide(default_oov_policy),
+      encoder,
+      &AtomicBool::new(false),
+    )
+    .expect("aligned");
+  assert!(
+    outcome
+      .alignment()
+      .words()
+      .iter()
+      .all(|word| word.language() == Some(&Lang::Ko))
+  );
+  t.complete(request.aligned(vec![outcome]).expect("its own unit"))
+    .expect("its own command");
 }
 
 /// `finish` CONSUMES `prepared`, so a chunk cannot be finished twice.

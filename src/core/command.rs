@@ -853,6 +853,11 @@ impl UnitJob {
     }
   }
 
+  /// The identity of the request this job answers a unit of.
+  pub(crate) const fn ticket(&self) -> NonZeroU64 {
+    self.ticket
+  }
+
   /// Where the unit's audio sits in the stream.
   #[cfg(any(feature = "alignment", feature = "emissions"))]
   pub(crate) const fn place(&self) -> &UnitPlace {

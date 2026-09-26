@@ -970,9 +970,72 @@ impl AlignerCore {
     Ok(events)
   }
 
+  /// Detect out-of-vocabulary characters in one unit job, bound to the job
+  /// and to this aligner, its events in the job's requested language.
+  ///
+  /// `fallback` states that this aligner reads the job as a multilingual
+  /// fallback. Without it, a job in another language than this aligner's
+  /// is refused, as `AlignmentError::Tokenization`, before anything is
+  /// read: a unit is aligned by an aligner of its language, or by one the
+  /// caller names its fallback.
+  pub(crate) fn detect_job(
+    &self,
+    job: &crate::core::UnitJob,
+    fallback: bool,
+  ) -> Result<crate::core::OovDetection, WorkFailure> {
+    if !fallback && *job.language() != self.language {
+      return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+        AlignmentFailure::new(
+          format_smolstr!(
+            "this aligner reads {:?}, not {:?}, the unit's language. Align the unit with an \
+ aligner of its language, or read it with this one as the multilingual fallback \
+ (`detect_oov_unit_as_fallback`).",
+            self.language,
+            job.language(),
+          ),
+          job.language().clone(),
+        ),
+      )));
+    }
+    let mut events = self.detect_oov(job.text())?;
+    // The unit's policy is keyed on its requested language, also when a
+    // fallback aligner of another language reads it.
+    for event in &mut events {
+      event.set_language(job.language().clone());
+    }
+    Ok(crate::core::OovDetection::of_job(
+      job,
+      events,
+      self.id.get(),
+    ))
+  }
+
+  /// The decisions of `resolution`, when this aligner detected it for
+  /// exactly `job`: the check both direct `align_unit`s run before they
+  /// tokenize. A resolution detected for another job, another unit, in
+  /// another language, by another aligner, or in a text of the caller's
+  /// own (`detect_oov`) is refused, as `AlignmentError::Tokenization`.
+  pub(crate) fn accept_job<'r>(
+    &self,
+    resolution: &'r crate::core::OovResolution,
+    job: &crate::core::UnitJob,
+  ) -> Result<&'r [crate::core::ResolvedOov], WorkFailure> {
+    resolution.for_job(job, self.id.get()).ok_or_else(|| {
+      WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(
+        SmolStr::new_static(
+          "this OovResolution was not detected for this unit job by this aligner: a unit's \
+ decisions apply only to the job, the unit and the language their detection read. Detect \
+ the job with this aligner's `detect_oov_unit(&job)` and decide that detection.",
+        ),
+        job.language().clone(),
+      )))
+    })
+  }
+
   /// The decisions of `resolution`, when this aligner detected it in
   /// exactly `text`: the check a direct front end (`Aligner`,
-  /// `EmissionsAligner`) runs before it tokenizes.
+  /// `EmissionsAligner`) runs before it tokenizes a text of the caller's
+  /// own.
   ///
   /// A resolution is bound to the aligner and the text its detection
   /// read. Positional identity alone cannot tell two texts with the same

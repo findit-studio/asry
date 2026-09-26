@@ -320,8 +320,15 @@ impl ResolvedOov {
 #[derive(Debug)]
 enum Binding {
   /// A direct front end's detection: read by the aligner `reader`, in
-  /// exactly `text`.
+  /// exactly `text`, for a caller that aligns a text of its own.
   Text { reader: NonZeroU64, text: SmolStr },
+  /// A direct front end's detection of one unit job: read by the aligner
+  /// `reader` for the unit of the request whose ticket is `ticket`. The
+  /// unit and its requested language are the detection's own.
+  Job {
+    reader: NonZeroU64,
+    ticket: NonZeroU64,
+  },
   /// One unit of a pool job, read by the aligner `reader`, or by none
   /// when no aligner is registered for its language. The job and the
   /// registry it belongs to are bound by its `JobDetection`.
@@ -332,9 +339,10 @@ enum Binding {
 /// decide it.
 ///
 /// Only detection makes one: `Aligner::detect_oov` and
-/// `EmissionsAligner::detect_oov` for one text, and
-/// `AlignmentSet::detect_oov` for each unit of a pool job (inside a
-/// `JobDetection`). It cannot be cloned, and [`decide`](Self::decide)
+/// `EmissionsAligner::detect_oov` for a text of the caller's own,
+/// `Aligner::detect_oov_unit` and `EmissionsAligner::detect_oov_unit` for
+/// one unit job of an alignment request, and `AlignmentSet::detect_oov`
+/// for each unit of a pool job (inside a `JobDetection`). It cannot be cloned, and [`decide`](Self::decide)
 /// consumes it, so a detection is decided once, by one policy, into one
 /// [`OovResolution`].
 ///
@@ -368,6 +376,24 @@ impl OovDetection {
       binding: Binding::Text {
         reader,
         text: SmolStr::new(text),
+      },
+    }
+  }
+
+  /// A direct front end's detection of `job`, read by the aligner
+  /// `reader`: its events carry the job's requested language.
+  pub(crate) fn of_job(
+    job: &crate::core::UnitJob,
+    events: Vec<OovEvent>,
+    reader: NonZeroU64,
+  ) -> Self {
+    Self {
+      unit: job.unit(),
+      language: job.language().clone(),
+      events,
+      binding: Binding::Job {
+        reader,
+        ticket: job.ticket(),
       },
     }
   }
@@ -438,8 +464,11 @@ impl OovDetection {
 /// It cannot be cloned or built by hand, and alignment consumes it. A
 /// front end checks it was detected for what it is about to align: by
 /// the same aligner, in the same text (`Aligner::align_chunk_with_abort`,
-/// `EmissionsAligner::prepare`), or for the same pool job, through the
-/// same registry (`run_one_alignment`, inside a `JobResolution`).
+/// `EmissionsAligner::prepare`); by the same aligner, for the same unit
+/// job, in its requested language (`Aligner::align_unit`,
+/// `EmissionsAligner::align_unit`, which take no other); or for the same
+/// pool job, through the same registry (`run_one_alignment`, inside a
+/// `JobResolution`).
 ///
 /// ```compile_fail
 /// fn replay(resolution: asry::core::OovResolution) {
@@ -483,6 +512,29 @@ impl OovResolution {
         reader: read_by,
         text: read,
       } if *read_by == reader && read == text => Some(&self.resolved),
+      _ => None,
+    }
+  }
+
+  /// The decisions, when this resolution was detected for exactly `job`
+  /// (the unit of its request, in its requested language) by the aligner
+  /// `reader`.
+  pub(crate) fn for_job(
+    &self,
+    job: &crate::core::UnitJob,
+    reader: NonZeroU64,
+  ) -> Option<&[ResolvedOov]> {
+    match self.binding {
+      Binding::Job {
+        reader: read_by,
+        ticket,
+      } if read_by == reader
+        && ticket == job.ticket()
+        && self.unit == job.unit()
+        && self.language == *job.language() =>
+      {
+        Some(&self.resolved)
+      }
       _ => None,
     }
   }

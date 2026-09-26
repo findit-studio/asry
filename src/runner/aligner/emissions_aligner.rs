@@ -271,6 +271,43 @@ impl EmissionsAligner {
     ))
   }
 
+  /// Detect out-of-vocabulary characters in one unit of an alignment
+  /// request, in the unit's own language: the one detection
+  /// [`align_unit`](Self::align_unit) takes for that job.
+  ///
+  /// The detection is bound to the job (the unit of its request) and to
+  /// this aligner, and its events carry the job's requested language, the
+  /// key its policy decides on.
+  ///
+  /// # Errors
+  ///
+  /// [`EmissionsError::Tokenization`] for a job in another language than
+  /// this aligner's: a unit is aligned by an aligner of its language, or
+  /// read as the multilingual fallback by name
+  /// ([`detect_oov_unit_as_fallback`](Self::detect_oov_unit_as_fallback));
+  /// [`EmissionsError::Normalization`] if the normalizer rejects the text.
+  pub fn detect_oov_unit(&self, job: &UnitJob) -> Result<OovDetection, EmissionsError> {
+    self
+      .core
+      .detect_job(job, false)
+      .map_err(|e| to_emissions_error(e, Stage::Prepare))
+  }
+
+  /// As [`detect_oov_unit`](Self::detect_oov_unit), with this aligner read
+  /// as the multilingual fallback for a unit in any language, as the pool
+  /// reads a unit with its `AlignerKey::Any` aligner: the events carry the
+  /// unit's requested language.
+  ///
+  /// # Errors
+  ///
+  /// [`EmissionsError::Normalization`] if the normalizer rejects the text.
+  pub fn detect_oov_unit_as_fallback(&self, job: &UnitJob) -> Result<OovDetection, EmissionsError> {
+    self
+      .core
+      .detect_job(job, true)
+      .map_err(|e| to_emissions_error(e, Stage::Prepare))
+  }
+
   /// Steps 0-2: non-finite sample scan → speech mask → zero non-speech →
   /// pad to the stated receptive field (400 samples, wav2vec2's, by
   /// default) → normalise → tokenise.
@@ -479,7 +516,10 @@ impl EmissionsAligner {
   ///
   /// `job` is one of the command's `AlignmentRequest::take_units()`, and
   /// `resolution` is this aligner's
-  /// [`detect_oov(job.text())`](Self::detect_oov), decided. The job carries
+  /// [`detect_oov_unit(&job)`](Self::detect_oov_unit) (or
+  /// [`detect_oov_unit_as_fallback`](Self::detect_oov_unit_as_fallback)),
+  /// decided: bound to the job, the unit and its requested language, it is
+  /// the only resolution this method takes. The job carries
   /// its unit's text, audio (the chunk's, or the run's slice of it),
   /// sub-VAD-segments and place in the stream (the output clock), so the
   /// outcome answers the unit it was computed from, and
@@ -515,7 +555,25 @@ impl EmissionsAligner {
       place.base_pts_out_anchor,
     )
     .map_err(invalid)?;
-    let prepared = match self.prepare(job.samples(), &speech, job.text(), resolution, abort_flag) {
+    // The resolution must be this aligner's detection of this very job,
+    // checked before anything is tokenized, and its decisions are keyed on
+    // the job's requested language, never this aligner's.
+    let decisions = self
+      .core
+      .accept_job(&resolution, &job)
+      .map_err(|e| to_emissions_error(e, Stage::Prepare))?;
+    let prepared = match self
+      .core
+      .prepare(
+        job.samples(),
+        &speech,
+        job.text(),
+        decisions,
+        job.language(),
+        abort_flag,
+      )
+      .map_err(|e| to_emissions_error(e, Stage::Prepare))
+    {
       Ok(prepared) => prepared,
       Err(error) => return unit_failure(job, error),
     };
