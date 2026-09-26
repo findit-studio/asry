@@ -5,17 +5,17 @@ use std::path::Path;
 
 use mediatime::TimeRange;
 use ort::session::{RunOptions, Session};
-use smol_str::format_smolstr;
+use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
-  core::AlignmentResult,
+  core::{UnalignedCause, UnitAlignment},
   runner::{
     RunnerError,
     aligner::{
       core::{
-        AlignerCore, AlignerCoreLoadError, capture_vocab_size, detect_blank_token_id,
-        detect_unk_token_id, detect_vocab_uppercase_only, load_tokenizer_with_compat,
-        validate_word_delimiter_present,
+        AlignerCore, AlignerCoreLoadError, WAV2VEC2_RECEPTIVE_FIELD_SAMPLES,
+        WAV2VEC2_WORD_DELIMITER, capture_vocab_size, declared_unk_token_id, detect_blank_token_id,
+        detect_vocab_uppercase_only, load_tokenizer_with_compat, validate_word_delimiter_present,
       },
       emissions_api::{SpanError, SpeechCoverage, SpeechSpans},
       normalizer::DynTextNormalizer,
@@ -104,7 +104,7 @@ const fn nonzero_hop(value: u32) -> NonZeroU32 {
 /// single alignment worker can drive any language without copying.
 ///
 /// The ONNX front end of the sandwich: everything that is *not* the
-/// encoder lives in [`AlignerCore`], which `EmissionsAligner` contains
+/// encoder lives in `AlignerCore`, which `EmissionsAligner` contains
 /// too. Both front ends therefore run one implementation of the
 /// preprocessing, the validators, and the composition, and neither can
 /// drift from the other.
@@ -164,7 +164,7 @@ impl Aligner {
           "tokenizer has no <pad> / [PAD] entry; cannot determine CTC blank token"
         ),
       })?;
-    let unk_token_id = detect_unk_token_id(&tokenizer);
+    let unk_token_id = declared_unk_token_id(&tokenizer);
     // wav2vec2-base-960h's vocab is uppercase-only; en/de/fr CTC
     // checkpoints typically follow the same convention.
     let vocab_uppercase_only = detect_vocab_uppercase_only(&tokenizer);
@@ -173,8 +173,12 @@ impl Aligner {
     // (the English-shape default), the tokenizer MUST expose a
     // `|` token. See [`validate_word_delimiter_present`] for the
     // rationale.
-    validate_word_delimiter_present(&tokenizer, normalizer.use_word_delimiter())
-      .map_err(lift_core_load_error)?;
+    validate_word_delimiter_present(
+      &tokenizer,
+      normalizer.use_word_delimiter(),
+      WAV2VEC2_WORD_DELIMITER,
+    )
+    .map_err(lift_core_load_error)?;
 
     // Snapshot the tokenizer's vocab size (including added
     // tokens) so per-align validation can reject ORT outputs
@@ -202,6 +206,8 @@ impl Aligner {
         language,
         normalizer,
         DEFAULT_HOP_SAMPLES,
+        SmolStr::new_static(WAV2VEC2_WORD_DELIMITER),
+        WAV2VEC2_RECEPTIVE_FIELD_SAMPLES,
         blank_token_id,
         unk_token_id,
         vocab_uppercase_only,
@@ -217,31 +223,86 @@ impl Aligner {
     self.core.language()
   }
 
-  /// Detect out-of-vocab characters in `text` against this
-  /// aligner's wav2vec2 vocab + per-language normalizer,
-  /// without making any policy decision. Returns events in
-  /// the order [`tokenize_with_word_map`](crate::runner::aligner::algorithm::tokenize::tokenize_with_word_map)
-  /// will encounter them — caller-supplied `&[ResolvedOov]`
-  /// to `align_chunk_with_abort` (or via
-  /// [`AlignWorkItem::oov_decisions`](crate::AlignWorkItem))
-  /// must be in the same order.
+  /// Detect out-of-vocab characters in `text` against this aligner's
+  /// wav2vec2 vocab + per-language normalizer, without making any
+  /// policy decision.
   ///
-  /// Sans-I/O OOV resolution: the library produces events as
-  /// data, the caller decides via pure functions in
-  /// [`crate::core::oov`] (or a custom policy), then passes
-  /// the decisions back as data. No callbacks, no traits the
-  /// library holds.
+  /// Returns the one way to decide them: an [`OovDetection`] bound to
+  /// `text` and to this aligner. Decide it with a policy from
+  /// [`crate::core::oov`] (or a closure), then hand the
+  /// [`OovResolution`] to [`Self::align_chunk_with_abort`] with the same
+  /// text, which refuses a resolution detected in another text or by
+  /// another aligner. A unit of a `Transcriber`'s alignment command is
+  /// detected with [`detect_oov_unit`](Self::detect_oov_unit) instead:
+  /// [`align_unit`](Self::align_unit) takes no text's resolution.
   ///
-  /// Returns an empty vec for in-vocab text. A character the
-  /// vocabulary cannot spell is an event, never an error:
-  /// detection looks each character up in the vocabulary and
-  /// never runs the tokenizer's `encode`. Returns an error only
-  /// on normalizer rejection, or on normalizer output whose
-  /// word count disagrees with its boundary map
-  /// (`NormalizationError::EmptyText` for punctuation-only
-  /// input is converted to an empty event vec — there's
-  /// nothing to align, so nothing to decide).
+  /// No events for in-vocab text. A character the vocabulary cannot
+  /// spell is an event, never an error: detection looks each character
+  /// up in the vocabulary and never runs the tokenizer's `encode`.
+  /// Returns an error only on normalizer rejection, or on normalizer
+  /// output whose word count disagrees with its boundary map
+  /// (`NormalizationError::EmptyText` for punctuation-only input is no
+  /// events: there's nothing to align, so nothing to decide).
+  ///
+  /// [`OovDetection`]: crate::core::OovDetection
+  /// [`OovResolution`]: crate::core::OovResolution
   pub fn detect_oov(
+    &self,
+    text: &str,
+  ) -> Result<crate::core::OovDetection, crate::types::WorkFailure> {
+    Ok(crate::core::OovDetection::of_text(
+      text,
+      self.core.language().clone(),
+      self.core.detect_oov(text)?,
+      self.core.id().get(),
+    ))
+  }
+
+  /// Detect out-of-vocabulary characters in one unit of an alignment
+  /// request, in the unit's own language: the one detection
+  /// [`align_unit`](Self::align_unit) takes for that job.
+  ///
+  /// The detection is bound to the job (the unit of its request) and to
+  /// this aligner, and its events carry the job's requested language, the
+  /// key its policy decides on.
+  ///
+  /// # Errors
+  ///
+  /// [`AlignmentError::Tokenization`](crate::types::AlignmentError::Tokenization)
+  /// for a job in another language than this aligner's: a unit is aligned
+  /// by an aligner of its language, or read as the multilingual fallback
+  /// by name ([`detect_oov_unit_as_fallback`](Self::detect_oov_unit_as_fallback));
+  /// `AlignmentError::Normalization` if the normalizer rejects the text.
+  pub fn detect_oov_unit(
+    &self,
+    job: &crate::core::UnitJob,
+  ) -> Result<crate::core::OovDetection, crate::types::WorkFailure> {
+    self.core.detect_job(job, false)
+  }
+
+  /// As [`detect_oov_unit`](Self::detect_oov_unit), with this aligner read
+  /// as the multilingual fallback for a unit in any language, as the pool
+  /// reads a unit with its `AlignerKey::Any` aligner: the events carry the
+  /// unit's requested language.
+  ///
+  /// # Errors
+  ///
+  /// `AlignmentError::Normalization` if the normalizer rejects the text.
+  pub fn detect_oov_unit_as_fallback(
+    &self,
+    job: &crate::core::UnitJob,
+  ) -> Result<crate::core::OovDetection, crate::types::WorkFailure> {
+    self.core.detect_job(job, true)
+  }
+
+  /// This aligner's identity, as a detection it made is bound to it.
+  pub(crate) const fn id(&self) -> core::num::NonZeroU64 {
+    self.core.id().get()
+  }
+
+  /// The OOV events of `text`, undecided: what `AlignmentSet::detect_oov`
+  /// binds to a unit of a pool job.
+  pub(crate) fn detect_events(
     &self,
     text: &str,
   ) -> Result<Vec<crate::core::OovEvent>, crate::types::WorkFailure> {
@@ -373,7 +434,7 @@ impl Aligner {
   /// SIGINT), call [`Self::align_chunk_with_abort`] with
   /// caller-owned handles.
   ///
-  /// Inputs match [`Self::align`] minus the
+  /// Inputs match [`Self::align_chunk_with_abort`] minus the
   /// `abort_flag` / `run_options` infrastructure. See that
   /// method's doc-comment for argument semantics.
   ///
@@ -390,7 +451,7 @@ impl Aligner {
     text: &str,
     chunk_first_sample_in_stream: u64,
     samples_to_output_range: F,
-  ) -> Result<AlignmentResult, WorkFailure>
+  ) -> Result<UnitAlignment, WorkFailure>
   where
     F: Fn(u64, u64) -> TimeRange,
   {
@@ -401,20 +462,15 @@ impl Aligner {
         self.core.language().clone(),
       )))
     })?;
-    // Default OOV policy for the no-abort entrypoint:
-    // detect events first, apply the historical default
-    // (`alphanumeric → wildcard, pronounced → fail-closed`).
-    // Power users that want `wildcard_all_decisions` or a
-    // custom policy should use `align_chunk_with_abort` and
-    // supply explicit decisions.
-    let oov_events = self.detect_oov(text)?;
-    let oov_decisions = crate::core::default_oov_decisions(&oov_events);
-    // Self-generated decisions, so they carry this aligner's language by
-    // construction; naming it as the key is a tautology here, and that is
-    // exactly the point — there is no call path into the core that does
-    // not state one.
-    let expected = self.core.language().clone();
-    self.align(
+    // Default OOV policy for the no-abort entrypoint: detect, then
+    // decide with the historical default (`alphanumeric → wildcard,
+    // pronounced → fail-closed`). Power users that want
+    // `wildcard_all_policy` or a custom policy should use
+    // `align_chunk_with_abort` with their own resolution.
+    let resolution = self
+      .detect_oov(text)?
+      .decide(crate::core::default_oov_policy);
+    self.align_chunk_with_abort(
       samples,
       sub_segments,
       text,
@@ -422,8 +478,7 @@ impl Aligner {
       samples_to_output_range,
       &abort_flag,
       &run_options,
-      &oov_decisions,
-      &expected,
+      resolution,
     )
   }
 
@@ -445,6 +500,12 @@ impl Aligner {
   /// `RunOptions` lives in [`crate::ort::session::RunOptions`].
   /// Construct one per align call (or share a pool — `terminate`
   /// is process-wide for the underlying ORT graph).
+  ///
+  /// `resolution` is this aligner's [`Self::detect_oov`] of `text`,
+  /// decided. It is consumed, so it applies once; one detected in another
+  /// text or by another aligner is refused as
+  /// [`AlignmentError::Tokenization`](crate::types::AlignmentError::Tokenization)
+  /// before anything is tokenized.
   #[allow(
     clippy::too_many_arguments,
     reason = "7 args carry independent semantic inputs (audio, \
@@ -461,15 +522,16 @@ impl Aligner {
     samples_to_output_range: F,
     abort_flag: &core::sync::atomic::AtomicBool,
     run_options: &RunOptions,
-    // Caller-resolved per-OOV-event decisions. See
-    // `Self::align`'s `oov_decisions` parameter and
-    // `crate::core::oov` for the full Sans-I/O resolution
-    // flow.
-    oov_decisions: &[crate::core::ResolvedOov],
-  ) -> Result<AlignmentResult, WorkFailure>
+    // The caller's decisions for `text`: this aligner's
+    // `detect_oov(text)`, decided. Consumed, so it applies once.
+    resolution: crate::core::OovResolution,
+  ) -> Result<UnitAlignment, WorkFailure>
   where
     F: Fn(u64, u64) -> TimeRange,
   {
+    // The resolution must be this aligner's detection of this very text,
+    // checked before anything is tokenized.
+    let oov_decisions = self.core.accept(&resolution, text)?;
     // No `Any` fallback at this layer — `align_chunk_with_abort` is
     // bound to a specific `Aligner`, so `self.language` IS the key the
     // caller's OOV policy was resolved against. The check itself lives
@@ -486,6 +548,79 @@ impl Aligner {
       run_options,
       oov_decisions,
       &expected,
+    )
+  }
+
+  /// Align one unit of an alignment request: the job's own text against the
+  /// job's own audio, answering the unit with what came of it.
+  ///
+  /// `job` is one of the command's `AlignmentRequest::take_units()`, and
+  /// `resolution` is this aligner's
+  /// [`detect_oov_unit(&job)`](Self::detect_oov_unit) (or
+  /// [`detect_oov_unit_as_fallback`](Self::detect_oov_unit_as_fallback)),
+  /// decided: bound to the job, the unit and its requested language, it is
+  /// the only resolution this method takes. The job carries its unit's text, audio (the chunk's, or the
+  /// run's slice of it), sub-VAD-segments and place in the stream, so the
+  /// outcome answers the unit it was computed from, and
+  /// `AlignmentRequest::aligned` accepts it for that unit only.
+  ///
+  /// A data-dependent failure (no alignment path, a character the policy
+  /// refused, an empty text) is the unit's outcome,
+  /// `Unaligned(Failed(..))`, as on the pool.
+  ///
+  /// # Errors
+  ///
+  /// Any other failure: a resolution this aligner did not detect for this
+  /// job ([`AlignmentError::Tokenization`](crate::types::AlignmentError::Tokenization)),
+  /// a backend or configuration fault, or an abort. The job is consumed;
+  /// answer the command with `request.failed(failure)`.
+  pub fn align_unit(
+    &mut self,
+    job: crate::core::UnitJob,
+    resolution: crate::core::OovResolution,
+    abort_flag: &core::sync::atomic::AtomicBool,
+    run_options: &RunOptions,
+  ) -> Result<crate::core::UnitOutcome, WorkFailure> {
+    // The resolution must be this aligner's detection of this very job,
+    // checked before anything is tokenized, and its decisions are keyed on
+    // the job's requested language, never this aligner's.
+    let decisions = self.core.accept_job(&resolution, &job)?;
+    let expected = job.language().clone();
+    let alignment = match self.align_job(&job, decisions, &expected, abort_flag, run_options) {
+      Ok(alignment) => alignment,
+      Err(WorkFailure::Alignment(err))
+        if crate::runner::alignment_pool::alignment_error_is_recoverable(&err) =>
+      {
+        UnitAlignment::Unaligned(UnalignedCause::Failed(err))
+      }
+      Err(failure) => return Err(failure),
+    };
+    Ok(job.answer(alignment))
+  }
+
+  /// Align `job`'s own text against its own audio, with `decisions`
+  /// resolved against `expected_decision_language`: what the unit came to,
+  /// for the caller to answer that same job with.
+  pub(crate) fn align_job(
+    &mut self,
+    job: &crate::core::UnitJob,
+    decisions: &[crate::core::ResolvedOov],
+    expected_decision_language: &Lang,
+    abort_flag: &core::sync::atomic::AtomicBool,
+    run_options: &RunOptions,
+  ) -> Result<UnitAlignment, WorkFailure> {
+    let place = job.place();
+    let bridge = job.samples_to_output_range();
+    self.align(
+      job.samples(),
+      &place.sub_segments,
+      job.text(),
+      place.first_sample_in_stream,
+      move |start, end| (bridge)(start, end),
+      abort_flag,
+      run_options,
+      decisions,
+      expected_decision_language,
     )
   }
 
@@ -542,7 +677,7 @@ impl Aligner {
     // run). Validating against the fallback aligner's `Lang` instead
     // would reject every correct `AnyFallback` payload.
     expected_decision_language: &Lang,
-  ) -> Result<AlignmentResult, WorkFailure>
+  ) -> Result<UnitAlignment, WorkFailure>
   where
     F: Fn(u64, u64) -> TimeRange,
   {
@@ -568,7 +703,7 @@ impl Aligner {
     // `words: []` rather than an `Event::Error` — alignment is
     // optional, not a data-loss path.
     if prepared.is_trivial() {
-      return Ok(AlignmentResult::new(Vec::new()));
+      return Ok(UnitAlignment::Unaligned(UnalignedCause::NoAlignableText));
     }
 
     // Steps 3-4: the ONE hole in the sandwich. `encoder_input()` is
@@ -809,7 +944,7 @@ mod tests {
   /// Regression: punctuation-only ASR text normalises to empty,
   /// but alignment must NOT turn the successful ASR transcript
   /// into `Event::Error`. The fix short-circuits `EmptyText` to
-  /// `Ok(empty AlignmentResult)` inside `Aligner::align`; this
+  /// `Ok(Unaligned(NoAlignableText))` inside `Aligner::align`; this
   /// test exercises that path without ONNX inference (the
   /// short-circuit returns before `encode_log_softmax` runs).
   ///
@@ -839,7 +974,7 @@ mod tests {
     let run_options = ort::session::RunOptions::new().expect("RunOptions::new");
 
     // Punctuation-only input → EnglishNormalizer returns
-    // `EmptyText`; align must surface as Ok(empty), not Err.
+    // `EmptyText`; align must surface as Ok(NoAlignableText), not Err.
     let result = aligner
       .align(
         &samples,
@@ -860,9 +995,11 @@ mod tests {
       )
       .expect("EmptyText must short-circuit to Ok, not propagate as AlignmentFailed");
     assert!(
-      result.words().is_empty(),
-      "empty normalisation must yield zero words; got {:?}",
-      result.words()
+      matches!(
+        result,
+        UnitAlignment::Unaligned(UnalignedCause::NoAlignableText)
+      ),
+      "empty normalisation must yield no words, saying why; got {result:?}"
     );
   }
 
@@ -883,16 +1020,17 @@ mod tests {
   /// and it is the *general* guard (`t < num_tokens`), not a
   /// special case for short audio.
   ///
-  /// `Ok(empty)` — "aligned successfully, zero words" — is the answer
-  /// one layer **up**. `NoAlignmentPath` is classified *recoverable*
-  /// by `alignment_pool`, which names "a too-short chunk" as its
-  /// canonical cause, converts it to an empty `AlignmentResult`, keeps
-  /// the ASR transcript, and logs the drop. See
+  /// A zero-word `Ok` is the answer one layer **up**.
+  /// `NoAlignmentPath` is classified *recoverable* by
+  /// `alignment_pool`, which names "a too-short chunk" as its
+  /// canonical cause, converts it to the unit's `Unaligned(Failed(..))`
+  /// outcome, keeps the ASR transcript,
+  /// and logs the drop. See
   /// `alignment_pool::tests::too_short_chunk_recovers_to_empty_result`,
   /// which pins that half against this exact input.
   ///
   /// Collapsing the two would be a regression, not a simplification:
-  /// an `Ok(empty)` manufactured *inside* the aligner is
+  /// a zero-word `Ok` manufactured *inside* the aligner is
   /// indistinguishable from a genuine zero-word alignment, so the pool
   /// could no longer tell "alignment was dropped" from "alignment
   /// found nothing" — the very distinction it goes out of its way to
@@ -998,7 +1136,7 @@ mod tests {
   /// `Aligner::from_paths` accepts the jonatasgrosman tokenizer
   /// shape, the JapaneseNormalizer is wired up via
   /// `default_normalizer_for(Lang::Ja)`, and the empty-input
-  /// short-circuit returns Ok(empty AlignmentResult) just like
+  /// short-circuit returns Ok(Unaligned(NoAlignableText)) just like
   /// the English aligner.
   #[test]
   #[cfg_attr(
@@ -1051,7 +1189,13 @@ mod tests {
         &Lang::Ja,
       )
       .expect("Ja aligner empty-text must short-circuit Ok");
-    assert!(result.words().is_empty());
+    assert!(
+      matches!(
+        result,
+        UnitAlignment::Unaligned(UnalignedCause::NoAlignableText)
+      ),
+      "{result:?}"
+    );
   }
 
   /// Smoke test: load the Chinese wav2vec2 fixture. Mirrors the
@@ -1108,7 +1252,13 @@ mod tests {
         &Lang::Zh,
       )
       .expect("Zh aligner empty-text must short-circuit Ok");
-    assert!(result.words().is_empty());
+    assert!(
+      matches!(
+        result,
+        UnitAlignment::Unaligned(UnalignedCause::NoAlignableText)
+      ),
+      "{result:?}"
+    );
   }
 
   /// Smoke test: load the Korean wav2vec2 fixture. Mirrors the
@@ -1120,7 +1270,7 @@ mod tests {
   /// `Aligner::from_paths` accepts the kresnik tokenizer
   /// shape, the KoreanNormalizer is wired up via
   /// `default_normalizer_for(Lang::Ko)`, and the empty-input
-  /// short-circuit returns Ok(empty AlignmentResult).
+  /// short-circuit returns Ok(Unaligned(NoAlignableText)).
   #[test]
   #[cfg_attr(
     not(asry_w2v_ko),
@@ -1172,7 +1322,13 @@ mod tests {
         &Lang::Ko,
       )
       .expect("Ko aligner empty-text must short-circuit Ok");
-    assert!(result.words().is_empty());
+    assert!(
+      matches!(
+        result,
+        UnitAlignment::Unaligned(UnalignedCause::NoAlignableText)
+      ),
+      "{result:?}"
+    );
   }
 
   /// Helper for the Latin-language smoke tests below. Loads the
@@ -1237,8 +1393,11 @@ mod tests {
       )
       .expect("Latin aligner empty-text must short-circuit Ok");
     assert!(
-      result.words().is_empty(),
-      "{lang:?} aligner empty-text must yield zero words"
+      matches!(
+        result,
+        UnitAlignment::Unaligned(UnalignedCause::NoAlignableText)
+      ),
+      "{lang:?} aligner empty-text must yield no words, saying why; got {result:?}"
     );
   }
 

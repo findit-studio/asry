@@ -81,7 +81,7 @@ impl Run {
   /// underlying segment's timing source (DTW-derived or segment
   /// envelope); see [`Self::bounds_source`].
   ///
-  /// **Coordinate contract** ([medium]):
+  /// **Coordinate contract:**
   /// values are **chunk-local** — origin at the start of the
   /// chunk's audio, NOT stream-absolute. The runner's alignment
   /// path
@@ -90,7 +90,7 @@ impl Run {
   /// silently produces zero-word per-run alignment (a stderr
   /// warning fires when bounds land outside the chunk window).
   /// Pluggable [`crate::AsrSource`] implementations populating
-  /// [`crate::types::AsrResult::runs`] must respect this
+  /// [`crate::core::AsrResult::runs`] must respect this
   /// contract.
   #[must_use]
   pub const fn audio_t0_ms(&self) -> i64 {
@@ -207,8 +207,8 @@ impl Run {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum BoundsSource {
-  /// Bounds are min/max of [`SegmentLike::token_dtw_timestamps`]
-  /// across the run's tokens. Every token in the run had a
+  /// Bounds are min/max of the DTW timestamps of the run's
+  /// [`SegmentLike::tokens`]. Every token in the run had a
   /// concrete DTW timestamp.
   Dtw,
   /// At least one token in the run had `t_dtw == None`; the run
@@ -342,9 +342,21 @@ const fn cs_to_ms(cs: i64) -> i64 {
 /// language changes. `Carry` characters (digits, punctuation,
 /// whitespace, ambiguous scripts without a hint) extend the
 /// current run; leading carries before any concrete classification
-/// fold into the first concrete run that follows. Segments with
-/// only carries (e.g. pure punctuation) are skipped — they have no
-/// language to attach to.
+/// fold into the first concrete run that follows.
+///
+/// **The runs cover every nonempty segment.** The per-run alignment
+/// road aligns the runs' texts and nothing else, so a character left
+/// outside every run would reach no OOV detection. A segment with no
+/// concrete-script character (`"4"`, `"50%"`, `"&"`, `"..."`) is
+/// therefore one run of its own, in the language of the nearest run
+/// before it, or, leading the chunk, of the chunk's first run: the
+/// language a carry character inside a segment takes from its run.
+/// It never takes a language no run of the chunk has, `state_lang`
+/// included, since an aligner the chunk does not otherwise use may be
+/// unregistered, and the segment would then be skipped or refused
+/// where its neighbours align. A chunk none of whose segments has a
+/// concrete-script character yields no runs at all: alignment then
+/// takes the whole-text road, which reads every character.
 ///
 /// `state_lang` is the transcriber's current language hint, used
 /// for Latin disambiguation and as a fallback for ambiguous
@@ -368,15 +380,61 @@ const fn cs_to_ms(cs: i64) -> i64 {
 /// runs replayed the parent's tail audio (this commit).
 #[must_use]
 pub fn dispatch_segments<S: SegmentLike>(segments: &[S], state_lang: Option<Lang>) -> Vec<Run> {
-  let mut runs = Vec::new();
   let state_lang_ref = state_lang.as_ref();
 
-  for (idx, seg) in segments.iter().enumerate() {
+  // First pass: carve every segment into runs by language.
+  let carved_per_segment: Vec<Vec<CarvedRun>> = segments
+    .iter()
+    .map(|seg| carve_by_language(seg.text(), state_lang_ref))
+    .collect();
+
+  // No segment names a language: no runs, so alignment reads the
+  // whole text.
+  let Some(first_lang) = carved_per_segment
+    .iter()
+    .find_map(|carved| carved.first())
+    .map(|run| run.lang.clone())
+  else {
+    return Vec::new();
+  };
+
+  // The language a nonempty segment with no concrete-script
+  // character takes: the nearest run's before it, else the first
+  // run's. Decided before any segment's runs are moved.
+  let carry_langs: Vec<Option<Lang>> = segments
+    .iter()
+    .enumerate()
+    .map(|(idx, seg)| {
+      let uncarved = carved_per_segment[idx].is_empty() && !seg.text().is_empty();
+      uncarved.then(|| {
+        carved_per_segment[..idx]
+          .iter()
+          .rev()
+          .find_map(|carved| carved.last())
+          .map_or_else(|| first_lang.clone(), |run| run.lang.clone())
+      })
+    })
+    .collect();
+
+  let mut runs = Vec::new();
+  for (((idx, seg), mut carved), carry_lang) in segments
+    .iter()
+    .enumerate()
+    .zip(carved_per_segment)
+    .zip(carry_langs)
+  {
     let text = seg.text();
     if text.is_empty() {
       continue;
     }
-    let ctx = SegmentContext::from_text(text);
+    let text_char_count = text.chars().count();
+    if let Some(lang) = carry_lang {
+      carved.push(CarvedRun {
+        lang,
+        byte_range: 0..text.len(),
+        char_range: 0..text_char_count,
+      });
+    }
     let seg_t0_cs = seg.t0();
     let seg_t1_cs = seg.t1();
     let tokens = seg.tokens();
@@ -386,51 +444,6 @@ pub fn dispatch_segments<S: SegmentLike>(segments: &[S], state_lang: Option<Lang
     // overflow rather than truncate — wraparound would silently
     // alias telemetry across far-apart segments.
     let source_idx = i32::try_from(idx).unwrap_or(i32::MAX);
-
-    // First pass: carve runs by language, tracking BOTH byte and
-    // character ranges. Bytes are needed for `&text[..]` slicing
-    // and DTW-token overlap math (whisper tokens carry byte
-    // offsets); chars are needed for non-DTW interpolation so
-    // mixed-script segments (e.g. "hello你好") split timing
-    // proportionally to glyphs, not UTF-8 byte length.
-    let mut carved: Vec<CarvedRun> = Vec::new();
-    let mut current_lang: Option<Lang> = None;
-    let mut run_byte_start: usize = 0;
-    let mut run_char_start: usize = 0;
-    let mut char_idx: usize = 0;
-
-    for (byte_idx, ch) in text.char_indices() {
-      let class = script_to_lang(ch, ctx, state_lang_ref);
-      match class {
-        CharClass::Carry => {}
-        CharClass::Lang(lang) => match &current_lang {
-          None => {
-            current_lang = Some(lang);
-          }
-          Some(active) if *active == lang => {}
-          Some(_) => {
-            let active = current_lang.take().expect("checked Some above");
-            carved.push(CarvedRun {
-              lang: active,
-              byte_range: run_byte_start..byte_idx,
-              char_range: run_char_start..char_idx,
-            });
-            run_byte_start = byte_idx;
-            run_char_start = char_idx;
-            current_lang = Some(lang);
-          }
-        },
-      }
-      char_idx += 1;
-    }
-    let text_char_count = char_idx;
-    if let Some(active) = current_lang {
-      carved.push(CarvedRun {
-        lang: active,
-        byte_range: run_byte_start..text.len(),
-        char_range: run_char_start..text_char_count,
-      });
-    }
 
     // Second pass: per-run DTW slice + raw bounds info. We
     // collect this for ALL runs first, then post-process across
@@ -530,11 +543,79 @@ pub fn dispatch_segments<S: SegmentLike>(segments: &[S], state_lang: Option<Lang
         bounds_source,
       );
     }
-    // Segments containing only carry characters produce no runs —
-    // there is no language to label them with.
   }
 
   runs
+}
+
+/// Carve `text` into runs by language, tracking BOTH byte and
+/// character ranges. Bytes are needed for `&text[..]` slicing and
+/// DTW-token overlap math (whisper tokens carry byte offsets); chars
+/// are needed for non-DTW interpolation so mixed-script segments
+/// (e.g. "hello你好") split timing proportionally to glyphs, not
+/// UTF-8 byte length.
+///
+/// The runs partition `text` when it holds a concrete-script
+/// character; otherwise there are none, and [`dispatch_segments`]
+/// decides the segment's language.
+fn carve_by_language(text: &str, state_lang: Option<&Lang>) -> Vec<CarvedRun> {
+  let ctx = SegmentContext::from_text(text);
+  let mut carved: Vec<CarvedRun> = Vec::new();
+  let mut current_lang: Option<Lang> = None;
+  let mut run_byte_start: usize = 0;
+  let mut run_char_start: usize = 0;
+  let mut char_idx: usize = 0;
+
+  for (byte_idx, ch) in text.char_indices() {
+    let class = script_to_lang(ch, ctx, state_lang);
+    match class {
+      CharClass::Carry => {}
+      CharClass::Lang(lang) => match &current_lang {
+        None => {
+          current_lang = Some(lang);
+        }
+        Some(active) if *active == lang => {}
+        Some(_) => {
+          let active = current_lang.take().expect("checked Some above");
+          carved.push(CarvedRun {
+            lang: active,
+            byte_range: run_byte_start..byte_idx,
+            char_range: run_char_start..char_idx,
+          });
+          run_byte_start = byte_idx;
+          run_char_start = char_idx;
+          current_lang = Some(lang);
+        }
+      },
+    }
+    char_idx += 1;
+  }
+  if let Some(active) = current_lang {
+    carved.push(CarvedRun {
+      lang: active,
+      byte_range: run_byte_start..text.len(),
+      char_range: run_char_start..char_idx,
+    });
+  }
+  carved
+}
+
+/// Whether `runs` reproduce `text`: their texts, concatenated in order,
+/// are `text` itself, apart from whitespace at the start and the end of
+/// the whole transcript (the one trim a transcript takes when it is
+/// assembled from its segments).
+///
+/// The per-run alignment road aligns the runs' texts and nothing else,
+/// so it may be taken only when this holds. Nothing looser is safe: a
+/// spoken character outside every run reaches no OOV detection at all;
+/// whitespace moved inside a run changes its word boundaries (`"ab c"`
+/// read as `"a bc"`); and punctuation a vocabulary spells is a token
+/// (`"dont"` read as `"don't"`). Equality needs no normalizer and no
+/// vocabulary, which the road is chosen without, and every character it
+/// accepts is the transcript's own.
+pub(crate) fn runs_reproduce_text(runs: &[Run], text: &str) -> bool {
+  let reproduced: String = runs.iter().map(Run::text).collect();
+  reproduced.trim() == text.trim()
 }
 
 /// One language run carved out of a segment. Carries both byte
@@ -1196,6 +1277,192 @@ mod tests {
     let segs = vec![seg("...!?", 0, 100, vec![])];
     let runs = dispatch_segments(&segs, None);
     assert!(runs.is_empty());
+  }
+
+  /// `(language, text)` of every run, in order.
+  fn labelled(runs: &[Run]) -> Vec<(Lang, &str)> {
+    runs
+      .iter()
+      .map(|run| (run.language().clone(), run.text()))
+      .collect()
+  }
+
+  /// **A segment with no concrete-script character is a run of its own.**
+  /// A digit, a mark read aloud, a percentage: each is spoken, and the
+  /// per-run road aligns runs only, so each segment becomes a run in the
+  /// preceding run's language, with its own segment's bounds. It used to
+  /// produce no run at all.
+  #[test]
+  fn a_segment_without_a_concrete_script_character_is_a_run_of_its_own() {
+    for spoken in ["4", "&", "50%", " 4", "$20"] {
+      let segs = vec![seg("hello", 0, 50, vec![]), seg(spoken, 50, 90, vec![])];
+      for state_lang in [Some(Lang::En), None] {
+        let runs = dispatch_segments(&segs, state_lang.clone());
+        assert_eq!(
+          labelled(&runs),
+          [(Lang::En, "hello"), (Lang::En, spoken)],
+          "{spoken:?}, state_lang = {state_lang:?}"
+        );
+        assert_eq!(runs[1].source_segment_idx(), 1);
+        assert_eq!(runs[1].bounds_source(), BoundsSource::Segment);
+        assert_eq!((runs[1].audio_t0_ms(), runs[1].audio_t1_ms()), (500, 900));
+      }
+    }
+  }
+
+  /// Such a segment takes the language of the nearest run before it, and
+  /// a leading one the language of the chunk's first run: the language a
+  /// carry character takes inside a segment. Never the state language when
+  /// no run has it: `Ko` here, which the chunk's runs do not align.
+  #[test]
+  fn a_segment_without_a_script_takes_its_neighbours_language() {
+    let segs = vec![
+      seg("4", 0, 10, vec![]),
+      seg("hello \u{4F60}\u{597D}", 10, 50, vec![]),
+      seg("50%", 50, 60, vec![]),
+    ];
+    for state_lang in [None, Some(Lang::En), Some(Lang::Ko)] {
+      assert_eq!(
+        labelled(&dispatch_segments(&segs, state_lang.clone())),
+        [
+          (Lang::En, "4"),
+          (Lang::En, "hello "),
+          (Lang::Zh, "\u{4F60}\u{597D}"),
+          (Lang::Zh, "50%"),
+        ],
+        "{state_lang:?}"
+      );
+    }
+    let segs = vec![seg("bonjour", 0, 10, vec![]), seg("50%", 10, 20, vec![])];
+    assert_eq!(
+      labelled(&dispatch_segments(&segs, Some(Lang::Fr))),
+      [(Lang::Fr, "bonjour"), (Lang::Fr, "50%")]
+    );
+  }
+
+  /// A chunk none of whose segments has a concrete-script character yields
+  /// no runs, so alignment takes the whole-text road, which reads every
+  /// character.
+  #[test]
+  fn a_chunk_without_a_concrete_script_character_has_no_runs() {
+    let segs = vec![seg("4", 0, 10, vec![]), seg("50%", 10, 20, vec![])];
+    assert!(dispatch_segments(&segs, Some(Lang::En)).is_empty());
+    assert!(dispatch_segments(&segs, None).is_empty());
+  }
+
+  /// **The runs cover every nonempty segment.** Over every sequence of up to
+  /// three segments drawn from mixed scripts, spoken symbols, digits,
+  /// punctuation and whitespace, with and without a state language: either
+  /// there are no runs and no segment has a concrete-script character, or
+  /// the runs' texts, in order, are the segments' texts exactly, so they
+  /// cover the transcript.
+  #[test]
+  fn runs_cover_every_nonempty_segment() {
+    let pool = [
+      "hello",
+      "\u{4F60}\u{597D}",
+      "4",
+      "&",
+      "50%",
+      "...",
+      " ",
+      "",
+      "\u{C548}\u{B155}",
+      "\u{3053}\u{308C}\u{306F}",
+      "\u{41F}\u{440}\u{438}\u{432}\u{435}\u{442}",
+      " hello \u{4F60}\u{597D} 4.",
+    ];
+    let mut sequences: Vec<Vec<&str>> = vec![Vec::new()];
+    for _ in 0..3 {
+      let longer: Vec<Vec<&str>> = sequences
+        .iter()
+        .flat_map(|prefix| {
+          pool.iter().map(move |text| {
+            let mut next = prefix.clone();
+            next.push(text);
+            next
+          })
+        })
+        .collect();
+      sequences.extend(longer);
+    }
+    for texts in &sequences {
+      let segs: Vec<MockSeg> = texts
+        .iter()
+        .enumerate()
+        .map(|(i, text)| seg(text, i as i64 * 10, i as i64 * 10 + 10, vec![]))
+        .collect();
+      let transcript: String = texts.concat();
+      for state_lang in [Some(Lang::En), Some(Lang::Zh), None] {
+        let runs = dispatch_segments(&segs, state_lang.clone());
+        if runs.is_empty() {
+          assert!(
+            texts
+              .iter()
+              .all(|text| carve_by_language(text, state_lang.as_ref()).is_empty()),
+            "{texts:?}, {state_lang:?}: no runs, yet a segment names a language"
+          );
+          continue;
+        }
+        let covered: String = runs.iter().map(Run::text).collect();
+        assert_eq!(covered, transcript, "{texts:?}, {state_lang:?}");
+        assert!(runs_reproduce_text(&runs, transcript.trim()));
+        for run in &runs {
+          let segment = texts[usize::try_from(run.source_segment_idx()).unwrap()];
+          assert!(segment.contains(run.text()), "{texts:?}, {state_lang:?}");
+        }
+      }
+    }
+  }
+
+  /// **The runs reproduce the transcript exactly.** Only whitespace at the
+  /// start and end of the whole transcript may differ. Moving whitespace
+  /// (`"ab c"` read as `"a bc"`), adding or dropping punctuation a
+  /// vocabulary spells (`"dont"` read as `"don't"`), or dropping, adding or
+  /// reordering any character is refused.
+  #[test]
+  fn runs_reproduce_text_compares_the_text_exactly() {
+    let run = |text: &str| {
+      Run::new(
+        Lang::En,
+        SmolStr::new(text),
+        0,
+        10,
+        0,
+        BoundsSource::Segment,
+      )
+    };
+    let text = "Hello, world 4 & 50%.";
+    assert!(runs_reproduce_text(
+      &[run(" Hello, world "), run("4 & 50%. ")],
+      text
+    ));
+    assert!(runs_reproduce_text(
+      &[run("Hello,"), run(" world 4 & 50%.")],
+      text
+    ));
+    assert!(!runs_reproduce_text(
+      &[run("Hello"), run("world"), run("4&50%")],
+      text
+    ));
+    assert!(!runs_reproduce_text(&[run("Hello world 4 & 50%.")], text));
+    assert!(!runs_reproduce_text(&[run("Hello, world ")], text));
+    assert!(!runs_reproduce_text(
+      &[run("4 & 50%."), run("Hello, world ")],
+      text
+    ));
+    assert!(!runs_reproduce_text(
+      &[run("Hello, world 4 & 50%. 6")],
+      text
+    ));
+    assert!(!runs_reproduce_text(&[], text));
+
+    assert!(runs_reproduce_text(&[run("ab"), run(" c")], "ab c"));
+    assert!(!runs_reproduce_text(&[run("a bc")], "ab c"));
+    assert!(!runs_reproduce_text(&[run("a"), run(" bc")], "ab c"));
+    assert!(!runs_reproduce_text(&[run("don't")], "dont"));
+    assert!(!runs_reproduce_text(&[run("dont")], "don't"));
+    assert!(runs_reproduce_text(&[run("don't")], "don't"));
   }
 
   #[test]

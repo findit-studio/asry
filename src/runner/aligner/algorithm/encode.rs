@@ -35,8 +35,8 @@ use crate::types::{AlignmentError, AlignmentFailure, Lang, WorkFailure};
 // keeps the (1, T) reshape semantically identical without forcing a
 // cross-version `ndarray` bridge or an unused direct dependency.
 
-/// The shape/indexing arm of [`LogProbsError`] — the
-/// [`LogProbsError::Shape`] payload [`LogProbsTV::new`] returns when
+/// The shape/indexing arm of `LogProbsError` — the
+/// `LogProbsError::Shape` payload [`LogProbsTV::new`] returns when
 /// it rejects the `(t, v, data.len())` triple: either `t * v !=
 /// data.len()` (the flat buffer's length doesn't match the declared
 /// `(T, V)` shape, including the overflow case where `t * v` doesn't
@@ -134,8 +134,8 @@ impl core::fmt::Display for LogProbsValueClass {
   }
 }
 
-/// The value-domain arm of [`LogProbsError`] — the
-/// [`LogProbsError::Value`] payload [`LogProbsTV::new`] returns when
+/// The value-domain arm of `LogProbsError` — the
+/// `LogProbsError::Value` payload [`LogProbsTV::new`] returns when
 /// `data` holds a value outside the log-probability domain (finite ∧
 /// `≤ 0`). Locates the first offending element by `frame` (row) and
 /// `vocab_index` (column) and records its [`LogProbsValueClass`]
@@ -358,7 +358,7 @@ impl LogProbsTV {
   /// the caller — the two internal producers of log-probabilities.
   ///
   /// `pub(crate)`, and it must stay that way. Both callers earn the
-  /// skip: `encode_log_softmax` and `Emissions::from_logits` each run
+  /// skip: `encode_log_softmax` and `EncoderOutput::Logits` each run
   /// [`log_softmax_with_finite_guard`], whose output is finite and
   /// `<= 0` **by construction** (`lp = (x − max) − ln Σ exp(x − max)`;
   /// the `max` element contributes `exp(0) = 1`, so `ln Σ >= 0` and
@@ -708,66 +708,78 @@ pub(crate) fn validate_output_dims(
   Ok((t, v))
 }
 
-/// Validate the encoder's frame count against the input audio
-/// length. wav2vec2's CNN downsamples by `hop_samples`, so the
-/// encoded "time" `T * hop_samples` should lie within
-/// `chunk_extent ± 2*hop_samples` (a couple of frames of
-/// receptive-field slack on each side).
+/// Validate the encoder's frame count `t` against the geometry of the
+/// input it read: `encoder_input_len` samples (the chunk, zero-padded to
+/// the receptive field when shorter), through a front end whose first
+/// layer reads `receptive_field_samples` samples and advances
+/// `hop_samples` per frame.
 ///
-/// Two-sided check — both bounds matter:
+/// **The admissible band** is
+/// `[floor((L - rf) / hop) + 1, floor(L / hop) + 1]` frames, for
+/// `L = encoder_input_len`, `rf = receptive_field_samples` and
+/// `hop = hop_samples`:
 ///
-/// - **Upper bound** (`T * hop > chunk + 2*hop`): the model
-/// reports more frames than the input could plausibly support.
-/// Either the export uses a smaller stride than `hop_samples`
-/// or the configured `hop_samples` is too small. `compose_words`
-/// would otherwise emit ranges past the chunk's audio
-/// boundary.
-/// - **Lower bound** (`T * hop < chunk - 2*hop`): the model
-/// reports far fewer frames than the input should produce.
-/// Either the export uses a *larger* stride than
-/// `hop_samples` or `hop_samples` is too large. `compose_words`
-/// would otherwise emit ranges that compress every word into
-/// the first portion of the chunk — plausible-looking
-/// timestamps that all sit in (e.g.) the first half of the
-/// audio.
+/// - the lower end is the frame count of a valid (unpadded) strided
+///   convolution, the fewest a front end with this receptive field and hop
+///   emits: wav2vec2's CNN (400 / 320) gives 49 frames for 16 000 samples,
+///   a 640 / 160 front end 97;
+/// - the upper end admits a front end that pads its input instead: a
+///   "same"-padded convolution gives `ceil(L / hop)` frames, a frame grid
+///   centred on the samples `floor(L / hop) + 1`, and none gives more.
 ///
-/// `chunk_extent.saturating_sub(slack)` lets very short chunks
-/// (where the slack is comparable to `chunk_extent`) pass without
-/// false positives — the lower bound clamps to 0. T == 0 cases
-/// are already routed to recoverable `NoAlignmentPath` by
-/// [`validate_output_dims`].
+/// A count outside the band says the declared hop is not the model's
+/// stride. Above it, the model advances by less than `hop_samples` per
+/// frame, and composition would place words past the chunk's audio.
+/// Below it, the model advances by more, and composition would crowd every
+/// word into the chunk's first part. Both are fatal: the recovery is to
+/// declare the model's stride, not to retry. The band is read from the
+/// declared receptive field and hop together, so a correctly declared
+/// front end whose receptive field spans many hops passes; the chunk's
+/// real (unpadded) length plays no part in it.
+///
+/// T == 0 is routed to recoverable `NoAlignmentPath` by
+/// [`validate_output_dims`] before this runs.
 pub(crate) fn validate_stride_extent(
   t: usize,
   hop_samples: u32,
-  chunk_extent: usize,
+  receptive_field_samples: u32,
+  encoder_input_len: usize,
   language: &Lang,
 ) -> Result<(), WorkFailure> {
-  let frame_extent = (t as u64).saturating_mul(hop_samples as u64);
-  let chunk_extent_u64 = chunk_extent as u64;
-  let slack = 2u64.saturating_mul(hop_samples as u64);
-  let upper_bound = chunk_extent_u64.saturating_add(slack);
-  let lower_bound = chunk_extent_u64.saturating_sub(slack);
-  if frame_extent > upper_bound {
+  let frames = t as u64;
+  let hop = u64::from(hop_samples.max(1));
+  let field = u64::from(receptive_field_samples);
+  let extent = encoder_input_len as u64;
+  // `prepare` pads a shorter chunk to the receptive field, so
+  // `extent >= field` on both front ends; a shorter input admits no
+  // unpadded frame at all.
+  let fewest = if extent >= field {
+    (extent - field) / hop + 1
+  } else {
+    0
+  };
+  let most = extent / hop + 1;
+  if frames > most {
     return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
       AlignmentFailure::new(
         format_smolstr!(
-          "ORT output stride mismatch: T={t} × hop={hop_samples} = {frame_extent} \
- sample-equivalents exceeds chunk ({chunk_extent} samples) + 2-frame slack \
- ({upper_bound}); model export uses a smaller stride than `hop_samples` \
- or `hop_samples` is misconfigured"
+          "encoder output stride mismatch: T={t} frames for {encoder_input_len} input samples \
+ exceeds the {most} a front end with receptive field {receptive_field_samples} and hop \
+ {hop_samples} can emit even when it pads its input; the model uses a smaller stride \
+ than `hop_samples`, or `hop_samples` is misdeclared"
         ),
         language.clone(),
       ),
     )));
   }
-  if frame_extent < lower_bound {
+  if frames < fewest {
     return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
       AlignmentFailure::new(
         format_smolstr!(
-          "ORT output stride mismatch: T={t} × hop={hop_samples} = {frame_extent} \
- sample-equivalents below chunk ({chunk_extent} samples) − 2-frame slack \
- ({lower_bound}); model export uses a larger stride than `hop_samples` \
- or `hop_samples` is misconfigured"
+          "encoder output stride mismatch: T={t} frames for {encoder_input_len} input samples \
+ is below the {fewest} a valid convolution with receptive field \
+ {receptive_field_samples} and hop {hop_samples} emits; the model uses a larger stride \
+ than `hop_samples`, or `hop_samples` is misdeclared"
         ),
         language.clone(),
       ),
@@ -1745,29 +1757,67 @@ own encoder; got {message:?}"
 
   // -------- stride / vocab-dim guards --------
 
-  /// Stride in range — e.g., 16 000-sample chunk at hop=320
-  /// gives T=49 (`49 × 320 = 15 680`, 320-sample slack from the
-  /// chunk extent). Within the ±2-frame band, accepted.
+  /// wav2vec2's front end (receptive field 400, hop 320) on 16 000
+  /// samples: 49 frames as a valid convolution, up to 51 for one that pads.
   #[test]
-  fn validate_stride_extent_accepts_typical_under_extent() {
+  fn validate_stride_extent_accepts_the_wav2vec2_band() {
     use crate::types::Lang;
-    assert!(validate_stride_extent(49, 320, 16_000, &Lang::En).is_ok());
-    // Exact integer match
-    assert!(validate_stride_extent(50, 320, 16_000, &Lang::En).is_ok());
-    // 1-frame over (within 2-frame slack)
-    assert!(validate_stride_extent(51, 320, 16_000, &Lang::En).is_ok());
+    for t in [49, 50, 51] {
+      assert!(
+        validate_stride_extent(t, 320, 400, 16_000, &Lang::En).is_ok(),
+        "{t}"
+      );
+    }
+    assert!(validate_stride_extent(48, 320, 400, 16_000, &Lang::En).is_err());
+    assert!(validate_stride_extent(52, 320, 400, 16_000, &Lang::En).is_err());
+  }
+
+  /// **A front end whose receptive field spans several hops passes.**
+  /// Receptive field 640 and hop 160 on 16 000 samples give 97 frames as a
+  /// valid convolution: `97 × 160 = 15 520`, which the old
+  /// `real ± 2 hops` window (from 15 680) refused. A "same"-padded one
+  /// gives 100 and a centred grid 101; both pass, and nothing outside
+  /// `[97, 101]` does.
+  #[test]
+  fn validate_stride_extent_reads_the_declared_receptive_field() {
+    use crate::types::Lang;
+    for t in 97..=101 {
+      assert!(
+        validate_stride_extent(t, 160, 640, 16_000, &Lang::En).is_ok(),
+        "{t}"
+      );
+    }
+    assert!(validate_stride_extent(96, 160, 640, 16_000, &Lang::En).is_err());
+    assert!(validate_stride_extent(102, 160, 640, 16_000, &Lang::En).is_err());
+  }
+
+  /// **A hop declared at twice the true stride is refused.** The 640 / 160
+  /// front end's 97 frames, read under a declared hop of 320, are far above
+  /// the `[49, 51]` that hop admits.
+  #[test]
+  fn validate_stride_extent_refuses_a_hop_twice_the_true_stride() {
+    use crate::types::Lang;
+    let err = validate_stride_extent(97, 320, 640, 16_000, &Lang::En).unwrap_err();
+    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
+      panic!("expected AlignmentFailed");
+    };
+    assert!(
+      payload.message().contains("smaller stride"),
+      "{}",
+      payload.message()
+    );
   }
 
   /// Stride too small (T overshoots): the model emits more
-  /// frames than the chunk could produce, e.g. claimed stride
-  /// is 320 but real stride is 160 → T is roughly 2× expected.
+  /// frames than the input could produce, e.g. declared hop 320 but
+  /// real stride 160 → T is roughly 2× expected.
   /// Rejected as fatal `ModelInferenceFailed`.
   #[test]
   fn validate_stride_extent_rejects_t_too_large() {
     use crate::types::Lang;
-    // 100 frames × 320 = 32 000 sample-equivalents for a
-    // 16 000-sample chunk. Way past the upper bound (16 640).
-    let err = validate_stride_extent(100, 320, 16_000, &Lang::En).unwrap_err();
+    // 100 frames for 16 000 samples at hop 320: past the 51 the hop
+    // admits.
+    let err = validate_stride_extent(100, 320, 400, 16_000, &Lang::En).unwrap_err();
     let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
       panic!("expected AlignmentFailed");
     };
@@ -1780,18 +1830,17 @@ own encoder; got {message:?}"
   }
 
   /// Stride too large (T undershoots): the model emits far
-  /// fewer frames than the input audio supports, e.g. claimed
-  /// stride is 320 but real stride is 640. Without this check,
+  /// fewer frames than the input audio supports, e.g. declared hop 320
+  /// but real stride 640. Without this check,
   /// `compose_words` would compress every word into the first
   /// half of the chunk's audio. Rejected as fatal
   /// `ModelInferenceFailed`.
   #[test]
   fn validate_stride_extent_rejects_t_too_small() {
     use crate::types::Lang;
-    // 25 frames × 320 = 8 000 sample-equivalents for a 16 000-
-    // sample chunk. Half the expected — far below the lower
-    // bound (15 360 = 16 000 − 640).
-    let err = validate_stride_extent(25, 320, 16_000, &Lang::En).unwrap_err();
+    // 25 frames for 16 000 samples: below the 49 a valid convolution with
+    // receptive field 400 and hop 320 emits.
+    let err = validate_stride_extent(25, 320, 400, 16_000, &Lang::En).unwrap_err();
     let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
       panic!("expected AlignmentFailed");
     };
@@ -1803,16 +1852,15 @@ own encoder; got {message:?}"
     );
   }
 
-  /// Very short chunks where the slack is comparable to the
-  /// chunk extent — the lower bound saturates to 0 and small
-  /// `T` values pass. (T=0 itself is routed to recoverable
-  /// `NoAlignmentPath` upstream by `validate_output_dims`.)
+  /// A chunk shorter than the receptive field is padded to it, so the
+  /// encoder reads exactly one receptive field: one frame as a valid
+  /// convolution, two for a padded front end at hop 320.
   #[test]
-  fn validate_stride_extent_accepts_very_short_chunk_with_small_t() {
+  fn validate_stride_extent_accepts_a_chunk_padded_to_the_receptive_field() {
     use crate::types::Lang;
-    // 200-sample chunk, hop=320 → slack=640, lower=0.
-    // T=1 → frame_extent=320, within [0, 840]. Accepted.
-    assert!(validate_stride_extent(1, 320, 200, &Lang::En).is_ok());
+    assert!(validate_stride_extent(1, 320, 400, 400, &Lang::En).is_ok());
+    assert!(validate_stride_extent(2, 320, 400, 400, &Lang::En).is_ok());
+    assert!(validate_stride_extent(3, 320, 400, 400, &Lang::En).is_err());
   }
 
   /// Vocab-dim equality: model output V matches tokenizer

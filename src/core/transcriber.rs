@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
   core::{
     buffer::SampleBuffer,
-    command::{AlignmentResult, AsrParams, AsrParamsOverride, AsrResult, Command},
+    command::{
+      AlignmentCompletion, AsrParams, AsrParamsOverride, AsrResult, Command, RefusedCompletion,
+    },
     cut::Cut,
     dispatch::Dispatch,
     event::Event,
@@ -155,7 +157,7 @@ pub const MAX_IN_FLIGHT: usize = 4_096;
 /// [`crate::core::buffer::SampleBuffer::append`] additionally
 /// rejects any `delta_samples` whose addition would wrap, but
 /// capping the public knob keeps the configuration intent
-/// honest. ([high].)
+/// honest.
 pub const MAX_GAP_TOLERANCE_SAMPLES: u64 = MAX_BUFFER_CAP_SAMPLES as u64;
 
 impl TranscriberOptions {
@@ -243,7 +245,7 @@ impl TranscriberOptions {
   // --- Mutating setters ----------------------------------------
 
   /// Set [`Self::chunk_size`]. Panics if `value` exceeds
-  /// [`MAX_CHUNK_SIZE`] ( /// per-chunk RAM is unbounded otherwise).
+  /// `MAX_CHUNK_SIZE` (600 s); per-chunk RAM is unbounded otherwise.
   pub fn set_chunk_size(&mut self, value: Duration) {
     assert!(
       value <= MAX_CHUNK_SIZE,
@@ -253,7 +255,7 @@ impl TranscriberOptions {
   }
 
   /// Set [`Self::buffer_cap_samples`]. Panics if `value`
-  /// exceeds [`MAX_BUFFER_CAP_SAMPLES`].
+  /// exceeds `MAX_BUFFER_CAP_SAMPLES` (one hour at 16 kHz).
   pub fn set_buffer_cap_samples(&mut self, value: usize) {
     assert!(
       value <= MAX_BUFFER_CAP_SAMPLES,
@@ -263,7 +265,7 @@ impl TranscriberOptions {
   }
 
   /// Set [`Self::gap_tolerance_samples`]. Panics if `value`
-  /// exceeds [`MAX_GAP_TOLERANCE_SAMPLES`].
+  /// exceeds `MAX_GAP_TOLERANCE_SAMPLES` (one hour at 16 kHz).
   pub fn set_gap_tolerance_samples(&mut self, value: u64) {
     assert!(
       value <= MAX_GAP_TOLERANCE_SAMPLES,
@@ -278,7 +280,7 @@ impl TranscriberOptions {
   }
 
   /// Set [`Self::max_in_flight`]. Panics if `value` exceeds
-  /// [`MAX_IN_FLIGHT`].
+  /// `MAX_IN_FLIGHT` (4096).
   pub fn set_max_in_flight(&mut self, value: usize) {
     assert!(
       value <= MAX_IN_FLIGHT,
@@ -305,7 +307,7 @@ impl TranscriberOptions {
   // --- Builder-style (consuming) -------------------------------
 
   /// Builder-style override for [`Self::chunk_size`]. Panics
-  /// if `value` exceeds [`MAX_CHUNK_SIZE`] .
+  /// if `value` exceeds `MAX_CHUNK_SIZE` (600 s).
   pub fn with_chunk_size(mut self, value: Duration) -> Self {
     assert!(
       value <= MAX_CHUNK_SIZE,
@@ -316,7 +318,8 @@ impl TranscriberOptions {
   }
 
   /// Builder-style override for [`Self::buffer_cap_samples`].
-  /// Panics if `value` exceeds [`MAX_BUFFER_CAP_SAMPLES`].
+  /// Panics if `value` exceeds `MAX_BUFFER_CAP_SAMPLES` (one hour
+  /// at 16 kHz).
   pub fn with_buffer_cap_samples(mut self, value: usize) -> Self {
     assert!(
       value <= MAX_BUFFER_CAP_SAMPLES,
@@ -327,8 +330,8 @@ impl TranscriberOptions {
   }
 
   /// Builder-style override for [`Self::gap_tolerance_samples`].
-  /// Panics if `value` exceeds [`MAX_GAP_TOLERANCE_SAMPLES`]
-  /// ([high]).
+  /// Panics if `value` exceeds `MAX_GAP_TOLERANCE_SAMPLES` (one
+  /// hour at 16 kHz).
   pub fn with_gap_tolerance_samples(mut self, value: u64) -> Self {
     assert!(
       value <= MAX_GAP_TOLERANCE_SAMPLES,
@@ -345,8 +348,7 @@ impl TranscriberOptions {
   }
 
   /// Builder-style override for [`Self::max_in_flight`].
-  /// Panics if `value` exceeds [`MAX_IN_FLIGHT`] (Codex
-  /// [medium]).
+  /// Panics if `value` exceeds `MAX_IN_FLIGHT` (4096).
   pub fn with_max_in_flight(mut self, value: usize) -> Self {
     assert!(
       value <= MAX_IN_FLIGHT,
@@ -498,12 +500,30 @@ impl Transcriber {
   /// Pop the front command, consulting `unpoll_command`'s parked
   /// slot first.
   pub fn poll_command(&mut self) -> Option<Command> {
+    self.settle_abandoned();
     self.dispatch.poll_command()
   }
 
   /// Pop the front event.
+  ///
+  /// An alignment command whose request or completion was dropped
+  /// unanswered is answered here first: its chunk's terminal event is its
+  /// `Event::Error`, `AlignmentError::Abandoned`.
   pub fn poll_event(&mut self) -> Option<Event> {
+    self.settle_abandoned();
     self.dispatch.poll_event()
+  }
+
+  /// Fail every chunk whose alignment command was abandoned (its ticket
+  /// dropped unanswered), and move what that frees along.
+  fn settle_abandoned(&mut self) {
+    if self.dispatch.settle_abandoned() {
+      self.dispatch.after_inject(
+        &mut self.buffer,
+        self.cut.pending_start(),
+        self.vad_watermark,
+      );
+    }
   }
 
   /// Re-park the front of the command queue. **Visibility:
@@ -593,9 +613,9 @@ impl Transcriber {
   /// mapping the chunk's pre-restart sample indices through the
   /// post-restart PTS origin and emitting word ranges far
   /// outside the transcript's own range. The per-chunk form
-  /// snapshots the anchor pair at extract time (see
-  /// [`super::dispatch::ChunkRecord::output_tb`]) so the rebuilt
-  /// closure stays in the chunk's own epoch.
+  /// snapshots the anchor pair at extract time (the chunk
+  /// record's output timebase) so the rebuilt closure stays in the
+  /// chunk's own epoch.
   #[cfg(feature = "alignment")]
   pub fn chunk_samples_to_output_range_fn(
     &self,
@@ -976,16 +996,27 @@ impl Transcriber {
     Ok(())
   }
 
-  /// Inject the result of a `Command::Alignment`.
+  /// Complete a `Command::Alignment`: the one entry point for alignment
+  /// work, success or failure.
   ///
-  /// Errors:
-  /// - `UnknownChunk(chunk_id)` if `chunk_id` is not awaiting alignment.
-  pub fn handle_alignment(
-    &mut self,
-    chunk_id: ChunkId,
-    result: AlignmentResult,
-  ) -> Result<(), TranscriberError> {
-    self.dispatch.handle_alignment(chunk_id, result)?;
+  /// The completion is built only by the command's own
+  /// [`AlignmentRequest`](crate::core::AlignmentRequest):
+  /// [`aligned`](crate::core::AlignmentRequest::aligned) with each unit's
+  /// outcome, or [`failed`](crate::core::AlignmentRequest::failed). It names
+  /// its chunk, whose transcript then keeps each unit's outcome, its words
+  /// in time order; a failure becomes the chunk's `Event::Error`. The
+  /// completion is consumed, so it is delivered once.
+  ///
+  /// Errors, each checked before any state changes, and each handing the
+  /// completion back ([`RefusedCompletion`]) so its command can still be
+  /// completed, by the transcriber that issued it:
+  /// - `ForeignAlignment` if the completion answers a command another
+  ///   transcriber issued, or another command than the one its chunk
+  ///   awaits.
+  /// - `UnknownChunk(chunk_id)` if its chunk is not awaiting alignment.
+  pub fn complete(&mut self, completion: AlignmentCompletion) -> Result<(), RefusedCompletion> {
+    self.settle_abandoned();
+    self.dispatch.complete(completion)?;
     self.dispatch.after_inject(
       &mut self.buffer,
       self.cut.pending_start(),
@@ -994,11 +1025,16 @@ impl Transcriber {
     Ok(())
   }
 
-  /// Inject a per-chunk failure.
+  /// Inject the failure of a `Command::Asr`.
+  ///
+  /// An alignment failure is not delivered here: it answers through its
+  /// command's request ([`AlignmentRequest::failed`](crate::core::AlignmentRequest::failed),
+  /// then [`complete`](Self::complete)), which binds it to the command.
   ///
   /// Errors:
   /// - `UnknownChunk(chunk_id)` if `chunk_id` is not in flight or
-  /// is in flight but not awaiting any worker result.
+  /// is in flight but not awaiting a worker result.
+  /// - `AwaitsCompletion(chunk_id)` if the chunk awaits alignment.
   pub fn handle_failure(
     &mut self,
     chunk_id: ChunkId,
@@ -1097,6 +1133,107 @@ mod tests {
   use super::*;
   use crate::types::VadSegment;
   use core::num::NonZeroI32;
+  use smol_str::SmolStr;
+
+  /// A transcriber holding one second of audio whose one chunk awaits
+  /// alignment of `text`, and the command's request.
+  fn awaiting_alignment(text: &str) -> (Transcriber, crate::core::AlignmentRequest) {
+    let mut t = Transcriber::new(TranscriberOptions::default().with_word_alignment(true));
+    let tb = Timebase::new(1, NonZeroI32::new(16_000).expect("16000 != 0"));
+    t.handle_samples(Timestamp::new(0, tb), &vec![0.1_f32; 16_000])
+      .expect("samples");
+    t.handle_vad_segment(VadSegment::new(0, 16_000))
+      .expect("a VAD segment over the audio");
+    t.handle_eof().expect("eof");
+    let Some(Command::Asr { chunk_id, .. }) = t.poll_command() else {
+      panic!("the chunk asks for ASR");
+    };
+    t.handle_asr(
+      chunk_id,
+      AsrResult::new(SmolStr::new(text), Lang::En, -0.5, 0.05, 0.0),
+    )
+    .expect("a non-empty ASR result under word alignment");
+    let Some(Command::Alignment(request)) = t.poll_command() else {
+      panic!("the chunk asks for alignment");
+    };
+    (t, request)
+  }
+
+  /// The chunk's terminal event, which must name its command abandoned.
+  fn abandoned(t: &mut Transcriber) {
+    match t.poll_event() {
+      Some(Event::Error {
+        error: WorkFailure::Alignment(crate::types::AlignmentError::Abandoned(failure)),
+        ..
+      }) => assert!(
+        failure
+          .message()
+          .contains("dropped before a completion answered it"),
+        "{}",
+        failure.message()
+      ),
+      other => panic!("an abandoned command fails its chunk by name; got {other:?}"),
+    }
+    assert_eq!(t.in_flight_chunk_count(), 0);
+  }
+
+  /// **A command dropped unanswered answers its chunk.** Its ticket
+  /// reports it to the transcriber that issued it, and at that
+  /// transcriber's next call the chunk's terminal event is its
+  /// `Event::Error`, `AlignmentError::Abandoned`: a request a `?` drops, a
+  /// completion that is never delivered, and a refused completion discarded
+  /// by name alike. A command answered by its completion reports nothing.
+  #[test]
+  fn a_command_dropped_unanswered_answers_its_chunk() {
+    fn drive(request: crate::core::AlignmentRequest) -> Result<(), WorkFailure> {
+      let _owned = request;
+      Err(WorkFailure::Alignment(
+        crate::types::AlignmentError::ModelInference(crate::types::AlignmentFailure::new(
+          SmolStr::new_static("a backend fault"),
+          Lang::En,
+        )),
+      ))?;
+      Ok(())
+    }
+    let failure = || {
+      WorkFailure::LanguageUnsupported(crate::types::LanguageUnsupportedForAlignment::new(Lang::En))
+    };
+
+    // A `?` drops the request.
+    let (mut t, request) = awaiting_alignment("hello");
+    drive(request).expect_err("the driver fails");
+    abandoned(&mut t);
+
+    // A completion built but never delivered.
+    let (mut t, request) = awaiting_alignment("hello");
+    drop(request.failed(failure()));
+    abandoned(&mut t);
+
+    // A refused completion discarded by name: its issuer answers the chunk.
+    let (mut a, from_a) = awaiting_alignment("hello");
+    let (mut z, from_z) = awaiting_alignment("hello");
+    let refused = z
+      .complete(from_a.failed(failure()))
+      .expect_err("another transcriber's completion is refused");
+    assert!(matches!(
+      refused.discard_completion(),
+      TranscriberError::ForeignAlignment(_)
+    ));
+    abandoned(&mut a);
+
+    // A command its completion answers reports nothing.
+    z.complete(from_z.failed(failure()))
+      .expect("its own command");
+    match z.poll_event() {
+      Some(Event::Error { error, .. }) => assert!(
+        matches!(error, WorkFailure::LanguageUnsupported(_)),
+        "{error:?}"
+      ),
+      other => panic!("expected the command's own failure; got {other:?}"),
+    }
+    assert!(z.poll_event().is_none());
+    assert_eq!(z.in_flight_chunk_count(), 0);
+  }
 
   fn tb_48k() -> Timebase {
     Timebase::new(1, NonZeroI32::new(48_000).unwrap())

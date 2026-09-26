@@ -3,9 +3,10 @@
 //!
 //! Every guard in this file runs **before** the first sample reaches
 //! an encoder, and none of them needs `ort`: they read a HuggingFace
-//! `tokenizer.json`, resolve the CTC blank / `<unk>` ids, probe the
-//! vocab's casing convention, capture its size, and check that a
-//! word-delimiter-using normaliser actually has a `|` to work with.
+//! `tokenizer.json`, resolve the CTC blank id and the unknown token the
+//! tokenizer declares, probe the vocab's casing convention, capture its
+//! size, and check that a word-delimiter-using normaliser actually has a
+//! `|` to work with.
 //!
 //! They were only reachable under `alignment` because they were
 //! textually inside `aligner.rs`, which owns an `ort::Session`. That
@@ -38,12 +39,12 @@ use smol_str::{SmolStr, format_smolstr};
 use tokenizers::Tokenizer;
 
 use crate::{
-  core::AlignmentResult,
+  core::{UnalignedCause, UnitAlignment},
   runner::aligner::{
     algorithm::{
       compose::{build_speech_frames, compose_words, effective_samples_per_frame},
       encode::{LogProbsTV, validate_stride_extent, validate_vocab_dim},
-      tokenize::{TokenizedText, detect_oov_events, tokenize_with_word_map},
+      tokenize::{ReservedIds, TokenizedText, detect_oov_events, tokenize_with_word_map},
       trellis_beam::align_to_word_segments,
     },
     emissions_api::{SpeechCoverage, SpeechSpans},
@@ -80,6 +81,17 @@ impl AlignerCoreLoadError {
   }
 }
 
+/// The word delimiter of the English wav2vec2 vocabularies
+/// (wav2vec2-base-960h and its kin): `|`.
+pub(crate) const WAV2VEC2_WORD_DELIMITER: &str = "|";
+
+/// The receptive field of wav2vec2's CNN front end, in 16 kHz samples:
+/// the shortest input its first stride-conv reads.
+pub(crate) const WAV2VEC2_RECEPTIVE_FIELD_SAMPLES: NonZeroU32 = match NonZeroU32::new(400) {
+  Some(samples) => samples,
+  None => unreachable!(),
+};
+
 /// Read the CTC blank-token id from a HuggingFace tokenizer.
 pub(crate) fn detect_blank_token_id(tok: &Tokenizer) -> Option<u32> {
   // Standard wav2vec2 convention: pad token == CTC blank.
@@ -95,17 +107,45 @@ pub(crate) fn detect_blank_token_id(tok: &Tokenizer) -> Option<u32> {
   None
 }
 
-/// Resolve the `<unk>` / `[UNK]` token id, when the tokenizer exposes
-/// one. `tokenize_with_word_map` uses it to reject out-of-vocab word
-/// tokens up-front rather than feeding `<unk>` ids into the CTC graph
-/// and silently producing garbage alignments.
+/// The id of the unknown token the tokenizer declares: its model's
+/// `unk_token` (a Unigram model's `unk_id`), looked up in its vocabulary.
+/// `None` when the model declares none, or its vocabulary does not hold
+/// the one it declares.
 ///
-/// Tries the SentencePiece-style `<unk>` first, then the BERT-style
-/// `[UNK]` — the kresnik Korean wav2vec2 checkpoint uses the latter.
-pub(crate) fn detect_unk_token_id(tok: &Tokenizer) -> Option<u32> {
-  tok
-    .token_to_id("<unk>")
-    .or_else(|| tok.token_to_id("[UNK]"))
+/// The tokenizer's own statement, never an inference from a token's
+/// spelling: an entry spelled `<unk>` or `[UNK]` is an ordinary token
+/// unless the model declares it, and a declared unknown token is one
+/// however it is spelled, a single character (`�`) too. It is reserved
+/// ([`ReservedIds`]), so no transcript character is aligned to it.
+pub(crate) fn declared_unk_token_id(tok: &Tokenizer) -> Option<u32> {
+  use tokenizers::models::ModelWrapper;
+  let declared = match tok.get_model() {
+    ModelWrapper::WordLevel(model) => Some(model.unk_token.as_str()),
+    ModelWrapper::WordPiece(model) => Some(model.unk_token.as_str()),
+    ModelWrapper::BPE(model) => model.unk_token.as_deref(),
+    // A Unigram model declares its unknown token by id, a field
+    // `tokenizers` keeps private: read it from the model's serialization.
+    ModelWrapper::Unigram(_) => return declared_unigram_unk_id(tok),
+  };
+  declared.and_then(|token| tok.token_to_id(token))
+}
+
+/// The `unk_id` a Unigram model declares, read from the tokenizer's own
+/// serialization of it. `None` when it declares none (`null`).
+fn declared_unigram_unk_id(tok: &Tokenizer) -> Option<u32> {
+  let json = tok.to_string(false).ok()?;
+  let bytes = json.as_bytes();
+  let open = find_top_level_object_value_open(bytes, b"model")?;
+  let close = find_matching_close_brace(bytes, open)?;
+  let value = top_level_key_value(bytes, open + 1, close, b"unk_id")?;
+  let digits = bytes[value..close]
+    .iter()
+    .take_while(|byte| byte.is_ascii_digit())
+    .count();
+  core::str::from_utf8(&bytes[value..value + digits])
+    .ok()?
+    .parse()
+    .ok()
 }
 
 /// Whether the tokenizer's vocab covers ASCII uppercase but not
@@ -141,11 +181,11 @@ pub(crate) fn capture_vocab_size(tok: &Tokenizer) -> Option<NonZeroUsize> {
   NonZeroUsize::new(tok.get_vocab_size(true))
 }
 
-/// Validate that the tokenizer exposes the wav2vec2 `|`
-/// word-delimiter token whenever the normaliser declared
+/// Validate that the tokenizer spells the word-delimiter token `delimiter`
+/// (`|` for wav2vec2) whenever the normaliser declared
 /// `use_word_delimiter == true`.
 ///
-/// Without this check, a missing `|` token slips through silently
+/// Without this check, a missing delimiter slips through silently
 /// — `tokenize_with_word_map` would simply emit no inter-word
 /// delimiter, glueing adjacent words together in the CTC graph.
 /// Word timings would then be plausible but wrong with no
@@ -159,18 +199,20 @@ pub(crate) fn capture_vocab_size(tok: &Tokenizer) -> Option<NonZeroUsize> {
 pub(crate) fn validate_word_delimiter_present(
   tokenizer: &Tokenizer,
   use_word_delimiter: bool,
+  delimiter: &str,
 ) -> Result<(), AlignerCoreLoadError> {
   if !use_word_delimiter {
     return Ok(());
   }
-  if tokenizer.token_to_id("|").is_some() {
+  if tokenizer.token_to_id(delimiter).is_some() {
     return Ok(());
   }
-  Err(AlignerCoreLoadError::new(SmolStr::from(
-    "tokenizer is missing the `|` word-delimiter token, but the language's normaliser \
- declared `use_word_delimiter = true`. wav2vec2 word-segmented vocabularies require \
- a `|` token between spoken words. Either swap to a tokenizer that exposes `|`, or \
- supply a normaliser whose `use_word_delimiter` returns false (char-level segmentation).",
+  Err(AlignerCoreLoadError::new(format_smolstr!(
+    "tokenizer is missing the {delimiter:?} word-delimiter token, but the language's \
+ normaliser declared `use_word_delimiter = true`. Word-segmented CTC vocabularies need a \
+ token between spoken words. Either use a tokenizer that spells {delimiter:?}, name the \
+ delimiter your vocabulary uses, or supply a normaliser whose `use_word_delimiter` returns \
+ false (char-level segmentation).",
   )))
 }
 
@@ -486,6 +528,13 @@ fn find_matching_close_brace(bytes: &[u8], open: usize) -> Option<usize> {
 /// present as a JSON key (string immediately followed by `:`) at
 /// the top level of this object.
 fn has_top_level_key(bytes: &[u8], start: usize, end: usize, key: &[u8]) -> bool {
+  top_level_key_value(bytes, start, end, key).is_some()
+}
+
+/// Where the value of the named key starts, when [`has_top_level_key`]
+/// finds it in `bytes[start..end]`: the first byte after its `:` and any
+/// whitespace.
+fn top_level_key_value(bytes: &[u8], start: usize, end: usize, key: &[u8]) -> Option<usize> {
   let mut in_string = false;
   let mut escape = false;
   let mut depth = 0_i32;
@@ -515,7 +564,11 @@ fn has_top_level_key(bytes: &[u8], start: usize, end: usize, key: &[u8]) -> bool
             j += 1;
           }
           if j < end && bytes[j] == b':' {
-            return true;
+            j += 1;
+            while j < end && (bytes[j] as char).is_ascii_whitespace() {
+              j += 1;
+            }
+            return Some(j);
           }
         }
         in_string = true;
@@ -526,7 +579,7 @@ fn has_top_level_key(bytes: &[u8], start: usize, end: usize, key: &[u8]) -> bool
     }
     i += 1;
   }
-  false
+  None
 }
 
 /// The identity of one `AlignerCore` instance.
@@ -572,6 +625,33 @@ impl AlignerId {
     // hand out id 0 twice.
     Self(NonZeroU64::new(raw).expect("AlignerId counter overflowed u64"))
   }
+
+  /// The raw id, as a detection this aligner made is bound to it.
+  pub(crate) const fn get(self) -> NonZeroU64 {
+    self.0
+  }
+}
+
+/// The identity of one [`AlignerCore::prepare`] call: what its
+/// [`PreparedChunk`] carries, what every
+/// [`Emissions`](crate::runner::aligner::emissions_api::Emissions) made
+/// through that chunk carries, and what `EmissionsAligner::finish`
+/// compares before it reads a frame.
+///
+/// Never reused within a process, and minted only here, so emissions
+/// answer exactly one preparation: two chunks of the same aligner, with
+/// the same shape, cannot trade emissions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct PreparationId(NonZeroU64);
+
+impl PreparationId {
+  /// Mint the next process-unique id.
+  pub(crate) fn next() -> Self {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let raw = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Unreachable: exhausting this needs 2^64 preparations.
+    Self(NonZeroU64::new(raw).expect("PreparationId counter overflowed u64"))
+  }
 }
 
 /// Everything an aligner owns **except** the encoder.
@@ -612,8 +692,17 @@ pub(crate) struct AlignerCore {
   /// panic a caller sees is unchanged; the emissions builder simply
   /// cannot spell zero.
   hop_samples: NonZeroU32,
+  /// The token tokenization puts between words when the normaliser
+  /// delimits words: `|` for wav2vec2.
+  word_delimiter: SmolStr,
+  /// The length `prepare` zero-pads a shorter chunk to: the acoustic
+  /// front end's receptive field, 400 samples for wav2vec2.
+  receptive_field_samples: NonZeroU32,
   blank_token_id: u32,
-  unk_token_id: Option<u32>,
+  /// The ids no transcript character is looked up to: the blank, the word
+  /// delimiter, the unknown token and every declared special.
+  reserved: ReservedIds,
+  /// Look ASCII letters up in upper case.
   vocab_uppercase_only: bool,
   /// Tokenizer vocab size, captured at construction. The encoder's
   /// `V` MUST equal this — [`finish`](Self::finish) enforces it. See
@@ -630,36 +719,46 @@ pub(crate) struct AlignerCore {
 /// A chunk that has been through steps 0-2 and is ready for an
 /// encoder — the capability token the seam hands out.
 ///
-/// Constructible **only** by [`AlignerCore::prepare`]. That is the
+/// Constructible **only** by the aligner core's `prepare`. That is the
 /// whole point: it carries the masked + zero-padded encoder buffer and
 /// the geometry derived from it, so a caller cannot hand `finish` a
 /// sample count, a frame count, or a stride that disagrees with the
 /// audio the encoder actually saw. Every extent in here is a slice
 /// length, not a caller integer.
 ///
-/// It also carries the identity of the aligner that minted it (see
-/// [`AlignerId`]), which `finish` checks. A chunk prepared by one
+/// It also carries the identity of the aligner that minted it, which
+/// `finish` checks. A chunk prepared by one
 /// aligner and finished by another is rejected rather than aligned
 /// against the wrong vocabulary.
+///
+/// And it carries the identity of its own preparation. Its encoder runs
+/// only through it ([`encode_with`](Self::encode_with), which hands the
+/// encoder this chunk's input and builds the emissions from its output),
+/// and those emissions answer this chunk alone: `finish` refuses to pair a chunk with
+/// emissions made through another, by name, before it reads a frame.
 pub struct PreparedChunk<'a> {
   /// The aligner that produced this chunk. Sits OUTSIDE `inner` on
   /// purpose: a trivial chunk carries no encoder buffer, but it is
   /// still bound to its originating aligner, so the ownership check
   /// runs before the trivial short-circuit rather than after it.
   owner: AlignerId,
+  /// This preparation's identity: what the emissions made through this
+  /// chunk carry. Outside `inner` for the reason `owner` is.
+  preparation: PreparationId,
   /// `None` for the two short-circuits `Aligner::align` has always
   /// had: normalisation produced empty text, or tokenisation produced
   /// zero alignable tokens. The encoder should be skipped entirely and
-  /// the result is an empty `AlignmentResult`.
+  /// the unit is `Unaligned(NoAlignableText)`.
   inner: Option<PreparedInner<'a>>,
 }
 
 struct PreparedInner<'a> {
-  /// Silence-zeroed and zero-padded to wav2vec2's 400-sample
-  /// receptive field — the exact buffer `Aligner` hands ORT.
+  /// Silence-zeroed and zero-padded to the front end's receptive
+  /// field (400 samples for wav2vec2) — the exact buffer `Aligner`
+  /// hands ORT.
   encoder_input: Vec<f32>,
   /// The chunk's REAL audio length (`samples.len()`), before padding.
-  /// Drives the stride check and word-range clamping.
+  /// Drives the speech gates and word-range clamping.
   real_samples: usize,
   /// The coalesced VAD spans, in sample space. Carried here so `finish`
   /// cannot be handed a DIFFERENT set than `prepare` masked with.
@@ -670,7 +769,8 @@ struct PreparedInner<'a> {
 
 impl PreparedChunk<'_> {
   /// **Feed EXACTLY this to your encoder.** Silence-zeroed and
-  /// zero-padded to wav2vec2's 400-sample receptive field — identical to
+  /// zero-padded to the front end's receptive field (400 samples for
+  /// wav2vec2) — identical to
   /// the buffer `Aligner` hands ORT.
   ///
   /// You do not re-implement the mask, the zeroing, or the pad, which is
@@ -690,22 +790,33 @@ impl PreparedChunk<'_> {
     self.inner.is_none()
   }
 
-  /// The chunk's REAL audio length in 16 kHz samples, BEFORE the 400-sample
+  /// The chunk's REAL audio length in 16 kHz samples, BEFORE the
   /// receptive-field zero-padding that [`encoder_input`](Self::encoder_input)
   /// carries — a slice length (`samples.len()`), never a caller integer, which
   /// is exactly why `finish` cannot be lied to about it. Zero when
   /// [`is_trivial`](Self::is_trivial).
   ///
   /// Public and read-only so a caller composing `prepare` → their own encoder
-  /// → `finish` can truncate their encoder's frames from the SAME authoritative
-  /// extent `finish` validates against, instead of mis-deriving it from
-  /// `encoder_input().len()` — the PADDED length, which for a short chunk is one
-  /// or more frames longer and would silently keep frames that are all
-  /// zero-pad. Fixed at `prepare` time from the audio itself; there is no
-  /// setter, and reading it cannot change what `finish` sees.
+  /// → `finish` knows how much of [`encoder_input`](Self::encoder_input) is
+  /// audio: `finish` keeps no word past it. The frame count `finish` accepts
+  /// is read from the length of `encoder_input` itself, with the declared
+  /// receptive field and hop. Fixed at `prepare` time from the audio itself;
+  /// there is no setter, and reading it cannot change what `finish` sees.
   #[must_use]
   pub fn real_samples(&self) -> usize {
     self.inner.as_ref().map_or(0, |i| i.real_samples)
+  }
+
+  /// This preparation's identity: what the emissions made through this
+  /// chunk carry.
+  pub(crate) const fn preparation(&self) -> PreparationId {
+    self.preparation
+  }
+
+  /// The token stream tokenization produced: empty when trivial.
+  #[cfg(test)]
+  pub(crate) fn token_ids(&self) -> &[i32] {
+    self.inner.as_ref().map_or(&[], |i| i.tokenized.token_ids())
   }
 }
 
@@ -728,6 +839,8 @@ impl AlignerCore {
     language: Lang,
     normalizer: DynTextNormalizer,
     hop_samples: NonZeroU32,
+    word_delimiter: SmolStr,
+    receptive_field_samples: NonZeroU32,
     blank_token_id: u32,
     unk_token_id: Option<u32>,
     vocab_uppercase_only: bool,
@@ -735,14 +848,17 @@ impl AlignerCore {
     min_speech_coverage: SpeechCoverage,
     max_intra_silent_run: Duration,
   ) -> Self {
+    let reserved = ReservedIds::new(&tokenizer, blank_token_id, &word_delimiter, unk_token_id);
     Self {
       id: AlignerId::next(),
       tokenizer,
       language,
       normalizer,
       hop_samples,
+      word_delimiter,
+      receptive_field_samples,
       blank_token_id,
-      unk_token_id,
+      reserved,
       vocab_uppercase_only,
       tokenizer_vocab_size,
       min_speech_coverage,
@@ -762,6 +878,11 @@ impl AlignerCore {
     prepared.owner == self.id
   }
 
+  /// This core's identity: what a detection it made is bound to.
+  pub(crate) const fn id(&self) -> AlignerId {
+    self.id
+  }
+
   pub(crate) const fn language(&self) -> &Lang {
     &self.language
   }
@@ -776,6 +897,18 @@ impl AlignerCore {
 
   pub(crate) const fn blank_token_id(&self) -> u32 {
     self.blank_token_id
+  }
+
+  pub(crate) fn word_delimiter(&self) -> &str {
+    &self.word_delimiter
+  }
+
+  pub(crate) const fn receptive_field_samples(&self) -> NonZeroU32 {
+    self.receptive_field_samples
+  }
+
+  pub(crate) const fn vocab_uppercase_only(&self) -> bool {
+    self.vocab_uppercase_only
   }
 
   pub(crate) const fn vocab_size(&self) -> NonZeroUsize {
@@ -824,21 +957,112 @@ impl AlignerCore {
     // `detect_oov_events` returns the backend-neutral `EmissionsError`;
     // re-map it to the pool `WorkFailure` at this orchestration
     // boundary so the aligner's public error type is unchanged.
-    detect_oov_events(
+    let events = detect_oov_events(
       &self.tokenizer,
       normalized.normalized(),
       n_words,
       self.vocab_uppercase_only,
-      self.unk_token_id,
+      &self.reserved,
       &self.language,
       normalized.wildcard_boundary_per_word(),
     )
-    .map_err(|e| e.into_work_failure(&self.language))
+    .map_err(|e| e.into_work_failure(&self.language))?;
+    Ok(events)
+  }
+
+  /// Detect out-of-vocabulary characters in one unit job, bound to the job
+  /// and to this aligner, its events in the job's requested language.
+  ///
+  /// `fallback` states that this aligner reads the job as a multilingual
+  /// fallback. Without it, a job in another language than this aligner's
+  /// is refused, as `AlignmentError::Tokenization`, before anything is
+  /// read: a unit is aligned by an aligner of its language, or by one the
+  /// caller names its fallback.
+  pub(crate) fn detect_job(
+    &self,
+    job: &crate::core::UnitJob,
+    fallback: bool,
+  ) -> Result<crate::core::OovDetection, WorkFailure> {
+    if !fallback && *job.language() != self.language {
+      return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+        AlignmentFailure::new(
+          format_smolstr!(
+            "this aligner reads {:?}, not {:?}, the unit's language. Align the unit with an \
+ aligner of its language, or read it with this one as the multilingual fallback \
+ (`detect_oov_unit_as_fallback`).",
+            self.language,
+            job.language(),
+          ),
+          job.language().clone(),
+        ),
+      )));
+    }
+    let mut events = self.detect_oov(job.text())?;
+    // The unit's policy is keyed on its requested language, also when a
+    // fallback aligner of another language reads it.
+    for event in &mut events {
+      event.set_language(job.language().clone());
+    }
+    Ok(crate::core::OovDetection::of_job(
+      job,
+      events,
+      self.id.get(),
+    ))
+  }
+
+  /// The decisions of `resolution`, when this aligner detected it for
+  /// exactly `job`: the check both direct `align_unit`s run before they
+  /// tokenize. A resolution detected for another job, another unit, in
+  /// another language, by another aligner, or in a text of the caller's
+  /// own (`detect_oov`) is refused, as `AlignmentError::Tokenization`.
+  pub(crate) fn accept_job<'r>(
+    &self,
+    resolution: &'r crate::core::OovResolution,
+    job: &crate::core::UnitJob,
+  ) -> Result<&'r [crate::core::ResolvedOov], WorkFailure> {
+    resolution.for_job(job, self.id.get()).ok_or_else(|| {
+      WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(
+        SmolStr::new_static(
+          "this OovResolution was not detected for this unit job by this aligner: a unit's \
+ decisions apply only to the job, the unit and the language their detection read. Detect \
+ the job with this aligner's `detect_oov_unit(&job)` and decide that detection.",
+        ),
+        job.language().clone(),
+      )))
+    })
+  }
+
+  /// The decisions of `resolution`, when this aligner detected it in
+  /// exactly `text`: the check a direct front end (`Aligner`,
+  /// `EmissionsAligner`) runs before it tokenizes a text of the caller's
+  /// own.
+  ///
+  /// A resolution is bound to the aligner and the text its detection
+  /// read. Positional identity alone cannot tell two texts with the same
+  /// event layout apart (`"sold at&t"`, `"told at&t"`), nor two aligners
+  /// with the same vocabulary size, so a resolution detected anywhere else
+  /// is refused here, as `AlignmentError::Tokenization`, before any
+  /// tokenization.
+  pub(crate) fn accept<'r>(
+    &self,
+    resolution: &'r crate::core::OovResolution,
+    text: &str,
+  ) -> Result<&'r [crate::core::ResolvedOov], WorkFailure> {
+    resolution.for_text(text, self.id.get()).ok_or_else(|| {
+      WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(
+        SmolStr::new_static(
+          "this OovResolution was not detected by this aligner in this text: decisions apply \
+ only to the text and the aligner their detection read. Detect this text with this \
+ aligner's `detect_oov` and decide that detection.",
+        ),
+        self.language.clone(),
+      )))
+    })
   }
 
   /// Steps 0-2 of the alignment pipeline, up to (but not including)
   /// the encoder: non-finite sample scan → speech mask → zero
-  /// non-speech → pad to 400 → normalise → tokenise.
+  /// non-speech → pad to the receptive field → normalise → tokenise.
   ///
   /// The body is `Aligner::align`'s, unchanged. The only thing that
   /// moved is where it stops.
@@ -867,6 +1091,7 @@ impl AlignerCore {
     if abort_flag.load(Ordering::Relaxed) {
       return Err(timed_out());
     }
+    let preparation = PreparationId::next();
 
     // Step 0: silence-aware preprocessing.
     //
@@ -908,15 +1133,16 @@ impl AlignerCore {
     // `NormalizationError::EmptyText` (punctuation-only or
     // whitespace-only ASR output) is *not* an error here — it
     // mirrors the empty-tokens short-circuit below. Returning a
-    // TRIVIAL chunk (→ `Ok(empty AlignmentResult)`) lets the cached
+    // TRIVIAL chunk (→ `Unaligned(NoAlignableText)`) lets the cached
     // ASR transcript surface as `Transcript { text, words: [] }`
     // instead of `Event::Error`. Otherwise this would be a data-loss
-    // path that contradicts the `AlignmentResult` contract.
+    // path that contradicts the alignment result's contract.
     let normalized = match self.normalizer.normalize(text) {
       Ok(nt) => nt,
       Err(NormalizationError::EmptyText) => {
         return Ok(PreparedChunk {
           owner: self.id,
+          preparation,
           inner: None,
         });
       }
@@ -939,15 +1165,19 @@ impl AlignerCore {
     // Chinese/Japanese where whitespace is an indexing artefact).
     // `vocab_uppercase_only` triggers ASCII case projection so a
     // lowercase normaliser doesn't feed <unk>s into a vocab like
-    // wav2vec2-base-960h's. `unk_token_id` is the per-character
-    // skip target.
+    // wav2vec2-base-960h's. `reserved` holds the ids no character is
+    // looked up to (the blank, the delimiter, the unknown token, the
+    // declared specials).
     let tokenized = tokenize_with_word_map(
       &self.tokenizer,
       normalized.normalized(),
       n_words,
-      self.normalizer.use_word_delimiter(),
+      self
+        .normalizer
+        .use_word_delimiter()
+        .then_some(self.word_delimiter.as_str()),
       self.vocab_uppercase_only,
-      self.unk_token_id,
+      &self.reserved,
       normalized.wildcard_boundary_per_word(),
       &self.language,
       oov_decisions,
@@ -967,6 +1197,7 @@ impl AlignerCore {
     if tokenized.token_ids().is_empty() {
       return Ok(PreparedChunk {
         owner: self.id,
+        preparation,
         inner: None,
       });
     }
@@ -996,10 +1227,12 @@ impl AlignerCore {
       .map(|(&s, &is_speech)| if is_speech { s } else { 0.0_f32 })
       .collect();
 
-    // wav2vec2's CNN front-end has a minimum input length (the
-    // receptive field of the first stride-conv) of 400 samples at
-    // 16 kHz. WhisperX's `align()` pads with zeros to 400 if the slice
-    // is shorter (`alignment.py:243-247`). Without this padding, the
+    // The acoustic front end has a minimum input length, its receptive
+    // field: 400 samples at 16 kHz for wav2vec2's CNN (the first
+    // stride-conv), the default. WhisperX's `align()` pads with zeros to
+    // 400 if the slice is shorter (`alignment.py:243-247`); a front end
+    // with another receptive field states it, and short chunks pad to
+    // that. Without this padding, the
     // model's first conv produces a degenerate output for very short
     // segments — typical for a 1-2 word segment after Whisper splits on
     // a brief utterance — and the encoder either errors out or emits
@@ -1009,12 +1242,13 @@ impl AlignerCore {
     //
     // Owned rather than the `Cow` this was: `PreparedChunk` carries the
     // buffer across the seam, so it must own it. Same values, same
-    // allocation count — the `>= 400` arm moves the vec instead of
-    // borrowing it.
-    let encoder_input: Vec<f32> = if normalized_samples.len() < 400 {
-      let mut buf = Vec::with_capacity(400);
+    // allocation count — the `>= receptive_field` arm moves the vec
+    // instead of borrowing it.
+    let receptive_field = self.receptive_field_samples.get() as usize;
+    let encoder_input: Vec<f32> = if normalized_samples.len() < receptive_field {
+      let mut buf = Vec::with_capacity(receptive_field);
       buf.extend_from_slice(&normalized_samples);
-      buf.resize(400, 0.0_f32);
+      buf.resize(receptive_field, 0.0_f32);
       buf
     } else {
       normalized_samples
@@ -1022,6 +1256,7 @@ impl AlignerCore {
 
     Ok(PreparedChunk {
       owner: self.id,
+      preparation,
       inner: Some(PreparedInner {
         encoder_input,
         real_samples: samples.len(),
@@ -1053,7 +1288,7 @@ impl AlignerCore {
     chunk_first_sample_in_stream: u64,
     samples_to_output_range: F,
     abort_flag: &AtomicBool,
-  ) -> Result<AlignmentResult, WorkFailure>
+  ) -> Result<UnitAlignment, WorkFailure>
   where
     F: Fn(u64, u64) -> TimeRange,
   {
@@ -1091,7 +1326,7 @@ impl AlignerCore {
     let Some(prepared) = prepared.inner else {
       // Trivial chunk: `prepare` short-circuited (empty normalised
       // text or zero alignable tokens). No encoder output to consume.
-      return Ok(AlignmentResult::new(Vec::new()));
+      return Ok(UnitAlignment::Unaligned(UnalignedCause::NoAlignableText));
     };
     let tokenized = &prepared.tokenized;
 
@@ -1149,21 +1384,20 @@ impl AlignerCore {
       }
     }
 
-    // Two-sided stride check: the encoded time `T * hop_samples` must
-    // lie within `real_samples ± 2*hop_samples`. Catches both
-    // stride-too-small (T*hop overshoots — `compose_words` would emit
-    // ranges past the chunk's audio) and stride-too-large (T*hop
-    // undershoots — `compose_words` would compress every word into the
-    // first portion of the chunk). Fatal: the only recovery is fixing
-    // the model / `hop_samples` config, not retrying.
-    //
-    // Fed the REAL, unpadded extent — `samples.len()` at the original
-    // call site, `prepared.real_samples` now. Same value. The emissions
-    // seam has never run this check at all.
+    // Two-sided stride check: `T` must be a frame count the declared
+    // front end (its receptive field and hop) gives for the input the
+    // encoder read, the PADDED buffer. Catches both stride-too-small
+    // (too many frames: `compose_words` would emit ranges past the
+    // chunk's audio) and stride-too-large (too few: `compose_words` would
+    // crowd every word into the first portion of the chunk). Fatal: the
+    // only recovery is declaring the model's stride, not retrying. The
+    // real extent drives only the speech gates and the word-range clamp
+    // below.
     validate_stride_extent(
       log_probs.t(),
       self.hop_samples.get(),
-      prepared.real_samples,
+      self.receptive_field_samples.get(),
+      prepared.encoder_input.len(),
       &self.language,
     )?;
 
@@ -1190,12 +1424,16 @@ impl AlignerCore {
     // before — the DP checks `abort_flag` periodically so a
     // hallucinated long token sequence can't run past the deadline and
     // starve every chunk queued behind it.
+    // A wildcard scores the best column that could be a character: never
+    // the blank, the delimiter, the unknown token or a declared special.
+    let wildcard_columns = self.reserved.wildcard_columns(log_probs.v());
     let word_segments = align_to_word_segments(
       log_probs,
       tokenized.token_ids(),
       tokenized.word_idx_per_token(),
       tokenized.separator_token_id(),
       self.blank_token_id,
+      &wildcard_columns,
       abort_flag,
       &self.language,
     )?;
@@ -1216,6 +1454,7 @@ impl AlignerCore {
           log_probs,
           tokenized.token_ids(),
           self.blank_token_id,
+          &wildcard_columns,
           abort_flag,
           &self.language,
         );
@@ -1271,7 +1510,7 @@ impl AlignerCore {
       real_n_samples,
       &prepared.speech,
     );
-    Ok(compose_words(
+    let composed = compose_words(
       &word_segments,
       prepared.normalized.original_words(),
       &speech_frames,
@@ -1283,7 +1522,8 @@ impl AlignerCore {
       samples_to_output_range,
       self.min_speech_coverage,
       self.max_intra_silent_run,
-    ))
+    );
+    Ok(UnitAlignment::from_words(composed))
   }
 }
 
@@ -1684,7 +1924,7 @@ mod tests {
   #[test]
   fn delimiter_check_passes_when_token_present_and_required() {
     let tok = tokenizer_with_pipe_delimiter();
-    assert!(validate_word_delimiter_present(&tok, true).is_ok());
+    assert!(validate_word_delimiter_present(&tok, true, "|").is_ok());
   }
 
   /// The delimiter diagnostic is unchanged by the de-gating: the
@@ -1694,10 +1934,10 @@ mod tests {
   #[test]
   fn delimiter_check_fails_when_required_but_missing() {
     let tok = tokenizer_without_pipe_delimiter();
-    let err = validate_word_delimiter_present(&tok, true).unwrap_err();
+    let err = validate_word_delimiter_present(&tok, true, "|").unwrap_err();
     let message = err.message();
     assert!(
-      message.contains("`|` word-delimiter"),
+      message.contains("\"|\" word-delimiter"),
       "must call out the missing delimiter; got {message}"
     );
   }
@@ -1708,7 +1948,7 @@ mod tests {
     // Missing `|` is fine — char-segmented inputs don't use
     // inter-word delimiters in the CTC graph.
     let tok = tokenizer_without_pipe_delimiter();
-    assert!(validate_word_delimiter_present(&tok, false).is_ok());
+    assert!(validate_word_delimiter_present(&tok, false, "|").is_ok());
   }
 
   // --- BERT-style specials at non-zero ids (kresnik Korean shape) ---
@@ -1754,25 +1994,45 @@ mod tests {
     assert_eq!(detect_blank_token_id(&tok), Some(1204));
   }
 
+  /// **The unknown token is the one the model declares.** kresnik's
+  /// WordLevel model declares `[UNK]`, at 1203. A table that spells `<unk>`
+  /// and `[UNK]` but declares `?` has `?` as its unknown token: the
+  /// spellings are ordinary entries. A Unigram model declares its unknown
+  /// token by id, and a model that declares none, or declares one its
+  /// vocabulary does not hold, has none.
   #[test]
-  fn unk_fallback_resolves_bracket_unk() {
-    // Mirror of the `unk_token_id` resolution in
-    // `Aligner::from_paths` (lines 121-123): try `<unk>` first,
-    // then `[UNK]`. A vocab missing `<unk>` but exposing
-    // `[UNK]` (BERT convention) must resolve to the latter.
-    let tok = tokenizer_kresnik_shape();
-    let unk = tok
-      .token_to_id("<unk>")
-      .or_else(|| tok.token_to_id("[UNK]"));
-    assert_eq!(unk, Some(1203));
-  }
+  fn the_unknown_token_is_the_one_the_model_declares() {
+    assert_eq!(
+      declared_unk_token_id(&tokenizer_kresnik_shape()),
+      Some(1203)
+    );
 
-  /// The extracted resolver agrees with the inline logic above —
-  /// it IS that logic, now with one definition instead of two.
-  #[test]
-  fn detect_unk_token_id_resolves_bracket_unk() {
-    let tok = tokenizer_kresnik_shape();
-    assert_eq!(detect_unk_token_id(&tok), Some(1203));
+    let word_level = |unk: &str| {
+      let json = format!(
+        r#"{{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": null, "pre_tokenizer": null, "post_processor": null,
+            "decoder": null, "model": {{"type": "WordLevel",
+            "vocab": {{"<pad>": 0, "<unk>": 1, "[UNK]": 2, "?": 3, "A": 4}},
+            "unk_token": "{unk}"}}}}"#
+      );
+      Tokenizer::from_bytes(json.as_bytes()).expect("parse")
+    };
+    assert_eq!(declared_unk_token_id(&word_level("?")), Some(3));
+    assert_eq!(declared_unk_token_id(&word_level("[UNK]")), Some(2));
+    assert_eq!(declared_unk_token_id(&word_level("<none>")), None);
+
+    let unigram = |unk_id: &str| {
+      let json = format!(
+        r#"{{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": null, "pre_tokenizer": null, "post_processor": null,
+            "decoder": null, "model": {{"type": "Unigram", "unk_id": {unk_id},
+            "vocab": [["<pad>", 0.0], ["<unk>", 0.0], ["B", 0.0], ["A", -1.0]],
+            "byte_fallback": false}}}}"#
+      );
+      Tokenizer::from_bytes(json.as_bytes()).expect("parse")
+    };
+    assert_eq!(declared_unk_token_id(&unigram("2")), Some(2));
+    assert_eq!(declared_unk_token_id(&unigram("null")), None);
   }
 
   #[test]
@@ -1783,7 +2043,7 @@ mod tests {
     // check must short-circuit on `false` regardless of whether
     // the tokenizer happens to expose `|`.
     let tok = tokenizer_kresnik_shape();
-    assert!(validate_word_delimiter_present(&tok, false).is_ok());
+    assert!(validate_word_delimiter_present(&tok, false, "|").is_ok());
   }
 
   /// The uppercase probe fires on a wav2vec2-base-960h-shape vocab
@@ -1836,7 +2096,7 @@ mod tests {
     let tok = load_tokenizer_bytes_with_compat(raw, "<test>").expect("compat shim must patch");
     assert_eq!(tok.token_to_id("A"), Some(5));
     assert_eq!(detect_blank_token_id(&tok), Some(0));
-    assert_eq!(detect_unk_token_id(&tok), Some(3));
+    assert_eq!(declared_unk_token_id(&tok), Some(3));
   }
 
   /// Garbage in, typed error out — and the diagnostic names the

@@ -5,6 +5,7 @@ use smol_str::format_smolstr;
 use tokenizers::Tokenizer;
 
 use crate::{
+  align::punctuation::is_silent_mark,
   runner::aligner::algorithm::{
     errors::{EmissionsError, EmissionsFailure},
     trellis_beam::WILDCARD_TOKEN_ID,
@@ -28,12 +29,12 @@ pub struct TokenizedText {
   /// All non-wildcard ids are non-negative and fit in `u32`.
   token_ids: Vec<i32>,
   /// Per-token mapping back to the normalised-word index. `None`
-  /// for tokens that have no natural word index (word-delimiter
-  /// `|`, special tokens like `<s>`, `<pad>`, `<unk>`).
+  /// for tokens that have no natural word index (the word
+  /// delimiter, special tokens like `<s>`, `<pad>`, `<unk>`).
   word_idx_per_token: Vec<Option<usize>>,
-  /// The wav2vec2 word-delimiter `|` token id, when the
-  /// tokenizer exposes one and the normaliser opted in. The
-  /// trellis-beam orchestrator uses this to recognise
+  /// The word-delimiter token id (`|` for wav2vec2), when the
+  /// normaliser opted in and the vocabulary spells the delimiter.
+  /// The trellis-beam orchestrator uses this to recognise
   /// separators in `merge_words`.
   separator_token_id: Option<u32>,
 }
@@ -65,76 +66,121 @@ impl TokenizedText {
     &self.word_idx_per_token
   }
 
-  /// The wav2vec2 word-delimiter `|` token id, when present.
+  /// The word-delimiter token id, when present.
   #[must_use]
   pub const fn separator_token_id(&self) -> Option<u32> {
     self.separator_token_id
   }
 }
 
-/// Tokenise `normalized` against the wav2vec2 tokeniser, building a
-/// per-token word-index map.
+/// The vocabulary ids no transcript character is looked up to: the CTC
+/// blank, the word delimiter, the unknown token, and every token the
+/// tokenizer declares special (`added_tokens[].special`).
 ///
-/// The wav2vec2 vocab uses a single character per token (one of:
-/// letter, digit, apostrophe, the word-delimiter `|`, or a special
-/// like `<s>`, `<pad>`, `<unk>`, `</s>`). For word-segmented
-/// languages the model is trained to align `|` between every pair
-/// of spoken words.
+/// Each names a column of the model's output that stands for no letter: the
+/// blank for "no symbol", the delimiter for the boundary between two words,
+/// a special for whatever the tokenizer reserved it for. A vocabulary may
+/// spell one of them with a single character (the chordai wav2vec2-base-960h
+/// table spells its blank `-`, and every English wav2vec2 table its
+/// delimiter `|`), so a transcript character can look up to it. Such a
+/// character is not spelled: the mark rules decide it as any character the
+/// vocabulary cannot spell (a mark nobody reads aloud is dropped, anything
+/// else is an OOV event for the caller's policy). The delimiter's column
+/// takes only the separators tokenization itself puts between normalized
+/// words.
 ///
-/// We tokenise word-by-word (not the whole sentence at once) to
-/// trivially get the word index — each word's encoded tokens map
-/// to the word's index, and the inter-word `|` is appended with
-/// `None` between words **only when the source normaliser declared
-/// that whitespace represents real word boundaries**.
+/// The unknown token and the specials are the tokenizer's own statement,
+/// read from its model's `unk_token` and its `added_tokens`; nothing is
+/// inferred from a token's spelling.
+#[derive(Clone, Debug)]
+pub struct ReservedIds(Vec<u32>);
+
+impl ReservedIds {
+  /// The reserved ids of `tokenizer`, whose CTC blank is `blank`, whose
+  /// word delimiter is `word_delimiter` (reserved when the vocabulary
+  /// spells it) and whose unknown token is `unk`, with every token the
+  /// tokenizer declares special.
+  #[must_use]
+  pub fn new(tokenizer: &Tokenizer, blank: u32, word_delimiter: &str, unk: Option<u32>) -> Self {
+    let mut ids: Vec<u32> = tokenizer
+      .get_added_vocabulary()
+      .get_added_tokens_decoder()
+      .iter()
+      .filter(|(_, token)| token.special)
+      .map(|(&id, _)| id)
+      .chain([blank])
+      .chain(tokenizer.token_to_id(word_delimiter))
+      .chain(unk)
+      .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    Self(ids)
+  }
+
+  /// Whether `id` is reserved.
+  #[must_use]
+  pub fn contains(&self, id: u32) -> bool {
+    self.0.binary_search(&id).is_ok()
+  }
+
+  /// The columns of a `vocab`-wide emission row a wildcard may take:
+  /// `true` for every column but a reserved one. A wildcard stands for a
+  /// transcript character the vocabulary cannot spell, so it scores the
+  /// best column that could be a character, never the blank, the word
+  /// delimiter, the unknown token or a declared special.
+  #[must_use]
+  pub fn wildcard_columns(&self, vocab: usize) -> Vec<bool> {
+    (0..vocab)
+      .map(|column| u32::try_from(column).map_or(true, |id| !self.contains(id)))
+      .collect()
+  }
+}
+
+/// How tokenization treats one character of a normalized word.
 ///
-/// `use_word_delimiter` is the
-/// [`crate::emissions::TextNormalizer::use_word_delimiter`] signal:
-/// `true` for English (whitespace = real word break, insert
-/// `|`); `false` for character-segmented languages (Chinese,
-/// Japanese) where whitespace is an indexing artefact only and must
-/// not introduce CTC-graph delimiters that were never spoken.
+/// [`classify`] is the one classification [`detect_oov_events`] and
+/// [`tokenize_with_word_map`] share, so tokenization meets exactly the OOV
+/// positions detection reported.
+enum CharClass {
+  /// The vocabulary spells the character: this id, never a
+  /// [reserved](ReservedIds) one.
+  Spelled(u32),
+  /// A punctuation mark nobody reads aloud, which the vocabulary does not
+  /// spell. It has no acoustic realization, so it is dropped under every
+  /// policy: no token, no wildcard, no OOV event.
+  Silent,
+  /// A spoken character the vocabulary cannot spell (a letter, a digit, a
+  /// symbol, a mark read aloud): an
+  /// [`OovKind::Symbol`](crate::core::OovKind::Symbol) event for the
+  /// caller's policy.
+  Unspelled,
+}
+
+/// Classify `ch`, looked up as `uppercase_input` projects it.
 ///
-/// `uppercase_input` projects ASCII to uppercase before the vocabulary
-/// lookup;
-/// set when the vocab covers `A`-`Z` only (the case for
-/// `wav2vec2-base-960h`). Without this projection a lowercase
-/// normaliser would feed every English letter through `<unk>`,
-/// producing a CTC graph that cannot meaningfully align word
-/// boundaries — the bug that motivated this parameter.
-///
-/// `unk_token_id`, when supplied, is used to detect out-of-vocab
-/// characters per char. The handling is **WhisperX-style**:
-/// alphanumeric chars not in the vocab become wildcard tokens
-/// (`WILDCARD_TOKEN_ID = -1`) and the trellis aligns them to
-/// whichever non-blank vocab item carries the highest
-/// log-probability at each frame. This matches WhisperX's
-/// `clean_char.append('*')` placeholder + `tokens =
-/// [model_dictionary.get(c, -1) for c in text_clean]` flow.
-///
-/// **Asry-specific guard (default policy):** non-alphanumeric
-/// chars (e.g. `&` in `AT&T`) that aren't on the whitelist of
-/// skippable internal punctuation still drop the whole chunk's
-/// alignment. WhisperX would silently align them as wildcards too,
-/// but those chars represent semantic content the model can't
-/// reasonably align (the `&` in `AT&T` is "and"); silently aligning
-/// to whichever vocab item happens to win the frame would produce
-/// honest-looking but wrong word ranges. Asry fails closed at
-/// chunk granularity instead.
-///
-/// **WhisperX-equivalent runtime policy:** callers that want
-/// `clean_char.append('*')` 1:1 (every OOV → wildcard) supply
-/// `crate::core::wildcard_all_decisions(&events)` instead of
-/// `default_oov_decisions(&events)`. The Cargo feature that
-/// used to flip this globally (`whisperx-strict-tokenizer`)
-/// was removed in the Sans-I/O OOV refactor — per-deployment
-/// policy is now data, not a compile-time flag.
-///
-/// Internal punctuation that's never pronounced as a separate
-/// sound and is safe to strip before encoding so the
-/// surrounding letters still align. Currently just the period:
-/// `U.S.A.`, `D.C.`, `etc.` are pronounced as their letters.
-fn is_skippable_internal_punct(c: char) -> bool {
-  c == '.'
+/// The vocabulary is asked first: a mark it spells (the apostrophe of
+/// wav2vec2-base-960h) is a token like any letter, and only a mark it
+/// cannot spell is silent. A character that looks up to a
+/// [reserved](ReservedIds) id is not spelled, so the mark rules decide it:
+/// the `-` a table spells as its blank is a silent mark and dropped, and a
+/// `|` the table spells as its delimiter is a symbol, an OOV event.
+fn classify(
+  tokenizer: &Tokenizer,
+  ch: char,
+  uppercase_input: bool,
+  reserved: &ReservedIds,
+) -> CharClass {
+  let projected = if uppercase_input {
+    ch.to_ascii_uppercase()
+  } else {
+    ch
+  };
+  let mut utf8 = [0; 4];
+  match vocab_id(tokenizer, projected.encode_utf8(&mut utf8), reserved) {
+    Some(id) => CharClass::Spelled(id),
+    None if is_silent_mark(ch) => CharClass::Silent,
+    None => CharClass::Unspelled,
+  }
 }
 
 /// The vocabulary id of the one-character `token`, or `None` when the
@@ -143,25 +189,21 @@ fn is_skippable_internal_punct(c: char) -> bool {
 /// A lookup ([`Tokenizer::token_to_id`]: added tokens, then the model's own
 /// entries), never `Tokenizer::encode`. A `WordLevel` model whose declared
 /// unknown token is absent from its vocabulary answers `encode` of an
-/// unknown character with an error; the lookup answers `None`. The
-/// `unk_token_id`, when there is one, is no member of the alphabet: a
-/// character that looks up to it is unspellable as well.
-///
-/// The one classification [`detect_oov_events`] and
-/// [`tokenize_with_word_map`] share, so tokenization meets exactly the OOV
-/// positions detection reported.
-fn vocab_id(tokenizer: &Tokenizer, token: &str, unk_token_id: Option<u32>) -> Option<u32> {
+/// unknown character with an error; the lookup answers `None`. A
+/// [reserved](ReservedIds) id (the blank, the delimiter, the unknown token,
+/// a declared special) is no member of the alphabet: a character that
+/// looks up to one is unspellable as well.
+fn vocab_id(tokenizer: &Tokenizer, token: &str, reserved: &ReservedIds) -> Option<u32> {
   tokenizer
     .token_to_id(token)
-    .filter(|&id| Some(id) != unk_token_id)
+    .filter(|&id| !reserved.contains(id))
 }
 
 /// Consume the next caller decision for a wildcard-generating
 /// position; surface a typed `TokenizationFailed` if the
-/// caller pre-sized too small. (parity
-/// loop) [high]: shared by the boundary-prefix /
-/// internal-punct / symbol-OOV / boundary-suffix sites so
-/// they all consult the same indexed slice.
+/// caller pre-sized too small. Shared by the boundary-prefix,
+/// symbol-OOV and boundary-suffix sites so they all consult
+/// the same indexed slice.
 fn consume_oov_decision(
   oov_decisions: &[crate::core::ResolvedOov],
   oov_consumed: &mut usize,
@@ -194,11 +236,11 @@ fn boundary_fail_closed(position: &str) -> EmissionsError {
 // (the `whisperx-strict-tokenizer` Cargo feature went with it).
 // Policy is now caller-supplied as data — see
 // `crate::core::oov`:
-// * `default_oov_decisions` — historical default
+// * `default_oov_policy` — historical default
 // (alphanumeric/apostrophe → wildcard, pronounced → fail-closed).
-// * `wildcard_all_decisions` — replaces the removed
+// * `wildcard_all_policy` — replaces the removed
 // `whisperx-strict-tokenizer` feature (WhisperX 1:1).
-// * `fail_closed_all_decisions` — strictest.
+// * `fail_closed_all_policy` — strictest.
 //
 // `tokenize_with_word_map` consumes the resulting
 // `&[ResolvedOov]` per OOV position in `detect_oov_events`
@@ -217,7 +259,7 @@ fn boundary_fail_closed(position: &str) -> EmissionsError {
 )]
 /// Sans-I/O OOV detection — runs the same per-character
 /// iteration as [`tokenize_with_word_map`] but emits an
-/// [`OovEvent`] for each char that call will need a decision
+/// [`OovEvent`](crate::core::OovEvent) for each char that call will need a decision
 /// for, instead of making a policy decision.
 ///
 /// **Order invariant.** Events are emitted in the order
@@ -226,20 +268,23 @@ fn boundary_fail_closed(position: &str) -> EmissionsError {
 /// must produce decisions in the same order, with each
 /// `ResolvedOov.event` matching the event at its position.
 ///
-/// `is_skippable_internal_punct` chars (currently `.`) ARE surfaced,
-/// as [`OovKind::InternalPunct`](crate::core::OovKind::InternalPunct)
-/// events — one per occurrence. They are then stripped and replaced
-/// with a wildcard token at the same position, but the caller still
-/// sees them and still decides: `fail_closed_all_decisions` refuses
-/// them like any other OOV. (This doc used to claim they were "NOT
-/// surfaced"; `U.S.A` emits two `InternalPunct` events, as
-/// `detect_oov_events_surfaces_internal_punct` pins.)
+/// **A punctuation mark nobody reads aloud is never an event.** A mark
+/// of Unicode general category P* that is not read aloud (as `#`, `%`,
+/// `&`, `@` and their kin are) and that the vocabulary does not spell has
+/// no acoustic realization, so it is dropped before any policy decides,
+/// wherever it stands: the stops of `U.S.A`, the comma of `4,9`, a
+/// guillemet, an ellipsis. It still occupies its position in the
+/// `char_index` space, which indexes `normalized` as given. A mark the
+/// vocabulary spells, such as the apostrophe of `don't` against
+/// wav2vec2-base-960h, is a token and never an event.
 ///
 /// **Membership is a vocabulary lookup; this function never encodes.** A
 /// character, after the `uppercase_input` projection, is in the alphabet
 /// exactly when the vocabulary has an entry for it
-/// ([`Tokenizer::token_to_id`]) that is not `unk_token_id`. Every other
-/// character is surfaced as
+/// (`Tokenizer::token_to_id`) that is not [reserved](ReservedIds): not the
+/// blank, the word delimiter, the unknown token or a declared special.
+/// Every other
+/// spoken character is surfaced as
 /// [`OovKind::Symbol`](crate::core::OovKind::Symbol) at its char and word
 /// index. `Tokenizer::encode` is never called: a `WordLevel` model whose
 /// declared unknown token is absent from its vocabulary (a CTC alphabet
@@ -249,10 +294,11 @@ fn boundary_fail_closed(position: &str) -> EmissionsError {
 /// the tokenizer's normalizer or pre-tokenizer: WhisperX's
 /// `model_dictionary.get(c, -1)`. For a vocabulary that holds its unknown
 /// token and whose tokenizer passes a lone character through unchanged
-/// (wav2vec2's do), these are the events an `encode` probe produced.
+/// (wav2vec2's do), the lookup spells exactly what an `encode` probe
+/// spelled.
 ///
-/// That includes **alphanumerics**, not just pronounced symbols like
-/// `&` / `@` / `%` / `,`: a digit against the English wav2vec2 vocab,
+/// That includes **alphanumerics**, not just spoken symbols like
+/// `&` / `@` / `%`: a digit against the English wav2vec2 vocab,
 /// which has none, is a `Symbol` event too
 /// (`tokenize_with_word_map_rejects_stale_same_length_decisions` leans
 /// on `"4"` producing exactly one).
@@ -270,15 +316,14 @@ pub fn detect_oov_events(
   normalized: &str,
   word_count: usize,
   uppercase_input: bool,
-  unk_token_id: Option<u32>,
+  reserved: &ReservedIds,
   language: &Lang,
-  // Per-word boundary-punct counts as supplied to
+  // Per-word boundary wildcard counts as supplied to
   // `tokenize_with_word_map`. Must be either empty (=
-  // "no boundary wildcards") or `word_count`-long. Codex
-  // boundary-punct
-  // wildcards are surfaced as `OovKind::BoundaryPunct`
-  // events so strict callers
-  // (`fail_closed_all_decisions`) can refuse them.
+  // "no boundary wildcards") or `word_count`-long. Each
+  // requested wildcard is surfaced as an
+  // `OovKind::BoundaryPunct` event so strict callers
+  // (`fail_closed_all_policy`) can refuse it.
   wildcard_boundary_per_word: &[crate::runner::aligner::normalizer::WildcardBoundary],
 ) -> Result<Vec<crate::core::OovEvent>, EmissionsError> {
   use crate::core::OovEvent;
@@ -306,7 +351,6 @@ pub fn detect_oov_events(
       ),
     )));
   }
-  let mut tmp_buf = String::with_capacity(8);
   let mut char_index: usize = 0;
   for (word_index, word) in words.iter().enumerate() {
     let boundary = wildcard_boundary_per_word
@@ -327,24 +371,10 @@ pub fn detect_oov_events(
       ));
     }
     for ch in word.chars() {
-      if is_skippable_internal_punct(ch) {
-        events.push(OovEvent::new(
-          crate::core::OovKind::InternalPunct(ch),
-          char_index,
-          word_index,
-          language.clone(),
-        ));
-        char_index += 1;
-        continue;
-      }
-      let projected = if uppercase_input {
-        ch.to_ascii_uppercase()
-      } else {
-        ch
-      };
-      tmp_buf.clear();
-      tmp_buf.push(projected);
-      if vocab_id(tokenizer, &tmp_buf, unk_token_id).is_none() {
+      if matches!(
+        classify(tokenizer, ch, uppercase_input, reserved),
+        CharClass::Unspelled
+      ) {
         events.push(OovEvent::new(
           crate::core::OovKind::Symbol(ch),
           char_index,
@@ -379,6 +409,36 @@ pub fn detect_oov_events(
 /// `TokenizedText` (token-id stream + per-token word index +
 /// separator id).
 ///
+/// The wav2vec2 vocab uses a single character per token (a letter,
+/// a digit, the apostrophe, the word delimiter `|`, or a special
+/// like `<pad>`). Each word is tokenised on its own, so every token
+/// maps to its word's index, and the `word_delimiter` token goes
+/// between two words that produced tokens only when there is one:
+/// `Some` when whitespace is a real word break (English, whose
+/// wav2vec2 delimiter is `|`), `None` for Chinese and Japanese, whose
+/// whitespace is an indexing device that must not put a delimiter
+/// nobody spoke into the CTC graph. `uppercase_input` projects ASCII to
+/// uppercase before the vocabulary lookup, for a vocab that covers
+/// `A`-`Z` only (`wav2vec2-base-960h`).
+///
+/// Each character is classified as [`detect_oov_events`] classifies
+/// it:
+/// * one the vocabulary spells is its id, never a [reserved](ReservedIds)
+///   one (a character that looks up to the blank, the delimiter, the
+///   unknown token or a declared special is not spelled);
+/// * a punctuation mark nobody reads aloud that the vocabulary does
+///   not spell is dropped, under every policy: no token, no wildcard,
+///   no decision consumed;
+/// * any other character takes the caller's decision for its event.
+///   `OovDecision::Wildcard` pushes `WILDCARD_TOKEN_ID = -1`, which
+///   the trellis aligns to whichever non-blank vocab item carries the
+///   highest log-probability at each frame (WhisperX's `*`
+///   placeholder); `OovDecision::FailClosed` returns
+///   `SemanticOutOfVocab`, naming the character. The default policy
+///   wildcards alphanumerics and refuses a spoken symbol: the `&` of
+///   `AT&T` is "and", and aligning it to whichever vocab item wins the
+///   frame would produce an honest-looking but wrong word range.
+///
 /// This is the second half of the Sans-I/O OOV resolution
 /// flow: callers run [`detect_oov_events`] first to get a
 /// `Vec<OovEvent>`, decide on each via a policy helper from
@@ -409,9 +469,6 @@ pub fn detect_oov_events(
 /// * mid-loop too-short consumption — defense-in-depth if the
 /// preflight is somehow bypassed.
 ///
-/// `OovDecision::Wildcard` pushes `WILDCARD_TOKEN_ID = -1`;
-/// `OovDecision::FailClosed` returns `SemanticOutOfVocab`.
-///
 /// `pub` so both `asry::emissions` (the ort-free tokenisation entry
 /// point) and the doc-hidden `feature = "bench-internals"`
 /// `asry::__bench` re-export can reach it.
@@ -419,32 +476,30 @@ pub fn tokenize_with_word_map(
   tokenizer: &Tokenizer,
   normalized: &str,
   word_count: usize,
-  use_word_delimiter: bool,
+  // The token that separates words, when whitespace is a word break;
+  // `None` when it is not.
+  word_delimiter: Option<&str>,
   uppercase_input: bool,
-  unk_token_id: Option<u32>,
+  reserved: &ReservedIds,
   // Per-word `(prefix, suffix)` count of wildcard tokens to
   // inject around the word's encoded chars. Prefix wildcards
-  // are pushed BEFORE the encoded chars; suffix wildcards
-  // (plus any internal-skipped chars discovered during this
-  // pass) are pushed AFTER. Mirrors WhisperX's `*` placeholder
-  // for unpronounced boundary punctuation IN SOURCE ORDER, so
-  // leading punctuation like `"hello` keeps its `*` before the
-  // letters and trailing `hello"` keeps it after — Codex
-  // round-28 flagged that an earlier total-count design pushed
-  // every wildcard at the end of the word, making leading vs
-  // trailing punctuation indistinguishable in the CTC graph.
+  // are pushed BEFORE the encoded chars and suffix wildcards
+  // AFTER, in source order, so a normaliser that asks for
+  // WhisperX's `*` placeholder over what it stripped keeps
+  // leading and trailing padding distinguishable in the CTC
+  // graph. Each wildcard is an `OovKind::BoundaryPunct` event
+  // the caller decides.
   //
-  // Empty slice means "zero wildcards for every word" (legacy
-  // / non-English-normaliser path); asry's
-  // [`crate::EnglishNormalizer`] populates it from the
-  // boundary-punctuation strip count.
+  // Empty slice means "zero wildcards for every word". asry's
+  // own normalisers always report none: a mark they strip is
+  // dropped, never padded.
   wildcard_boundary_per_word: &[crate::runner::aligner::normalizer::WildcardBoundary],
   language: &Lang,
   // Caller's per-OOV-event resolved decisions, indexed by the
   // order [`detect_oov_events`] would have produced them.
   // Required: produce via `detect_oov_events` + a policy
   // helper from `crate::core::oov` (e.g.
-  // `default_oov_decisions`, `wildcard_all_decisions`). An
+  // `default_oov_policy`, `wildcard_all_policy`). An
   // empty slice means "no OOV expected"; encountering one
   // anyway raises `TokenizationFailed`. Each
   // `ResolvedOov.event` must match the freshly-detected event
@@ -474,7 +529,7 @@ pub fn tokenize_with_word_map(
     normalized,
     word_count,
     uppercase_input,
-    unk_token_id,
+    reserved,
     language,
     wildcard_boundary_per_word,
   )?;
@@ -545,11 +600,10 @@ pub fn tokenize_with_word_map(
     )));
   }
 
-  // Per-char tokenisation: each character is looked up on its
-  // own, so an unspellable one is known by position and gets
-  // its own decision (wildcard-and-keep vs drop-the-chunk).
+  // Per-char tokenisation: each character is classified on its
+  // own, so an unspellable spoken one is known by position and
+  // gets its own decision (wildcard-and-keep vs drop-the-chunk).
   let mut per_word_tokens: Vec<Vec<i32>> = Vec::with_capacity(words.len());
-  let mut tmp_buf = String::with_capacity(8);
   for (wi, word) in words.iter().enumerate() {
     let boundary = wildcard_boundary_per_word
       .get(wi)
@@ -559,13 +613,11 @@ pub fn tokenize_with_word_map(
     let suffix_wildcards = boundary.suffix();
     let mut word_tokens: Vec<i32> = Vec::with_capacity(word.len());
     // Push prefix wildcards BEFORE the encoded chars so leading
-    // punctuation like `"hello` aligns its `*` placeholders
-    // ahead of `h, e, l, l, o`. The CTC graph then matches the
-    // source order, mirroring WhisperX's approach. Codex
-    // each wildcard
-    // consults `oov_decisions` so strict callers
-    // (`fail_closed_all_decisions`) genuinely fail-close on
-    // structural wildcards too.
+    // padding aligns its `*` placeholders ahead of the word's
+    // letters, in source order. Each wildcard consults
+    // `oov_decisions`, so strict callers
+    // (`fail_closed_all_policy`) fail closed on requested
+    // padding too.
     for _ in 0..prefix_wildcards {
       let decision =
         consume_oov_decision(oov_decisions, &mut oov_consumed, "BoundaryPunct (prefix)")?;
@@ -577,64 +629,32 @@ pub fn tokenize_with_word_map(
       }
     }
     for ch in word.chars() {
-      if is_skippable_internal_punct(ch) {
-        // emit the wildcard
-        // token immediately at the source position of the
-        // skipped internal punctuation. this counted
-        // skipped chars and appended all wildcards at the end
-        // of the word, breaking WhisperX token-order parity for
-        // dotted acronyms like "U.S.A": WhisperX interleaves
-        // [U, *, S, *, A, *] (one `*` per `.`), the  // emitted [U, S, A, *, *, *]. The total token count
-        // matched but the per-position CTC frame attribution
-        // shifted, moving boundaries on the following word.
-        // Now we keep the source order — wildcards land at the
-        // exact byte position of the punct char. The OOV
-        // decision (parity-loop [high])
-        // governs whether the wildcard is actually emitted or
-        // surfaces as `SemanticOutOfVocab`.
-        let decision = consume_oov_decision(oov_decisions, &mut oov_consumed, "InternalPunct")?;
-        match decision {
-          crate::core::OovDecision::Wildcard => word_tokens.push(WILDCARD_TOKEN_ID),
-          crate::core::OovDecision::FailClosed => {
-            return Err(EmissionsError::SemanticOutOfVocab(EmissionsFailure::new(
-              format_smolstr!(
-                "InternalPunct {ch:?} resolved as FailClosed by caller policy; \
+      let id = match classify(tokenizer, ch, uppercase_input, reserved) {
+        CharClass::Spelled(id) => id,
+        CharClass::Silent => continue,
+        CharClass::Unspelled => {
+          let decision = consume_oov_decision(oov_decisions, &mut oov_consumed, "Symbol")?;
+          match decision {
+            crate::core::OovDecision::Wildcard => {
+              word_tokens.push(WILDCARD_TOKEN_ID);
+            }
+            crate::core::OovDecision::FailClosed => {
+              // A spoken character the caller policy told us to
+              // refuse. Surface a typed failure so the drop is
+              // observable; on the `alignment` pool path the
+              // orchestrator re-maps this to
+              // `AlignmentError::SemanticOutOfVocab` and the dispatch
+              // recovery still ships the cached ASR transcript.
+              return Err(EmissionsError::SemanticOutOfVocab(EmissionsFailure::new(
+                format_smolstr!(
+                  "OOV {ch:?} resolved as FailClosed by caller policy; \
  no word alignment produced for the supplied tokens."
-              ),
-            )));
+                ),
+              )));
+            }
           }
+          continue;
         }
-        continue;
-      }
-      let projected = if uppercase_input {
-        ch.to_ascii_uppercase()
-      } else {
-        ch
-      };
-      tmp_buf.clear();
-      tmp_buf.push(projected);
-      let Some(id) = vocab_id(tokenizer, &tmp_buf, unk_token_id) else {
-        let decision = consume_oov_decision(oov_decisions, &mut oov_consumed, "Symbol")?;
-        match decision {
-          crate::core::OovDecision::Wildcard => {
-            word_tokens.push(WILDCARD_TOKEN_ID);
-          }
-          crate::core::OovDecision::FailClosed => {
-            // Non-alphanumeric semantic OOV the caller policy told
-            // us to drop. Surface a typed failure so the drop is
-            // observable; on the `alignment` pool path the
-            // orchestrator re-maps this to
-            // `AlignmentError::SemanticOutOfVocab` and the dispatch
-            // recovery still ships the cached ASR transcript.
-            return Err(EmissionsError::SemanticOutOfVocab(EmissionsFailure::new(
-              format_smolstr!(
-                "OOV {ch:?} resolved as FailClosed by caller policy; \
- no word alignment produced for the supplied tokens."
-              ),
-            )));
-          }
-        }
-        continue;
       };
       // Validate that the model id fits an `i32` AND is
       // non-negative before storing it alongside the
@@ -664,12 +684,9 @@ pub fn tokenize_with_word_map(
       }
       word_tokens.push(signed_id);
     }
-    // Append SUFFIX wildcards from the normaliser's trailing-
-    // punct strip count. Internal-punct wildcards are emitted
-    // in source order inside the loop above ( // round-8 fix), so this branch only handles boundary
-    // wildcards now.
-    // [high]: each suffix wildcard consults `oov_decisions`
-    // — see the prefix loop above for the rationale.
+    // Append SUFFIX wildcards from the normaliser's requested
+    // trailing padding; each consults `oov_decisions`, as the
+    // prefix loop above does.
     for _ in 0..suffix_wildcards {
       let decision =
         consume_oov_decision(oov_decisions, &mut oov_consumed, "BoundaryPunct (suffix)")?;
@@ -684,16 +701,13 @@ pub fn tokenize_with_word_map(
   }
 
   // Pass 2: flatten into the final token stream, inserting the
-  // `|` delimiter only between adjacent NON-EMPTY groups when
-  // the normaliser opted in. The orphan-delimiter rule still
-  // applies — empty groups (every char unprintable / dropped to
-  // skippable internal punct) leave no stray `|` for the trellis
-  // to attribute frames to.
-  let delim_id = if use_word_delimiter {
-    tokenizer.token_to_id("|")
-  } else {
-    None
-  };
+  // delimiter only between adjacent NON-EMPTY groups when the
+  // normaliser opted in. These inserted separators are the only tokens
+  // that reach the delimiter's column: a transcript character that looks
+  // up to it is reserved, so no group holds it. The orphan-delimiter rule
+  // still applies — an empty group (a word of dropped marks) leaves no
+  // stray delimiter for the trellis to attribute frames to.
+  let delim_id = word_delimiter.and_then(|token| tokenizer.token_to_id(token));
   let mut last_emitted_word: Option<usize> = None;
   for (word_idx, group) in per_word_tokens.iter().enumerate() {
     if group.is_empty() {
@@ -706,14 +720,14 @@ pub fn tokenize_with_word_map(
       // path above ([high]).
       let signed_d = i32::try_from(d).map_err(|_| {
         EmissionsError::Tokenization(EmissionsFailure::new(format_smolstr!(
-          "tokenizer returned `|` delimiter id {} which exceeds i32::MAX",
+          "tokenizer returned delimiter id {} which exceeds i32::MAX",
           d
         )))
       })?;
       if signed_d < 0 {
         return Err(EmissionsError::Tokenization(EmissionsFailure::new(
           format_smolstr!(
-            "tokenizer returned negative-after-cast `|` delimiter id {} (raw {})",
+            "tokenizer returned negative-after-cast delimiter id {} (raw {})",
             signed_d,
             d
           ),
@@ -753,7 +767,7 @@ pub fn tokenize_with_word_map(
   }
 
   // An empty token list is *not* an error. A chunk like `"...."`
-  // (skippable punctuation only) legitimately produces zero
+  // (marks nobody reads aloud only) legitimately produces zero
   // tokens. Returning `TokenizationFailed` here would convert
   // the successful ASR `Transcript` into an `Event::Error` at the
   // dispatch layer.
@@ -768,10 +782,14 @@ pub fn tokenize_with_word_map(
 mod tests {
   use super::*;
   use crate::{
+    align::punctuation::READ_ALOUD,
     core::{OovEvent, OovKind},
     runner::aligner::{
-      core::{detect_unk_token_id, load_tokenizer_bytes_with_compat},
-      normalizer::WildcardBoundary,
+      core::{
+        declared_unk_token_id, detect_vocab_uppercase_only, load_tokenizer_bytes_with_compat,
+      },
+      normalizer::{TextNormalizer, WildcardBoundary},
+      normalizers::{ChineseNormalizer, LatinNormalizer},
     },
     types::Lang,
   };
@@ -813,19 +831,31 @@ mod tests {
       .expect("inline WordLevel tokenizer must parse")
   }
 
+  /// `tok`'s reserved ids, as a front end builds them: its detected blank
+  /// (an id no vocabulary holds when it has none), the `|` delimiter, its
+  /// unknown token and its declared specials.
+  fn reserved(tok: &Tokenizer) -> ReservedIds {
+    ReservedIds::new(
+      tok,
+      crate::runner::aligner::core::detect_blank_token_id(tok).unwrap_or(u32::MAX),
+      "|",
+      declared_unk_token_id(tok),
+    )
+  }
+
   /// Convenience wrapper that mirrors the historical default
   /// policy (alphanumeric / apostrophe → wildcard, pronounced
   /// → fail-closed) for tests written against
   /// `tokenize_with_word_map` before slice 4 made decisions
   /// caller-supplied. Calls `detect_oov_events` + the
-  /// `default_oov_decisions` helper.
+  /// `default_oov_policy`.
   fn tokenize_with_default_oov(
     tokenizer: &Tokenizer,
     normalized: &str,
     word_count: usize,
     use_word_delimiter: bool,
     uppercase_input: bool,
-    unk_token_id: Option<u32>,
+    reserved: &ReservedIds,
     wildcard_boundary_per_word: &[crate::runner::aligner::normalizer::WildcardBoundary],
     language: &Lang,
   ) -> Result<TokenizedText, EmissionsError> {
@@ -834,18 +864,18 @@ mod tests {
       normalized,
       word_count,
       uppercase_input,
-      unk_token_id,
+      reserved,
       language,
       wildcard_boundary_per_word,
     )?;
-    let decisions = crate::core::default_oov_decisions(&events);
+    let decisions = crate::core::oov::resolve_events(&events, crate::core::default_oov_policy);
     tokenize_with_word_map(
       tokenizer,
       normalized,
       word_count,
-      use_word_delimiter,
+      use_word_delimiter.then_some("|"),
       uppercase_input,
-      unk_token_id,
+      reserved,
       wildcard_boundary_per_word,
       language,
       &decisions,
@@ -859,7 +889,7 @@ mod tests {
   #[test]
   fn detect_oov_events_empty_for_in_vocab_text() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     let events = detect_oov_events(
       &tok,
       "hello",
@@ -881,7 +911,7 @@ mod tests {
   #[test]
   fn detect_oov_events_collects_in_source_order() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     let events = detect_oov_events(&tok, "AT&T", 1, true, unk, &Lang::En, &[]).expect("ok");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].kind(), &crate::core::OovKind::Symbol('&'));
@@ -900,7 +930,7 @@ mod tests {
   #[test]
   fn tokenize_with_word_map_rejects_too_long_oov_decisions() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     // "AT&T" has exactly one OOV (`&`); supply two ResolvedOov.
     // The first matches the real event so length mismatch (not
     // identity mismatch) is the failing predicate; the second
@@ -915,8 +945,17 @@ mod tests {
       crate::core::ResolvedOov::new(real_event, crate::core::OovDecision::Wildcard),
       crate::core::ResolvedOov::new(extra_event, crate::core::OovDecision::Wildcard),
     ];
-    let result =
-      tokenize_with_word_map(&tok, "AT&T", 1, true, true, unk, &[], &Lang::En, &too_long);
+    let result = tokenize_with_word_map(
+      &tok,
+      "AT&T",
+      1,
+      Some("|"),
+      true,
+      unk,
+      &[],
+      &Lang::En,
+      &too_long,
+    );
     match result {
       Err(EmissionsError::Tokenization(payload)) => {
         assert!(
@@ -942,7 +981,7 @@ mod tests {
   #[test]
   fn tokenize_with_word_map_rejects_too_long_decisions_even_when_first_is_fail_closed() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     let real_event = detect_oov_events(&tok, "AT&T", 1, true, unk, &Lang::En, &[])
       .expect("ok")
       .pop()
@@ -953,8 +992,17 @@ mod tests {
       crate::core::ResolvedOov::new(real_event, crate::core::OovDecision::FailClosed),
       crate::core::ResolvedOov::new(extra_event, crate::core::OovDecision::Wildcard),
     ];
-    let result =
-      tokenize_with_word_map(&tok, "AT&T", 1, true, true, unk, &[], &Lang::En, &too_long);
+    let result = tokenize_with_word_map(
+      &tok,
+      "AT&T",
+      1,
+      Some("|"),
+      true,
+      unk,
+      &[],
+      &Lang::En,
+      &too_long,
+    );
     match result {
       Err(EmissionsError::Tokenization(_)) => {
         // Correct: stale-payload mismatch surfaces as
@@ -985,7 +1033,7 @@ mod tests {
   #[test]
   fn tokenize_with_word_map_rejects_stale_same_length_decisions() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     // Decisions produced for `"4"` (digit OOV at char_index=0).
     let stale_for_digit = detect_oov_events(&tok, "4", 1, true, unk, &Lang::En, &[]).expect("ok");
     assert_eq!(stale_for_digit.len(), 1);
@@ -1000,7 +1048,7 @@ mod tests {
       &tok,
       "AT&T",
       1,
-      true,
+      Some("|"),
       true,
       unk,
       &[],
@@ -1037,7 +1085,7 @@ mod tests {
   #[test]
   fn tokenize_with_word_map_accepts_mismatched_language_under_any_fallback() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     // The fallback aligner detects against its own language
     // (En), producing `Symbol('&')` at char_index=2, word_idx=0.
     let pre = detect_oov_events(&tok, "AT&T", 1, true, unk, &Lang::En, &[])
@@ -1057,8 +1105,17 @@ mod tests {
       ),
       crate::core::OovDecision::Wildcard,
     )];
-    let result =
-      tokenize_with_word_map(&tok, "AT&T", 1, true, true, unk, &[], &Lang::En, &resolved);
+    let result = tokenize_with_word_map(
+      &tok,
+      "AT&T",
+      1,
+      Some("|"),
+      true,
+      unk,
+      &[],
+      &Lang::En,
+      &resolved,
+    );
     assert!(
       result.is_ok(),
       "Any-fallback identity check must compare positional fields \
@@ -1072,7 +1129,7 @@ mod tests {
   #[test]
   fn detect_oov_events_tracks_word_index() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     let events = detect_oov_events(&tok, "AT&T cost 43", 3, true, unk, &Lang::En, &[]).expect("ok");
     let chars: Vec<Option<char>> = events.iter().map(|e| e.char()).collect();
     let words: Vec<usize> = events.iter().map(|e| e.word_index()).collect();
@@ -1080,27 +1137,14 @@ mod tests {
     assert_eq!(words, vec![0, 2, 2]);
   }
 
-  /// Internal-skippable punct (`.`) is NOT surfaced — it's a
-  /// tokenizer-internal detail (always wildcarded at the
-  /// position).
+  /// The stops inside `U.S.A` are marks nobody reads aloud and the
+  /// vocabulary cannot spell: no event, so no policy decides them.
   #[test]
-  fn detect_oov_events_surfaces_internal_punct() {
+  fn detect_oov_events_reports_no_internal_stop() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     let events = detect_oov_events(&tok, "U.S.A", 1, true, unk, &Lang::En, &[]).expect("ok");
-    // internal-
-    // punct wildcards are now surfaced as `OovKind::InternalPunct`
-    // events so strict policies (`fail_closed_all_decisions`)
-    // can refuse them. `U.S.A` has two `.` chars.
-    let kinds: Vec<crate::core::OovKind> = events.iter().map(|e| e.kind().clone()).collect();
-    assert_eq!(
-      kinds,
-      vec![
-        crate::core::OovKind::InternalPunct('.'),
-        crate::core::OovKind::InternalPunct('.'),
-      ],
-      "U.S.A should surface 2 InternalPunct events; got {events:?}",
-    );
+    assert!(events.is_empty(), "got {events:?}");
   }
 
   /// Word-count mismatch surfaces as `TokenizationFailed`,
@@ -1108,7 +1152,7 @@ mod tests {
   #[test]
   fn detect_oov_events_word_count_mismatch_errors() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     let result = detect_oov_events(&tok, "hello world", 1, true, unk, &Lang::En, &[]);
     assert!(matches!(result, Err(EmissionsError::Tokenization(_))));
   }
@@ -1118,15 +1162,15 @@ mod tests {
   #[test]
   fn english_lowercase_word_uppercases_for_uppercase_only_vocab() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let result = tokenize_with_word_map(
       &tok,
       "hello",
       /* word_count: */ 1,
-      /* use_word_delimiter: */ true,
+      /* word_delimiter: */ Some("|"),
       /* uppercase_input: */ true,
-      /* unk_token_id: */ unk,
+      /* reserved: */ unk,
       /* wildcard_boundary_per_word: */ &[],
       &Lang::En,
       &[],
@@ -1134,7 +1178,7 @@ mod tests {
     .expect("tokenisation must succeed with uppercase projection");
 
     assert_eq!(result.token_ids.len(), 5);
-    let unk_i32 = unk.unwrap() as i32;
+    let unk_i32 = declared_unk_token_id(&tok).expect("<unk>") as i32;
     assert!(
       result.token_ids.iter().all(|&id| id != unk_i32),
       "no <unk> ids; got {:?}",
@@ -1148,41 +1192,51 @@ mod tests {
     assert_eq!(result.token_ids, expected.to_vec());
   }
 
-  /// Punctuation-only input now maps to a single trailing
-  /// wildcard token (matching WhisperX's `*` placeholder for
-  /// chars not in the model dictionary). Pre-port this returned
-  /// zero tokens because the legacy tokeniser stripped the `.`
-  /// before encoding; the new policy retains stripped chars as
-  /// wildcards so the word's audio frames still factor into the
-  /// alignment.
+  /// A word made only of marks nobody reads aloud tokenizes to
+  /// nothing, and the delimiter skips it: the words around it are
+  /// joined by one `|`, as if it were absent.
   ///
-  /// Real all-punctuation chunks short-circuit upstream — the
-  /// English normaliser returns `EmptyText` because every word
-  /// strips down to empty. So this test pins the
-  /// `tokenize_with_word_map` boundary behaviour, not what the
-  /// runner sees end-to-end.
+  /// The English normaliser strips a lone `.` itself (`EmptyText`);
+  /// this pins what tokenization does with the marks a normaliser
+  /// leaves, such as a guillemet or an ellipsis.
   #[test]
-  fn skippable_punctuation_only_yields_one_wildcard_token() {
+  fn a_word_of_silent_marks_tokenizes_to_nothing() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
+    let pipe = tok.token_to_id("|").expect("|") as i32;
 
-    let result =
+    let alone =
       tokenize_with_default_oov(&tok, ".", 1, true, true, unk, &[], &Lang::En).expect("ok");
-    assert_eq!(result.token_ids, vec![WILDCARD_TOKEN_ID]);
-    assert_eq!(result.word_idx_per_token, vec![Some(0)]);
+    assert!(alone.token_ids.is_empty(), "got {:?}", alone.token_ids);
+
+    let between = tokenize_with_default_oov(
+      &tok,
+      "hi \u{2026}\u{AB}\u{BB} yo",
+      3,
+      true,
+      true,
+      unk,
+      &[],
+      &Lang::En,
+    )
+    .expect("ok");
+    let id_of = |c: char| tok.token_to_id(&c.to_string()).unwrap() as i32;
+    assert_eq!(
+      between.token_ids,
+      vec![id_of('H'), id_of('I'), pipe, id_of('Y'), id_of('O')]
+    );
+    assert_eq!(
+      between.word_idx_per_token,
+      vec![Some(0), Some(0), None, Some(2), Some(2)]
+    );
   }
 
-  /// Internal periods strip to wildcard tokens in **source
-  /// order** (the
-  /// implementation appended internal-punct wildcards at the
-  /// end of the word, breaking WhisperX token-order parity for
-  /// dotted acronyms; the post-fix layout is [U, *, S, *, A] —
-  /// matching WhisperX's per-position `*` placeholder for
-  /// chars not in the model dictionary).
+  /// The stops of a dotted acronym are dropped: `U.S.A` tokenizes as
+  /// its letters, all of word 0, with no wildcard between them.
   #[test]
   fn internal_periods_in_abbreviation_strip_to_letters() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let result = tokenize_with_default_oov(
       &tok,
@@ -1190,35 +1244,19 @@ mod tests {
       /* word_count: */ 1,
       /* use_word_delimiter: */ true,
       /* uppercase_input: */ true,
-      /* unk_token_id: */ unk,
+      /* reserved: */ unk,
       /* wildcard_boundary_per_word: */ &[],
       &Lang::En,
     )
     .expect("U.S.A. must tokenise via per-char strip");
 
-    // 3 letter ids + 2 internal-period wildcards = 5 tokens,
-    // interleaved in source order: [U, *, S, *, A].
-    assert_eq!(result.token_ids.len(), 5);
-    let unk_i32 = unk.unwrap() as i32;
-    assert!(
-      result.token_ids.iter().all(|&id| id != unk_i32),
-      "no <unk> ids must reach the lattice; got {:?}",
-      result.token_ids
-    );
     let id_of = |c: char| tok.token_to_id(&c.to_string()).unwrap() as i32;
     assert_eq!(
       result.token_ids,
-      vec![
-        id_of('U'),
-        WILDCARD_TOKEN_ID,
-        id_of('S'),
-        WILDCARD_TOKEN_ID,
-        id_of('A'),
-      ],
-      "internal-punct wildcards must land in source order, not appended at end"
+      vec![id_of('U'), id_of('S'), id_of('A')],
+      "the stops leave no token behind"
     );
-    // All 5 tokens belong to word 0.
-    assert_eq!(result.word_idx_per_token, vec![Some(0); 5]);
+    assert_eq!(result.word_idx_per_token, vec![Some(0); 3]);
   }
 
   /// **NEW behaviour**: alphanumeric OOV chars become wildcards
@@ -1231,7 +1269,7 @@ mod tests {
   #[test]
   fn partial_oov_alphanumeric_word_uses_wildcard() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let result =
       tokenize_with_default_oov(&tok, "B2B", 1, true, true, unk, &[], &Lang::En).expect("ok");
@@ -1249,7 +1287,7 @@ mod tests {
   #[test]
   fn all_digit_word_against_uppercase_vocab_uses_wildcards() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let result =
       tokenize_with_default_oov(&tok, "1000", 1, true, true, unk, &[], &Lang::En).expect("ok");
@@ -1280,7 +1318,7 @@ mod tests {
   /// (`tokenize_with_default_oov` — alphanumeric → wildcard,
   /// pronounced → fail-closed). Callers who want the
   /// WhisperX wildcard-everything behaviour now opt in at
-  /// runtime via `wildcard_all_decisions` (see
+  /// runtime via `wildcard_all_policy` (see
   /// `whisperx_unit_parity::issue_1372_digits_comma_no_timestamps`)
   /// instead of via a Cargo feature; the cfg gate this test
   /// previously carried is gone with the removed
@@ -1288,7 +1326,7 @@ mod tests {
   #[test]
   fn ampersand_oov_drops_chunk() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let outcome = tokenize_with_default_oov(&tok, "AT&T", 1, true, true, unk, &[], &Lang::En);
     match outcome {
@@ -1326,7 +1364,7 @@ mod tests {
   #[test]
   fn accented_letter_uses_wildcard() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let result =
       tokenize_with_default_oov(&tok, "café", 1, true, true, unk, &[], &Lang::En).expect("ok");
@@ -1347,7 +1385,7 @@ mod tests {
   #[test]
   fn middle_digit_word_no_longer_drops_chunk() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let result =
       tokenize_with_default_oov(&tok, "hi 1000 world", 3, true, true, unk, &[], &Lang::En)
@@ -1366,14 +1404,14 @@ mod tests {
   #[test]
   fn separator_token_id_is_returned() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
     let pipe = tok.token_to_id("|").expect("|");
 
     let result = tokenize_with_word_map(
       &tok,
       "hello world",
       2,
-      /* use_word_delimiter: */ true,
+      /* word_delimiter: */ Some("|"),
       true,
       unk,
       /* wildcard_boundary_per_word: */ &[],
@@ -1387,13 +1425,13 @@ mod tests {
   #[test]
   fn separator_token_id_none_when_normaliser_opts_out() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let result = tokenize_with_word_map(
       &tok,
       "hello world",
       2,
-      /* use_word_delimiter: */ false,
+      /* word_delimiter: */ None,
       true,
       unk,
       /* wildcard_boundary_per_word: */ &[],
@@ -1414,7 +1452,7 @@ mod tests {
   #[test]
   fn trailing_wildcards_land_after_encoded_chars() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     // "hello" with 1 SUFFIX wildcard reported → 5 letters + 1 wildcard.
     // Trailing punctuation case: `hello"` → letters then wildcard.
@@ -1457,7 +1495,7 @@ mod tests {
   #[test]
   fn leading_wildcards_land_before_encoded_chars() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let result = tokenize_with_default_oov(
       &tok,
@@ -1494,7 +1532,7 @@ mod tests {
   #[test]
   fn paired_wildcards_bracket_encoded_chars() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let result = tokenize_with_default_oov(
       &tok,
@@ -1528,13 +1566,13 @@ mod tests {
   #[test]
   fn wildcard_boundary_per_word_length_mismatch_errors() {
     let tok = uppercase_tokenizer();
-    let unk = tok.token_to_id("<unk>");
+    let unk = &reserved(&tok);
 
     let err = tokenize_with_word_map(
       &tok,
       "hello world",
       2,
-      true,
+      Some("|"),
       true,
       unk,
       &[
@@ -1592,8 +1630,8 @@ mod tests {
       tok.encode("4", false).is_err(),
       "precondition: this vocabulary cannot encode a character outside it"
     );
-    let unk = detect_unk_token_id(&tok);
-    assert_eq!(unk, None);
+    assert_eq!(declared_unk_token_id(&tok), None);
+    let unk = &reserved(&tok);
 
     let events = detect_oov_events(&tok, "b4d", 1, true, unk, &Lang::En, &[])
       .expect("an unspellable character is an event, never an error");
@@ -1610,11 +1648,12 @@ mod tests {
   #[test]
   fn tokenize_with_word_map_applies_the_decision_on_a_vocabulary_without_unk() {
     let tok = word_level_tokenizer(&LETTERS, false);
-    let events = detect_oov_events(&tok, "b4d", 1, true, None, &Lang::En, &[]).expect("detect");
+    let unk = &reserved(&tok);
+    let events = detect_oov_events(&tok, "b4d", 1, true, unk, &Lang::En, &[]).expect("detect");
 
-    let wildcard = crate::core::wildcard_all_decisions(&events);
+    let wildcard = crate::core::oov::resolve_events(&events, crate::core::wildcard_all_policy);
     let tokenized =
-      tokenize_with_word_map(&tok, "b4d", 1, false, true, None, &[], &Lang::En, &wildcard)
+      tokenize_with_word_map(&tok, "b4d", 1, None, true, unk, &[], &Lang::En, &wildcard)
         .expect("a character the caller decided tokenizes");
     let id_of = |token: &str| tok.token_to_id(token).expect("in the alphabet") as i32;
     assert_eq!(
@@ -1622,8 +1661,8 @@ mod tests {
       [id_of("B"), WILDCARD_TOKEN_ID, id_of("D")]
     );
 
-    let refused = crate::core::fail_closed_all_decisions(&events);
-    let err = tokenize_with_word_map(&tok, "b4d", 1, false, true, None, &[], &Lang::En, &refused)
+    let refused = crate::core::oov::resolve_events(&events, crate::core::fail_closed_all_policy);
+    let err = tokenize_with_word_map(&tok, "b4d", 1, None, true, unk, &[], &Lang::En, &refused)
       .expect_err("a refused character refuses the chunk");
     assert!(
       matches!(err, EmissionsError::SemanticOutOfVocab(_)),
@@ -1638,7 +1677,7 @@ mod tests {
   fn detect_oov_events_reports_only_what_a_letters_only_alphabet_cannot_spell() {
     for unk_entry in [false, true] {
       let tok = word_level_tokenizer(&LETTERS, unk_entry);
-      let unk = detect_unk_token_id(&tok);
+      let unk = &reserved(&tok);
       let events = detect_oov_events(&tok, "Good <morning>", 2, true, unk, &Lang::En, &[])
         .expect("an unspellable character is an event, never an error");
       assert_eq!(
@@ -1653,25 +1692,27 @@ mod tests {
   }
 
   /// How a character was classified before the vocabulary was asked:
-  /// `encode` the projected character alone; nothing, or the unknown
-  /// token, meant unspellable (`None`), anything else was the ids
-  /// tokenization pushed.
-  fn encode_probe(tok: &Tokenizer, projected: char, unk: Option<u32>) -> Option<Vec<u32>> {
+  /// `encode` the projected character alone; nothing, or a reserved id
+  /// (the unknown token among them), meant unspellable (`None`), anything
+  /// else was the ids tokenization pushed.
+  fn encode_probe(tok: &Tokenizer, projected: char, reserved: &ReservedIds) -> Option<Vec<u32>> {
     let encoding = tok
       .encode(projected.to_string().as_str(), false)
       .expect("a vocabulary that holds its unknown token encodes every character");
     let ids = encoding.get_ids();
-    let unspellable = ids.is_empty() || unk.is_some_and(|unk| ids.contains(&unk));
+    let unspellable = ids.is_empty() || ids.iter().any(|&id| reserved.contains(id));
     (!unspellable).then(|| ids.to_vec())
   }
 
-  /// `detect_oov_events` as it was before it asked the vocabulary: the
-  /// same walk, each character classified by [`encode_probe`].
-  fn events_before(
+  /// `detect_oov_events` with each character classified by
+  /// [`encode_probe`] instead of the vocabulary: the same walk, and a
+  /// mark nobody reads aloud that the probe cannot spell is dropped, as
+  /// detection drops it.
+  fn events_by_encode_probe(
     tok: &Tokenizer,
     normalized: &str,
     uppercase_input: bool,
-    unk: Option<u32>,
+    unk: &ReservedIds,
     boundaries: &[WildcardBoundary],
   ) -> Vec<OovEvent> {
     let words: Vec<&str> = normalized.split_whitespace().collect();
@@ -1696,15 +1737,13 @@ mod tests {
         } else {
           ch
         };
-        let kind = if is_skippable_internal_punct(ch) {
-          Some(OovKind::InternalPunct(ch))
-        } else if encode_probe(tok, projected, unk).is_none() {
-          Some(OovKind::Symbol(ch))
-        } else {
-          None
-        };
-        if let Some(kind) = kind {
-          events.push(OovEvent::new(kind, char_index, word_index, Lang::En));
+        if encode_probe(tok, projected, unk).is_none() && !is_silent_mark(ch) {
+          events.push(OovEvent::new(
+            OovKind::Symbol(ch),
+            char_index,
+            word_index,
+            Lang::En,
+          ));
         }
         char_index += 1;
       }
@@ -1724,24 +1763,17 @@ mod tests {
   }
 
   /// For a vocabulary that holds its unknown token, asking the vocabulary
-  /// changes nothing. Every character a whitespace-split word can hold is
-  /// classified as the encode probe classified it and tokenizes to the
-  /// same id, and whole-text events are identical. Checked against the
-  /// bundled wav2vec2-base-960h tokenizer (added tokens, a `Replace`
-  /// normalizer, a per-character `Split`) and two plain `WordLevel`
-  /// alphabets.
+  /// rather than the encoder changes no classification. Every character a
+  /// whitespace-split word can hold is spelled exactly when the encode
+  /// probe spelled it and tokenizes to the same id, a mark nobody reads
+  /// aloud that neither can spell is dropped by both, and whole-text
+  /// events are identical. Checked against the bundled wav2vec2-base-960h
+  /// tokenizer (added tokens, a `Replace` normalizer, a per-character
+  /// `Split`) and two plain `WordLevel` alphabets.
   #[test]
   fn events_and_tokens_are_unchanged_when_the_vocabulary_holds_its_unk_token() {
-    let bundled = load_tokenizer_bytes_with_compat(
-      include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/assets/wav2vec2_base_960h_tokenizer.json"
-      )),
-      "bundled wav2vec2-base-960h",
-    )
-    .expect("the bundled tokenizer loads");
     let vocabularies = [
-      ("bundled wav2vec2-base-960h", bundled),
+      ("bundled wav2vec2-base-960h", bundled_tokenizer()),
       ("uppercase", uppercase_tokenizer()),
       ("letters", word_level_tokenizer(&LETTERS, true)),
     ];
@@ -1762,8 +1794,11 @@ mod tests {
       "tab|pipe e\u{301}clair",
     ];
     for (name, tok) in &vocabularies {
-      let unk = detect_unk_token_id(tok);
-      assert!(unk.is_some(), "{name}: holds its unknown token");
+      assert!(
+        declared_unk_token_id(tok).is_some(),
+        "{name}: holds its unknown token"
+      );
+      let unk = &reserved(tok);
       for uppercase_input in [false, true] {
         for &ch in &chars {
           let text = ch.to_string();
@@ -1771,15 +1806,16 @@ mod tests {
             detect_oov_events(tok, &text, 1, uppercase_input, unk, &Lang::En, &[]).expect("detect");
           assert_eq!(
             events,
-            events_before(tok, &text, uppercase_input, unk, &[]),
+            events_by_encode_probe(tok, &text, uppercase_input, unk, &[]),
             "{name}: {ch:?}, uppercase_input = {uppercase_input}"
           );
-          let decisions = crate::core::wildcard_all_decisions(&events);
+          let decisions =
+            crate::core::oov::resolve_events(&events, crate::core::wildcard_all_policy);
           let tokenized = tokenize_with_word_map(
             tok,
             &text,
             1,
-            false,
+            None,
             uppercase_input,
             unk,
             &[],
@@ -1793,10 +1829,9 @@ mod tests {
             ch
           };
           let before: Vec<i32> = match encode_probe(tok, projected, unk) {
-            Some(ids) if !is_skippable_internal_punct(ch) => {
-              ids.iter().map(|&id| id as i32).collect()
-            }
-            _ => vec![WILDCARD_TOKEN_ID],
+            Some(ids) => ids.iter().map(|&id| id as i32).collect(),
+            None if is_silent_mark(ch) => Vec::new(),
+            None => vec![WILDCARD_TOKEN_ID],
           };
           assert_eq!(
             tokenized.token_ids(),
@@ -1819,11 +1854,214 @@ mod tests {
             .expect("detect");
             assert_eq!(
               events,
-              events_before(tok, text, uppercase_input, unk, &boundaries),
+              events_by_encode_probe(tok, text, uppercase_input, unk, &boundaries),
               "{name}: {text:?}, uppercase_input = {uppercase_input}"
             );
           }
         }
+      }
+    }
+  }
+
+  // -- punctuation is never an alignment target ---------------
+
+  /// The bundled wav2vec2-base-960h tokenizer, loaded as `Aligner` loads it.
+  fn bundled_tokenizer() -> Tokenizer {
+    load_tokenizer_bytes_with_compat(
+      include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/wav2vec2_base_960h_tokenizer.json"
+      )),
+      "bundled wav2vec2-base-960h",
+    )
+    .expect("the bundled tokenizer loads")
+  }
+
+  /// An OOV policy: one decision per event, in order.
+  type Policy = fn(&OovEvent) -> crate::core::OovDecision;
+
+  /// The three shipped policies.
+  const POLICIES: [Policy; 3] = [
+    crate::core::default_oov_policy,
+    crate::core::wildcard_all_policy,
+    crate::core::fail_closed_all_policy,
+  ];
+
+  /// `text` through `normalizer`, detection, `policy` and tokenization, in
+  /// the order `AlignerCore::prepare` runs them.
+  fn prepare_tokens(
+    tok: &Tokenizer,
+    normalizer: &impl TextNormalizer,
+    text: &str,
+    language: &Lang,
+    policy: Policy,
+  ) -> (Vec<OovEvent>, Result<TokenizedText, EmissionsError>) {
+    let normalized = normalizer.normalize(text).expect("the text normalizes");
+    let words = normalized.original_words().len();
+    let uppercase_input = detect_vocab_uppercase_only(tok);
+    let unk = &reserved(tok);
+    let events = detect_oov_events(
+      tok,
+      normalized.normalized(),
+      words,
+      uppercase_input,
+      unk,
+      language,
+      normalized.wildcard_boundary_per_word(),
+    )
+    .expect("detect");
+    let tokenized = tokenize_with_word_map(
+      tok,
+      normalized.normalized(),
+      words,
+      normalizer.use_word_delimiter().then_some("|"),
+      uppercase_input,
+      unk,
+      normalized.wildcard_boundary_per_word(),
+      language,
+      &crate::core::oov::resolve_events(&events, policy),
+    );
+    (events, tokenized)
+  }
+
+  /// **Punctuated text yields no event for its marks, under every policy.**
+  /// A mark nobody reads aloud has no acoustic realization: the English
+  /// normalizer strips the ones at a word's edge without padding the word,
+  /// keeps the ones inside a word in that word (`well-known` is one word),
+  /// and tokenization drops them. The fail-closed policy finds nothing to
+  /// refuse, and every policy tokenizes exactly the words.
+  #[test]
+  fn punctuated_text_yields_no_event_for_its_marks_under_every_policy() {
+    let tok = bundled_tokenizer();
+    let english = LatinNormalizer::new(Lang::En);
+    let written = "\u{201C}Hello,\u{201D} she said \u{2014} isn\u{2019}t it (really) well-known? \
+                   \u{AB}Yes\u{2026}\u{BB} *U.S.A.*";
+    let (_, words) = prepare_tokens(
+      &tok,
+      &english,
+      "hello she said isn't it really wellknown yes usa",
+      &Lang::En,
+      crate::core::fail_closed_all_policy,
+    );
+    let words = words.expect("the words alone tokenize");
+    for policy in POLICIES {
+      let (events, tokenized) = prepare_tokens(&tok, &english, written, &Lang::En, policy);
+      assert!(events.is_empty(), "got {events:?}");
+      let tokenized = tokenized.expect("every policy tokenizes punctuated text");
+      assert_eq!(tokenized.token_ids(), words.token_ids());
+      assert_eq!(tokenized.word_idx_per_token(), words.word_idx_per_token());
+    }
+  }
+
+  /// A per-character normalizer keeps a mark it does not know as a word of
+  /// its own. That word tokenizes to nothing under every policy, so a Chinese
+  /// sentence with book-title marks, dashes and quotes aligns its glyphs.
+  #[test]
+  fn a_mark_a_per_character_normalizer_keeps_is_no_event() {
+    let tok = word_level_tokenizer(&["\u{4F60}", "\u{597D}", "\u{4E16}", "\u{754C}"], true);
+    let id_of = |token: &str| tok.token_to_id(token).expect("in the alphabet") as i32;
+    let written =
+      "\u{300A}\u{4F60}\u{597D}\u{300B}\u{2014}\u{2014}\u{201C}\u{4E16}\u{754C}\u{201D}";
+    for policy in POLICIES {
+      let (events, tokenized) =
+        prepare_tokens(&tok, &ChineseNormalizer::new(), written, &Lang::Zh, policy);
+      assert!(events.is_empty(), "got {events:?}");
+      let tokenized = tokenized.expect("every policy tokenizes");
+      assert_eq!(
+        tokenized.token_ids(),
+        [
+          id_of("\u{4F60}"),
+          id_of("\u{597D}"),
+          id_of("\u{4E16}"),
+          id_of("\u{754C}")
+        ]
+      );
+      assert_eq!(
+        tokenized.word_idx_per_token(),
+        [Some(1), Some(2), Some(7), Some(8)]
+      );
+    }
+  }
+
+  /// **`FailClosed` still refuses an unspellable spoken character, by name.**
+  /// A mark read aloud, a symbol and a digit are each an event, and the
+  /// refusal names the character. In a punctuated sentence only the spoken
+  /// characters are events.
+  #[test]
+  fn fail_closed_refuses_an_unspellable_spoken_character_by_name() {
+    let tok = bundled_tokenizer();
+    let unk = &reserved(&tok);
+    let spoken = READ_ALOUD
+      .into_iter()
+      .chain(['$', '+', '<', '=', '^', '`', '~', '\u{A9}', '\u{20AC}', '4']);
+    for ch in spoken {
+      let text = format!("a{ch}b");
+      let events = detect_oov_events(&tok, &text, 1, true, unk, &Lang::En, &[]).expect("detect");
+      assert_eq!(
+        events,
+        vec![OovEvent::new(OovKind::Symbol(ch), 1, 0, Lang::En)],
+        "{ch:?}"
+      );
+      let refused = tokenize_with_word_map(
+        &tok,
+        &text,
+        1,
+        Some("|"),
+        true,
+        unk,
+        &[],
+        &Lang::En,
+        &crate::core::oov::resolve_events(&events, crate::core::fail_closed_all_policy),
+      );
+      match refused {
+        Err(EmissionsError::SemanticOutOfVocab(failure)) => assert!(
+          failure.message().contains(&format!("{ch:?}")),
+          "the refusal names {ch:?}: {}",
+          failure.message()
+        ),
+        other => panic!("{ch:?}: expected SemanticOutOfVocab; got {other:?}"),
+      }
+    }
+
+    let english = LatinNormalizer::new(Lang::En);
+    let (events, refused) = prepare_tokens(
+      &tok,
+      &english,
+      "The AT&T deal, 50% done.",
+      &Lang::En,
+      crate::core::fail_closed_all_policy,
+    );
+    let decided: Vec<Option<char>> = events.iter().map(OovEvent::char).collect();
+    assert_eq!(decided, [Some('&'), Some('5'), Some('0'), Some('%')]);
+    match refused {
+      Err(EmissionsError::SemanticOutOfVocab(failure)) => assert!(
+        failure.message().contains("'&'"),
+        "the refusal names the ampersand: {}",
+        failure.message()
+      ),
+      other => panic!("expected SemanticOutOfVocab; got {other:?}"),
+    }
+  }
+
+  /// **`don’t` tokenizes as `don't` on the bundled wav2vec2-base-960h
+  /// vocabulary.** The English normalizer folds a curly apostrophe inside a
+  /// word to the straight one the vocabulary spells, so it stays a token
+  /// rather than a mark nobody reads aloud.
+  #[test]
+  fn a_curly_apostrophe_inside_a_word_tokenizes_as_the_straight_one() {
+    let tok = bundled_tokenizer();
+    let english = LatinNormalizer::new(Lang::En);
+    let id_of = |token: &str| tok.token_to_id(token).expect("in the vocabulary") as i32;
+    let spelled = [id_of("D"), id_of("O"), id_of("N"), id_of("'"), id_of("T")];
+    for written in ["don\u{2019}t", "don't"] {
+      for policy in POLICIES {
+        let (events, tokenized) = prepare_tokens(&tok, &english, written, &Lang::En, policy);
+        assert!(events.is_empty(), "{written:?}: {events:?}");
+        assert_eq!(
+          tokenized.expect("tokenizes").token_ids(),
+          spelled,
+          "{written:?}"
+        );
       }
     }
   }

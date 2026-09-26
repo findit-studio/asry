@@ -32,10 +32,10 @@ use core::{
   time::Duration,
 };
 
-use smol_str::format_smolstr;
+use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
-  core::{AlignmentResult, OovEvent, ResolvedOov},
+  core::{OovDetection, OovResolution, UnalignedCause, UnitAlignment, UnitJob, UnitOutcome},
   runner::aligner::{
     algorithm::{
       compose::DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -43,11 +43,11 @@ use crate::{
       errors::{EmissionsError, EmissionsFailure},
     },
     core::{
-      AlignerCore, AlignerCoreLoadError, PreparedChunk, capture_vocab_size, detect_blank_token_id,
-      detect_unk_token_id, detect_vocab_uppercase_only, load_tokenizer_bytes_with_compat,
-      validate_word_delimiter_present,
+      AlignerCore, AlignerCoreLoadError, PreparedChunk, WAV2VEC2_RECEPTIVE_FIELD_SAMPLES,
+      WAV2VEC2_WORD_DELIMITER, capture_vocab_size, declared_unk_token_id, detect_blank_token_id,
+      load_tokenizer_bytes_with_compat, validate_word_delimiter_present,
     },
-    emissions_api::{Emissions, OutputClock, SpeechCoverage, SpeechSpans},
+    emissions_api::{Emissions, EncoderOutput, OutputClock, SpeechCoverage, SpeechSpans},
     normalizer::DynTextNormalizer,
     normalizers::default_normalizer_for,
   },
@@ -95,7 +95,9 @@ fn to_emissions_error(err: WorkFailure, stage: Stage) -> EmissionsError {
       }
       AlignmentError::SemanticOutOfVocab(ref f) => EmissionsError::SemanticOutOfVocab(neutral(f)),
       AlignmentError::NoAlignmentPath(ref f) => EmissionsError::NoAlignmentPath(neutral(f)),
-      AlignmentError::Aborted(ref f) => EmissionsError::Aborted(neutral(f)),
+      AlignmentError::Aborted(ref f) | AlignmentError::Abandoned(ref f) => {
+        EmissionsError::Aborted(neutral(f))
+      }
     },
     // No worker and no pool behind a bare call: the only way the core
     // raises this is the cooperative `abort_flag`.
@@ -130,7 +132,7 @@ fn load_error(err: AlignerCoreLoadError) -> EmissionsError {
 /// Holds everything `Aligner` holds except the `ort::Session` — the same
 /// tokenizer, the same normalizer, the same guards, the same validators,
 /// the same composition. Not a parallel implementation: literally the
-/// same [`AlignerCore`]. And, like the ORT path, it is cancellable
+/// same `AlignerCore`. And, like the ORT path, it is cancellable
 /// throughout: both [`prepare`](Self::prepare) and [`finish`](Self::finish)
 /// thread the caller's abort flag straight into that core, so a watchdog
 /// that fires mid-`prepare` stops it before the O(n) scan / mask /
@@ -157,6 +159,9 @@ impl EmissionsAligner {
       tokenizer_json: tokenizer_json.to_vec(),
       normalizer: None,
       hop_samples: DEFAULT_HOP_SAMPLES,
+      word_delimiter: SmolStr::new_static(WAV2VEC2_WORD_DELIMITER),
+      letter_case: LetterCase::Upper,
+      receptive_field_samples: WAV2VEC2_RECEPTIVE_FIELD_SAMPLES,
       min_speech_coverage: SpeechCoverage::DEFAULT,
       max_intra_silent_run: DEFAULT_MAX_INTRA_SILENT_RUN,
       blank_token_id: None,
@@ -186,6 +191,29 @@ impl EmissionsAligner {
     self.core.hop_samples()
   }
 
+  /// The token tokenization puts between words, as built.
+  #[must_use]
+  pub fn word_delimiter(&self) -> &str {
+    self.core.word_delimiter()
+  }
+
+  /// How tokenization looks letters up in the vocabulary, as built.
+  #[must_use]
+  pub const fn letter_case(&self) -> LetterCase {
+    if self.core.vocab_uppercase_only() {
+      LetterCase::Upper
+    } else {
+      LetterCase::AsWritten
+    }
+  }
+
+  /// The length, in 16 kHz samples, `prepare` zero-pads a shorter chunk
+  /// to, as built.
+  #[must_use]
+  pub const fn receptive_field_samples(&self) -> NonZeroU32 {
+    self.core.receptive_field_samples()
+  }
+
   /// The language this aligner was built for.
   #[must_use]
   pub const fn language(&self) -> &Lang {
@@ -207,18 +235,24 @@ impl EmissionsAligner {
   /// Detect out-of-vocabulary characters in `text`, as data — no policy
   /// decision is made.
   ///
-  /// Resolve the events with [`default_oov_decisions`], [`wildcard_all_decisions`],
-  /// [`fail_closed_all_decisions`], or your own policy, then hand the
-  /// result to [`prepare`](Self::prepare).
+  /// Returns the one way to decide them: an [`OovDetection`] bound to
+  /// `text` and to this aligner. Decide it with [`default_oov_policy`],
+  /// [`wildcard_all_policy`], [`fail_closed_all_policy`], or your own
+  /// closure, then hand the [`OovResolution`] to
+  /// [`prepare`](Self::prepare) with the same text: `prepare` refuses a
+  /// resolution detected in another text or by another aligner. A unit of
+  /// a `Transcriber`'s alignment command is detected with
+  /// [`detect_oov_unit`](Self::detect_oov_unit) instead:
+  /// [`align_unit`](Self::align_unit) takes no text's resolution.
   ///
   /// Note what is NOT an argument: the tokenizer, the word count, the
   /// uppercase flag, the unk id, the boundary map. Every one of those was
   /// a positional parameter on the helper this replaces, and every one of
   /// them was a way to get it wrong.
   ///
-  /// [`default_oov_decisions`]: crate::core::oov::default_oov_decisions
-  /// [`wildcard_all_decisions`]: crate::core::oov::wildcard_all_decisions
-  /// [`fail_closed_all_decisions`]: crate::core::oov::fail_closed_all_decisions
+  /// [`default_oov_policy`]: crate::core::oov::default_oov_policy
+  /// [`wildcard_all_policy`]: crate::core::oov::wildcard_all_policy
+  /// [`fail_closed_all_policy`]: crate::core::oov::fail_closed_all_policy
   ///
   /// # Errors
   ///
@@ -228,17 +262,60 @@ impl EmissionsAligner {
   /// boundary map). A character the vocabulary cannot spell is an event,
   /// never an error: detection looks each character up in the vocabulary
   /// and never runs the tokenizer's `encode`. Punctuation-only input
-  /// yields an empty vec, not an error.
-  pub fn detect_oov(&self, text: &str) -> Result<Vec<OovEvent>, EmissionsError> {
-    self
+  /// yields no events, not an error.
+  pub fn detect_oov(&self, text: &str) -> Result<OovDetection, EmissionsError> {
+    let events = self
       .core
       .detect_oov(text)
+      .map_err(|e| to_emissions_error(e, Stage::Prepare))?;
+    Ok(OovDetection::of_text(
+      text,
+      self.core.language().clone(),
+      events,
+      self.core.id().get(),
+    ))
+  }
+
+  /// Detect out-of-vocabulary characters in one unit of an alignment
+  /// request, in the unit's own language: the one detection
+  /// [`align_unit`](Self::align_unit) takes for that job.
+  ///
+  /// The detection is bound to the job (the unit of its request) and to
+  /// this aligner, and its events carry the job's requested language, the
+  /// key its policy decides on.
+  ///
+  /// # Errors
+  ///
+  /// [`EmissionsError::Tokenization`] for a job in another language than
+  /// this aligner's: a unit is aligned by an aligner of its language, or
+  /// read as the multilingual fallback by name
+  /// ([`detect_oov_unit_as_fallback`](Self::detect_oov_unit_as_fallback));
+  /// [`EmissionsError::Normalization`] if the normalizer rejects the text.
+  pub fn detect_oov_unit(&self, job: &UnitJob) -> Result<OovDetection, EmissionsError> {
+    self
+      .core
+      .detect_job(job, false)
+      .map_err(|e| to_emissions_error(e, Stage::Prepare))
+  }
+
+  /// As [`detect_oov_unit`](Self::detect_oov_unit), with this aligner read
+  /// as the multilingual fallback for a unit in any language, as the pool
+  /// reads a unit with its `AlignerKey::Any` aligner: the events carry the
+  /// unit's requested language.
+  ///
+  /// # Errors
+  ///
+  /// [`EmissionsError::Normalization`] if the normalizer rejects the text.
+  pub fn detect_oov_unit_as_fallback(&self, job: &UnitJob) -> Result<OovDetection, EmissionsError> {
+    self
+      .core
+      .detect_job(job, true)
       .map_err(|e| to_emissions_error(e, Stage::Prepare))
   }
 
   /// Steps 0-2: non-finite sample scan → speech mask → zero non-speech →
-  /// pad to wav2vec2's 400-sample receptive field → normalise →
-  /// tokenise.
+  /// pad to the stated receptive field (400 samples, wav2vec2's, by
+  /// default) → normalise → tokenise.
   ///
   /// Feed [`PreparedChunk::encoder_input`] to your encoder — it is the
   /// EXACT buffer `Aligner` hands ORT. You do not re-implement the mask,
@@ -258,20 +335,19 @@ impl EmissionsAligner {
   /// mask, the normalise, and the tokenise, so cancellation lands before
   /// each O(n) stage rather than after its work is already spent.
   ///
-  /// [`EmissionsError::Tokenization`] also covers a cross-language
-  /// `oov_decisions` payload: every [`ResolvedOov`] must carry THIS
-  /// aligner's language. Positional matching deliberately ignores
-  /// language, so a foreign decision at a matching position would
-  /// otherwise apply another language's wildcard / fail-closed policy
-  /// silently. This check runs FIRST — ahead of the first abort poll — so a
-  /// malformed payload is still reported as the caller bug it is even when
-  /// `abort_flag` is already set; cancellation does not mask it.
+  /// [`EmissionsError::Tokenization`] also covers a `resolution` this
+  /// aligner did not detect in exactly `text`: decisions apply only to the
+  /// text and the aligner their detection read. This check runs FIRST —
+  /// ahead of the first abort poll — so a crossed resolution is still
+  /// reported as the caller bug it is even when `abort_flag` is already
+  /// set; cancellation does not mask it. `resolution` is consumed, so it
+  /// applies once.
   pub fn prepare<'a>(
     &self,
     samples: &[f32],
     speech: &SpeechSpans,
     text: &'a str,
-    oov_decisions: &[ResolvedOov],
+    resolution: OovResolution,
     abort_flag: &AtomicBool,
   ) -> Result<PreparedChunk<'a>, EmissionsError> {
     // Cancellable throughout, symmetric with `finish`. `prepare` is the
@@ -289,6 +365,10 @@ impl EmissionsAligner {
     // `Any` fallback: this aligner's own language IS the key the caller's
     // OOV policy must have been resolved against. The check itself is the
     // core's — see `AlignerCore::prepare`.
+    let oov_decisions = self
+      .core
+      .accept(&resolution, text)
+      .map_err(|e| to_emissions_error(e, Stage::Prepare))?;
     let expected = self.core.language().clone();
     self
       .core
@@ -296,10 +376,22 @@ impl EmissionsAligner {
       .map_err(|e| to_emissions_error(e, Stage::Prepare))
   }
 
-  /// Steps 3-9. **Consumes `prepared`**, so a chunk cannot be finished
-  /// twice.
+  /// Steps 3-9. **Consumes `prepared` and `emissions`**, so a chunk cannot
+  /// be finished twice and emissions cannot be reused.
   ///
-  /// Runs [`validate_stride_extent`] and [`validate_vocab_dim`] — neither
+  /// `emissions` must be the ones made through `prepared`
+  /// ([`PreparedChunk::encode_with`]): emissions made through
+  /// another chunk are refused by name before a frame is read, whatever
+  /// their shape.
+  ///
+  /// Returns the text's one [`UnitAlignment`]: its aligned words, or
+  /// `Unaligned` with the reason it has none (`NoAlignableText` for a
+  /// trivial chunk, `NoSurvivingWords` when the speech gates kept no
+  /// word). It answers no alignment command: a unit of a `Transcriber`'s
+  /// command is aligned with [`align_unit`](Self::align_unit), which
+  /// consumes the unit's job.
+  ///
+  /// Runs the stride-extent and vocab-width checks — neither
   /// of which the emissions seam has ever run — then the pinned
   /// trellis → beam → merge_repeats → merge_words, then derives
   /// `samples_per_frame` ONCE and feeds it to both the speech-frame mask
@@ -307,23 +399,29 @@ impl EmissionsAligner {
   ///
   /// # Errors
   ///
-  /// [`EmissionsError::StrideMismatch`] if `emissions.frames() · hop` is
-  /// outside the chunk's real extent ± 2 frames — which also catches
-  /// pairing `prepared` with emissions from materially different audio;
+  /// [`EmissionsError::StrideMismatch`] if `emissions.frames()` is not a
+  /// frame count the declared front end gives for
+  /// [`PreparedChunk::encoder_input`]: from the `floor((L - rf) / hop) + 1`
+  /// frames of a valid convolution to the `floor(L / hop) + 1` of one that
+  /// pads its input, for input length `L`, receptive field `rf` and hop
+  /// `hop`. That also catches pairing `prepared` with emissions from
+  /// materially different audio;
   /// [`EmissionsError::VocabMismatch`] if `emissions.vocab()` disagrees
   /// with [`vocab_size`](Self::vocab_size); [`EmissionsError::Config`]
   /// if the blank id does not fit the vocab;
   /// [`EmissionsError::NoAlignmentPath`] if the lattice admits no finite
   /// path; [`EmissionsError::Aborted`] if `abort_flag` is observed set;
   /// [`EmissionsError::AlignerMismatch`] if `prepared` came from a
-  /// *different* `EmissionsAligner`.
+  /// *different* `EmissionsAligner`;
+  /// [`EmissionsError::PreparationMismatch`] if `emissions` were made
+  /// through another chunk than `prepared`.
   pub fn finish(
     &self,
     prepared: PreparedChunk<'_>,
-    emissions: &Emissions,
+    emissions: Emissions,
     clock: OutputClock,
     abort_flag: &AtomicBool,
-  ) -> Result<AlignmentResult, EmissionsError> {
+  ) -> Result<UnitAlignment, EmissionsError> {
     // ——— The chunk must be OURS ———
     //
     // Ahead of everything else, including the trivial short-circuit: a
@@ -348,11 +446,30 @@ impl EmissionsAligner {
       )));
     }
 
+    // ——— The emissions must answer THIS chunk ———
+    //
+    // Emissions are made through the chunk whose encoder output they are,
+    // and carry that preparation's identity. Checked before a frame is
+    // read, and before the trivial short-circuit, for the reason the
+    // aligner check above is: two chunks of one aligner, with the same
+    // shape, would otherwise trade tensors and align each one's tokens to
+    // the other's audio.
+    if emissions.preparation() != prepared.preparation() {
+      return Err(EmissionsError::PreparationMismatch(EmissionsFailure::new(
+        SmolStr::new_static(
+          "these Emissions were made through another PreparedChunk. Emissions answer the one \
+ chunk they were made through, whatever their shape: make them with \
+ `prepared.encode_with` on the chunk you \
+ finish.",
+        ),
+      )));
+    }
+
     // A trivial chunk never saw the encoder, so there is nothing to
     // validate the emissions against. Short-circuit exactly as the ORT
     // path does.
     if prepared.is_trivial() {
-      return Ok(AlignmentResult::new(Vec::new()));
+      return Ok(UnitAlignment::Unaligned(UnalignedCause::NoAlignableText));
     }
 
     // ——— The two checks the seam has NEVER run ———
@@ -368,7 +485,8 @@ impl EmissionsAligner {
     validate_stride_extent(
       emissions.frames(),
       self.core.hop_samples().get(),
-      prepared.real_samples(),
+      self.core.receptive_field_samples().get(),
+      prepared.encoder_input().len(),
       language,
     )
     .map_err(|e| EmissionsError::StrideMismatch(work_failure_message(e)))?;
@@ -395,6 +513,101 @@ impl EmissionsAligner {
   }
 }
 
+impl EmissionsAligner {
+  /// Align one unit of an alignment request end to end, answering the unit
+  /// with what came of it: [`prepare`](Self::prepare) the job's own audio
+  /// and text, run `encoder` on the prepared input (as
+  /// [`PreparedChunk::encode_with`] does), and [`finish`](Self::finish).
+  ///
+  /// `job` is one of the command's `AlignmentRequest::take_units()`, and
+  /// `resolution` is this aligner's
+  /// [`detect_oov_unit(&job)`](Self::detect_oov_unit) (or
+  /// [`detect_oov_unit_as_fallback`](Self::detect_oov_unit_as_fallback)),
+  /// decided: bound to the job, the unit and its requested language, it is
+  /// the only resolution this method takes. The job carries
+  /// its unit's text, audio (the chunk's, or the run's slice of it),
+  /// sub-VAD-segments and place in the stream (the output clock), so the
+  /// outcome answers the unit it was computed from, and
+  /// `AlignmentRequest::aligned` accepts it for that unit only. A trivial
+  /// unit's encoder is not called.
+  ///
+  /// A data-dependent failure (no alignment path, a character the policy
+  /// refused) is the unit's outcome, `Unaligned(Failed(..))`, as on the
+  /// pool.
+  ///
+  /// # Errors
+  ///
+  /// What `encoder` returns, and every other [`EmissionsError`] of
+  /// `prepare`, `encode_with` and `finish`, converted into `E`. The job is
+  /// consumed; answer the command with `request.failed(failure)`.
+  pub fn align_unit<E: From<EmissionsError>>(
+    &self,
+    job: UnitJob,
+    resolution: OovResolution,
+    encoder: impl FnOnce(&[f32]) -> Result<EncoderOutput, E>,
+    abort_flag: &AtomicBool,
+  ) -> Result<UnitOutcome, E> {
+    let place = job.place();
+    let invalid = |error: crate::runner::aligner::emissions_api::SpanError| {
+      EmissionsError::Config(EmissionsFailure::new(format_smolstr!(
+        "the unit's place in the stream is invalid: {error}"
+      )))
+    };
+    let speech = SpeechSpans::from_time_ranges(&place.sub_segments).map_err(invalid)?;
+    let clock = OutputClock::new(
+      place.first_sample_in_stream,
+      place.output_tb,
+      place.base_pts_out_anchor,
+    )
+    .map_err(invalid)?;
+    // The resolution must be this aligner's detection of this very job,
+    // checked before anything is tokenized, and its decisions are keyed on
+    // the job's requested language, never this aligner's.
+    let decisions = self
+      .core
+      .accept_job(&resolution, &job)
+      .map_err(|e| to_emissions_error(e, Stage::Prepare))?;
+    let prepared = match self
+      .core
+      .prepare(
+        job.samples(),
+        &speech,
+        job.text(),
+        decisions,
+        job.language(),
+        abort_flag,
+      )
+      .map_err(|e| to_emissions_error(e, Stage::Prepare))
+    {
+      Ok(prepared) => prepared,
+      Err(error) => return unit_failure(job, error),
+    };
+    let emissions = prepared.encode_with(encoder)?;
+    match self.finish(prepared, emissions, clock, abort_flag) {
+      Ok(alignment) => Ok(job.answer(alignment)),
+      Err(error) => unit_failure(job, error),
+    }
+  }
+}
+
+/// `error` for the unit `job`: its outcome when it is data-dependent (no
+/// alignment path, a character the policy refused), as on the pool, else
+/// the error.
+fn unit_failure<E: From<EmissionsError>>(
+  job: UnitJob,
+  error: EmissionsError,
+) -> Result<UnitOutcome, E> {
+  let language = job.language().clone();
+  let failure =
+    |f: &EmissionsFailure| crate::types::AlignmentFailure::new(f.message().clone(), language);
+  let cause = match &error {
+    EmissionsError::NoAlignmentPath(f) => AlignmentError::NoAlignmentPath(failure(f)),
+    EmissionsError::SemanticOutOfVocab(f) => AlignmentError::SemanticOutOfVocab(failure(f)),
+    _ => return Err(error.into()),
+  };
+  Ok(job.answer(UnitAlignment::Unaligned(UnalignedCause::Failed(cause))))
+}
+
 /// Pull the diagnostic out of a `WorkFailure` the validators produced.
 fn work_failure_message(err: WorkFailure) -> EmissionsFailure {
   match err {
@@ -405,21 +618,67 @@ fn work_failure_message(err: WorkFailure) -> EmissionsFailure {
       | AlignmentError::NoAlignmentPath(f)
       | AlignmentError::EmptyText(f)
       | AlignmentError::SemanticOutOfVocab(f)
-      | AlignmentError::Aborted(f),
+      | AlignmentError::Aborted(f)
+      | AlignmentError::Abandoned(f),
     ) => EmissionsFailure::new(f.message().clone()),
     other => EmissionsFailure::new(format_smolstr!("{other:?}")),
   }
 }
 
+/// How tokenization looks a letter up in the vocabulary.
+///
+/// Stated, never inferred from the vocabulary: the caller asserts which
+/// case its vocabulary spells letters in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LetterCase {
+  /// Look ASCII letters up in upper case: the vocabulary spells `A`-`Z`,
+  /// as wav2vec2-base-960h's does. The English wav2vec2 convention, and
+  /// the default.
+  #[default]
+  Upper,
+  /// Look every character up as the normalizer wrote it: the vocabulary
+  /// is case-sensitive, or spells letters in the case the normalizer
+  /// writes (lower case, for asry's normalizers).
+  AsWritten,
+}
+
 /// Builder for [`EmissionsAligner`]. Runs the same construction guards
-/// `Aligner::from_paths` does — blank-id detection, unk id, the
-/// uppercase-vocab probe, the vocab-size capture, and `|` delimiter
+/// `Aligner::from_paths` does — blank-id detection, the unknown token the
+/// tokenizer declares, the vocab-size capture, and word-delimiter
 /// validation against the normalizer.
+///
+/// # What the caller states
+///
+/// Three properties of the vocabulary and the acoustic front end are
+/// stated, never read off the vocabulary: the word delimiter
+/// ([`word_delimiter`](Self::word_delimiter)), the letter case
+/// ([`letter_case`](Self::letter_case)), and the receptive field
+/// ([`receptive_field_samples`](Self::receptive_field_samples)). Each
+/// defaults to the English wav2vec2 convention (`|`, upper case, 400
+/// samples), and a model that differs states its own. asry aligns
+/// correctly for correctly declared inputs; declaring the model's
+/// properties is the caller's part.
+///
+/// # Reserved ids
+///
+/// No transcript character is looked up to the CTC blank, the word
+/// delimiter, the unknown token the tokenizer JSON declares (its model's
+/// `unk_token`, however it is spelled), or a token it declares special
+/// (`added_tokens[].special`): a character whose lookup lands on one is
+/// one the vocabulary does not spell, so a mark nobody reads aloud is
+/// dropped and anything else is an OOV event for the caller's policy.
+/// Only the separators tokenization puts between words reach the
+/// delimiter's column. A model with special tokens declares them in its
+/// tokenizer JSON as special added tokens.
 pub struct EmissionsAlignerBuilder {
   language: Lang,
   tokenizer_json: Vec<u8>,
   normalizer: Option<DynTextNormalizer>,
   hop_samples: NonZeroU32,
+  word_delimiter: SmolStr,
+  letter_case: LetterCase,
+  receptive_field_samples: NonZeroU32,
   min_speech_coverage: SpeechCoverage,
   max_intra_silent_run: Duration,
   blank_token_id: Option<u32>,
@@ -442,6 +701,38 @@ impl EmissionsAlignerBuilder {
   #[must_use]
   pub const fn hop_samples(mut self, hop: NonZeroU32) -> Self {
     self.hop_samples = hop;
+    self
+  }
+
+  /// The vocabulary token that separates words, put between two words
+  /// when the normalizer delimits words. Default `|`, the English
+  /// wav2vec2 convention; a vocabulary delimited by a space states
+  /// `" "`.
+  ///
+  /// [`build`](Self::build) refuses a vocabulary that does not spell it
+  /// when the normalizer delimits words.
+  #[must_use]
+  pub fn word_delimiter(mut self, token: &str) -> Self {
+    self.word_delimiter = SmolStr::new(token);
+    self
+  }
+
+  /// How tokenization looks letters up in the vocabulary. Default
+  /// [`LetterCase::Upper`], the English wav2vec2 convention; a
+  /// case-sensitive or lower-case vocabulary states
+  /// [`LetterCase::AsWritten`].
+  #[must_use]
+  pub const fn letter_case(mut self, case: LetterCase) -> Self {
+    self.letter_case = case;
+    self
+  }
+
+  /// The acoustic front end's receptive field, in 16 kHz samples: the
+  /// length [`prepare`](EmissionsAligner::prepare) zero-pads a shorter
+  /// chunk to. Default 400, wav2vec2's.
+  #[must_use]
+  pub const fn receptive_field_samples(mut self, samples: NonZeroU32) -> Self {
+    self.receptive_field_samples = samples;
     self
   }
 
@@ -478,8 +769,8 @@ impl EmissionsAlignerBuilder {
   ///
   /// [`EmissionsError::Config`] if the tokenizer JSON does not parse, if
   /// no CTC blank token can be resolved, if the language has no default
-  /// normalizer and none was supplied, or if the normalizer needs a `|`
-  /// word-delimiter the tokenizer does not have.
+  /// normalizer and none was supplied, or if the normalizer delimits
+  /// words and the tokenizer does not spell the stated word delimiter.
   pub fn build(self) -> Result<EmissionsAligner, EmissionsError> {
     let tokenizer = load_tokenizer_bytes_with_compat(&self.tokenizer_json, "tokenizer.json")
       .map_err(load_error)?;
@@ -504,11 +795,14 @@ impl EmissionsAlignerBuilder {
       })?,
     };
 
-    let unk_token_id = detect_unk_token_id(&tokenizer);
-    let vocab_uppercase_only = detect_vocab_uppercase_only(&tokenizer);
+    let unk_token_id = declared_unk_token_id(&tokenizer);
 
-    validate_word_delimiter_present(&tokenizer, normalizer.use_word_delimiter())
-      .map_err(load_error)?;
+    validate_word_delimiter_present(
+      &tokenizer,
+      normalizer.use_word_delimiter(),
+      &self.word_delimiter,
+    )
+    .map_err(load_error)?;
 
     let tokenizer_vocab_size = capture_vocab_size(&tokenizer).ok_or_else(|| {
       EmissionsError::Config(EmissionsFailure::new(format_smolstr!(
@@ -523,9 +817,11 @@ impl EmissionsAlignerBuilder {
         self.language,
         normalizer,
         self.hop_samples,
+        self.word_delimiter,
+        self.receptive_field_samples,
         blank_token_id,
         unk_token_id,
-        vocab_uppercase_only,
+        matches!(self.letter_case, LetterCase::Upper),
         tokenizer_vocab_size,
         self.min_speech_coverage,
         self.max_intra_silent_run,

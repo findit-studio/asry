@@ -82,7 +82,7 @@ pub enum EmissionsError {
   /// The `(t, v, data.len())` triple is inconsistent: `t * v !=
   /// data.len()`, `t * v` overflows `usize`, or `v == 0`. Produced
   /// by [`LogProbsTV::new`](super::encode::LogProbsTV::new) and by
-  /// [`log_softmax_with_finite_guard`](super::encode::log_softmax_with_finite_guard).
+  /// the encoder's finite-guarded log-softmax.
   #[error(transparent)]
   Shape(LogProbsShapeError),
 
@@ -96,8 +96,8 @@ pub enum EmissionsError {
   /// A numeric step produced a non-finite intermediate that is not
   /// attributable to a single input element — e.g. a caller-supplied
   /// encoder logit was non-finite, or a log-softmax normaliser /
-  /// output went non-finite. Produced by
-  /// [`log_softmax_with_finite_guard`](super::encode::log_softmax_with_finite_guard).
+  /// output went non-finite. Produced by the encoder's
+  /// finite-guarded log-softmax.
   #[error("numeric failure: {0}")]
   Numeric(EmissionsFailure),
 
@@ -107,11 +107,14 @@ pub enum EmissionsError {
   Config(EmissionsFailure),
 
   /// The encoder returned a frame count that cannot correspond to the
-  /// audio it was handed: `T · hop` is outside `real_samples ± 2·hop`.
+  /// input it was handed: `T` is outside
+  /// `[floor((L - rf) / hop) + 1, floor(L / hop) + 1]` for the encoder
+  /// input's length `L` and the declared receptive field `rf` and hop
+  /// `hop`, the counts from a valid convolution to one that pads its input.
   ///
-  /// Either the model's stride differs from the configured
-  /// `hop_samples`, or the emissions came from *different audio than the
-  /// `PreparedChunk` they were paired with*. Left unchecked, composition
+  /// Either the model's stride differs from the declared `hop_samples`,
+  /// or the emissions came from *different audio than the `PreparedChunk`
+  /// they were paired with*. Left unchecked, composition
   /// emits word ranges past the chunk's audio (stride too small) or
   /// compresses every word into its first portion (stride too large) —
   /// plausible-looking timings that are simply wrong.
@@ -153,6 +156,17 @@ pub enum EmissionsError {
   #[error("prepared chunk belongs to a different aligner: {0}")]
   AlignerMismatch(EmissionsFailure),
 
+  /// The `Emissions` handed to `finish` were made through a **different**
+  /// `PreparedChunk`.
+  ///
+  /// Emissions are made only through the chunk whose encoder output they
+  /// are (`PreparedChunk::encode_with`) and carry its identity. Two
+  /// chunks of one aligner with the same shape pass every dimension check,
+  /// so pairing one chunk with the other's emissions would align its
+  /// tokens to the other chunk's audio. Refused before a frame is read.
+  #[error("emissions answer a different prepared chunk: {0}")]
+  PreparationMismatch(EmissionsFailure),
+
   /// The audio contains a non-finite (`NaN` / `±inf`) sample.
   ///
   /// Rejected against the RAW samples, before the speech mask zeroes
@@ -189,9 +203,8 @@ pub enum EmissionsError {
   NoAlignmentPath(EmissionsFailure),
 
   /// A seam memory budget would be exceeded: the reconstructed CTC
-  /// path (one point per emissions frame) is larger than
-  /// [`align_emissions`](super::trellis_beam::align_emissions) will
-  /// allocate. Rejected *before* the trellis/path allocation so a
+  /// path (one point per emissions frame) is larger than the
+  /// alignment DP will allocate. Rejected *before* the trellis/path allocation so a
   /// degenerate single-token, huge-`T` lattice fails fast instead of
   /// allocating hundreds of megabytes.
   #[error("path budget exceeded: {0}")]
@@ -239,10 +252,13 @@ impl EmissionsError {
   /// budget guard stays `NoAlignmentPath`, and abort stays
   /// `Aborted`. The inner diagnostic message is carried through
   /// verbatim.
-  pub(crate) fn into_work_failure(
-    self,
-    language: &crate::types::Lang,
-  ) -> crate::types::WorkFailure {
+  ///
+  /// Public so a caller that answers an alignment command after an
+  /// emissions failure (`AlignmentRequest::failed`) states it in the
+  /// command's terms; `AlignmentRequest::align_units` applies it through
+  /// [`IntoWorkFailure`](crate::types::IntoWorkFailure).
+  #[must_use]
+  pub fn into_work_failure(self, language: &crate::types::Lang) -> crate::types::WorkFailure {
     use crate::types::{AlignmentError, AlignmentFailure, WorkFailure};
 
     let failure = |message: SmolStr| AlignmentFailure::new(message, language.clone());
@@ -254,6 +270,7 @@ impl EmissionsError {
       | Self::StrideMismatch(f)
       | Self::VocabMismatch(f)
       | Self::AlignerMismatch(f)
+      | Self::PreparationMismatch(f)
       | Self::NonFiniteAudio(f) => AlignmentError::ModelInference(failure(f.message)),
       Self::Tokenization(f) => AlignmentError::Tokenization(failure(f.message)),
       Self::Normalization(f) => AlignmentError::Normalization(failure(f.message)),
@@ -264,6 +281,12 @@ impl EmissionsError {
       Self::Aborted(f) => AlignmentError::Aborted(failure(f.message)),
     };
     WorkFailure::Alignment(inner)
+  }
+}
+
+impl crate::types::IntoWorkFailure for EmissionsError {
+  fn into_work_failure(self, language: &crate::types::Lang) -> crate::types::WorkFailure {
+    EmissionsError::into_work_failure(self, language)
   }
 }
 

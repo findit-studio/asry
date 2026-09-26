@@ -43,15 +43,18 @@ pub use align::dispatch;
 pub use mediatime::{TimeRange, Timebase, Timestamp};
 
 pub use types::{
-  AlignmentError, AlignmentFailure, AsrError, AsrFailure, Backpressure, ChunkId,
-  GapExceedsTolerance, InconsistentTimebase, InvalidTimebase, Lang,
+  AlignmentError, AlignmentFailure, AsrError, AsrFailure, Backpressure, ChunkId, ForeignAlignment,
+  GapExceedsTolerance, InconsistentTimebase, IntoWorkFailure, InvalidTimebase, Lang,
   LanguageUnsupportedForAlignment, PtsRegression, PushKind, TranscriberError, Transcript,
-  VadAheadOfAudio, VadSegment, Word, WorkFailure, WorkerHangTimeout, WorkerKind,
+  UnaccountedAlignment, VadAheadOfAudio, VadSegment, Word, WorkFailure, WorkerHangTimeout,
+  WorkerKind,
 };
 
 pub use core::{
-  AlignmentResult, AsrParams, AsrParamsOverride, AsrResult, Command, Event, LanguagePolicy,
-  SamplingStrategy, Transcriber, TranscriberOptions,
+  AlignedWords, AlignmentCompletion, AlignmentReport, AlignmentRequest, AlignmentUnit, AsrParams,
+  AsrParamsOverride, AsrResult, Command, Event, LanguagePolicy, RefusedCompletion,
+  SamplingStrategy, Transcriber, TranscriberOptions, UnaccountedOutcomes, UnalignedCause,
+  UnitAlignment, UnitJob, UnitOutcome,
 };
 
 // Reachable under `runner` (whisper.cpp ASR) OR `emissions` (the
@@ -86,8 +89,8 @@ pub use runner::{
   AlignWorkItem, Aligner, AlignerKey, AlignmentFallback, AlignmentLookup, AlignmentSet,
   AlignmentSetBuilder, ChineseNormalizer, DEFAULT_MAX_INTRA_SILENT_RUN,
   DEFAULT_MIN_SPEECH_COVERAGE, DynTextNormalizer, EnglishNormalizer, JapaneseNormalizer,
-  KoreanNormalizer, LatinNormalizer, NormalizationError, NormalizedText, TextNormalizer, bundled,
-  default_normalizer_for, run_one_alignment,
+  JobDetection, JobResolution, KoreanNormalizer, LatinNormalizer, NormalizationError,
+  NormalizedText, TextNormalizer, bundled, default_normalizer_for, run_one_alignment,
 };
 
 // Re-export ort types that appear on the alignment public API.
@@ -130,16 +133,39 @@ pub use ort;
 /// | pass VAD in the wrong timebase (which was silently ignored) | [`SampleSpan`](emissions::SampleSpan) has no timebase; the bridge from `TimeRange` is strict |
 /// | mean "no VAD" and get "all silence" (which dropped every word) | [`SpeechSpans::all_speech()`](emissions::SpeechSpans::all_speech) says it out loud |
 /// | supply a non-total sample→time closure (which panicked in your own code) | [`OutputClock`](emissions::OutputClock) is data; asry owns the saturation |
-/// | supply `V = 0`, a `T` that OOMs, or a non-log-probability | [`Emissions`](emissions::Emissions) is the one door, and it checks all three |
+/// | supply `V = 0`, a `T` that OOMs, or a non-log-probability | a chunk's [`Emissions`](emissions::Emissions) are made through its [`PreparedChunk`](emissions::PreparedChunk)'s `encode_with`, the one door, and it checks all three |
+/// | stamp another chunk's encoder output as this chunk's emissions | `encode_with` hands your encoder this chunk's prepared input and builds the emissions from what it returns; no emissions are made from a free tensor |
+/// | answer a unit of a `Transcriber`'s command with an alignment computed for another unit | a unit is answered only by [`EmissionsAligner::align_unit`](emissions::EmissionsAligner::align_unit) consuming its [`UnitJob`], from the job's own text and audio |
+/// | apply decisions made for another unit, or in another language | `align_unit` takes only the resolution [`detect_oov_unit`](emissions::EmissionsAligner::detect_oov_unit) made for that very job, keyed on its requested language |
+/// | strand a command with a `?`, a panic or a dropped request | [`AlignmentRequest::align_units`](crate::AlignmentRequest::align_units) answers the command on every road, and a command dropped unanswered fails its chunk as `AlignmentError::Abandoned` |
+/// | finish a chunk with another chunk's emissions of the same shape | emissions carry the identity of the preparation they were made through, and `finish` refuses any other by name |
 /// | disagree with asry about the sample count, frame count, or stride | asry derives all three from slices that physically exist |
 /// | run a CTC head whose width disagrees with the tokenizer | `finish` validates it — the check this seam has NEVER run |
+///
+/// # What the caller asserts
+///
+/// asry aligns correctly for correctly declared inputs: any transcript
+/// text, any audio. The model's properties are the caller's to declare,
+/// and asry takes them as declared: that the vocabulary is the model's
+/// own, and the blank id, the word delimiter, the letter case, the hop and
+/// the receptive field are the model's, and that the tokenizer JSON
+/// declares the model's unknown token (its model's `unk_token`) and its
+/// special tokens special. It checks what a
+/// declaration makes checkable (a delimiter the vocabulary does not spell,
+/// a head width that disagrees with the vocabulary), and does not defend
+/// against a model, vocabulary or configuration declared wrongly. No
+/// transcript character is ever aligned to the blank, the word delimiter,
+/// the unknown token or a declared special.
 #[cfg(feature = "emissions")]
 #[cfg_attr(docsrs, doc(cfg(feature = "emissions")))]
 pub mod emissions {
   pub use crate::{
-    core::oov::{
-      OovDecision, OovEvent, OovKind, ResolvedOov, default_oov_decisions,
-      fail_closed_all_decisions, wildcard_all_decisions,
+    core::{
+      AlignedWords, AlignmentReport, AlignmentUnit, UnalignedCause, UnitAlignment,
+      oov::{
+        OovDecision, OovDetection, OovEvent, OovKind, OovResolution, ResolvedOov,
+        default_oov_policy, fail_closed_all_policy, wildcard_all_policy,
+      },
     },
     runner::aligner::{
       ChineseNormalizer, DynTextNormalizer, EnglishNormalizer, JapaneseNormalizer,
@@ -152,8 +178,10 @@ pub mod emissions {
       },
       core::PreparedChunk,
       default_normalizer_for,
-      emissions_aligner::{EmissionsAligner, EmissionsAlignerBuilder},
-      emissions_api::{Emissions, OutputClock, SampleSpan, SpanError, SpeechCoverage, SpeechSpans},
+      emissions_aligner::{EmissionsAligner, EmissionsAlignerBuilder, LetterCase},
+      emissions_api::{
+        Emissions, EncoderOutput, OutputClock, SampleSpan, SpanError, SpeechCoverage, SpeechSpans,
+      },
     },
   };
 }
@@ -169,13 +197,16 @@ pub mod emissions {
 #[cfg(all(feature = "bench-internals", feature = "alignment"))]
 #[doc(hidden)]
 pub mod __bench {
-  pub use crate::runner::aligner::algorithm::{
-    encode::LogProbsTV,
-    normalize::{scalar, zero_mean_unit_var_normalize},
-    tokenize::{TokenizedText, detect_oov_events, tokenize_with_word_map},
-    trellis_beam::{
-      ALIGN_BEAM_WIDTH, PathPointPublic, WILDCARD_TOKEN_ID, WordSegment, align_to_word_segments,
-      backtrack_beam, get_trellis,
+  pub use crate::{
+    core::oov::resolve_events,
+    runner::aligner::algorithm::{
+      encode::LogProbsTV,
+      normalize::{scalar, zero_mean_unit_var_normalize},
+      tokenize::{ReservedIds, TokenizedText, detect_oov_events, tokenize_with_word_map},
+      trellis_beam::{
+        ALIGN_BEAM_WIDTH, PathPointPublic, WILDCARD_TOKEN_ID, WordSegment, align_to_word_segments,
+        backtrack_beam, get_trellis,
+      },
     },
   };
 

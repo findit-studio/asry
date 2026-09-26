@@ -14,7 +14,6 @@ use mediatime::{TimeRange, Timebase};
 use smol_str::SmolStr;
 
 use crate::{
-  core::AlignmentResult,
   runner::aligner::{
     algorithm::trellis_beam::WordSegment,
     emissions_api::{SpeechCoverage, SpeechSpans},
@@ -366,7 +365,7 @@ pub fn build_speech_frames(
     .collect()
 }
 
-/// Compose the final `AlignmentResult` from
+/// Compose the final word list from
 /// [`WordSegment`]s + original-word surface forms.
 ///
 /// `word_segments` come from `merge_words` (crate-internal;
@@ -474,7 +473,7 @@ pub fn compose_words<F>(
   // ORT path, whose value was already always coerced.
   min_speech_coverage: SpeechCoverage,
   max_intra_silent_run: Duration,
-) -> AlignmentResult
+) -> Vec<Word>
 where
   F: Fn(u64, u64) -> TimeRange,
 {
@@ -600,7 +599,7 @@ where
     words.push(Word::new(SmolStr::new(surface.as_ref()), range, score));
   }
 
-  AlignmentResult::new(words)
+  words
 }
 
 #[cfg(test)]
@@ -685,7 +684,7 @@ mod tests {
     // Function may emit zero or one word depending on whether
     // the saturated end is still strictly greater than start.
     // The hard contract is that no overflow / panic occurred.
-    for w in result.words() {
+    for w in result.as_slice() {
       assert!(
         w.text() == "hi" || w.text().is_empty(),
         "unexpected surface form on overflow recovery: {:?}",
@@ -793,7 +792,7 @@ mod tests {
                         );
                       }
                       // `Word`'s public score contract: finite, [0, 1].
-                      for w in result.words() {
+                      for w in result.as_slice() {
                         let s = w.score();
                         assert!(
                           !s.is_nan() && (0.0..=1.0).contains(&s),
@@ -828,7 +827,7 @@ mod tests {
       SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
-    assert!(result.words().is_empty());
+    assert!(result.as_slice().is_empty());
   }
 
   #[test]
@@ -848,7 +847,7 @@ mod tests {
       SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
-    assert_eq!(result.words()[0].text(), "Hello!");
+    assert_eq!(result.as_slice()[0].text(), "Hello!");
   }
 
   /// Defensive-output regression (codex round 4): a `WordSegment`
@@ -877,11 +876,11 @@ mod tests {
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert_eq!(
-      result.words().len(),
+      result.as_slice().len(),
       1,
       "the word should survive composition"
     );
-    let score = result.words()[0].score();
+    let score = result.as_slice()[0].score();
     assert!(
       !score.is_nan(),
       "a NaN segment score must be sanitized, got {score}"
@@ -911,7 +910,7 @@ mod tests {
       SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
-    assert!(result.words().is_empty());
+    assert!(result.as_slice().is_empty());
   }
 
   #[test]
@@ -935,8 +934,8 @@ mod tests {
       SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
-    assert_eq!(result.words().len(), 1);
-    let r = result.words()[0].range();
+    assert_eq!(result.as_slice().len(), 1);
+    let r = result.as_slice()[0].range();
     let start = r.start_pts();
     let expected = 32_021_i64;
     assert!(
@@ -962,7 +961,7 @@ mod tests {
       SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
-    assert!(result.words().is_empty());
+    assert!(result.as_slice().is_empty());
   }
 
   #[test]
@@ -983,7 +982,7 @@ mod tests {
       SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
-    assert_eq!(result.words().len(), 1);
+    assert_eq!(result.as_slice().len(), 1);
   }
 
   #[test]
@@ -1006,7 +1005,7 @@ mod tests {
       SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
-    assert!(result.words().is_empty());
+    assert!(result.as_slice().is_empty());
   }
 
   #[test]
@@ -1027,7 +1026,7 @@ mod tests {
       SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
-    assert!(result.words().is_empty());
+    assert!(result.as_slice().is_empty());
   }
 
   #[test]
@@ -1049,8 +1048,8 @@ mod tests {
       SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
-    assert_eq!(result.words().len(), 1);
-    assert_eq!(result.words()[0].range().end_pts(), 1_000);
+    assert_eq!(result.as_slice().len(), 1);
+    assert_eq!(result.as_slice()[0].range().end_pts(), 1_000);
   }
 
   #[test]
@@ -1073,7 +1072,7 @@ mod tests {
       SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
-    assert!(result.words().is_empty());
+    assert!(result.as_slice().is_empty());
   }
 
   #[test]
@@ -1576,8 +1575,8 @@ mod tests {
       SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
-    assert_eq!(result.words().len(), 1);
-    let r = result.words()[0].range();
+    assert_eq!(result.as_slice().len(), 1);
+    let r = result.as_slice()[0].range();
     assert!(
       r.end_pts() <= 200,
       "word end {} must not exceed real_n_samples (200); padded \
@@ -1603,7 +1602,7 @@ mod tests {
       SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
-    let s = result.words()[0].score();
+    let s = result.as_slice()[0].score();
     assert!((0.0..=1.0).contains(&s));
   }
 
@@ -1635,9 +1634,9 @@ mod tests {
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert!(
-      default_result.words().is_empty(),
+      default_result.as_slice().is_empty(),
       "5-frame silent run > 80ms threshold (4 frames); must drop. got {:?}",
-      default_result.words()
+      default_result.as_slice()
     );
 
     // Bumping the threshold to 200 ms (= 10 frames at 50 fps)
@@ -1655,7 +1654,7 @@ mod tests {
       SpeechCoverage::DEFAULT,
       Duration::from_millis(200),
     );
-    assert_eq!(permissive.words().len(), 1);
+    assert_eq!(permissive.as_slice().len(), 1);
   }
 
   /// Configurable coverage: bumping `min_speech_coverage` to
@@ -1678,7 +1677,7 @@ mod tests {
       SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
-    assert_eq!(default_result.words().len(), 1);
+    assert_eq!(default_result.as_slice().len(), 1);
 
     let strict = compose_words(
       &[one_word(0, 5, 0.9, 0)],
@@ -1693,6 +1692,6 @@ mod tests {
       SpeechCoverage::clamped(0.9),
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
-    assert!(strict.words().is_empty());
+    assert!(strict.as_slice().is_empty());
   }
 }

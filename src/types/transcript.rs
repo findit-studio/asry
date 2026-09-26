@@ -6,7 +6,10 @@ use std::vec::Vec;
 use mediatime::TimeRange;
 use smol_str::SmolStr;
 
-use crate::types::{ChunkId, Lang};
+use crate::{
+  core::AlignmentReport,
+  types::{ChunkId, Lang},
+};
 
 /// Per-chunk transcription result.
 ///
@@ -19,7 +22,7 @@ pub struct Transcript {
   range: TimeRange,
   language: Lang,
   text: SmolStr,
-  words: Vec<Word>,
+  alignment: AlignmentReport,
   avg_logprob: f32,
   no_speech_prob: f32,
   temperature: f32,
@@ -36,7 +39,7 @@ impl Transcript {
     range: TimeRange,
     language: Lang,
     text: SmolStr,
-    words: Vec<Word>,
+    alignment: AlignmentReport,
     avg_logprob: f32,
     no_speech_prob: f32,
     temperature: f32,
@@ -47,7 +50,7 @@ impl Transcript {
       range,
       language,
       text,
-      words,
+      alignment,
       avg_logprob,
       no_speech_prob,
       temperature,
@@ -75,12 +78,18 @@ impl Transcript {
     self.text.as_str()
   }
 
-  /// Word-level alignment results, in time order. Empty when
-  /// alignment was disabled, the chunk's language has no
-  /// registered aligner with `AlignmentFallback::SkipChunk`, or
-  /// some words landed in silence-masked regions and were dropped.
-  pub fn words(&self) -> &[Word] {
-    &self.words
+  /// What word alignment made of this chunk: not attempted, or each
+  /// alignment unit's outcome, naming why a unit has no words.
+  pub const fn alignment(&self) -> &AlignmentReport {
+    &self.alignment
+  }
+
+  /// The aligned words, in time order across units, read from
+  /// [`alignment`](Self::alignment). Empty when no alignment was
+  /// attempted or no unit aligned a word; the report says which, and
+  /// why, unit by unit.
+  pub fn words(&self) -> impl ExactSizeIterator<Item = &Word> + '_ {
+    self.alignment.words()
   }
 
   /// Whisper's mean log-probability over emitted tokens.
@@ -218,7 +227,7 @@ pub(crate) mod for_test {
       range,
       Lang::En,
       SmolStr::new(text),
-      words,
+      AlignmentReport::Whole(crate::core::UnitAlignment::from_words(words)),
       -0.5,
       0.05,
       0.0,
@@ -252,8 +261,9 @@ mod tests {
     );
     assert_eq!(t.text(), "hello world");
     assert_eq!(t.chunk_id().as_u64(), 7);
-    assert_eq!(t.words().len(), 2);
-    assert_eq!(t.words()[0].text(), "hello");
-    assert_eq!(t.words()[1].score(), 0.92);
+    let words: Vec<&Word> = t.words().collect();
+    assert_eq!(words.len(), 2);
+    assert_eq!(words[0].text(), "hello");
+    assert_eq!(words[1].score(), 0.92);
   }
 }

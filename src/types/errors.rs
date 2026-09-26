@@ -18,7 +18,10 @@ use std::time::Duration;
 
 use smol_str::SmolStr;
 
-use crate::types::{ChunkId, Lang};
+use crate::{
+  core::AlignmentUnit,
+  types::{ChunkId, Lang},
+};
 
 /// Push or inject failure on the state machine.
 #[derive(Clone, Debug, thiserror::Error)]
@@ -48,9 +51,132 @@ pub enum TranscriberError {
   /// Caller `inject_*`-ed a chunk_id that does not match in-flight.
   #[error("unknown or already-resolved chunk_id {0}")]
   UnknownChunk(ChunkId),
+  /// `complete` got an alignment completion of a command this transcriber
+  /// did not issue, or of another command than the one its chunk awaits.
+  /// Refused before any state changes.
+  #[error("{0}")]
+  ForeignAlignment(ForeignAlignment),
+  /// `handle_failure` got a chunk awaiting alignment. An alignment failure
+  /// answers through its command's request: `AlignmentRequest::failed`,
+  /// then `Transcriber::complete`. Refused; the chunk stays awaiting
+  /// alignment.
+  #[error(
+    "chunk {0} awaits the completion of its alignment request; an alignment failure answers \
+     through the request (`AlignmentRequest::failed`, then `Transcriber::complete`)"
+  )]
+  AwaitsCompletion(ChunkId),
   /// Caller called `handle_eof` and then attempted to push.
   #[error("operation rejected after handle_eof")]
   AfterEof,
+}
+
+/// An alignment completion handed to a transcriber whose awaited command
+/// it does not answer: it was built from the request of a command another
+/// transcriber issued, or of another command than the one its chunk
+/// awaits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "alignment completion for chunk {chunk_id} answers {}; a transcriber completes a chunk only \
+   with the completion its own command's request built",
+  issuer(*.another_transcriber)
+)]
+pub struct ForeignAlignment {
+  chunk_id: ChunkId,
+  another_transcriber: bool,
+}
+
+/// Who issued the command a foreign completion answers.
+const fn issuer(another_transcriber: bool) -> &'static str {
+  if another_transcriber {
+    "a command another transcriber issued"
+  } else {
+    "another alignment command than the one the chunk awaits"
+  }
+}
+
+impl ForeignAlignment {
+  /// Construct from the chunk the completion names and whether another
+  /// transcriber issued the command it answers.
+  #[must_use]
+  pub const fn new(chunk_id: ChunkId, another_transcriber: bool) -> Self {
+    Self {
+      chunk_id,
+      another_transcriber,
+    }
+  }
+
+  /// The chunk the completion names.
+  #[must_use]
+  pub const fn chunk_id(&self) -> ChunkId {
+    self.chunk_id
+  }
+
+  /// Whether another transcriber issued the command the completion
+  /// answers.
+  #[must_use]
+  pub const fn another_transcriber(&self) -> bool {
+    self.another_transcriber
+  }
+}
+
+/// Outcomes that do not account for an alignment request's units: they are
+/// not exactly the request's own units (the whole text when its command
+/// carried no runs, else one per run), each once, in order.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "alignment outcomes for chunk {chunk_id} answer units {received:?} ({foreign} of them another \
+   request's), but the request's units are {expected:?}; each unit is answered once, in order, by \
+   the outcome made by consuming its own job"
+)]
+pub struct UnaccountedAlignment {
+  chunk_id: ChunkId,
+  expected: Vec<AlignmentUnit>,
+  received: Vec<AlignmentUnit>,
+  foreign: usize,
+}
+
+impl UnaccountedAlignment {
+  /// Construct from the chunk, the units it expected, the units the
+  /// outcomes answer, and how many of those outcomes answer another
+  /// request.
+  #[must_use]
+  pub const fn new(
+    chunk_id: ChunkId,
+    expected: Vec<AlignmentUnit>,
+    received: Vec<AlignmentUnit>,
+    foreign: usize,
+  ) -> Self {
+    Self {
+      chunk_id,
+      expected,
+      received,
+      foreign,
+    }
+  }
+
+  /// The chunk the request was for.
+  #[must_use]
+  pub const fn chunk_id(&self) -> ChunkId {
+    self.chunk_id
+  }
+
+  /// The request's alignment units, in order.
+  #[must_use]
+  pub fn expected(&self) -> &[AlignmentUnit] {
+    &self.expected
+  }
+
+  /// The units the outcomes answer, in the order they came.
+  #[must_use]
+  pub fn received(&self) -> &[AlignmentUnit] {
+    &self.received
+  }
+
+  /// How many of the outcomes answer another request's units.
+  #[must_use]
+  pub const fn foreign(&self) -> usize {
+    self.foreign
+  }
 }
 
 /// PTS regression payload.
@@ -225,6 +351,27 @@ pub enum WorkFailure {
   WorkerHang(WorkerHangTimeout),
 }
 
+/// An error that fails a whole alignment command: what a unit's aligner
+/// returns when it cannot answer the unit, as the command's
+/// [`WorkFailure`] for a unit in `language`.
+///
+/// [`AlignmentRequest::align_units`](crate::core::AlignmentRequest::align_units)
+/// answers the command with it when a unit fails. It is implemented for
+/// [`WorkFailure`] (as it is) and, with the `emissions` feature, for
+/// `EmissionsError` (`EmissionsError::into_work_failure`); a caller's own
+/// error type implements it to answer the command in its own terms.
+pub trait IntoWorkFailure {
+  /// This error as the failure that answers the command, for a unit in
+  /// `language`.
+  fn into_work_failure(self, language: &Lang) -> WorkFailure;
+}
+
+impl IntoWorkFailure for WorkFailure {
+  fn into_work_failure(self, _language: &Lang) -> WorkFailure {
+    self
+  }
+}
+
 /// ASR-side per-chunk failures. Variant identifies the cause; the
 /// payload carries the diagnostic message.
 #[derive(Clone, Debug, thiserror::Error)]
@@ -273,6 +420,11 @@ impl AsrFailure {
 /// them, instead of forcing a SemVer-major bump each time one
 /// lands.
 #[derive(Clone, Debug, thiserror::Error)]
+#[cfg_attr(
+  feature = "serde",
+  derive(serde::Serialize, serde::Deserialize),
+  serde(rename_all = "snake_case")
+)]
 #[non_exhaustive]
 pub enum AlignmentError {
   /// wav2vec2 ONNX inference failed.
@@ -303,10 +455,18 @@ pub enum AlignmentError {
   /// context to attach).
   #[error("alignment aborted before completing: {0}")]
   Aborted(AlignmentFailure),
+  /// The alignment command was dropped before a completion answered it:
+  /// its request, or its completion, went out of scope unanswered (a `?`,
+  /// a panic, a discarded refusal, a dropped pool job). The transcriber
+  /// that issued it answers the chunk with this at its next call, so the
+  /// chunk never waits for a completion no one can build.
+  #[error("alignment command abandoned: {0}")]
+  Abandoned(AlignmentFailure),
 }
 
 /// Diagnostic payload shared across [`AlignmentError`] variants.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[error("language={language:?} message={message}")]
 pub struct AlignmentFailure {
   message: SmolStr,

@@ -184,6 +184,7 @@ fn bench_ctc_viterbi(c: &mut Criterion) {
           black_box(&log_probs),
           black_box(&tokens),
           /* blank_id: */ 0,
+          /* wildcard_columns: */ &[true; VOCAB],
           &NEVER,
           black_box(&Lang::En),
         ));

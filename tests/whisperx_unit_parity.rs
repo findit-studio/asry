@@ -16,13 +16,12 @@
 //!    Asry wildcards alphanumeric OOV chars, matching WhisperX
 //!    on every test that doesn't involve a non-alphanumeric
 //!    pronounced symbol.
-//! 2. **Relaxed policy (test 7):** gated behind
-//!    `#[cfg(feature = "whisperx-strict-tokenizer")]`. Test 7
-//!    (`test_issue_1372_digits_comma_no_timestamps`) uses `"4,9"`
-//!    where the comma is a non-alphanumeric pronounced char.
-//!    Default asry drops the chunk; the strict-tokenizer
-//!    feature relaxes that policy to wildcard the comma instead,
-//!    matching WhisperX 1:1.
+//! 2. **Both policies (test 7):** test 7
+//!    (`test_issue_1372_digits_comma_no_timestamps`) uses `"4,9"`.
+//!    The comma is a punctuation mark nobody reads aloud, dropped
+//!    under every policy, so the word aligns under
+//!    `wildcard_all_policy` (WhisperX 1:1) and asry's default
+//!    alike.
 //!
 //! ## Why `bench-internals` / `__bench`
 //!
@@ -192,27 +191,23 @@ fn build_synthetic_emission(num_frames: usize, tokens: &[i32]) -> LogProbsTV {
 /// policy. Returns one `AlignedWord` per non-empty word in the
 /// text (mirroring WhisperX's `result["word_segments"]`).
 fn run_align(text: &str, num_frames: usize, duration_s: f32) -> Vec<AlignedWord> {
-  run_align_with_policy(
-    text,
-    num_frames,
-    duration_s,
-    asry::core::default_oov_decisions,
-  )
+  run_align_with_policy(text, num_frames, duration_s, asry::core::default_oov_policy)
 }
 
 /// Like [`run_align`] but the caller picks the OOV policy as
-/// a `fn(&[OovEvent]) -> Vec<ResolvedOov>` (e.g.
-/// `wildcard_all_decisions`, `fail_closed_all_decisions`, or
-/// a custom helper). The Sans-I/O entry point — every other
-/// test in this file is `run_align(...)` (default policy).
+/// a `fn(&OovEvent) -> OovDecision` (e.g. `wildcard_all_policy`,
+/// `fail_closed_all_policy`, or a custom one). The Sans-I/O entry
+/// point — every other test in this file is `run_align(...)`
+/// (default policy).
 fn run_align_with_policy(
   text: &str,
   num_frames: usize,
   duration_s: f32,
-  policy: fn(&[asry::core::OovEvent]) -> Vec<asry::core::ResolvedOov>,
+  policy: fn(&asry::core::OovEvent) -> asry::core::OovDecision,
 ) -> Vec<AlignedWord> {
   let tokenizer = load_tokenizer();
-  let unk = tokenizer.token_to_id("<unk>");
+  let reserved =
+    asry::__bench::ReservedIds::new(&tokenizer, BLANK_ID, "|", tokenizer.token_to_id("<unk>"));
   let words: Vec<&str> = text.split_whitespace().collect();
   let word_count = words.len();
 
@@ -221,20 +216,20 @@ fn run_align_with_policy(
     text,
     word_count,
     /* uppercase_input: */ true,
-    unk,
+    &reserved,
     &Lang::En,
     /* wildcard_boundary_per_word: */ &[],
   )
   .expect("OOV detection must succeed");
-  let oov_decisions = policy(&oov_events);
+  let oov_decisions = asry::__bench::resolve_events(&oov_events, policy);
 
   let tokenize_result = tokenize_with_word_map(
     &tokenizer,
     text,
     word_count,
-    /* use_word_delimiter: */ true,
+    /* word_delimiter: */ Some("|"),
     /* uppercase_input: */ true,
-    /* unk_token_id: */ unk,
+    &reserved,
     /* wildcard_boundary_per_word: */ &[],
     &Lang::En,
     &oov_decisions,
@@ -264,6 +259,7 @@ fn run_align_with_policy(
     tokenized.word_idx_per_token(),
     tokenized.separator_token_id(),
     BLANK_ID,
+    &reserved.wildcard_columns(log_probs.v()),
     &abort,
     &Lang::En,
   )
@@ -415,40 +411,46 @@ fn known_neighbour_score_is_positive_around_unknown() {
 // Test 7 — formerly gated on the removed
 // `whisperx-strict-tokenizer` Cargo feature, now unconditional:
 // the test calls `tokenize_with_word_map` with
-// `wildcard_all_decisions` (the runtime equivalent the feature
+// `wildcard_all_policy` (the runtime equivalent the feature
 // flipped to). Default policy is asry's
-// `default_oov_decisions` (run_align uses that); test 7 opts
+// `default_oov_policy` (run_align uses that); test 7 opts
 // into the WhisperX 1:1 policy via data, no Cargo feature.
 // =====================================================================
 
 /// **Test 7** (regression for whisperX issue #1372): `"4,9"` (digits
-/// + comma) must align under WhisperX semantics.
+/// + comma) must align.
 ///
-/// Asry's default policy drops the chunk because `,` is a non-
-/// alphanumeric pronounced char (the German speaker pronounces it
-/// "Komma"). Calling `tokenize_with_word_map` with
-/// `wildcard_all_decisions` opts into WhisperX's `*` placeholder
-/// behaviour 1:1 — the comma wildcards instead of dropping.
+/// The comma is a mark read aloud only in context (the German "Komma"),
+/// so it is a punctuation mark nobody reads aloud: tokenization drops it
+/// under every policy, and the two digits are wildcards. The word aligns
+/// under `wildcard_all_policy` (WhisperX's `*` placeholder 1:1) and
+/// under asry's default policy alike; the default used to refuse the
+/// chunk over the comma.
 #[test]
 fn issue_1372_digits_comma_no_timestamps() {
   // 200 frames — WhisperX's regression reproducer uses the
   // same higher frame count because the German sentence is
-  // long. Use `wildcard_all_decisions` to opt into WhisperX's
-  // `*` placeholder behaviour for the pronounced comma.
-  let result = run_align_with_policy(
-    "halt mit 4,9 nicht ins parlament",
-    200,
-    DEFAULT_DURATION_S,
-    asry::core::wildcard_all_decisions,
-  );
-  let by_word: std::collections::HashMap<&str, &AlignedWord> =
-    result.iter().map(|w| (w.word.as_str(), w)).collect();
-  let target = by_word.get("4,9").unwrap_or_else(|| {
-    panic!(
-      "'4,9' must align under wildcard_all_decisions; got {:?}",
-      result.iter().map(|w| &w.word).collect::<Vec<_>>()
-    )
-  });
-  assert!(target.start_s < target.end_s, "'4,9': start < end");
-  assert!(target.score >= 0.0, "'4,9': score must be present");
+  // long.
+  let policies: [fn(&asry::core::OovEvent) -> asry::core::OovDecision; 2] = [
+    asry::core::wildcard_all_policy,
+    asry::core::default_oov_policy,
+  ];
+  for policy in policies {
+    let result = run_align_with_policy(
+      "halt mit 4,9 nicht ins parlament",
+      200,
+      DEFAULT_DURATION_S,
+      policy,
+    );
+    let by_word: std::collections::HashMap<&str, &AlignedWord> =
+      result.iter().map(|w| (w.word.as_str(), w)).collect();
+    let target = by_word.get("4,9").unwrap_or_else(|| {
+      panic!(
+        "'4,9' must align; got {:?}",
+        result.iter().map(|w| &w.word).collect::<Vec<_>>()
+      )
+    });
+    assert!(target.start_s < target.end_s, "'4,9': start < end");
+    assert!(target.score >= 0.0, "'4,9': score must be present");
+  }
 }

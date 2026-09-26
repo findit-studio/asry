@@ -68,7 +68,7 @@ impl SampleBuffer {
   /// extract time so post-restart word-mapping for surviving
   /// pre-restart chunks uses the original epoch's anchor
   /// rather than whatever the buffer is currently anchored at.
-  #[cfg(feature = "alignment")]
+  #[cfg(any(feature = "alignment", feature = "emissions"))]
   pub(crate) fn base_pts_out_anchor(&self) -> i64 {
     self.base_pts_out_anchor
   }

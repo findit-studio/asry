@@ -42,18 +42,17 @@ pub struct NormalizedText<'a> {
   /// slice. Step 9 of the alignment algorithm uses this map to
   /// recover `Word.text`.
   original_words: Vec<Cow<'a, str>>,
-  /// Per-word `(prefix, suffix)` count of "wildcard chars" —
-  /// surface-form chars that are NOT pronounced (boundary
-  /// punctuation the normaliser stripped) but still occupy
-  /// frames in the audio. WhisperX includes these as wildcard
-  /// tokens (`*` placeholder + token id `-1`) IN SOURCE ORDER,
-  /// so leading punctuation like `"hello` keeps its `*` BEFORE
-  /// the encoded chars while trailing punctuation like `hello"`
-  /// keeps its `*` AFTER. Flagged that an earlier
-  /// design carrying only a TOTAL count caused
-  /// `tokenize_with_word_map` to push every wildcard at the end
-  /// of the word's encoded chars, making leading and trailing
-  /// punctuation indistinguishable in the CTC graph.
+  /// Per-word `(prefix, suffix)` count of wildcard tokens the
+  /// normaliser asks tokenization to pad the word with, IN SOURCE
+  /// ORDER: leading padding before the encoded chars, trailing
+  /// padding after them, WhisperX's `*` placeholder (token id
+  /// `-1`) for what a normaliser stripped. Each padded position is
+  /// an `OovKind::BoundaryPunct` event the caller's policy decides.
+  ///
+  /// asry's own normalisers report none. A mark they strip has no
+  /// acoustic realization and is never an alignment target, so it
+  /// leaves nothing behind; the counts are for a custom normaliser
+  /// that asks for padding.
   ///
   /// Empty (zero-length) means "no wildcard padding tracked";
   /// every word interpreted as `WildcardBoundary { prefix: 0,
@@ -61,14 +60,19 @@ pub struct NormalizedText<'a> {
   wildcard_boundary_per_word: Vec<WildcardBoundary>,
 }
 
-/// Per-word boundary wildcard counts produced by a
-/// [`TextNormalizer`] when it strips leading / trailing
-/// punctuation. The downstream tokeniser
-/// (`tokenize_with_word_map`) consults this per word to decide
-/// how many `WILDCARD_TOKEN_ID` tokens to emit on each side of
-/// the encoded letter chars; CTC alignment treats those
-/// wildcards as "match any non-blank vocab item" so the
-/// alignment doesn't lose frames over the stripped char.
+/// Per-word boundary wildcard counts a [`TextNormalizer`] may
+/// report for the leading / trailing punctuation it strips. The
+/// downstream tokeniser (`tokenize_with_word_map`) consults this
+/// per word to decide how many `WILDCARD_TOKEN_ID` tokens to emit
+/// on each side of the encoded letter chars, each one an
+/// `OovKind::BoundaryPunct` event for the caller's policy; CTC
+/// alignment treats those wildcards as "match any non-blank vocab
+/// item".
+///
+/// asry's built-in normalisers report none: punctuation is never
+/// an alignment target, so a mark they strip leaves no padding. A
+/// custom normaliser that wants WhisperX's `*` placeholder over
+/// what it strips reports it here.
 ///
 /// Replaces the historical `(u32, u32)` tuple shape. Carrying a
 /// named struct gives the boundary count a stable type identity

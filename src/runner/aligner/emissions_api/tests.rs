@@ -12,6 +12,23 @@ use mediatime::{TimeRange, Timebase};
 
 use super::*;
 
+/// Emissions for a preparation of their own, through the crate's
+/// constructor: what `PreparedChunk::encode_with` runs for
+/// `EncoderOutput::LogProbs`.
+fn log_probs(t: usize, v: NonZeroUsize, data: Vec<f32>) -> Result<Emissions, EmissionsError> {
+  Emissions::from_log_probs(PreparationId::next(), t, v, data)
+}
+
+/// As [`log_probs`], for `EncoderOutput::Logits`.
+fn logits(t: usize, v: NonZeroUsize, raw: Vec<f32>) -> Result<Emissions, EmissionsError> {
+  Emissions::from_logits_slice(PreparationId::next(), t, v, &raw)
+}
+
+/// As [`log_probs`], from a borrowed buffer.
+fn logits_slice(t: usize, v: NonZeroUsize, raw: &[f32]) -> Result<Emissions, EmissionsError> {
+  Emissions::from_logits_slice(PreparationId::next(), t, v, raw)
+}
+
 fn nz(v: usize) -> NonZeroUsize {
   NonZeroUsize::new(v).expect("test vocab is non-zero")
 }
@@ -333,7 +350,7 @@ fn output_clock_accepts_a_valid_output_timebase() {
 
 #[test]
 fn emissions_from_log_probs_accepts_a_valid_lattice() {
-  let em = Emissions::from_log_probs(2, nz(3), vec![-1.0, -2.0, -3.0, -4.0, -5.0, -6.0])
+  let em = log_probs(2, nz(3), vec![-1.0, -2.0, -3.0, -4.0, -5.0, -6.0])
     .expect("2 * 3 == 6 and every value is a log-probability");
   assert_eq!(em.frames(), 2);
   assert_eq!(em.vocab().get(), 3);
@@ -352,7 +369,7 @@ fn zero_vocab_is_unconstructible() {
 #[test]
 fn emissions_rejects_a_shape_mismatch() {
   assert!(matches!(
-    Emissions::from_log_probs(2, nz(3), vec![0.0; 5]),
+    log_probs(2, nz(3), vec![0.0; 5]),
     Err(EmissionsError::Shape(_))
   ));
 }
@@ -365,7 +382,7 @@ fn emissions_rejects_a_t_times_v_overflow() {
   // Under the frame budget check this trips PathBudget first, which is
   // also a rejection — so drive the overflow with a legal T.
   assert!(matches!(
-    Emissions::from_log_probs(2, nz(big), Vec::new()),
+    log_probs(2, nz(big), Vec::new()),
     Err(EmissionsError::Shape(_))
   ));
 }
@@ -376,7 +393,7 @@ fn emissions_rejects_a_t_times_v_overflow() {
 #[test]
 fn emissions_rejects_nan() {
   assert!(matches!(
-    Emissions::from_log_probs(1, nz(2), vec![f32::NAN, 0.0]),
+    log_probs(1, nz(2), vec![f32::NAN, 0.0]),
     Err(EmissionsError::Value(_))
   ));
 }
@@ -387,11 +404,11 @@ fn emissions_rejects_nan() {
 #[test]
 fn emissions_rejects_a_finite_positive_value() {
   assert!(matches!(
-    Emissions::from_log_probs(1, nz(2), vec![f32::MAX, -1.0]),
+    log_probs(1, nz(2), vec![f32::MAX, -1.0]),
     Err(EmissionsError::Value(_))
   ));
   assert!(matches!(
-    Emissions::from_log_probs(1, nz(2), vec![1.0e-7, -0.5]),
+    log_probs(1, nz(2), vec![1.0e-7, -0.5]),
     Err(EmissionsError::Value(_))
   ));
 }
@@ -399,7 +416,7 @@ fn emissions_rejects_a_finite_positive_value() {
 #[test]
 fn emissions_accepts_zero_and_negative_zero() {
   assert!(
-    Emissions::from_log_probs(1, nz(3), vec![0.0, -0.0, -1.0]).is_ok(),
+    log_probs(1, nz(3), vec![0.0, -0.0, -1.0]).is_ok(),
     "log(1) == 0 is a legal log-probability"
   );
 }
@@ -414,7 +431,7 @@ fn emissions_rejects_a_frame_count_past_the_budget() {
   // `let Err(..) else` rather than `.expect_err`: `Emissions` carries no
   // `Debug` on purpose — its buffer is a wav2vec2-scale emission matrix,
   // not something to print wholesale on a failed expectation.
-  let Err(err) = Emissions::from_log_probs(Emissions::FRAME_BUDGET + 1, nz(2), Vec::new()) else {
+  let Err(err) = log_probs(Emissions::FRAME_BUDGET + 1, nz(2), Vec::new()) else {
     panic!("T past the budget must be rejected BEFORE allocating");
   };
   assert!(matches!(err, EmissionsError::PathBudget(_)));
@@ -430,9 +447,9 @@ fn emissions_from_logits_applies_log_softmax_and_needs_no_value_scan() {
   // NOT "the CoreML path" — that label was wrong, and backwards for the
   // actual CoreML consumer, whose `.mlmodelc` bakes the log-softmax into
   // the graph and therefore needs `from_log_probs`. The criterion is the
-  // model's final op, never the runtime. See `Emissions::from_logits`.
-  let em = Emissions::from_logits(2, nz(2), vec![1.0, 2.0, 3.0, 4.0])
-    .expect("raw logits are the bare-CTC-head path");
+  // model's final op, never the runtime. See `EncoderOutput`.
+  let em =
+    logits(2, nz(2), vec![1.0, 2.0, 3.0, 4.0]).expect("raw logits are the bare-CTC-head path");
   assert_eq!(em.frames(), 2);
   assert_eq!(em.vocab().get(), 2);
   // Output is finite and <= 0 by construction.
@@ -447,7 +464,7 @@ fn emissions_from_logits_applies_log_softmax_and_needs_no_value_scan() {
 #[test]
 fn emissions_from_logits_rejects_a_non_finite_logit() {
   assert!(matches!(
-    Emissions::from_logits(1, nz(2), vec![f32::NAN, 0.0]),
+    logits(1, nz(2), vec![f32::NAN, 0.0]),
     Err(EmissionsError::Numeric(_))
   ));
 }
@@ -455,7 +472,7 @@ fn emissions_from_logits_rejects_a_non_finite_logit() {
 #[test]
 fn emissions_from_logits_respects_the_frame_budget() {
   assert!(matches!(
-    Emissions::from_logits(Emissions::FRAME_BUDGET + 1, nz(2), Vec::new()),
+    logits(Emissions::FRAME_BUDGET + 1, nz(2), Vec::new()),
     Err(EmissionsError::PathBudget(_))
   ));
 }
@@ -463,7 +480,7 @@ fn emissions_from_logits_respects_the_frame_budget() {
 #[test]
 fn emissions_from_logits_slice_agrees_with_the_owned_form() {
   let raw = vec![1.0_f32, 2.0, 3.0, 4.0];
-  let owned = Emissions::from_logits(2, nz(2), raw.clone()).expect("ok");
-  let borrowed = Emissions::from_logits_slice(2, nz(2), &raw).expect("ok");
+  let owned = logits(2, nz(2), raw.clone()).expect("ok");
+  let borrowed = logits_slice(2, nz(2), &raw).expect("ok");
   assert_eq!(owned.inner().data(), borrowed.inner().data());
 }

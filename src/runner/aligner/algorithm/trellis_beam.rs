@@ -102,8 +102,8 @@ const BEAM_NODE_BUDGET: usize = 2_000_000;
 /// that [`align_emissions`] will attempt.
 ///
 /// The `alignment` pool path bounds `T` structurally: the encoder
-/// stride check (`validate_stride_extent`) requires `T · hop ≈ chunk
-/// samples`, so a real 30 s chunk yields `T ≈ 1500`. A bare
+/// stride check (`validate_stride_extent`) holds `T` to about
+/// `chunk samples / hop`, so a real 30 s chunk yields `T ≈ 1500`. A bare
 /// `emissions` caller supplies [`LogProbsTV`] directly with no such
 /// bound, so a degenerate `num_tokens = 1, T = 32 M` lattice — under
 /// the `T · num_tokens ≤ 32 M` trellis-cell cap, so [`get_trellis`]
@@ -238,6 +238,7 @@ pub fn get_trellis(
   log_probs: &LogProbsTV,
   tokens: &[i32],
   blank_id: u32,
+  wildcard_columns: &[bool],
   abort_flag: &AtomicBool,
   language: &Lang,
 ) -> Result<Vec<f32>, WorkFailure> {
@@ -440,10 +441,11 @@ pub fn get_trellis(
     }
     let blank_emit = log_probs.at(t_idx, blank_id as usize);
     // Pre-compute the wildcard emission for this frame once
-    // (max over non-blank vocab); it's only consumed when at
-    // least one wildcard token exists in the suffix, but the
+    // (max over the columns a wildcard may take); it's only consumed
+    // when at least one wildcard token exists in the suffix, but the
     // computation is O(V) and amortises trivially.
-    let wildcard_emit_for_frame = max_non_blank_logprob(log_probs, t_idx, blank_id as usize);
+    let wildcard_emit_for_frame =
+      max_wildcard_logprob(log_probs, t_idx, blank_id as usize, wildcard_columns);
 
     for j in 1..num_tokens {
       let stay = trellis[t_idx * num_tokens + j] + blank_emit;
@@ -464,17 +466,26 @@ pub fn get_trellis(
   Ok(trellis)
 }
 
-/// Compute the max log-probability over all vocab columns
-/// excluding the blank. Mirrors WhisperX's `max_valid_score =
-/// frame_emission.clone(); max_valid_score[blank_id] = -inf;
-/// max_valid_score.max()` slice. Used as the emission for
-/// wildcard tokens (the model's best non-blank guess at that
-/// frame, regardless of which char the transcript expects).
-fn max_non_blank_logprob(log_probs: &LogProbsTV, t_idx: usize, blank_v: usize) -> f32 {
+/// Compute the max log-probability over the vocab columns a wildcard may
+/// take: `wildcard_columns[v]` is `true` (see
+/// [`ReservedIds::wildcard_columns`](super::tokenize::ReservedIds::wildcard_columns)),
+/// and never the blank. Used as the emission for wildcard tokens (the
+/// model's best guess at that frame among the columns that could be a
+/// character, regardless of which char the transcript expects). WhisperX
+/// excludes the blank alone (`max_valid_score[blank_id] = -inf`); asry
+/// also excludes the word delimiter, the unknown token and every declared
+/// special, so a wildcard never takes a reserved column. A column outside
+/// `wildcard_columns` is not taken.
+fn max_wildcard_logprob(
+  log_probs: &LogProbsTV,
+  t_idx: usize,
+  blank_v: usize,
+  wildcard_columns: &[bool],
+) -> f32 {
   let row_start = t_idx * log_probs.v();
   let mut best = f32::NEG_INFINITY;
   for v in 0..log_probs.v() {
-    if v == blank_v {
+    if v == blank_v || !wildcard_columns.get(v).copied().unwrap_or(false) {
       continue;
     }
     let lp = log_probs.data()[row_start + v];
@@ -527,6 +538,7 @@ pub fn backtrack_beam(
   log_probs: &LogProbsTV,
   tokens: &[i32],
   blank_id: u32,
+  wildcard_columns: &[bool],
   beam_width: usize,
   abort_flag: &AtomicBool,
   language: &Lang,
@@ -622,10 +634,11 @@ pub fn backtrack_beam(
       // Change emits the j-th token (the one we are LEAVING from
       // — WhisperX uses `tokens[j]`, which corresponds to the
       // current char in the transcript). For wildcards we use
-      // the per-frame max over non-blank vocab.
+      // the per-frame max over the columns a wildcard may take, as
+      // the forward pass did.
       let p_change_lp = match tokens[j_curr] {
         id if id == WILDCARD_TOKEN_ID => {
-          max_non_blank_logprob(log_probs, t_curr - 1, blank_id as usize)
+          max_wildcard_logprob(log_probs, t_curr - 1, blank_id as usize, wildcard_columns)
         }
         id => log_probs.at(t_curr - 1, id as usize),
       };
@@ -986,8 +999,10 @@ where
 /// `align()` body.
 ///
 /// `tokens` carry `WILDCARD_TOKEN_ID` (-1) for chars the model
-/// dictionary doesn't have an entry for; the trellis uses the
-/// per-frame max non-blank logprob in their place.
+/// dictionary doesn't have an entry for; the trellis and the beam use
+/// the per-frame max logprob over `wildcard_columns` in their place
+/// (never the blank, and never a reserved column when the mask comes
+/// from `ReservedIds::wildcard_columns`).
 ///
 /// `word_idx_per_token` maps each token to its word index in
 /// `original_words`. `None` marks delimiter / separator tokens
@@ -1005,6 +1020,7 @@ pub fn align_to_word_segments(
   word_idx_per_token: &[Option<usize>],
   separator_token_id: Option<u32>,
   blank_id: u32,
+  wildcard_columns: &[bool],
   abort_flag: &AtomicBool,
   language: &Lang,
 ) -> Result<Vec<WordSegment>, WorkFailure> {
@@ -1023,12 +1039,20 @@ pub fn align_to_word_segments(
     )));
   }
 
-  let trellis = get_trellis(log_probs, tokens, blank_id, abort_flag, language)?;
+  let trellis = get_trellis(
+    log_probs,
+    tokens,
+    blank_id,
+    wildcard_columns,
+    abort_flag,
+    language,
+  )?;
   let path = backtrack_beam(
     &trellis,
     log_probs,
     tokens,
     blank_id,
+    wildcard_columns,
     ALIGN_BEAM_WIDTH,
     abort_flag,
     language,
@@ -1078,17 +1102,37 @@ pub struct AlignEmissionsConfig {
   /// backend-neutral [`EmissionsError`] this call returns carries no
   /// language.
   language: Lang,
+  /// The ids a wildcard never takes besides the blank, sorted.
+  reserved: Vec<u32>,
 }
 
 impl AlignEmissionsConfig {
   /// Construct from the CTC blank-token id + the language to tag
-  /// errors with.
+  /// errors with. A wildcard takes any column but the blank.
   #[must_use]
   pub const fn new(blank_token_id: u32, language: Lang) -> Self {
     Self {
       blank_token_id,
       language,
+      reserved: Vec::new(),
     }
+  }
+
+  /// A wildcard also never takes the columns `reserved` names.
+  #[must_use]
+  pub fn with_reserved(mut self, reserved: impl IntoIterator<Item = u32>) -> Self {
+    self.reserved = reserved.into_iter().collect();
+    self.reserved.sort_unstable();
+    self
+  }
+
+  /// The columns of a `vocab`-wide row a wildcard may take.
+  fn wildcard_columns(&self, vocab: usize) -> Vec<bool> {
+    (0..vocab)
+      .map(|column| {
+        u32::try_from(column).map_or(true, |id| self.reserved.binary_search(&id).is_err())
+      })
+      .collect()
   }
 
   /// CTC blank-token id.
@@ -1170,6 +1214,7 @@ pub fn align_emissions(
     tokenized.word_idx_per_token(),
     tokenized.separator_token_id(),
     config.blank_token_id(),
+    &config.wildcard_columns(log_probs.v()),
     abort_flag,
     config.language(),
   )
@@ -1201,7 +1246,9 @@ fn into_emissions_error(err: WorkFailure) -> EmissionsError {
       AlignmentError::Tokenization(f) => EmissionsError::Tokenization(neutral(f)),
       AlignmentError::NoAlignmentPath(f) => EmissionsError::NoAlignmentPath(neutral(f)),
       AlignmentError::SemanticOutOfVocab(f) => EmissionsError::SemanticOutOfVocab(neutral(f)),
-      AlignmentError::Aborted(f) => EmissionsError::Aborted(neutral(f)),
+      AlignmentError::Aborted(f) | AlignmentError::Abandoned(f) => {
+        EmissionsError::Aborted(neutral(f))
+      }
       AlignmentError::Normalization(f) | AlignmentError::EmptyText(f) => {
         EmissionsError::Tokenization(neutral(f))
       }
@@ -1236,6 +1283,9 @@ mod tests {
     &NEVER
   }
 
+  /// A wildcard may take any column (the blank aside): WhisperX's rule.
+  const ANY_COLUMN: &[bool] = &[true; 64];
+
   #[test]
   fn trellis_single_token_initial_blank_column() {
     // num_tokens=1: trellis is (T, 1). Only column 0 exists, so
@@ -1252,7 +1302,8 @@ mod tests {
       data[ti * v + 2] = -10.0;
     }
     let log_probs = lp(t, v, data);
-    let trellis = get_trellis(&log_probs, &[1], 0, never(), &Lang::En).expect("trellis");
+    let trellis =
+      get_trellis(&log_probs, &[1], 0, ANY_COLUMN, never(), &Lang::En).expect("trellis");
     // trellis[0,0] = 0 (init), trellis[1,0] = emission[1, blank]
     // = -0.5, trellis[2,0] = -1.0, trellis[3,0] = -1.5.
     assert_eq!(trellis.len(), t);
@@ -1269,7 +1320,8 @@ mod tests {
     let v = 3;
     let t = 3;
     let log_probs = lp(t, v, vec![-1.0_f32; t * v]);
-    let trellis = get_trellis(&log_probs, &[1, 2], 0, never(), &Lang::En).expect("trellis");
+    let trellis =
+      get_trellis(&log_probs, &[1, 2], 0, ANY_COLUMN, never(), &Lang::En).expect("trellis");
     assert!(trellis[1].is_infinite());
     assert!(trellis[1] < 0.0);
   }
@@ -1281,7 +1333,8 @@ mod tests {
     let v = 3;
     let t = 5;
     let log_probs = lp(t, v, vec![-1.0_f32; t * v]);
-    let trellis = get_trellis(&log_probs, &[1, 2, 1], 0, never(), &Lang::En).expect("trellis");
+    let trellis =
+      get_trellis(&log_probs, &[1, 2, 1], 0, ANY_COLUMN, never(), &Lang::En).expect("trellis");
     assert!(trellis[3 * 3].is_infinite() && trellis[3 * 3] > 0.0);
     assert!(trellis[4 * 3].is_infinite() && trellis[4 * 3] > 0.0);
   }
@@ -1302,7 +1355,8 @@ mod tests {
       data[ti * v + 2] = -2.0; // token id 2
     }
     let log_probs = lp(t, v, data);
-    let trellis = get_trellis(&log_probs, &[1, 2], 0, never(), &Lang::En).expect("trellis");
+    let trellis =
+      get_trellis(&log_probs, &[1, 2], 0, ANY_COLUMN, never(), &Lang::En).expect("trellis");
     // trellis[2, 1] is finite because [stay from (1,1), change
     // from (1,0)] both exist.
     let last_cell = trellis[2 * 2 + 1];
@@ -1356,8 +1410,10 @@ mod tests {
 
     let lp_a = lp(t, v, a);
     let lp_b = lp(t, v, b);
-    let trellis_a = get_trellis(&lp_a, &tokens, blank as u32, never(), &Lang::En).expect("a");
-    let trellis_b = get_trellis(&lp_b, &tokens, blank as u32, never(), &Lang::En).expect("b");
+    let trellis_a =
+      get_trellis(&lp_a, &tokens, blank as u32, ANY_COLUMN, never(), &Lang::En).expect("a");
+    let trellis_b =
+      get_trellis(&lp_b, &tokens, blank as u32, ANY_COLUMN, never(), &Lang::En).expect("b");
 
     assert_eq!(
       trellis_a, trellis_b,
@@ -1373,8 +1429,74 @@ mod tests {
     // logprobs: [0, -2, -1, -3]. Max non-blank = -1 (vocab=2).
     let v = 4;
     let log_probs = lp(1, v, vec![0.0, -2.0, -1.0, -3.0]);
-    let m = max_non_blank_logprob(&log_probs, 0, 0);
+    let m = max_wildcard_logprob(&log_probs, 0, 0, ANY_COLUMN);
     assert!((m - (-1.0)).abs() < 1e-6);
+  }
+
+  /// **A wildcard never takes a reserved column.** Where the unknown
+  /// token's or the delimiter's column is a frame's argmax, a wildcard
+  /// scores the best column that is not reserved, in the forward pass and
+  /// in the backtracking alike.
+  #[test]
+  fn a_wildcard_takes_the_best_column_that_is_not_reserved() {
+    // V = 5: 0 the blank, 1 and 2 letters, 3 the unknown token, 4 the
+    // word delimiter; the mask `ReservedIds` gives for {0, 3, 4}.
+    let wildcard_columns = [false, true, true, false, false];
+    let (t, v) = (3, 5);
+    #[rustfmt::skip]
+    let log_probs = lp(t, v, vec![
+      -0.1, -3.0, -4.0, -5.0, -6.0, // frame 0: the letter `1` starts
+      -9.0, -3.0, -2.0, -0.1, -8.0, // frame 1: the unknown token leads; best allowed -2.0
+      -9.0, -1.5, -4.0, -8.0, -0.2, // frame 2: the delimiter leads; best allowed -1.5
+    ]);
+    assert_eq!(
+      max_wildcard_logprob(&log_probs, 1, 0, &wildcard_columns),
+      -2.0
+    );
+    assert_eq!(
+      max_wildcard_logprob(&log_probs, 2, 0, &wildcard_columns),
+      -1.5
+    );
+
+    // Forward: tokens `1`, then a wildcard. Column 1 at frame t + 1 reads
+    // the wildcard's emission at frame t (the WhisperX indexing), so the
+    // change into it scores the best allowed column, never -0.1 or -0.2.
+    let tokens = [1, WILDCARD_TOKEN_ID];
+    let trellis = get_trellis(
+      &log_probs,
+      &tokens,
+      0,
+      &wildcard_columns,
+      never(),
+      &Lang::En,
+    )
+    .expect("trellis");
+    let cell = |frame: usize, token: usize| trellis[frame * tokens.len() + token];
+    assert_eq!(cell(1, 1), cell(0, 0) + (-4.0_f32).max(-3.0));
+    let expected = (cell(1, 1) + -9.0).max(cell(1, 0) + -2.0);
+    assert_eq!(cell(2, 1), expected);
+
+    // Backtracking: the wildcard's point scores are the best allowed
+    // column's probability, never the unknown token's or the delimiter's.
+    let path = backtrack_beam(
+      &trellis,
+      &log_probs,
+      &tokens,
+      0,
+      &wildcard_columns,
+      ALIGN_BEAM_WIDTH,
+      never(),
+      &Lang::En,
+    )
+    .expect("path");
+    let reserved_scores = [(-0.1_f32).exp(), (-0.2_f32).exp()];
+    for point in path.iter().filter(|point| point.token_index == 1) {
+      assert!(
+        !reserved_scores.contains(&point.score),
+        "a wildcard took a reserved column: {point:?}"
+      );
+    }
+    assert!(path.iter().any(|point| point.token_index == 1));
   }
 
   /// regression: the beam-search
@@ -1416,12 +1538,14 @@ mod tests {
     data[6] = -0.5; // frame 2 blank
     data[7] = -0.2; // frame 2 token 2 (preferred)
     let log_probs = lp(t, v, data);
-    let trellis = get_trellis(&log_probs, &[1, 2], 0, never(), &Lang::En).expect("trellis");
+    let trellis =
+      get_trellis(&log_probs, &[1, 2], 0, ANY_COLUMN, never(), &Lang::En).expect("trellis");
     let path = backtrack_beam(
       &trellis,
       &log_probs,
       &[1, 2],
       0,
+      ANY_COLUMN,
       ALIGN_BEAM_WIDTH,
       never(),
       &Lang::En,
@@ -1463,12 +1587,14 @@ mod tests {
     data[2] = -1.0;
     data[6] = -0.5;
     let log_probs = lp(t, v, data);
-    let trellis = get_trellis(&log_probs, &[1, 2], 0, never(), &Lang::En).expect("trellis");
+    let trellis =
+      get_trellis(&log_probs, &[1, 2], 0, ANY_COLUMN, never(), &Lang::En).expect("trellis");
     let path = backtrack_beam(
       &trellis,
       &log_probs,
       &[1, 2],
       0,
+      ANY_COLUMN,
       ALIGN_BEAM_WIDTH,
       never(),
       &Lang::En,
@@ -1798,13 +1924,15 @@ mod tests {
     let log_probs = lp(t, v, data);
     let tokens = vec![1_i32, 2_i32, 3_i32];
     let abort = AtomicBool::new(false);
-    let trellis = get_trellis(&log_probs, &tokens, 0, &abort, &Lang::En).expect("trellis builds");
+    let trellis =
+      get_trellis(&log_probs, &tokens, 0, ANY_COLUMN, &abort, &Lang::En).expect("trellis builds");
 
     let path = backtrack_beam(
       &trellis,
       &log_probs,
       &tokens,
       /* blank_id */ 0,
+      ANY_COLUMN,
       ALIGN_BEAM_WIDTH,
       &abort,
       &Lang::En,
@@ -1853,6 +1981,7 @@ mod tests {
       &[Some(0), Some(0)],
       None,
       0,
+      ANY_COLUMN,
       never(),
       &Lang::En,
     )
@@ -1900,6 +2029,7 @@ mod tests {
       tokenized.word_idx_per_token(),
       tokenized.separator_token_id(),
       config.blank_token_id(),
+      ANY_COLUMN,
       never(),
       config.language(),
     )
@@ -2172,9 +2302,19 @@ to a bare align_emissions call; got {message:?}"
     data[10] = -1.0;
     data[11] = -1.0;
     let log_probs = lp(t, v, data);
-    let trellis = get_trellis(&log_probs, &[1, 2], 0, never(), &Lang::En).expect("trellis");
-    let path =
-      backtrack_beam(&trellis, &log_probs, &[1, 2], 0, 2, never(), &Lang::En).expect("path");
+    let trellis =
+      get_trellis(&log_probs, &[1, 2], 0, ANY_COLUMN, never(), &Lang::En).expect("trellis");
+    let path = backtrack_beam(
+      &trellis,
+      &log_probs,
+      &[1, 2],
+      0,
+      ANY_COLUMN,
+      2,
+      never(),
+      &Lang::En,
+    )
+    .expect("path");
     assert_eq!(path.len(), t);
     // The path should include both token 0 and token 1.
     let tokens: Vec<usize> = path.iter().map(|p| p.token_index).collect();
@@ -2185,7 +2325,7 @@ to a bare align_emissions call; got {message:?}"
   #[test]
   fn empty_token_sequence_returns_no_alignment_path() {
     let log_probs = lp(3, 3, vec![0.0_f32; 9]);
-    let err = get_trellis(&log_probs, &[], 0, never(), &Lang::En).unwrap_err();
+    let err = get_trellis(&log_probs, &[], 0, ANY_COLUMN, never(), &Lang::En).unwrap_err();
     assert!(matches!(
       err,
       WorkFailure::Alignment(AlignmentError::NoAlignmentPath(_))
@@ -2196,7 +2336,7 @@ to a bare align_emissions call; got {message:?}"
   fn audio_too_short_t_lt_num_tokens_errors() {
     // tokens=[1, 2, 3] needs T >= 3; T=2 fails.
     let log_probs = lp(2, 4, vec![0.0_f32; 8]);
-    let err = get_trellis(&log_probs, &[1, 2, 3], 0, never(), &Lang::En).unwrap_err();
+    let err = get_trellis(&log_probs, &[1, 2, 3], 0, ANY_COLUMN, never(), &Lang::En).unwrap_err();
     assert!(matches!(
       err,
       WorkFailure::Alignment(AlignmentError::NoAlignmentPath(_))
@@ -2206,7 +2346,7 @@ to a bare align_emissions call; got {message:?}"
   #[test]
   fn out_of_vocab_real_token_id_errors() {
     let log_probs = lp(3, 3, vec![0.0_f32; 9]);
-    let err = get_trellis(&log_probs, &[1, 99], 0, never(), &Lang::En).unwrap_err();
+    let err = get_trellis(&log_probs, &[1, 99], 0, ANY_COLUMN, never(), &Lang::En).unwrap_err();
     assert!(matches!(
       err,
       WorkFailure::Alignment(AlignmentError::Tokenization(_))
@@ -2218,14 +2358,21 @@ to a bare align_emissions call; got {message:?}"
     // Wildcards bypass the vocab-bound check; they're synthesised
     // by the tokeniser, not produced by the model.
     let log_probs = lp(3, 4, vec![-0.5_f32; 12]);
-    let trellis = get_trellis(&log_probs, &[1, WILDCARD_TOKEN_ID], 0, never(), &Lang::En);
+    let trellis = get_trellis(
+      &log_probs,
+      &[1, WILDCARD_TOKEN_ID],
+      0,
+      ANY_COLUMN,
+      never(),
+      &Lang::En,
+    );
     assert!(trellis.is_ok(), "wildcard tokens must pass validation");
   }
 
   #[test]
   fn negative_real_token_id_other_than_wildcard_errors() {
     let log_probs = lp(3, 3, vec![0.0_f32; 9]);
-    let err = get_trellis(&log_probs, &[1, -2], 0, never(), &Lang::En).unwrap_err();
+    let err = get_trellis(&log_probs, &[1, -2], 0, ANY_COLUMN, never(), &Lang::En).unwrap_err();
     assert!(matches!(
       err,
       WorkFailure::Alignment(AlignmentError::Tokenization(_))
@@ -2239,7 +2386,7 @@ to a bare align_emissions call; got {message:?}"
     // work that the row-loop abort check fires.
     let tokens: Vec<i32> = (0..200).map(|i| 1 + (i % 3)).collect();
     let abort = AtomicBool::new(true);
-    let err = get_trellis(&log_probs, &tokens, 0, &abort, &Lang::En).unwrap_err();
+    let err = get_trellis(&log_probs, &tokens, 0, ANY_COLUMN, &abort, &Lang::En).unwrap_err();
     assert!(matches!(
       err,
       WorkFailure::WorkerHang(ref t) if t.kind() == WorkerKind::Alignment
@@ -2260,7 +2407,7 @@ to a bare align_emissions call; got {message:?}"
     let log_probs =
       LogProbsTV::new(8_000, 8, vec![0.0_f32; 8_000 * 8]).expect("t * v == vals.len()");
     let tokens: Vec<i32> = (0..5_000).map(|i| 1 + (i % 4)).collect();
-    let err = get_trellis(&log_probs, &tokens, 0, never(), &Lang::En).unwrap_err();
+    let err = get_trellis(&log_probs, &tokens, 0, ANY_COLUMN, never(), &Lang::En).unwrap_err();
     let WorkFailure::Alignment(AlignmentError::NoAlignmentPath(payload)) = err else {
       panic!("expected AlignmentFailed");
     };
