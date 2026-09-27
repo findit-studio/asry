@@ -413,7 +413,11 @@ fn build_trellis(
   // overridden so the path can't sit on column 0 forever; it must
   // advance through all chars. With num_tokens == 1 this is a
   // no-op (`-num_tokens + 1 == 0` → range empty).
-  if num_tokens >= 2 {
+  //
+  // Not for a start state: a path that leaves it too late cannot reach
+  // the last token by the last frame, so no override is needed, and one
+  // would reward exactly those late departures.
+  if num_tokens >= 2 && !start_state {
     let row_start = t.saturating_sub(num_tokens - 1);
     for ti in row_start..t {
       trellis[ti * num_tokens] = f32::INFINITY;
@@ -570,7 +574,13 @@ fn max_wildcard_logprob(
 /// T=1500, ≤ 1 MB at T=10000).
 #[derive(Debug, Clone)]
 struct BeamNode {
+  /// The DP state (trellis column) this node sits in.
   token_index: usize,
+  /// The token that owns this node's frame on the path: the state itself
+  /// for a stay, and the token ENTERED for a change, whose emission the
+  /// frame is scored with. A change moves to the predecessor state while
+  /// its frame belongs to the token it enters.
+  owner: usize,
   time_index: usize,
   /// Cumulative trellis-cell score at `(time_index, token_index)`.
   /// Used to rank beams.
@@ -656,6 +666,7 @@ pub fn backtrack_beam(
   let mut arena: Vec<BeamNode> = Vec::new();
   arena.push(BeamNode {
     token_index: final_j,
+    owner: final_j,
     time_index: final_t,
     score: final_score,
     point_score: log_probs.at(final_t, blank_id as usize).exp(),
@@ -773,6 +784,7 @@ pub fn backtrack_beam(
         let new_idx = arena.len() as u32;
         arena.push(BeamNode {
           token_index: j_curr,
+          owner: j_curr,
           time_index: t_curr - 1,
           score: stay_score,
           point_score: p_stay_lp.exp(),
@@ -797,6 +809,7 @@ pub fn backtrack_beam(
         let new_idx = arena.len() as u32;
         arena.push(BeamNode {
           token_index: j_curr - 1,
+          owner: j_curr,
           time_index: t_curr - 1,
           score: change_score,
           point_score: p_change_lp.exp(),
@@ -861,8 +874,10 @@ pub fn backtrack_beam(
   let mut cur: Option<u32> = Some(active[0]);
   while let Some(idx) = cur {
     let node = &arena[idx as usize];
+    // The point belongs to the token that owns the node's frame: a
+    // change's frame to the token it enters.
     path.push(PathPointPublic {
-      token_index: node.token_index,
+      token_index: node.owner,
       time_index: node.time_index,
       score: node.point_score,
     });
@@ -1065,9 +1080,12 @@ where
 /// leading wildcard was scored through no column at all). With it, every
 /// transcript token, the first included, is scored at its entry like every
 /// other, a wildcard through its mask; the leading blanks the start state
-/// holds belong to no token, and the frame the first token is entered at,
-/// scored with its emission, is its own. A path therefore needs one frame
-/// more than it has tokens.
+/// holds belong to no token, and every token owns its entry frame, scored
+/// with its emission (the beam labels a change's frame with the token it
+/// enters). And it gets an explicit end state, a certain blank frame past
+/// the last, so the unit's last frame is scored by a transition like every
+/// other and a token spoken there is entered there. A path needs a frame
+/// per token.
 ///
 /// `tokens` carry `WILDCARD_TOKEN_ID` (-1) for chars the model
 /// dictionary doesn't have an entry for; the trellis and the beam use
@@ -1115,14 +1133,12 @@ pub fn align_to_word_segments(
       AlignmentFailure::new(SmolStr::from("token sequence is empty"), language.clone()),
     )));
   }
-  // A path spends a frame in the start state before its first token, and
-  // enters one token per frame at most.
-  if log_probs.t() <= tokens.len() {
+  // A path enters one token per frame at most.
+  if log_probs.t() < tokens.len() {
     return Err(WorkFailure::Alignment(AlignmentError::NoAlignmentPath(
       AlignmentFailure::new(
         format_smolstr!(
-          "audio too short: T={} frames for {} tokens; a path needs a frame for its start \
- state and one per token",
+          "audio too short: T={} frames for {} tokens; a path enters one token per frame",
           log_probs.t(),
           tokens.len()
         ),
@@ -1130,6 +1146,24 @@ pub fn align_to_word_segments(
       ),
     )));
   }
+  // The end state: one blank frame past the last. The WhisperX trellis
+  // scores frames `0..T-1` and seeds its last row as the last token's
+  // blank, so a token spoken in the unit's last frame could never be
+  // entered there. With a certain blank appended, every real frame is
+  // scored by a transition, the last included, and the appended frame,
+  // which belongs to no token, is dropped from the path.
+  let real_frames = log_probs.t();
+  let v = log_probs.v();
+  let mut ended = Vec::with_capacity((real_frames + 1) * v);
+  ended.extend_from_slice(log_probs.data());
+  ended.extend((0..v).map(|column| {
+    if column == blank_id as usize {
+      0.0
+    } else {
+      f32::NEG_INFINITY
+    }
+  }));
+  let log_probs = &LogProbsTV::from_parts_unchecked(real_frames + 1, v, ended);
   // The start state: the transcript's empty prefix, a column of its own
   // ahead of the first token. The recurrence scores a column's entry with
   // the token it enters, so every token, the first included, is scored at
@@ -1157,25 +1191,22 @@ pub fn align_to_word_segments(
     abort_flag,
     language,
   )?;
-  // The start state's leading blanks belong to no token. Its last point is
-  // the frame the first token is entered at, scored with that token's
-  // emission (the beam puts an entry's score on the state it leaves), so
-  // it is the first token's own. Every other point moves back onto the
-  // token it stands for.
-  let entry = path.iter().rposition(|point| point.token_index == 0);
+  // Every token owns its entry frame (the beam labels a change's frame
+  // with the token it enters), so the start state owns exactly its
+  // leading blanks, which belong to no token and are dropped; every other
+  // point moves back onto the transcript token it stands for.
+  // The end state's frame is dropped too.
   let path: Vec<PathPointPublic> = path
     .into_iter()
-    .enumerate()
-    .filter_map(|(index, point)| {
-      let token_index = match point.token_index.checked_sub(1) {
-        Some(token_index) => token_index,
-        None if Some(index) == entry => 0,
-        None => return None,
-      };
-      Some(PathPointPublic {
-        token_index,
-        ..point
-      })
+    .filter(|point| point.time_index < real_frames)
+    .filter_map(|point| {
+      point
+        .token_index
+        .checked_sub(1)
+        .map(|token_index| PathPointPublic {
+          token_index,
+          ..point
+        })
     })
     .collect();
   let char_segments = merge_repeats(&path);
@@ -1726,6 +1757,102 @@ mod tests {
         );
       }
     }
+  }
+
+  /// `t` = `lead.len()` census rows in which frame `f` is led by column
+  /// `lead[f].0` at log-probability `lead[f].1`; every other column sits at
+  /// -9.
+  fn led_rows(lead: &[(usize, f32)]) -> Vec<f32> {
+    let mut data = vec![-9.0_f32; lead.len() * CENSUS_V];
+    for (frame, &(column, lp)) in lead.iter().enumerate() {
+      data[frame * CENSUS_V + column] = lp;
+    }
+    data
+  }
+
+  /// `(start_frame, end_frame, score)` of each word.
+  fn spans(words: &[WordSegment]) -> Vec<(usize, usize, f32)> {
+    words
+      .iter()
+      .map(|word| (word.start_frame(), word.end_frame(), word.score()))
+      .collect()
+  }
+
+  fn close(got: &[(usize, usize, f32)], want: &[(usize, usize, f32)]) {
+    assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
+    for (g, w) in got.iter().zip(want) {
+      assert_eq!((g.0, g.1), (w.0, w.1), "{got:?} vs {want:?}");
+      assert!((g.2 - w.2).abs() < 1e-6, "{got:?} vs {want:?}");
+    }
+  }
+
+  /// **Every token owns its entry frame.** A change's frame is scored with
+  /// the token it enters and belongs to it, the first token and every later
+  /// one alike, and the unit's last frame can be an entry (the end state),
+  /// so each word's range starts at its first character's frame and its
+  /// confidence is its own frames' mean. `[A, delimiter, B]` over
+  /// `A / delimiter / B / blank`: B is `2..4`.
+  #[test]
+  fn a_one_character_word_owns_its_entry_frame() {
+    let e = |lp: f32| lp.exp();
+    let data = led_rows(&[(1, -0.01), (SEP as usize, -0.01), (2, -0.2), (0, -0.05)]);
+    close(
+      &spans(&census_align(4, &[1, SEP, 2], data)),
+      &[(0, 1, e(-0.01)), (2, 4, (e(-0.2) + e(-0.05)) / 2.0)],
+    );
+  }
+
+  /// Two CJK characters, one word each, over `X / Y / blank / blank`: the
+  /// boundary is at `Y`'s frame, `0..1` and `1..4`.
+  #[test]
+  fn a_cjk_boundary_is_at_the_next_character_frame() {
+    let e = |lp: f32| lp.exp();
+    let data = led_rows(&[(1, -0.1), (2, -0.3), (0, -0.05), (0, -0.05)]);
+    let words = align_to_word_segments(
+      &lp(4, CENSUS_V, data),
+      &[1, 2],
+      &[Some(0), Some(1)],
+      None,
+      0,
+      &CENSUS_MASK,
+      never(),
+      &Lang::Zh,
+    )
+    .expect("aligns");
+    close(
+      &spans(&words),
+      &[
+        (0, 1, e(-0.1)),
+        (1, 4, (e(-0.3) + e(-0.05) + e(-0.05)) / 3.0),
+      ],
+    );
+  }
+
+  /// A trailing one-character word, `[A, delimiter, B]` over
+  /// `A / blank / delimiter / B`: B is the last frame, `3..4`.
+  #[test]
+  fn a_trailing_one_character_word_owns_the_last_frame() {
+    let e = |lp: f32| lp.exp();
+    let data = led_rows(&[(1, -0.01), (0, -0.05), (SEP as usize, -0.01), (2, -0.2)]);
+    close(
+      &spans(&census_align(4, &[1, SEP, 2], data)),
+      &[(0, 2, (e(-0.01) + e(-0.05)) / 2.0), (3, 4, e(-0.2))],
+    );
+  }
+
+  /// A trailing wildcard word, `[A, delimiter, ?]` over
+  /// `A / blank / delimiter / C`: the wildcard is the last frame, `3..4`,
+  /// scored through its mask (the unknown token's column there is not its
+  /// score).
+  #[test]
+  fn a_trailing_wildcard_word_owns_the_last_frame() {
+    let e = |lp: f32| lp.exp();
+    let mut data = led_rows(&[(1, -0.01), (0, -0.05), (SEP as usize, -0.01), (5, -0.4)]);
+    data[3 * CENSUS_V + 3] = -0.2;
+    close(
+      &spans(&census_align(4, &[1, SEP, W], data)),
+      &[(0, 2, (e(-0.01) + e(-0.05)) / 2.0), (3, 4, e(-0.4))],
+    );
   }
 
   /// regression: the beam-search
@@ -2545,10 +2672,16 @@ to a bare align_emissions call; got {message:?}"
     )
     .expect("path");
     assert_eq!(path.len(), t);
-    // The path should include both token 0 and token 1.
+    // The path reaches the last token, and its owners never go back. On
+    // this bare trellis column 0 is token 0 itself, whose entry is never a
+    // frame of its own, so token 0 owns only the frames the path stays in
+    // it; every change's frame belongs to the token it enters.
     let tokens: Vec<usize> = path.iter().map(|p| p.token_index).collect();
-    assert!(tokens.contains(&0));
     assert!(tokens.contains(&1));
+    assert!(
+      tokens.windows(2).all(|pair| pair[0] <= pair[1]),
+      "{tokens:?}"
+    );
   }
 
   #[test]

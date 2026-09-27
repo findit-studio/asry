@@ -311,15 +311,23 @@ FIXED
   and never scores column 0's, so the first token's posterior never
   entered the lattice: a leading wildcard (`4 hello`, or a lone `4`) was
   scored through no column at all, and the first token absorbed the
-  unit's leading silence. The alignment now puts an explicit start state,
-  the transcript's empty prefix, ahead of the first token
-  (`align_to_word_segments`), so the first token's entry is scored like
-  every other, a wildcard through its mask, and the leading blanks belong
-  to no token. Behaviour: a unit's first word starts where its first
-  character is spoken, not at the unit's first frame, which departs from
-  WhisperX's timing for the first word; and a unit needs one frame more
-  than it has tokens (a unit with exactly as many frames as tokens is
-  `NoAlignmentPath`, a recoverable outcome).
+  unit's leading silence. And the beam gave each later token's entry frame
+  to the token before it (WhisperX's convention), so a delimiter took the
+  next word's first frame, a one-character word could lose its only
+  spoken frame to the speech gate, and every later boundary shifted; the
+  unit's last frame was never an entry at all, so a word spoken there was
+  lost. The alignment now puts an explicit start state, the transcript's
+  empty prefix, ahead of the first token and an explicit end state, a
+  certain blank frame, past the last (`align_to_word_segments`), and the
+  beam gives every change's frame to the token it enters. So every token,
+  the first and the last included, is scored at its entry and owns its
+  entry frame, a wildcard through its mask, and the leading and trailing
+  states belong to no token. Behaviour: word ranges start at each word's
+  first spoken character, not one frame later (or, for the first word, at
+  the unit's first frame), which departs from WhisperX's timing; the
+  confidence of a word is its own frames'. A unit needs a frame per token.
+  The `bench-internals` `backtrack_beam` labels a change's frame with the
+  token it enters.
 - **The unknown token is the one the tokenizer declares.** The reserved
   ids took the unknown token from its spelling: the first of `<unk>` and
   `[UNK]` the vocabulary held. A tokenizer declaring another
