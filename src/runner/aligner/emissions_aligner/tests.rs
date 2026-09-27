@@ -1216,6 +1216,66 @@ fn a_unit_of_only_a_last_frame_word_aligns() {
   }
 }
 
+/// A 200-sample unit of `a`, padded to the 400-sample receptive field,
+/// finished with `t` frames in which `A` leads frame `a_frame` and the blank
+/// every other.
+fn short_unit_word(t: usize, a_frame: usize) -> Result<UnitAlignment, EmissionsError> {
+  let a = aligner();
+  let samples: Vec<f32> = (0..200).map(|i| (i as f32 * 0.05).sin() * 0.2).collect();
+  let prepared = a
+    .prepare(
+      &samples,
+      &SpeechSpans::all_speech(),
+      "a",
+      resolution(&a, "a"),
+      &AtomicBool::new(false),
+    )
+    .expect("prepare");
+  assert_eq!(prepared.encoder_input().len(), 400);
+  assert_eq!(prepared.real_samples(), 200);
+  let mut raw = vec![-9.0_f32; t * VOCAB_SIZE];
+  for frame in 0..t {
+    raw[frame * VOCAB_SIZE] = -0.01;
+  }
+  raw[a_frame * VOCAB_SIZE] = -9.0;
+  raw[a_frame * VOCAB_SIZE + 7] = -0.01;
+  let emissions = prepared
+    .encoded_log_probs(t, a.vocab_size(), raw)
+    .expect("well-formed");
+  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
+  a.finish(prepared, emissions, clock, &AtomicBool::new(false))
+}
+
+/// The one word's `(start, end)` in samples.
+fn only_word_range(outcome: Result<UnitAlignment, EmissionsError>) -> (i64, i64) {
+  match outcome {
+    Ok(UnitAlignment::Aligned(words)) => {
+      assert_eq!(words.words().len(), 1);
+      let range = words.words()[0].range();
+      (range.start_pts(), range.end_pts())
+    }
+    other => panic!("the word aligns; got {other:?}"),
+  }
+}
+
+/// **A short unit's frames partition its REAL audio.** A 200-sample unit is
+/// zero-padded to the 400-sample receptive field; a front end that pads its
+/// input ("same") gives it 2 frames, which cover `[0, 100)` and
+/// `[100, 200)` of the real audio, both speech: a word on the last frame
+/// keeps `[100, 200)` instead of landing on the padding and being dropped.
+#[test]
+fn a_same_padded_short_unit_keeps_its_last_frame_word() {
+  assert_eq!(only_word_range(short_unit_word(2, 1)), (100, 200));
+}
+
+/// A front end that does not pad ("valid") gives the same 200-sample unit
+/// one frame, covering the whole real audio: its word is `[0, 200)`, as
+/// before.
+#[test]
+fn a_valid_padded_short_unit_is_unchanged() {
+  assert_eq!(only_word_range(short_unit_word(1, 0)), (0, 200));
+}
+
 /// `finish` CONSUMES `prepared`, so a chunk cannot be finished twice.
 /// (Compile-time; this test documents it — uncommenting the second call
 /// below is a borrow-check error.)

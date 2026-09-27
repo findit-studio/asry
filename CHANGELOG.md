@@ -332,7 +332,13 @@ FIXED
   the trellis with its end state; it was `n / (T - 1)`), so the last
   frame covers the audio's last samples instead of starting at its end,
   where a word entered there was masked as silence and dropped. Word
-  ranges scale by `(T - 1) / T` (about 0.07 % on a 30 s chunk).
+  ranges scale by `(T - 1) / T` (about 0.07 % on a 30 s chunk). The
+  output partitions the REAL audio, `n` being the real length, while the
+  frame-count check keeps the padded encoder input: a unit shorter than
+  the receptive field, zero-padded to it, whose front end pads its input
+  gets more than one frame, and those frames now cover the real audio
+  instead of the last ones landing on the padding, masked as silence, and
+  dropping their words.
   The `bench-internals` `backtrack_beam` labels a change's frame with the
   token it enters.
 - **The unknown token is the one the tokenizer declares.** The reserved

@@ -1494,19 +1494,23 @@ impl AlignerCore {
     // The seam cannot re-derive it differently, because it never sees
     // it.
     //
-    // For short slices padded to 400, the stride math runs against the
-    // PADDED length (what the encoder actually saw) while the per-frame
-    // threshold and word-range clamp run against the REAL length —
-    // padded frames carry no VAD overlap, so `min_speech_coverage`
-    // drops any word landing there.
-    let encoder_n_samples = prepared.encoder_input.len() as u64;
-    let samples_per_frame =
-      effective_samples_per_frame(encoder_n_samples, log_probs.t(), self.hop_samples.get());
+    // Two geometries, kept apart. VALIDATION reads the padded encoder
+    // input, what the encoder saw (`validate_stride_extent`, above). The
+    // OUTPUT (word ranges and speech coverage) partitions the REAL audio:
+    // frame `k` of `T` covers `[k * n / T, (k + 1) * n / T)` of the real
+    // `n` samples, WhisperX's ratio over the real waveform. A chunk
+    // shorter than the receptive field is zero-padded to it, and a front
+    // end that pads its input ("same" padding) gives it more than one
+    // frame; mapping them over the padded length put the last ones on the
+    // padding, masked as silence, and dropped their words, though their
+    // receptive fields cover the real tail.
     let real_n_samples = prepared.real_samples as u64;
+    let samples_per_frame =
+      effective_samples_per_frame(real_n_samples, log_probs.t(), self.hop_samples.get());
     let speech_frames = build_speech_frames(
       log_probs.t(),
       samples_per_frame,
-      encoder_n_samples,
+      real_n_samples,
       real_n_samples,
       &prepared.speech,
     );
@@ -1516,7 +1520,7 @@ impl AlignerCore {
       &speech_frames,
       chunk_first_sample_in_stream,
       self.hop_samples.get(),
-      encoder_n_samples,
+      real_n_samples,
       real_n_samples,
       log_probs.t(),
       samples_to_output_range,

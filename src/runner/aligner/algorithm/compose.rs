@@ -1474,6 +1474,18 @@ mod tests {
     assert!(mask.iter().all(|&speech| speech), "{mask:?}");
   }
 
+  /// **A padded short unit's full-span speech marks its last frame as
+  /// speech.** Its 2 frames partition its 200 real samples (not the 400 the
+  /// encoder saw), so frame 1 covers `[100, 200)`, all speech.
+  #[test]
+  fn a_padded_short_unit_marks_its_last_frame_speech() {
+    use mediatime::{TimeRange, Timebase};
+    let tb = Timebase::new(1, NonZeroI32::new(16_000).unwrap());
+    let spf = effective_samples_per_frame(200, 2, 320);
+    let mask = build_speech_frames(2, spf, 200, 200, &sp(vec![TimeRange::new(0, 200, tb)]));
+    assert_eq!(mask, vec![true, true]);
+  }
+
   #[test]
   fn effective_samples_per_frame_falls_back_to_nominal_for_short_chunks() {
     // An empty chunk has no ratio: the safety net returns nominal
