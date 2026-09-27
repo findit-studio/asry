@@ -1175,6 +1175,47 @@ fn every_road_of_the_direct_driver_answers_its_chunk() {
   assert!(matches!(t.poll_event(), Some(Event::Transcript(_))));
 }
 
+/// **A unit of only a word spoken on its last frame aligns.** One second of
+/// speech, 49 frames, blank everywhere but the last, where `A` leads: the
+/// word is entered at the last frame (the end state), the frames partition
+/// the 16 000 samples, and the last one covers `[15673, 16000)`, which is
+/// speech, so the word survives the gates and composition with exactly that
+/// range instead of the unit being `NoSurvivingWords`.
+#[test]
+fn a_unit_of_only_a_last_frame_word_aligns() {
+  let a = aligner();
+  let samples: Vec<f32> = (0..16_000).map(|i| (i as f32 * 0.01).sin() * 0.2).collect();
+  let prepared = a
+    .prepare(
+      &samples,
+      &SpeechSpans::all_speech(),
+      "a",
+      resolution(&a, "a"),
+      &AtomicBool::new(false),
+    )
+    .expect("prepare");
+  assert_eq!(prepared.encoder_input().len(), 16_000);
+  let t = 49;
+  let mut raw = vec![-9.0_f32; t * VOCAB_SIZE];
+  for frame in 0..t {
+    raw[frame * VOCAB_SIZE] = -0.01;
+  }
+  raw[(t - 1) * VOCAB_SIZE] = -9.0;
+  raw[(t - 1) * VOCAB_SIZE + 7] = -0.01;
+  let emissions = prepared
+    .encoded_log_probs(t, a.vocab_size(), raw)
+    .expect("well-formed");
+  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
+  match a.finish(prepared, emissions, clock, &AtomicBool::new(false)) {
+    Ok(UnitAlignment::Aligned(words)) => {
+      assert_eq!(words.words().len(), 1);
+      let range = words.words()[0].range();
+      assert_eq!((range.start_pts(), range.end_pts()), (15_673, 16_000));
+    }
+    other => panic!("a last-frame word aligns; got {other:?}"),
+  }
+}
+
 /// `finish` CONSUMES `prepared`, so a chunk cannot be finished twice.
 /// (Compile-time; this test documents it — uncommenting the second call
 /// below is a borrow-check error.)

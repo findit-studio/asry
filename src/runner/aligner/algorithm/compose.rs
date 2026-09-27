@@ -48,15 +48,21 @@ pub const DEFAULT_MAX_INTRA_SILENT_RUN: Duration = Duration::from_millis(80);
 
 /// Single source of truth for the effective samples-per-frame
 /// ratio asry uses to map encoder frame indices back to
-/// audio sample indices. Mirrors WhisperX's `alignment.py:279`
-/// `ratio = duration * waveform_segment.size(0) / (trellis.size(0) - 1)`.
-/// See the comment on [`compose_words`]'s `n_samples` /
-/// `total_frames` pair for why this ratio (rather than nominal
-/// `hop_samples`) is the correct mapping.
+/// audio sample indices: `n_samples / total_frames`, so the
+/// `total_frames` real frames partition the audio, frame `k`
+/// covering `[k * n / T, (k + 1) * n / T)`, the last included.
 ///
-/// Falls back to nominal `hop_samples` when `total_frames < 2`
-/// (single-frame / empty chunks have no defined ratio). Empty
-/// chunks short-circuit upstream; this is just a safety net.
+/// WhisperX's `alignment.py:279` divides by `trellis.size(0) - 1`,
+/// the rows of a trellis whose last row is only a seeded blank.
+/// asry's alignment appends an explicit end state, a trellis row
+/// past the last real frame that maps to no audio, so its trellis
+/// has `T + 1` rows and WhisperX's formula over it is `n / T`: the
+/// last real frame, which a word may now be entered at, covers the
+/// audio's last `n / T` samples instead of starting at its end.
+///
+/// Falls back to nominal `hop_samples` when `total_frames == 0`
+/// (an empty chunk has no ratio). Empty chunks short-circuit
+/// upstream; this is just a safety net.
 ///
 /// `pub` (not `pub(crate)`): reachable at
 /// `asry::emissions::effective_samples_per_frame` — a caller
@@ -68,8 +74,8 @@ pub const DEFAULT_MAX_INTRA_SILENT_RUN: Duration = Duration::from_millis(80);
 /// hop_samples)` arguments via this function, so both views share
 /// one ratio — exactly as `Aligner::align` does internally.
 pub fn effective_samples_per_frame(n_samples: u64, total_frames: usize, hop_samples: u32) -> f64 {
-  if total_frames >= 2 {
-    (n_samples as f64) / ((total_frames - 1) as f64)
+  if total_frames >= 1 {
+    (n_samples as f64) / (total_frames as f64)
   } else {
     hop_samples as f64
   }
@@ -915,12 +921,12 @@ mod tests {
 
   #[test]
   fn frame_to_sample_uses_effective_ratio_not_nominal_hop() {
-    // 1500 frames; word at frame 100. n_samples=480_000 →
-    // samples_per_frame = 480_000 / 1499 ≈ 320.2135. Frame 100
-    // maps to ≈ 32021 samples (NOT 32 000 as nominal `100 * 320`
-    // would give).
+    // 1499 frames (wav2vec2 truncates one at the edge); word at
+    // frame 100. n_samples=480_000 → samples_per_frame =
+    // 480_000 / 1499 ≈ 320.2135. Frame 100 maps to ≈ 32021 samples
+    // (NOT 32 000 as nominal `100 * 320` would give).
     let original = vec![Cow::Borrowed("ratio")];
-    let speech_frames = vec![true; 1500];
+    let speech_frames = vec![true; 1499];
     let result = compose_words(
       &[one_word(100, 110, 0.9, 0)],
       &original,
@@ -929,7 +935,7 @@ mod tests {
       320,
       480_000,
       480_000,
-      1500,
+      1499,
       fake_samples_to_output_range,
       SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -1052,11 +1058,12 @@ mod tests {
     assert_eq!(result.as_slice()[0].range().end_pts(), 1_000);
   }
 
+  /// **A word on the last frame keeps its samples.** The 4 real frames
+  /// partition the 900 samples, 225 each, so a word entered at the last
+  /// frame covers `[675, 900)`: it survives composition with that exact
+  /// range instead of starting at the chunk's end and being dropped.
   #[test]
-  fn word_entirely_in_overshoot_drops() {
-    // n_samples=900 → effective ratio 900/3 = 300. Word at
-    // frames [3,4); raw_start = 3 * 300 = 900 = chunk_end. So
-    // the start is exactly at the chunk_end — must drop.
+  fn a_word_on_the_last_frame_keeps_its_samples() {
     let original = vec![Cow::Borrowed("late")];
     let speech_frames = vec![true; 4];
     let result = compose_words(
@@ -1072,7 +1079,9 @@ mod tests {
       SpeechCoverage::DEFAULT,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
-    assert!(result.as_slice().is_empty());
+    assert_eq!(result.as_slice().len(), 1, "{:?}", result.as_slice());
+    let range = result.as_slice()[0].range();
+    assert_eq!((range.start_pts(), range.end_pts()), (675, 900));
   }
 
   #[test]
@@ -1451,14 +1460,27 @@ mod tests {
     assert_eq!(mask, vec![true]);
   }
 
+  /// **Full-span speech marks every frame as speech, the last included.**
+  /// The frames partition the audio, so frame `T - 1` covers the last
+  /// `n / T` samples, not a zero-width interval at the audio's end.
+  #[test]
+  fn full_span_speech_marks_the_last_frame_speech() {
+    use mediatime::{TimeRange, Timebase};
+    let tb = Timebase::new(1, NonZeroI32::new(16_000).unwrap());
+    let (n, t) = (16_000_u64, 49_usize);
+    let spf = effective_samples_per_frame(n, t, 320);
+    let mask = build_speech_frames(t, spf, n, n, &sp(vec![TimeRange::new(0, 16_000, tb)]));
+    assert_eq!(mask.len(), t);
+    assert!(mask.iter().all(|&speech| speech), "{mask:?}");
+  }
+
   #[test]
   fn effective_samples_per_frame_falls_back_to_nominal_for_short_chunks() {
-    // Real chunks always have `total_frames >= 2`, but the
-    // safety net for `T < 2` returns nominal `hop_samples` to
-    // avoid a divide-by-zero. Pin both branches.
+    // An empty chunk has no ratio: the safety net returns nominal
+    // `hop_samples`. Any other chunk's frames partition its samples.
     assert_eq!(effective_samples_per_frame(0, 0, 320), 320.0);
-    assert_eq!(effective_samples_per_frame(0, 1, 320), 320.0);
-    assert!((effective_samples_per_frame(480_000, 1499, 320) - (480_000.0 / 1498.0)).abs() < 1e-9);
+    assert_eq!(effective_samples_per_frame(400, 1, 320), 400.0);
+    assert!((effective_samples_per_frame(480_000, 1499, 320) - (480_000.0 / 1499.0)).abs() < 1e-9);
   }
 
   #[test]
@@ -1543,8 +1565,8 @@ mod tests {
     // Pin the helper output too so a "fix" that secretly
     // reverts to nominal hop is caught.
     assert!(
-      (samples_per_frame - 320.4272).abs() < 0.01,
-      "effective ratio for the 30 s edge case should be ~320.43; got {samples_per_frame}"
+      (samples_per_frame - 320.2135).abs() < 0.01,
+      "effective ratio for the 30 s edge case should be ~320.21; got {samples_per_frame}"
     );
   }
 

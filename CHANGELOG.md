@@ -326,6 +326,13 @@ FIXED
   first spoken character, not one frame later (or, for the first word, at
   the unit's first frame), which departs from WhisperX's timing; the
   confidence of a word is its own frames'. A unit needs a frame per token.
+  And the frames partition the audio: frame `k` of `T` covers samples
+  `[k * n / T, (k + 1) * n / T)` for word ranges and the speech mask
+  alike (`effective_samples_per_frame` is `n / T`, WhisperX's ratio over
+  the trellis with its end state; it was `n / (T - 1)`), so the last
+  frame covers the audio's last samples instead of starting at its end,
+  where a word entered there was masked as silence and dropped. Word
+  ranges scale by `(T - 1) / T` (about 0.07 % on a 30 s chunk).
   The `bench-internals` `backtrack_beam` labels a change's frame with the
   token it enters.
 - **The unknown token is the one the tokenizer declares.** The reserved
