@@ -13,7 +13,7 @@
 use mediatime::{Timebase, Timestamp};
 
 use crate::{
-  time::{ANALYSIS_TIMEBASE, sample_pts},
+  time::{distance_samples, sample_pts, sample_pts_exact},
   types::{
     Backpressure, GapExceedsTolerance, InconsistentTimebase, PtsRegression, PushKind,
     TranscriberError,
@@ -104,32 +104,37 @@ impl SampleBuffer {
       None => (starts_at.timebase(), starts_at.pts(), true),
     };
 
-    // Compute expected next-PTS in output-tb space, then the
-    // delta against caller's starts_at. The regression check
-    // stays in output-PTS space so contiguous pushes on
-    // non-integer-ratio output timebases don't trip spurious
-    // regressions through round-trip rounding.
-    let expected_pts_out = effective_anchor
-      + ANALYSIS_TIMEBASE.saturating_rescale(self.absolute_sample_offset as i64, effective_tb);
-    let delta_pts_out = starts_at.pts() - expected_pts_out;
+    // Compute the stream's next PTS in output-tb space exactly: the
+    // one conversion (`sample_pts`) before its final saturation, so
+    // a next sample past `i64::MAX` is never read as `i64::MAX`. The
+    // delta against the caller's `starts_at` is exact in `i128` too,
+    // so no anchor or `starts_at` overflows it: behind is a
+    // `PtsRegression` (its advance saturating at `i64::MIN`), ahead
+    // is a gap. The regression check stays in output-PTS space so
+    // contiguous pushes on non-integer-ratio output timebases don't
+    // trip spurious regressions through round-trip rounding.
+    let expected_pts_out =
+      sample_pts_exact(self.absolute_sample_offset, effective_tb, effective_anchor);
+    let delta_pts_out = i128::from(starts_at.pts()) - expected_pts_out;
 
     let delta_samples: u64 = if delta_pts_out < 0 {
       return Err(TranscriberError::PtsRegression(PtsRegression::new(
         PushKind::Samples,
-        delta_pts_out,
+        i64::try_from(delta_pts_out).unwrap_or(i64::MIN),
       )));
-    } else if delta_pts_out == 0 {
-      0
     } else {
-      // Convert the gap back to 16 kHz samples for the
-      // zero-fill width / tolerance check.
-      let g = effective_tb.saturating_rescale(delta_pts_out, ANALYSIS_TIMEBASE);
-      if (g as u64) > self.gap_tolerance_samples {
+      // Convert the gap back to 16 kHz samples for the zero-fill
+      // width / tolerance check. A gap is below 2^64 ticks:
+      // `starts_at` is at most `i64::MAX`, and the expected PTS at
+      // least the anchor.
+      let gap = u64::try_from(delta_pts_out)
+        .map_or(u64::MAX, |ticks| distance_samples(ticks, effective_tb));
+      if gap > self.gap_tolerance_samples {
         return Err(TranscriberError::GapExceedsTolerance(
-          GapExceedsTolerance::new(g as u64, self.gap_tolerance_samples),
+          GapExceedsTolerance::new(gap, self.gap_tolerance_samples),
         ));
       }
-      g as u64
+      gap
     };
 
     // Check capacity BEFORE mutating. The doc on
@@ -237,11 +242,15 @@ impl SampleBuffer {
   }
 
   /// Output-timebase PTS the buffer expects for the next contiguous
-  /// push. None before the first push.
+  /// push: the stream's next sample through [`sample_pts`], so it is
+  /// the end of the range the buffer emits for the samples so far.
+  /// None before the first push. Once the stream's next sample lies
+  /// past the output timebase's last tick, it reads `i64::MAX`, as
+  /// every output PTS there does, and no push continues the stream:
+  /// `append` measures from the exact PTS and answers `PtsRegression`.
   pub(crate) fn next_expected_starts_at(&self) -> Option<Timestamp> {
     let tb = self.output_tb?;
-    let pts = self.base_pts_out_anchor
-      + ANALYSIS_TIMEBASE.saturating_rescale(self.absolute_sample_offset as i64, tb);
+    let pts = sample_pts(self.absolute_sample_offset, tb, self.base_pts_out_anchor);
     Some(Timestamp::new(pts, tb))
   }
 
@@ -349,6 +358,7 @@ pub(crate) fn default_buffer() -> SampleBuffer {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::time::ANALYSIS_TIMEBASE;
   use core::num::NonZeroI32;
 
   fn tb_48k() -> Timebase {
@@ -714,5 +724,279 @@ mod tests {
         );
       }
     }
+  }
+
+  /// A buffer whose stream has taken `offset` samples on `timebase` from
+  /// `anchor`, every one trimmed: the state that many samples of pushes
+  /// leave, without holding their audio.
+  fn resumed(timebase: Timebase, anchor: i64, offset: u64, tolerance: u64) -> SampleBuffer {
+    let mut b = SampleBuffer::new(1_000_000, tolerance);
+    b.output_tb = Some(timebase);
+    b.base_pts_out_anchor = anchor;
+    b.absolute_sample_offset = offset;
+    b.buffer_drop_offset = offset;
+    b
+  }
+
+  /// **Codex R15's case: a contiguous packet is taken without a gap at any
+  /// anchor.** On a nanosecond clock from an anchor of -1 ms, the stream's
+  /// next sample, 147 573 952 589 677 samples in, is 36 693 ns past
+  /// `i64::MAX` before the anchor is added, and representable after it. A
+  /// packet stamped there is contiguous: it is taken with no gap and no
+  /// silence and emitted where it was stamped, and the PTS the buffer
+  /// expects next is the end of that range, where the next packet is
+  /// contiguous again. The old expected PTS saturated the offset before
+  /// adding the anchor, landed 36 693 ns early, and read the packet as a
+  /// one-sample gap, which it filled with silence.
+  #[test]
+  fn a_contiguous_packet_is_taken_without_a_gap_at_any_anchor() {
+    use crate::core::cut::SampleRange;
+    let nanos = Timebase::new(1, NonZeroI32::new(1_000_000_000).unwrap());
+    let offset = 147_573_952_589_677_u64;
+    assert_eq!(u128::from(offset) * 62_500 - i64::MAX as u128, 36_693);
+    let mut b = resumed(nanos, -1_000_000, offset, 3_200);
+    let next = b.next_expected_starts_at().unwrap();
+    assert_eq!(next.pts(), 9_223_372_036_853_812_500);
+
+    let packet = [0.25_f32; 8];
+    b.append(next, &packet, 0).unwrap();
+    assert_eq!(
+      b.absolute_sample_offset(),
+      offset + 8,
+      "no silence before the packet"
+    );
+    assert_eq!(
+      &*b.extract(SampleRange::new(offset, offset + 8)),
+      &packet[..]
+    );
+    let emitted = b.samples_to_output_range(SampleRange::new(offset, offset + 8));
+    let after = b.next_expected_starts_at().unwrap();
+    assert_eq!(
+      (emitted.start_pts(), emitted.end_pts()),
+      (next.pts(), after.pts())
+    );
+    assert_eq!(after.pts(), 9_223_372_036_854_312_500);
+
+    b.append(after, &[0.5; 4], 0).unwrap();
+    assert_eq!(
+      (b.absolute_sample_offset(), b.buffered_samples()),
+      (offset + 12, 12)
+    );
+    let emitted = b.samples_to_output_range(SampleRange::new(offset + 8, offset + 12));
+    assert_eq!(
+      (emitted.start_pts(), emitted.end_pts()),
+      (after.pts(), b.next_expected_starts_at().unwrap().pts())
+    );
+  }
+
+  /// **The delta road answers a typed error at every anchor, and never
+  /// panics.** Tests build with overflow checks, as the dev profile does,
+  /// so an unchecked sum or difference here panics rather than wrapping.
+  /// - From an anchor at `i64::MIN`, a packet at `i64::MAX` is `2^64 - 101`
+  ///   ticks ahead of the stream: a gap of that many samples on a sample
+  ///   clock, and one past `u64::MAX` samples, saturating, on the coarsest
+  ///   clock.
+  /// - From an expected PTS 50 ticks below `i64::MAX`, a packet at
+  ///   `i64::MIN` is more than `2^64` ticks behind: a regression whose
+  ///   advance saturates at `i64::MIN`.
+  /// - Anchored 10 ticks below the ceiling, 100 samples take the stream's
+  ///   next sample 90 ticks past `i64::MAX`. The expected PTS reads
+  ///   `i64::MAX`, the end of the range the buffer emits, and a packet there,
+  ///   or anywhere, is behind the stream by its exact distance, until a
+  ///   restart re-anchors it.
+  ///
+  /// A refused packet never moves the stream.
+  #[test]
+  fn the_delta_road_answers_a_typed_error_at_every_anchor() {
+    use crate::core::cut::SampleRange;
+    let samples = ANALYSIS_TIMEBASE;
+    let coarsest = Timebase::new(i32::MAX, NonZeroI32::new(1).unwrap());
+
+    for (timebase, gap) in [(samples, u64::MAX - 100), (coarsest, u64::MAX)] {
+      let mut b = SampleBuffer::new(1_000_000, 3_200);
+      b.append(Timestamp::new(i64::MIN, timebase), &[0.0; 100], 0)
+        .unwrap();
+      let r = b.append(Timestamp::new(i64::MAX, timebase), &[0.0; 1], 0);
+      assert!(
+        matches!(r, Err(TranscriberError::GapExceedsTolerance(g))
+          if g.gap_samples() == gap && g.tolerance_samples() == 3_200),
+        "{timebase:?}: {r:?}"
+      );
+      let next = b.next_expected_starts_at().unwrap();
+      b.append(next, &[0.0; 1], 0).unwrap();
+      assert_eq!(b.absolute_sample_offset(), 101);
+    }
+
+    let mut b = SampleBuffer::new(1_000_000, 3_200);
+    b.append(Timestamp::new(i64::MAX - 100, samples), &[0.0; 50], 0)
+      .unwrap();
+    let r = b.append(Timestamp::new(i64::MIN, samples), &[0.0; 1], 0);
+    assert!(
+      matches!(r, Err(TranscriberError::PtsRegression(p)) if p.advance() == i64::MIN),
+      "{r:?}"
+    );
+    let next = b.next_expected_starts_at().unwrap();
+    assert_eq!(next.pts(), i64::MAX - 50);
+    b.append(next, &[0.0; 1], 0).unwrap();
+    assert_eq!(b.absolute_sample_offset(), 51);
+
+    let mut b = SampleBuffer::new(1_000_000, 3_200);
+    b.append(Timestamp::new(i64::MAX - 10, samples), &[0.0; 100], 0)
+      .unwrap();
+    let emitted = b.samples_to_output_range(SampleRange::new(0, 100));
+    assert_eq!(
+      (
+        emitted.start_pts(),
+        emitted.end_pts(),
+        b.next_expected_starts_at().unwrap().pts()
+      ),
+      (i64::MAX - 10, i64::MAX, i64::MAX)
+    );
+    for (pts, advance) in [
+      (i64::MAX, -90),
+      (i64::MAX - 10, -100),
+      (0, i64::MIN),
+      (i64::MIN, i64::MIN),
+    ] {
+      let r = b.append(Timestamp::new(pts, samples), &[0.0; 1], 0);
+      assert!(
+        matches!(r, Err(TranscriberError::PtsRegression(p)) if p.advance() == advance),
+        "a packet at {pts}: {r:?}"
+      );
+    }
+    assert_eq!(
+      (b.absolute_sample_offset(), b.buffered_samples()),
+      (100, 100)
+    );
+    b.handle_restart(Timestamp::new(0, samples));
+    b.append(Timestamp::new(0, samples), &[0.0; 1], 0).unwrap();
+  }
+
+  /// Main's expected PTS, where it was exact: the offset narrowed to `i64`,
+  /// rescaled by mediatime and added to the anchor, and `None` wherever a
+  /// step left `i64` (a saturated rescale, or a sum that overflowed).
+  fn main_expected_pts(offset: u64, timebase: Timebase, anchor: i64) -> Option<i64> {
+    let offset = i64::try_from(offset).ok()?;
+    anchor.checked_add(ANALYSIS_TIMEBASE.checked_rescale(offset, timebase)?)
+  }
+
+  /// **The rounding law, over the continuity check.** Wherever main's
+  /// expected PTS was exact, the buffer expects the stream's next sample at
+  /// exactly that PTS: `next_expected_starts_at` reports it, a packet one
+  /// tick early is a regression of exactly one tick, a packet on it is
+  /// contiguous, and a packet `d` ticks late is a gap of exactly main's
+  /// rescale of `d` into samples, the halfway case (31 250 ns is half a
+  /// sample) included. The sweep is round 15's: eleven timebases from the
+  /// coarsest to the finest, seven anchors at both ends of `i64`, the
+  /// halfway offsets, the largest offsets main carried, and a
+  /// deterministic spread over every magnitude.
+  #[test]
+  fn the_buffer_expects_every_pts_main_got_exactly() {
+    let tb = |num: i32, den: i32| Timebase::new(num, NonZeroI32::new(den).unwrap());
+    let timebases = [
+      ANALYSIS_TIMEBASE,
+      tb(1, 1_000),
+      tb(1, 90_000),
+      tb(1, 48_000),
+      tb(1, 44_100),
+      tb(1_001, 30_000),
+      tb(1, 1_000_000_000),
+      tb(1, 3),
+      tb(7, 9),
+      tb(i32::MAX, 1),
+      tb(1, i32::MAX),
+    ];
+    let anchors = [
+      0,
+      5_000,
+      -5_000,
+      i64::MAX,
+      i64::MAX - 7,
+      i64::MIN,
+      i64::MIN + 3,
+    ];
+    let top = i64::MAX as u64;
+    let mut offsets = vec![
+      0,
+      1,
+      7,
+      8,
+      9,
+      15,
+      16,
+      17,
+      24,
+      8_000,
+      16_000,
+      1 << 31,
+      (1 << 53) + 1,
+      147_573_952_589_676,
+      147_573_952_589_677,
+      top - 16,
+      top - 8,
+      top - 1,
+      top,
+    ];
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    for _ in 0..4_096 {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      offsets.push(state >> 1);
+      offsets.push((state >> 1) >> (state % 63));
+    }
+    let mut compared = 0_usize;
+    for timebase in timebases {
+      for anchor in anchors {
+        for &offset in &offsets {
+          let Some(expected) = main_expected_pts(offset, timebase, anchor) else {
+            continue;
+          };
+          let at = |pts: i64| Timestamp::new(pts, timebase);
+          let point = || format!("offset {offset} on {timebase:?} from {anchor}");
+          let mut b = resumed(timebase, anchor, offset, 0);
+          assert_eq!(
+            b.next_expected_starts_at().map(|next| next.pts()),
+            Some(expected),
+            "{}",
+            point()
+          );
+          if let Some(early) = expected.checked_sub(1) {
+            let r = b.append(at(early), &[], 0);
+            assert!(
+              matches!(r, Err(TranscriberError::PtsRegression(p)) if p.advance() == -1),
+              "{}: {r:?}",
+              point()
+            );
+          }
+          assert!(b.append(at(expected), &[], 0).is_ok(), "{}", point());
+          for late in [1_i64, 2, 3, 31_249, 31_250, 1_000_003] {
+            let (Some(pts), Some(gap)) = (
+              expected.checked_add(late),
+              timebase.checked_rescale(late, ANALYSIS_TIMEBASE),
+            ) else {
+              continue;
+            };
+            let r = b.append(at(pts), &[], 0);
+            assert!(
+              if gap == 0 {
+                r.is_ok()
+              } else {
+                matches!(r, Err(TranscriberError::GapExceedsTolerance(g))
+                  if i64::try_from(g.gap_samples()) == Ok(gap))
+              },
+              "{}, {late} late: {r:?}",
+              point()
+            );
+          }
+          assert_eq!(b.absolute_sample_offset(), offset, "{}", point());
+          compared += 1;
+        }
+      }
+    }
+    // Every point main carried exactly: 71 007 for each anchor of at most
+    // 5 000 in magnitude but 5 000 itself (71 003), and 7 497 and 5 832 for
+    // the two anchors at the top, where most sums overflowed.
+    assert_eq!(compared, 368_360);
   }
 }

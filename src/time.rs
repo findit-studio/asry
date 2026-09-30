@@ -41,20 +41,23 @@ const SAMPLE_RATE_NZ: NonZeroI32 = nz(SAMPLE_RATE_HZ as i32);
 pub const ANALYSIS_TIMEBASE: Timebase = Timebase::new(1, SAMPLE_RATE_NZ);
 
 /// The PTS, in `timebase`, of the stream sample `sample`, where the
-/// stream's sample 0 is at `base_pts`: the conversion every output range
-/// takes from a 16 kHz sample index (`OutputClock`, and the sample buffer's
-/// chunk and word ranges).
+/// stream's sample 0 is at `base_pts`: the conversion every road from a
+/// 16 kHz sample index to a PTS takes. `OutputClock` takes it; so does the
+/// sample buffer, for its chunk and word ranges and for the PTS it expects
+/// next; and so does a chunk's sub-segment, into the analysis timebase,
+/// where a tick is a sample.
 ///
 /// Nothing narrows before the rescale, and nothing saturates before the
 /// sum. The whole `u64` index is rescaled from [`ANALYSIS_TIMEBASE`] in
-/// `u128`, as mediatime forms the product (`sample * from.num * to.den`
+/// `i128`, as mediatime forms the product (`sample * from.num * to.den`
 /// over `from.den * to.num`), with the rounding of
 /// [`Timebase::saturating_rescale`]: to nearest, halfway cases away from
 /// zero, which for a count of samples is up. `base_pts` is added, and only
 /// that final PTS saturates, at `i64::MAX`; the offset is never negative, so
-/// the sum never falls below `base_pts`. So an index above `i64::MAX` keeps
-/// its exact PTS wherever `timebase` can hold it, and the map is monotone,
-/// so an ordered pair of indices stays ordered. For an index of at most
+/// the sum never falls below `base_pts`. [`sample_pts_exact`] is the same
+/// PTS before that saturation. So an index above `i64::MAX` keeps its exact
+/// PTS wherever `timebase` can hold it, and the map is monotone, so an
+/// ordered pair of indices stays ordered. For an index of at most
 /// `i64::MAX` whose rescale fits an `i64`, the result is exactly
 /// `base_pts.saturating_add(ANALYSIS_TIMEBASE.saturating_rescale(sample as i64, timebase))`.
 ///
@@ -66,25 +69,49 @@ pub const ANALYSIS_TIMEBASE: Timebase = Timebase::new(1, SAMPLE_RATE_NZ);
 /// `Transcriber::handle_samples` and `handle_restart` for the buffer's
 /// timebase.
 pub(crate) fn sample_pts(sample: u64, timebase: Timebase, base_pts: i64) -> i64 {
-  // A timebase's parts are never negative (`num >= 0`, `den > 0`), so
-  // `unsigned_abs` is each part itself. The product is below 2^95 and the
-  // divisor below 2^45, so neither overflows `u128`.
-  let numerator = u128::from(sample)
-    * u128::from(ANALYSIS_TIMEBASE.num().unsigned_abs())
-    * u128::from(timebase.den().get().unsigned_abs());
-  let denominator = u128::from(ANALYSIS_TIMEBASE.den().get().unsigned_abs())
-    * u128::from(timebase.num().unsigned_abs());
+  // Never below `base_pts`, so only the top can leave `i64`.
+  i64::try_from(sample_pts_exact(sample, timebase, base_pts)).unwrap_or(i64::MAX)
+}
+
+/// [`sample_pts`] before its final saturation: the exact PTS, which an
+/// `i128` always holds. The sample buffer measures a packet's distance from
+/// the stream's next sample against it, so a next sample past `i64::MAX` is
+/// never read as `i64::MAX`.
+///
+/// # Panics
+///
+/// If `timebase.num() == 0`, as [`sample_pts`].
+pub(crate) fn sample_pts_exact(sample: u64, timebase: Timebase, base_pts: i64) -> i128 {
+  // Every operand is non-negative (a timebase has `num >= 0` and
+  // `den > 0`); the product is below 2^95 and the divisor below 2^45.
+  let numerator =
+    i128::from(sample) * i128::from(ANALYSIS_TIMEBASE.num()) * i128::from(timebase.den().get());
+  let denominator = i128::from(ANALYSIS_TIMEBASE.den().get()) * i128::from(timebase.num());
   assert!(
     denominator != 0,
     "target timebase numerator must be non-zero"
   );
   let remainder = numerator % denominator;
-  let ticks = numerator / denominator + u128::from(2 * remainder >= denominator);
-  // An offset past `u64::MAX` passes `i64::MAX` from any `base_pts`.
-  u64::try_from(ticks)
-    .ok()
-    .and_then(|ticks| base_pts.checked_add_unsigned(ticks))
-    .unwrap_or(i64::MAX)
+  // The offset is below 2^95 / 16 000 < 2^82, so the sum is exact.
+  i128::from(base_pts) + numerator / denominator + i128::from(2 * remainder >= denominator)
+}
+
+/// A forward distance of `ticks` in `timebase`, in 16 kHz samples:
+/// mediatime's rescale into [`ANALYSIS_TIMEBASE`], with its rounding (to
+/// nearest, halfway cases away from zero, which for a distance is up),
+/// formed in `i128`, where every distance between two `i64` PTS is exact.
+/// Past `u64::MAX` samples it saturates. For a distance of at most
+/// `i64::MAX` ticks whose rescale fits an `i64`, it is exactly
+/// `timebase.saturating_rescale(ticks as i64, ANALYSIS_TIMEBASE)`.
+pub(crate) fn distance_samples(ticks: u64, timebase: Timebase) -> u64 {
+  // Every operand is non-negative; the product is below 2^109, and the
+  // divisor is a timebase's denominator, at least 1.
+  let numerator =
+    i128::from(ticks) * i128::from(timebase.num()) * i128::from(ANALYSIS_TIMEBASE.den().get());
+  let denominator = i128::from(timebase.den().get()) * i128::from(ANALYSIS_TIMEBASE.num());
+  let remainder = numerator % denominator;
+  let samples = numerator / denominator + i128::from(2 * remainder >= denominator);
+  u64::try_from(samples).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

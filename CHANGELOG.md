@@ -360,6 +360,20 @@ FIXED
   arithmetic, with `mediatime`'s rounding (to nearest, halfway cases away
   from zero), add the base, and saturate only that final PTS; every PTS
   the old conversion got exactly is unchanged.
+  And `handle_samples` measures a packet against the stream's next PTS
+  through the same conversion, exactly. It narrowed the sample count and
+  saturated the rescaled offset before adding the anchor, so a stream
+  whose offset alone passed `i64::MAX` was expected early (36 693 ns early
+  on a nanosecond clock from an anchor of -1 ms), and a contiguous packet
+  there read as a one-sample gap and was given a sample of silence; and
+  the sum and the delta were unchecked, so an anchor or a timestamp near
+  either end of `i64` overflowed them. The delta is now exact: a packet
+  behind the stream is `PtsRegression` (its advance saturating at
+  `i64::MIN`), one ahead a gap of its exact length in samples, and past
+  the output timebase's last tick `next_expected_starts_at` reads
+  `i64::MAX` while every packet is `PtsRegression`, until
+  `handle_restart`. A VAD regression's advance is exact the same way.
+  Every PTS and every gap the old arithmetic got exactly is unchanged.
   Behaviour: word ranges scale by `(T - 1) / T` (about 0.07 % on a 30 s
   chunk) and round outward by under a sample; and the 80 ms silence
   default, measured in real time, admits 3 silent frames of a 30 s chunk

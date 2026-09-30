@@ -584,6 +584,11 @@ impl Transcriber {
   /// Authoritative output-timebase PTS the buffer expects for the
   /// next contiguous `handle_samples` call. Returns `None` before
   /// the first push.
+  ///
+  /// Once the stream's next sample lies past the output timebase's
+  /// last tick, this reads `i64::MAX`, as every output PTS there
+  /// does, and no push continues the stream: `handle_samples`
+  /// answers `PtsRegression` until `handle_restart` re-anchors it.
   pub fn next_expected_starts_at(&self) -> Option<Timestamp> {
     self.buffer.next_expected_starts_at()
   }
@@ -759,10 +764,7 @@ impl Transcriber {
     // contradict an explicit silence declaration is also caught
     // here.
     if seg.start_sample() < self.vad_watermark {
-      return Err(TranscriberError::PtsRegression(PtsRegression::new(
-        crate::types::PushKind::VadSegment,
-        seg.start_sample() as i64 - self.vad_watermark as i64,
-      )));
+      return Err(vad_regression(seg.start_sample(), self.vad_watermark));
     }
 
     let merged_chunks = self
@@ -852,10 +854,7 @@ impl Transcriber {
         )));
       }
       if seg.start_sample() < running_watermark {
-        return Err(TranscriberError::PtsRegression(PtsRegression::new(
-          crate::types::PushKind::VadSegment,
-          seg.start_sample() as i64 - running_watermark as i64,
-        )));
+        return Err(vad_regression(seg.start_sample(), running_watermark));
       }
       running_watermark = seg.end_sample();
     }
@@ -911,10 +910,7 @@ impl Transcriber {
       )));
     }
     if sample_index < self.vad_watermark {
-      return Err(TranscriberError::PtsRegression(PtsRegression::new(
-        PushKind::VadSegment,
-        (sample_index as i64) - (self.vad_watermark as i64),
-      )));
+      return Err(vad_regression(sample_index, self.vad_watermark));
     }
     self.vad_watermark = sample_index;
 
@@ -1126,6 +1122,16 @@ impl Transcriber {
 
     Ok(())
   }
+}
+
+/// A VAD push at `sample`, behind the watermark: a `PtsRegression`
+/// whose advance is the distance in samples, exact in `i128` for any
+/// two indices and saturating at `i64::MIN`.
+fn vad_regression(sample: u64, watermark: u64) -> TranscriberError {
+  TranscriberError::PtsRegression(PtsRegression::new(
+    PushKind::VadSegment,
+    i64::try_from(i128::from(sample) - i128::from(watermark)).unwrap_or(i64::MIN),
+  ))
 }
 
 #[cfg(test)]
@@ -2259,6 +2265,28 @@ mod tests {
     match t.precheck_vad_segments(&segs, 0) {
       Err(TranscriberError::OutputTimebaseUnset) => {}
       other => panic!("expected OutputTimebaseUnset; got {other:?}"),
+    }
+  }
+
+  /// **A VAD regression's advance is its exact distance behind the
+  /// watermark, for any two indices:** across `i64::MAX`, and saturating
+  /// at `i64::MIN` past it. Narrowing each index to `i64` first overflowed
+  /// the difference across `i64::MAX`.
+  #[test]
+  fn a_vad_regression_measures_its_exact_distance() {
+    let top = i64::MAX as u64;
+    for (sample, watermark, advance) in [
+      (5, 7, -2),
+      (top, top + 2, -2),
+      (0, top + 1, i64::MIN),
+      (0, u64::MAX, i64::MIN),
+    ] {
+      let r = vad_regression(sample, watermark);
+      assert!(
+        matches!(r, TranscriberError::PtsRegression(p)
+          if p.kind() == PushKind::VadSegment && p.advance() == advance),
+        "{sample} behind {watermark}: {r:?}"
+      );
     }
   }
 }

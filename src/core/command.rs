@@ -1266,16 +1266,20 @@ impl AlignmentRequest {
 
   /// The chunk's sub-VAD-segments in chunk-local 16 kHz sample indices,
   /// as `TimeRange`s in the 1/16000 timebase: the form the aligner reads.
+  /// Each bound's offset from the chunk's first sample is taken in `u64`
+  /// (a chunk begins at its first sub-segment, and VAD never regresses),
+  /// then [`sample_pts`](crate::time::sample_pts) takes it into the
+  /// analysis timebase, where a tick is a sample.
   #[cfg(any(feature = "alignment", feature = "emissions"))]
   pub(crate) fn chunk_local_sub_segments(&self) -> Vec<TimeRange> {
-    let first = self.context.first_sample as i64;
-    let tb_16k =
-      mediatime::Timebase::new(1, core::num::NonZeroI32::new(16_000).expect("16000 != 0"));
+    use crate::time::{ANALYSIS_TIMEBASE, sample_pts};
+    let first = self.context.first_sample;
+    let local = |sample: u64| sample_pts(sample.saturating_sub(first), ANALYSIS_TIMEBASE, 0);
     self
       .context
       .sub_segments_samples
       .iter()
-      .map(|&(start, end)| TimeRange::new(start as i64 - first, end as i64 - first, tb_16k))
+      .map(|&(start, end)| TimeRange::new(local(start), local(end), ANALYSIS_TIMEBASE))
       .collect()
   }
 
@@ -1850,10 +1854,12 @@ pub enum Command {
   /// let chunk_first = transcriber.chunk_first_sample(chunk_id).unwrap();
   /// let raw_subs = transcriber.chunk_sub_segments_samples(chunk_id).unwrap();
   /// let tb_16k = mediatime::Timebase::new(1, NonZeroI32::new(16_000).unwrap());
+  /// // Subtract in `u64` first: the chunk-local offset is small, and a
+  /// // stream index need not fit an `i64`.
   /// let aligner_subs: Vec<TimeRange> = raw_subs.iter()
-  /// .map(|(s, e)| TimeRange::new(
-  /// (*s as i64) - (chunk_first as i64),
-  /// (*e as i64) - (chunk_first as i64),
+  /// .map(|&(s, e)| TimeRange::new(
+  /// i64::try_from(s - chunk_first).unwrap(),
+  /// i64::try_from(e - chunk_first).unwrap(),
   /// tb_16k))
   /// .collect();
   /// ```
@@ -2548,5 +2554,33 @@ mod tests {
       SamplingStrategy::Greedy { best_of } => assert_eq!(best_of, 1),
       _ => panic!("expected Greedy"),
     }
+  }
+
+  /// **A sub-segment is an offset within its chunk, wherever the chunk
+  /// sits.** A chunk whose first sample is 5 below `2^63` has sub-segments
+  /// `0..5` and `15..30` samples in, the second past `2^63`: each offset is
+  /// taken in `u64`, then converted. Narrowing each stream index to `i64`
+  /// first overflowed their difference across `2^63`.
+  #[cfg(any(feature = "alignment", feature = "emissions"))]
+  #[test]
+  fn a_sub_segment_is_an_offset_within_its_chunk_wherever_the_chunk_sits() {
+    let mut request = AlignmentRequest::for_test(
+      ChunkId::from_raw(5),
+      NonZeroU64::new(1).expect("1 != 0"),
+      Arc::from(vec![0.0_f32; 1_600]),
+      SmolStr::new("hello"),
+      Lang::En,
+      Vec::new(),
+    );
+    let first = (1_u64 << 63) - 5;
+    request.context.first_sample = first;
+    request.context.sub_segments_samples = vec![(first, first + 5), (first + 15, first + 30)];
+    let local: Vec<(i64, i64, mediatime::Timebase)> = request
+      .chunk_local_sub_segments()
+      .iter()
+      .map(|range| (range.start_pts(), range.end_pts(), range.timebase()))
+      .collect();
+    let analysis = crate::time::ANALYSIS_TIMEBASE;
+    assert_eq!(local, [(0, 5, analysis), (15, 30, analysis)]);
   }
 }
