@@ -42,7 +42,7 @@ pub const DEFAULT_MIN_SPEECH_COVERAGE: f32 = 0.5;
 ///
 /// A silent run is measured in real samples: a run of silent frames
 /// lasts its frames' share of the unit's real audio (`run * n / T`
-/// samples, [`FrameGeometry::run_exceeds`]), compared with this limit's
+/// samples, for `T` frames over `n` real samples), compared with this limit's
 /// 1 280 samples, never through a nominal hop. At wav2vec2's 50 fps a
 /// frame is about 320 samples, so the limit admits 4 silent frames when
 /// they are exactly 320 samples each; a 30 s chunk whose encoder returns
