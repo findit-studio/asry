@@ -1401,6 +1401,7 @@ fn into_emissions_error(err: WorkFailure) -> EmissionsError {
       AlignmentError::Aborted(f) | AlignmentError::Abandoned(f) => {
         EmissionsError::Aborted(neutral(f))
       }
+      AlignmentError::Geometry(f) => EmissionsError::Geometry(neutral(f)),
       AlignmentError::Normalization(f) | AlignmentError::EmptyText(f) => {
         EmissionsError::Tokenization(neutral(f))
       }

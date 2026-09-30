@@ -1276,6 +1276,104 @@ fn a_valid_padded_short_unit_is_unchanged() {
   assert_eq!(only_word_range(short_unit_word(1, 0)), (0, 200));
 }
 
+/// A unit of `real` samples of `a`, zero-padded to the 400-sample
+/// receptive field, with speech over `speech`, finished with `t` frames in
+/// which `A` leads frame `a_frame` and the blank every other, by an aligner
+/// whose intra-word silence limit is `limit`, on `clock`.
+fn padded_unit_word(
+  real: usize,
+  speech: &SpeechSpans,
+  t: usize,
+  a_frame: usize,
+  limit: Duration,
+  clock: OutputClock,
+) -> Result<UnitAlignment, EmissionsError> {
+  let a = EmissionsAligner::builder(Lang::En, TOKENIZER_JSON.as_bytes())
+    .max_intra_silent_run(limit)
+    .build()
+    .expect("a wav2vec2-shape tokenizer must build");
+  let samples: Vec<f32> = (0..real)
+    .map(|i| (i as f32 * 0.05).sin() * 0.2 + 0.1)
+    .collect();
+  let prepared = a
+    .prepare(
+      &samples,
+      speech,
+      "a",
+      resolution(&a, "a"),
+      &AtomicBool::new(false),
+    )
+    .expect("prepare");
+  assert_eq!(prepared.encoder_input().len(), 400);
+  assert_eq!(prepared.real_samples(), real);
+  let mut raw = vec![-9.0_f32; t * VOCAB_SIZE];
+  for frame in 0..t {
+    raw[frame * VOCAB_SIZE] = -0.01;
+  }
+  raw[a_frame * VOCAB_SIZE] = -9.0;
+  raw[a_frame * VOCAB_SIZE + 7] = -0.01;
+  let emissions = prepared
+    .encoded_log_probs(t, a.vocab_size(), raw)
+    .expect("well-formed");
+  a.finish(prepared, emissions, clock, &AtomicBool::new(false))
+}
+
+/// **An 8 ms silence limit admits a 6.25 ms silent frame, end to end.** A
+/// same-padded 200-sample unit has 2 frames of 100 real samples (6.25 ms).
+/// Speech covers frame 0 only; the word `a`, entered at frame 0, holds
+/// both frames, so its coverage is 0.5 and its one silent frame lasts
+/// 6.25 ms, under the 8 ms limit: it stays, `[0, 200)`. Through a nominal
+/// 20 ms hop the limit rounded to no frame at all and the word was dropped.
+#[test]
+fn an_8_ms_limit_admits_a_6_25_ms_silent_frame_end_to_end() {
+  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
+  let speech = SpeechSpans::from_time_ranges(&[mediatime::TimeRange::new(0, 100, analysis_tb())])
+    .expect("analysis timebase");
+  let outcome = padded_unit_word(200, &speech, 2, 0, Duration::from_millis(8), clock);
+  assert_eq!(only_word_range(outcome), (0, 200));
+}
+
+/// **A one-real-sample unit keeps its last-frame word, or fails by name;
+/// never silently.** One real sample, padded to 400, and a front end that
+/// pads its input gives 2 frames of half a sample each. The word on the
+/// last frame keeps the one sample, `[0, 1)`, on a sample clock; on a
+/// millisecond clock, which cannot represent a sixteenth of a millisecond,
+/// `finish` fails with `EmissionsError::Geometry` naming the word, instead
+/// of the unit coming back `NoSurvivingWords`.
+#[test]
+fn a_one_real_sample_unit_keeps_its_last_frame_word_or_fails_by_name() {
+  let samples = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
+  let outcome = padded_unit_word(
+    1,
+    &SpeechSpans::all_speech(),
+    2,
+    1,
+    DEFAULT_MAX_INTRA_SILENT_RUN,
+    samples,
+  );
+  assert_eq!(only_word_range(outcome), (0, 1));
+
+  let ms = Timebase::new(1, NonZeroI32::new(1_000).expect("1000 != 0"));
+  let millis = OutputClock::new(0, ms, 0).expect("1/1000 is a valid output timebase");
+  match padded_unit_word(
+    1,
+    &SpeechSpans::all_speech(),
+    2,
+    1,
+    DEFAULT_MAX_INTRA_SILENT_RUN,
+    millis,
+  ) {
+    Err(EmissionsError::Geometry(failure)) => {
+      assert!(
+        failure.message().contains("word \"a\""),
+        "{}",
+        failure.message()
+      );
+    }
+    other => panic!("an unrepresentable word fails by name; got {other:?}"),
+  }
+}
+
 /// `finish` CONSUMES `prepared`, so a chunk cannot be finished twice.
 /// (Compile-time; this test documents it — uncommenting the second call
 /// below is a borrow-check error.)

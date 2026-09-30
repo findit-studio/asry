@@ -98,6 +98,7 @@ fn to_emissions_error(err: WorkFailure, stage: Stage) -> EmissionsError {
       AlignmentError::Aborted(ref f) | AlignmentError::Abandoned(ref f) => {
         EmissionsError::Aborted(neutral(f))
       }
+      AlignmentError::Geometry(ref f) => EmissionsError::Geometry(neutral(f)),
     },
     // No worker and no pool behind a bare call: the only way the core
     // raises this is the cooperative `abort_flag`.
@@ -414,7 +415,10 @@ impl EmissionsAligner {
   /// [`EmissionsError::AlignerMismatch`] if `prepared` came from a
   /// *different* `EmissionsAligner`;
   /// [`EmissionsError::PreparationMismatch`] if `emissions` were made
-  /// through another chunk than `prepared`.
+  /// through another chunk than `prepared`;
+  /// [`EmissionsError::Geometry`] if a word's frames hold speech but its
+  /// range cannot be represented by `clock` (it maps the word's nonempty
+  /// sample range to an empty one), named rather than dropped.
   pub fn finish(
     &self,
     prepared: PreparedChunk<'_>,
@@ -619,7 +623,8 @@ fn work_failure_message(err: WorkFailure) -> EmissionsFailure {
       | AlignmentError::EmptyText(f)
       | AlignmentError::SemanticOutOfVocab(f)
       | AlignmentError::Aborted(f)
-      | AlignmentError::Abandoned(f),
+      | AlignmentError::Abandoned(f)
+      | AlignmentError::Geometry(f),
     ) => EmissionsFailure::new(f.message().clone()),
     other => EmissionsFailure::new(format_smolstr!("{other:?}")),
   }

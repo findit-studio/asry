@@ -42,7 +42,7 @@ use crate::{
   core::{UnalignedCause, UnitAlignment},
   runner::aligner::{
     algorithm::{
-      compose::{build_speech_frames, compose_words, effective_samples_per_frame},
+      compose::{FrameGeometry, build_speech_frames, compose_words},
       encode::{LogProbsTV, validate_stride_extent, validate_vocab_dim},
       tokenize::{ReservedIds, TokenizedText, detect_oov_events, tokenize_with_word_map},
       trellis_beam::align_to_word_segments,
@@ -1496,37 +1496,39 @@ impl AlignerCore {
     //
     // Two geometries, kept apart. VALIDATION reads the padded encoder
     // input, what the encoder saw (`validate_stride_extent`, above). The
-    // OUTPUT (word ranges and speech coverage) partitions the REAL audio:
-    // frame `k` of `T` covers `[k * n / T, (k + 1) * n / T)` of the real
-    // `n` samples, WhisperX's ratio over the real waveform. A chunk
+    // OUTPUT (word ranges, the speech mask and its gates) partitions the
+    // REAL audio: frame `k` of `T` covers `[k * n / T, (k + 1) * n / T)` of
+    // the real `n` samples, exactly (`FrameGeometry`), WhisperX's ratio over
+    // the real waveform. A chunk
     // shorter than the receptive field is zero-padded to it, and a front
     // end that pads its input ("same" padding) gives it more than one
     // frame; mapping them over the padded length put the last ones on the
     // padding, masked as silence, and dropped their words, though their
     // receptive fields cover the real tail.
-    let real_n_samples = prepared.real_samples as u64;
-    let samples_per_frame =
-      effective_samples_per_frame(real_n_samples, log_probs.t(), self.hop_samples.get());
-    let speech_frames = build_speech_frames(
-      log_probs.t(),
-      samples_per_frame,
-      real_n_samples,
-      real_n_samples,
-      &prepared.speech,
-    );
+    //
+    // Every output gate spends this one geometry, exactly: the speech
+    // mask, the coverage and intra-word silence gates (the silence limit
+    // in real samples, never through the hop), and the word ranges, the
+    // finished range alone rounded, outward. A passing word whose range
+    // the output clock cannot represent fails the unit, by name.
+    let geometry = FrameGeometry::new(prepared.real_samples as u64, log_probs.t());
+    let speech_frames = build_speech_frames(geometry, &prepared.speech);
     let composed = compose_words(
       &word_segments,
       prepared.normalized.original_words(),
       &speech_frames,
+      geometry,
       chunk_first_sample_in_stream,
-      self.hop_samples.get(),
-      real_n_samples,
-      real_n_samples,
-      log_probs.t(),
       samples_to_output_range,
       self.min_speech_coverage,
       self.max_intra_silent_run,
-    );
+    )
+    .map_err(|failure| {
+      WorkFailure::Alignment(AlignmentError::Geometry(AlignmentFailure::new(
+        format_smolstr!("{failure}"),
+        self.language.clone(),
+      )))
+    })?;
     Ok(UnitAlignment::from_words(composed))
   }
 }

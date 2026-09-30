@@ -171,8 +171,9 @@ BREAKING
     `request.aligned(outcomes)` remain for a driver that assembles the
     outcomes itself; `request.failed(failure)` answers a failure that is
     not one unit's own.)
-  - `AlignmentError` has the new variant `Abandoned`, the terminal event
-    of a command dropped unanswered.
+  - `AlignmentError` has the new variants `Abandoned`, the terminal event
+    of a command dropped unanswered, and `Geometry`, a word whose range the
+    output clock cannot represent; `EmissionsError` has `Geometry` too.
   - `Transcriber::handle_alignment` is gone: use `complete`, which returns
     `Result<(), RefusedCompletion>`; `?` into a `RunnerError` gives
     `RunnerError::RefusedCompletion`. `handle_failure` takes ASR failures
@@ -326,19 +327,32 @@ FIXED
   first spoken character, not one frame later (or, for the first word, at
   the unit's first frame), which departs from WhisperX's timing; the
   confidence of a word is its own frames'. A unit needs a frame per token.
-  And the frames partition the audio: frame `k` of `T` covers samples
-  `[k * n / T, (k + 1) * n / T)` for word ranges and the speech mask
-  alike (`effective_samples_per_frame` is `n / T`, WhisperX's ratio over
-  the trellis with its end state; it was `n / (T - 1)`), so the last
-  frame covers the audio's last samples instead of starting at its end,
-  where a word entered there was masked as silence and dropped. Word
-  ranges scale by `(T - 1) / T` (about 0.07 % on a 30 s chunk). The
-  output partitions the REAL audio, `n` being the real length, while the
-  frame-count check keeps the padded encoder input: a unit shorter than
-  the receptive field, zero-padded to it, whose front end pads its input
-  gets more than one frame, and those frames now cover the real audio
-  instead of the last ones landing on the padding, masked as silence, and
-  dropping their words.
+  And every output gate reads one geometry: the unit's `T` frames
+  partition its `n` REAL samples, frame `k` covering exactly
+  `[k * n / T, (k + 1) * n / T)`, kept as exact rationals, never as a
+  pre-rounded samples-per-frame (it was `n / (T - 1)` over the padded
+  encoder input, rounded per frame). So the last frame covers the audio's
+  last samples instead of starting at its end, where a word entered there
+  was masked as silence and dropped; a unit shorter than the receptive
+  field, zero-padded to it, whose front end pads its input gets frames
+  that cover the real audio instead of the padding; and frames narrower
+  than a sample (more frames than real samples) are judged by their exact
+  share instead of collapsing to empty and silent. The frame-count check
+  keeps the padded encoder input. The speech mask judges each frame's
+  exact overlap with speech (at least half its width); the intra-word
+  silence gate measures a silent run in real samples (`run * n / T`)
+  against `max_intra_silent_run` in samples, never through the hop; and
+  only a finished word range is rounded, outward, to whole samples. A word
+  whose frames hold speech but whose range the output clock cannot
+  represent (placed in the stream it overflows `u64`, or the clock maps it
+  to an empty range, as a millisecond clock does a one-sample word) fails
+  the unit with the new `AlignmentError::Geometry` /
+  `EmissionsError::Geometry`, naming the word, instead of being dropped.
+  Behaviour: word ranges scale by `(T - 1) / T` (about 0.07 % on a 30 s
+  chunk) and round outward by under a sample; and the 80 ms silence
+  default, measured in real time, admits 3 silent frames of a 30 s chunk
+  (1 499 frames of about 320.21 samples) where it admitted 4, since 4 of
+  them last 80.05 ms.
   The `bench-internals` `backtrack_beam` labels a change's frame with the
   token it enters.
 - **The unknown token is the one the tokenizer declares.** The reserved

@@ -214,6 +214,14 @@ pub enum EmissionsError {
   /// pipeline completed.
   #[error("aborted before completing: {0}")]
   Aborted(EmissionsFailure),
+
+  /// A word the output clock cannot represent: its frames hold speech and
+  /// its finished range, rounded outward, is a nonempty span of real
+  /// samples, but placed in the stream it overflows the sample count or
+  /// the `OutputClock` maps it to an empty range. Named rather than
+  /// dropped.
+  #[error("geometry: {0}")]
+  Geometry(EmissionsFailure),
 }
 
 impl From<LogProbsError> for EmissionsError {
@@ -279,6 +287,7 @@ impl EmissionsError {
         AlignmentError::NoAlignmentPath(failure(f.message))
       }
       Self::Aborted(f) => AlignmentError::Aborted(failure(f.message)),
+      Self::Geometry(f) => AlignmentError::Geometry(failure(f.message)),
     };
     WorkFailure::Alignment(inner)
   }
