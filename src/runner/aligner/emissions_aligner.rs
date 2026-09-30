@@ -509,7 +509,8 @@ impl EmissionsAligner {
         emissions.inner(),
         clock.chunk_first_sample_in_stream(),
         // `OutputClock` IS the bridge: data, not a caller closure with a
-        // totality obligation. asry owns the u64 -> i64 saturation.
+        // totality obligation. asry owns the conversion: each u64 index is
+        // rescaled whole, and only the final PTS saturates.
         |start, end| clock.range(start, end),
         abort_flag,
       )

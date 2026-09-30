@@ -13,7 +13,7 @@
 use mediatime::{Timebase, Timestamp};
 
 use crate::{
-  time::ANALYSIS_TIMEBASE,
+  time::{ANALYSIS_TIMEBASE, sample_pts},
   types::{
     Backpressure, GapExceedsTolerance, InconsistentTimebase, PtsRegression, PushKind,
     TranscriberError,
@@ -256,9 +256,10 @@ impl SampleBuffer {
   }
 
   /// Convert a 16 kHz `SampleRange` (stream-relative) to a
-  /// `mediatime::TimeRange` in the output timebase. Always
-  /// rescales from the immutable anchor; the round-trip error is
-  /// at most ±1 PTS regardless of trim history.
+  /// `mediatime::TimeRange` in the output timebase, through
+  /// [`sample_pts`]: each index rescaled whole, only the final PTS
+  /// saturated. Always rescales from the immutable anchor; the
+  /// round-trip error is at most ±1 PTS regardless of trim history.
   pub(crate) fn samples_to_output_range(
     &self,
     range: crate::core::cut::SampleRange,
@@ -266,10 +267,8 @@ impl SampleBuffer {
     let tb = self
       .output_tb
       .expect("samples_to_output_range called before any push");
-    let start_out =
-      self.base_pts_out_anchor + ANALYSIS_TIMEBASE.saturating_rescale(range.start as i64, tb);
-    let end_out =
-      self.base_pts_out_anchor + ANALYSIS_TIMEBASE.saturating_rescale(range.end as i64, tb);
+    let start_out = sample_pts(range.start, tb, self.base_pts_out_anchor);
+    let end_out = sample_pts(range.end, tb, self.base_pts_out_anchor);
     mediatime::TimeRange::new(start_out, end_out, tb)
   }
 
@@ -282,10 +281,13 @@ impl SampleBuffer {
   /// the chunk's own PTS epoch even after a `handle_restart` shifts
   /// the live buffer onto a new one.
   ///
-  /// Conversion math is identical to
-  /// [`samples_to_output_range`](Self::samples_to_output_range)
-  /// (drift-free): `out_pts = base_pts_out_anchor +
-  /// ANALYSIS_TIMEBASE.saturating_rescale(sample, tb)`.
+  /// The conversion is
+  /// [`samples_to_output_range`](Self::samples_to_output_range)'s
+  /// (drift-free), [`sample_pts`]: each index rescaled whole from the
+  /// anchor, only the final PTS saturated. So the closure is total over
+  /// every `(u64, u64)` with `start <= end`, as `compose_words` requires of
+  /// its bridge, and lands where `OutputClock` does for the same timebase
+  /// and anchor.
   #[cfg(feature = "alignment")]
   pub(crate) fn samples_to_output_range_fn_at(
     tb: Timebase,
@@ -293,10 +295,8 @@ impl SampleBuffer {
   ) -> std::sync::Arc<dyn Fn(u64, u64) -> mediatime::TimeRange + Send + Sync> {
     std::sync::Arc::new(
       move |start_sample: u64, end_sample: u64| -> mediatime::TimeRange {
-        let s_pts =
-          base_pts_out_anchor + ANALYSIS_TIMEBASE.saturating_rescale(start_sample as i64, tb);
-        let e_pts =
-          base_pts_out_anchor + ANALYSIS_TIMEBASE.saturating_rescale(end_sample as i64, tb);
+        let s_pts = sample_pts(start_sample, tb, base_pts_out_anchor);
+        let e_pts = sample_pts(end_sample, tb, base_pts_out_anchor);
         mediatime::TimeRange::new(s_pts, e_pts, tb)
       },
     )
@@ -678,6 +678,41 @@ mod tests {
     match r {
       Err(TranscriberError::Backpressure(_)) => {}
       other => panic!("expected Backpressure on overflow; got {other:?}"),
+    }
+  }
+
+  /// **The transcriber's bridge is the one conversion.** The closure
+  /// `compose_words` gets on the transcriber's road rescales each whole
+  /// `u64` index and saturates only the final PTS, and lands where
+  /// `OutputClock` does for the same timebase and anchor. Codex R14's
+  /// example, samples `2^63..2^63 + 16 000` on a millisecond clock from 0,
+  /// is `2^59..2^59 + 1 000`, and a pair across `i64::MAX` stays ordered. A
+  /// bare `as i64` cast wrapped the upper index negative: the example came
+  /// back at `-2^59`, and the pair across `i64::MAX` inverted, which
+  /// `TimeRange::new` refuses with a panic.
+  #[cfg(feature = "alignment")]
+  #[test]
+  fn the_transcriber_bridge_rescales_the_whole_index() {
+    let ms = Timebase::new(1, NonZeroI32::new(1_000).unwrap());
+    let bridge = SampleBuffer::samples_to_output_range_fn_at(ms, 0);
+    let range = bridge(1 << 63, (1 << 63) + 16_000);
+    assert_eq!(
+      (range.start_pts(), range.end_pts()),
+      (1 << 59, (1 << 59) + 1_000)
+    );
+    let across = bridge(i64::MAX as u64, 1 << 63);
+    assert_eq!((across.start_pts(), across.end_pts()), (1 << 59, 1 << 59));
+    for base in [0, -1_000_000, i64::MAX - 500] {
+      let bridge = SampleBuffer::samples_to_output_range_fn_at(ms, base);
+      let clock = crate::emissions::OutputClock::new(0, ms, base).unwrap();
+      for (start, end) in [(0, 16_000), (1 << 63, (1 << 63) + 16_000), (0, u64::MAX)] {
+        let (ours, theirs) = (bridge(start, end), clock.range(start, end));
+        assert_eq!(
+          (ours.start_pts(), ours.end_pts()),
+          (theirs.start_pts(), theirs.end_pts()),
+          "{start}..{end} from {base}"
+        );
+      }
     }
   }
 }

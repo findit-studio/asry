@@ -348,6 +348,18 @@ FIXED
   to an empty range, as a millisecond clock does a one-sample word) fails
   the unit with the new `AlignmentError::Geometry` /
   `EmissionsError::Geometry`, naming the word, instead of being dropped.
+  And the output clock rescales a stream sample index whole. `OutputClock`
+  narrowed each `u64` index to `i64` before the rescale, so every index
+  above `i64::MAX` became one value, and a range the output timebase can
+  hold there (samples `2^63..2^63 + 16 000` on a millisecond clock are
+  `2^59..2^59 + 1 000`) came back empty and failed as `Geometry`; the
+  transcriber's own bridge (`chunk_samples_to_output_range_fn`) wrapped
+  such an index negative. And the rescaled offset saturated before
+  `base_pts` was added, so a negative base could not bring an offset past
+  `i64::MAX` back. Both now rescale the whole index in wide integer
+  arithmetic, with `mediatime`'s rounding (to nearest, halfway cases away
+  from zero), add the base, and saturate only that final PTS; every PTS
+  the old conversion got exactly is unchanged.
   Behaviour: word ranges scale by `(T - 1) / T` (about 0.07 % on a 30 s
   chunk) and round outward by under a sample; and the 80 ms silence
   default, measured in real time, admits 3 silent frames of a 30 s chunk

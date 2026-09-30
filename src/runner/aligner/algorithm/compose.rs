@@ -159,10 +159,10 @@ impl FrameGeometry {
 /// A word whose frames hold speech but whose range the output clock cannot
 /// represent. Its finished range, rounded outward, is a nonempty span of the
 /// unit's real samples; placed after the stream anchor it overflows the
-/// `u64` sample count, or the output clock maps it to an empty range (its
-/// timebase saturates, or is coarser than the span). Never silence and never
-/// a dropped word: composition stops with it, naming the word, and the
-/// unit's alignment fails.
+/// `u64` sample count, or the output clock maps it to an empty range (it
+/// lies past the timebase's last `i64` tick, or the timebase is coarser than
+/// the span). Never silence and never a dropped word: composition stops with
+/// it, naming the word, and the unit's alignment fails.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error(
   "the output clock cannot represent the range of word {word:?}: real samples {start}..{end} \
@@ -259,10 +259,14 @@ pub fn build_speech_frames(geometry: FrameGeometry, speech: &SpeechSpans) -> Vec
 /// 16 kHz sample indices, `start < end`, inside
 /// `[chunk_first_sample_in_stream, chunk_first_sample_in_stream + n]`. It
 /// must be total over the whole `u64` range: the anchor is the caller's, so
-/// indices above `i64::MAX` are legitimate, and a bridge that reaches `i64`
-/// with a bare `as i64` cast truncates (`u64::MAX as i64 == -1`) and can
-/// invert an ordered pair, which `TimeRange::new` refuses. Saturate
-/// (`i64::try_from(x).unwrap_or(i64::MAX)`), as asry's own bridges do.
+/// indices above `i64::MAX` are legitimate. An index narrowed to `i64`
+/// before the rescale is lost: a bare `as i64` cast truncates
+/// (`u64::MAX as i64 == -1`) and can invert an ordered pair, which
+/// `TimeRange::new` refuses, and a saturating one sends every index above
+/// `i64::MAX` to one PTS, so a range the output timebase can hold comes
+/// back empty and fails as a [`GeometryFailure`]. Rescale the whole `u64`
+/// in wide arithmetic, add the base PTS, and saturate only that final PTS,
+/// as asry's own bridges do (`OutputClock`, and the transcriber's).
 #[allow(
   clippy::too_many_arguments,
   reason = "8 args carry the per-unit composition contract (word segments, \
@@ -405,7 +409,7 @@ mod tests {
   /// A clock in milliseconds that rescales samples as asry's bridges do
   /// (to nearest): a span shorter than half a millisecond collapses.
   fn ms_clock(start: u64, end: u64) -> TimeRange {
-    let ms = |x: u64| crate::time::ANALYSIS_TIMEBASE.saturating_rescale(x as i64, tb_ms());
+    let ms = |x: u64| crate::time::sample_pts(x, tb_ms(), 0);
     TimeRange::new(ms(start), ms(end), tb_ms())
   }
 

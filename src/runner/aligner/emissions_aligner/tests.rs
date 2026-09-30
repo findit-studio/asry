@@ -1374,6 +1374,42 @@ fn a_one_real_sample_unit_keeps_its_last_frame_word_or_fails_by_name() {
   }
 }
 
+/// **A word past `i64::MAX` samples composes with its exact range (Codex
+/// R14's example).** A second of speech, 49 frames, `A` leading every one:
+/// the word holds the whole unit, `[0, 16 000)`. Placed at the stream sample
+/// `2^63` on a millisecond clock with `base_pts = 0`, it is
+/// `2^59..2^59 + 1 000` ms, well inside `i64`. Narrowing each index to `i64`
+/// before the rescale sent both ends to one PTS, and `finish` failed with
+/// `EmissionsError::Geometry`.
+#[test]
+fn a_word_past_i64_max_samples_composes_with_its_exact_range() {
+  let a = aligner();
+  let samples: Vec<f32> = (0..16_000).map(|i| (i as f32 * 0.01).sin() * 0.2).collect();
+  let prepared = a
+    .prepare(
+      &samples,
+      &SpeechSpans::all_speech(),
+      "a",
+      resolution(&a, "a"),
+      &AtomicBool::new(false),
+    )
+    .expect("prepare");
+  let t = 49;
+  let mut raw = vec![-9.0_f32; t * VOCAB_SIZE];
+  for frame in 0..t {
+    raw[frame * VOCAB_SIZE + 7] = -0.01;
+  }
+  let emissions = prepared
+    .encoded_log_probs(t, a.vocab_size(), raw)
+    .expect("well-formed");
+  let ms = Timebase::new(1, NonZeroI32::new(1_000).expect("1000 != 0"));
+  let clock = OutputClock::new(1 << 63, ms, 0).expect("1/1000 is a valid output timebase");
+  assert_eq!(
+    only_word_range(a.finish(prepared, emissions, clock, &AtomicBool::new(false))),
+    (1 << 59, (1 << 59) + 1_000)
+  );
+}
+
 /// `finish` CONSUMES `prepared`, so a chunk cannot be finished twice.
 /// (Compile-time; this test documents it — uncommenting the second call
 /// below is a borrow-check error.)

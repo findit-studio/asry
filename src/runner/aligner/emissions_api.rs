@@ -11,7 +11,7 @@
 //! |---|---|
 //! | `min_speech_coverage: f32` (NaN silently disabled the filter) | [`SpeechCoverage`] — NaN is unconstructible, so `<` is a total order |
 //! | `sub_segments: &[TimeRange]` (the timebase was silently ignored) | [`SpeechSpans`] of [`SampleSpan`] — **no timebase axis to ignore** |
-//! | `samples_to_output_range: impl Fn(u64, u64) -> TimeRange` (had to be total over all of `u64` or the caller's own closure panicked) | [`OutputClock`] — data; asry owns the saturation |
+//! | `samples_to_output_range: impl Fn(u64, u64) -> TimeRange` (had to be total over all of `u64` or the caller's own closure panicked) | [`OutputClock`] — data; asry owns the conversion, and only the final PTS saturates |
 //! | `(t, v, Vec<f32>)` (two doors, neither guarding the other's rule) | [`Emissions`] — one door, all the guards |
 //! | `n_samples`, `n_frames`, `samples_per_frame` | derived by asry from slices that physically exist |
 
@@ -30,7 +30,7 @@ use crate::{
     },
     core::{PreparationId, PreparedChunk, coerce_speech_coverage},
   },
-  time::{ANALYSIS_TIMEBASE, SAMPLE_RATE_HZ},
+  time::{ANALYSIS_TIMEBASE, SAMPLE_RATE_HZ, sample_pts},
 };
 
 // ————————————————————— SpeechCoverage —————————————————————
@@ -155,9 +155,12 @@ pub enum SpanError {
 
   /// A bound exceeded [`SampleSpan::MAX_SAMPLE`].
   ///
-  /// A codomain bound, not a policy number: `mediatime`'s PTS is `i64`,
-  /// so a sample index above `i64::MAX` has no representable output
-  /// time. (`i64::MAX` 16 kHz samples is ~18 million years of audio.)
+  /// A codomain bound, not a policy number: a span is chunk-local, and its
+  /// bridges from `mediatime` read one `i64` tick of the 1/16000 analysis
+  /// timebase per sample, so a chunk-local index above `i64::MAX` has no
+  /// analysis-timebase time. (`i64::MAX` 16 kHz samples is ~18 million
+  /// years of audio.) It bounds a span within its chunk, not a place in
+  /// the stream: [`OutputClock`] maps every `u64` stream index.
   #[error("sample index {value} exceeds the representable maximum {max}")]
   OutOfRange {
     /// The offending bound.
@@ -201,7 +204,7 @@ pub struct SampleSpan {
 }
 
 impl SampleSpan {
-  /// The largest representable sample index. See
+  /// The largest chunk-local sample index a span holds. See
   /// [`SpanError::OutOfRange`].
   pub const MAX_SAMPLE: u64 = i64::MAX as u64;
 
@@ -426,10 +429,16 @@ impl SpeechSpans {
 /// `TimeRange::new`'s `start <= end` assert. **A documented obligation on
 /// the caller is a representable illegal state.**
 ///
-/// This is data. asry owns the `u64 → i64` saturation, so there is no
-/// caller code left to get it wrong. The arithmetic is exactly what
-/// `core::buffer` does:
-/// `base_pts + ANALYSIS_TIMEBASE.saturating_rescale(sample, timebase)`.
+/// This is data, and asry owns the conversion, so there is no caller code
+/// left to get it wrong. Each stream sample index is rescaled whole, as a
+/// `u64` in wide integer arithmetic, with `mediatime`'s rounding
+/// (`Timebase::saturating_rescale`'s: to nearest, halfway cases away from
+/// zero); `base_pts` is added; and only that final PTS saturates, at
+/// `i64::MAX`. Nothing narrows before the rescale: an index above
+/// `i64::MAX` keeps its exact PTS wherever the output timebase can hold it
+/// (`2^63` samples is `2^59` ms), and a range past the timebase's last
+/// `i64` tick clamps at its end. The transcriber's own sample buffer maps
+/// its chunk and word ranges through the same conversion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutputClock {
   chunk_first_sample_in_stream: u64,
@@ -474,24 +483,20 @@ impl OutputClock {
   }
 
   /// Map a stream-absolute 16 kHz sample range to an output
-  /// [`TimeRange`]. Total over every `(u64, u64)` with `start <= end`:
-  /// the `u64 → i64` reach saturates rather than truncating, so the
-  /// pair can never invert.
+  /// [`TimeRange`]. Total over every `(u64, u64)` with `start <= end`: each
+  /// index is rescaled whole and only its final PTS saturates, so a range
+  /// the output timebase can hold keeps its exact PTS, and the conversion
+  /// is monotone, so the pair never inverts.
   ///
   /// Panic-free by invariant: [`new`](Self::new) rejects a zero-numerator
-  /// `timebase`, so the `saturating_rescale` *to* `self.timebase` below
-  /// cannot divide by zero.
+  /// `timebase`, so the rescale *to* `self.timebase` below cannot divide by
+  /// zero.
   pub(crate) fn range(&self, start_sample: u64, end_sample: u64) -> TimeRange {
-    let to_pts = |sample: u64| -> i64 {
-      let clamped = i64::try_from(sample).unwrap_or(i64::MAX);
-      self
-        .base_pts
-        .saturating_add(ANALYSIS_TIMEBASE.saturating_rescale(clamped, self.timebase))
-    };
-    let start = to_pts(start_sample);
-    let end = to_pts(end_sample);
-    // Saturation is monotone, so `start <= end` survives it — but if
-    // both saturate to `i64::MAX` they land equal, never inverted.
+    let start = sample_pts(start_sample, self.timebase, self.base_pts);
+    let end = sample_pts(end_sample, self.timebase, self.base_pts);
+    // Monotone, so `start <= end` survives the conversion; a range past
+    // the last tick lands on `i64::MAX` at both ends, equal, never
+    // inverted.
     TimeRange::new(start, end.max(start), self.timebase)
   }
 }

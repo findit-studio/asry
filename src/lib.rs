@@ -132,7 +132,7 @@ pub use ort;
 /// | pass a `NaN` coverage threshold (which silently disabled the filter) | [`SpeechCoverage`](emissions::SpeechCoverage) excludes it — the comparison is a total order |
 /// | pass VAD in the wrong timebase (which was silently ignored) | [`SampleSpan`](emissions::SampleSpan) has no timebase; the bridge from `TimeRange` is strict |
 /// | mean "no VAD" and get "all silence" (which dropped every word) | [`SpeechSpans::all_speech()`](emissions::SpeechSpans::all_speech) says it out loud |
-/// | supply a non-total sample→time closure (which panicked in your own code) | [`OutputClock`](emissions::OutputClock) is data; asry owns the saturation |
+/// | supply a non-total sample→time closure (which panicked in your own code) | [`OutputClock`](emissions::OutputClock) is data; asry owns the conversion, and only the final PTS saturates |
 /// | supply `V = 0`, a `T` that OOMs, or a non-log-probability | a chunk's [`Emissions`](emissions::Emissions) are made through its [`PreparedChunk`](emissions::PreparedChunk)'s `encode_with`, the one door, and it checks all three |
 /// | stamp another chunk's encoder output as this chunk's emissions | `encode_with` hands your encoder this chunk's prepared input and builds the emissions from what it returns; no emissions are made from a free tensor |
 /// | answer a unit of a `Transcriber`'s command with an alignment computed for another unit | a unit is answered only by [`EmissionsAligner::align_unit`](emissions::EmissionsAligner::align_unit) consuming its [`UnitJob`], from the job's own text and audio |

@@ -346,6 +346,200 @@ fn output_clock_accepts_a_valid_output_timebase() {
   assert!(OutputClock::new(0, analysis_tb(), 0).is_ok());
 }
 
+fn tb(num: i32, den: i32) -> Timebase {
+  Timebase::new(
+    num,
+    NonZeroI32::new(den).expect("test denominators are non-zero"),
+  )
+}
+
+/// The conversion `range` made before it rescaled whole indices, kept as
+/// the reference for the rounding law: the index narrowed to `i64` first
+/// (saturating), then rescaled by `mediatime`, then added to the base, each
+/// step saturating.
+fn narrow_then_rescale(sample: u64, timebase: Timebase, base_pts: i64) -> i64 {
+  let narrowed = i64::try_from(sample).unwrap_or(i64::MAX);
+  base_pts.saturating_add(ANALYSIS_TIMEBASE.saturating_rescale(narrowed, timebase))
+}
+
+/// **The rounding law.** Wherever the old conversion was exact (an index
+/// of at most `i64::MAX` whose rescale fits an `i64`), the whole-index
+/// conversion lands on its PTS exactly, for every base: `mediatime`'s
+/// rounding, to nearest with halfway cases away from zero, and the same
+/// saturation of the final PTS. The sweep takes the halfway cases (8 and 24
+/// samples on a millisecond clock, 8 000 at `1/3`), the largest indices
+/// the old conversion carried (`i64::MAX` itself, and the last sample a
+/// nanosecond clock held), a deterministic spread over every magnitude, and
+/// bases at both ends of `i64`, on eleven timebases from the coarsest to
+/// the finest.
+#[test]
+fn output_clock_keeps_every_pts_the_old_conversion_got_exactly() {
+  let timebases = [
+    analysis_tb(),
+    ms_tb(),
+    tb(1, 90_000),
+    tb(1, 48_000),
+    tb(1, 44_100),
+    tb(1_001, 30_000),
+    tb(1, 1_000_000_000),
+    tb(1, 3),
+    tb(7, 9),
+    tb(i32::MAX, 1),
+    tb(1, i32::MAX),
+  ];
+  let bases = [
+    0,
+    5_000,
+    -5_000,
+    i64::MAX,
+    i64::MAX - 7,
+    i64::MIN,
+    i64::MIN + 3,
+  ];
+  let top = i64::MAX as u64;
+  let mut samples = vec![
+    0,
+    1,
+    7,
+    8,
+    9,
+    15,
+    16,
+    17,
+    24,
+    8_000,
+    16_000,
+    1 << 31,
+    (1 << 53) + 1,
+    147_573_952_589_676,
+    147_573_952_589_677,
+    top - 16,
+    top - 8,
+    top - 1,
+    top,
+  ];
+  let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+  for _ in 0..4_096 {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    samples.push(state >> 1);
+    samples.push((state >> 1) >> (state % 63));
+  }
+  let mut compared = 0_usize;
+  for timebase in timebases {
+    for base_pts in bases {
+      let clock = OutputClock::new(0, timebase, base_pts).expect("a non-zero numerator");
+      for &sample in &samples {
+        let narrowed = i64::try_from(sample).expect("the sweep stays within i64::MAX");
+        if ANALYSIS_TIMEBASE
+          .checked_rescale(narrowed, timebase)
+          .is_none()
+        {
+          // The old conversion saturated the rescale before adding the
+          // base there: the final-saturation law's case.
+          continue;
+        }
+        let range = clock.range(sample, sample);
+        let expected = narrow_then_rescale(sample, timebase, base_pts);
+        assert_eq!(
+          (range.start_pts(), range.end_pts()),
+          (expected, expected),
+          "sample {sample} on {timebase:?} from base {base_pts}"
+        );
+        compared += 1;
+      }
+    }
+  }
+  // 497 049 points: 71 007 for each of the seven bases.
+  assert!(
+    compared > 450_000,
+    "the sweep compared only {compared} points"
+  );
+}
+
+/// **Codex R14's example.** On a millisecond clock with `base_pts = 0`, the
+/// stream samples `2^63..2^63 + 16_000`, one second past `i64::MAX`, are
+/// `2^59..2^59 + 1_000`, well inside `i64`. Narrowing each index to `i64`
+/// before the rescale sent both to `i64::MAX`, so both landed on `2^59`
+/// and the word's range came back empty. The last index of `u64` has its
+/// exact millisecond too.
+#[test]
+fn output_clock_rescales_an_index_above_i64_max_to_its_exact_pts() {
+  let clock = OutputClock::new(1 << 63, ms_tb(), 0).expect("1/1000 is a valid output timebase");
+  let range = clock.range(1 << 63, (1 << 63) + 16_000);
+  assert_eq!(
+    (range.start_pts(), range.end_pts()),
+    (1 << 59, (1 << 59) + 1_000)
+  );
+  assert_eq!(range.timebase(), ms_tb());
+  let last = clock.range(u64::MAX - 16, u64::MAX);
+  assert_eq!((last.start_pts(), last.end_pts()), ((1 << 60) - 1, 1 << 60));
+}
+
+/// **Only the final PTS saturates, and a pair never inverts.**
+/// - A range whose end passes `i64::MAX` once the base is added keeps its
+///   exact start and clamps its end.
+/// - An offset past `i64::MAX` that a negative base brings back is exact:
+///   a sample of 62 500 ns, 147 573 952 589 677 samples in, is 36 693 ns
+///   past `i64::MAX`, and from a base of -1 ms the PTS fits. Saturating the
+///   offset before adding the base landed 36 693 ns short.
+/// - A range wholly past the last tick lands on `i64::MAX` at both ends,
+///   equal, and pairs at the edges of `u64` stay ordered on every clock
+///   from every base.
+#[test]
+fn output_clock_saturates_only_the_final_pts() {
+  let late =
+    OutputClock::new(0, ms_tb(), i64::MAX - 500).expect("1/1000 is a valid output timebase");
+  let range = late.range(0, 16_000_000);
+  assert_eq!(
+    (range.start_pts(), range.end_pts()),
+    (i64::MAX - 500, i64::MAX)
+  );
+
+  let nanos = tb(1, 1_000_000_000);
+  let sample = 147_573_952_589_677_u64;
+  let offset = u128::from(sample) * 62_500;
+  assert_eq!(offset - i64::MAX as u128, 36_693);
+  let clock = OutputClock::new(0, nanos, -1_000_000).expect("1/1e9 is a valid output timebase");
+  assert_eq!(
+    clock.range(sample, sample).start_pts(),
+    9_223_372_036_853_812_500
+  );
+
+  let samples = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
+  let past = samples.range(u64::MAX - 1, u64::MAX);
+  assert_eq!((past.start_pts(), past.end_pts()), (i64::MAX, i64::MAX));
+
+  let top = i64::MAX as u64;
+  for timebase in [
+    analysis_tb(),
+    ms_tb(),
+    nanos,
+    tb(1, i32::MAX),
+    tb(i32::MAX, 1),
+  ] {
+    for base_pts in [0, -1_000_000, i64::MIN, i64::MAX] {
+      let clock = OutputClock::new(0, timebase, base_pts).expect("a non-zero numerator");
+      for (start, end) in [
+        (0, 0),
+        (0, u64::MAX),
+        (top, top + 1),
+        (top - 1, u64::MAX),
+        (u64::MAX, u64::MAX),
+      ] {
+        let range = clock.range(start, end);
+        assert!(
+          range.start_pts() <= range.end_pts(),
+          "{start}..{end} on {timebase:?} from {base_pts}: {}..{}",
+          range.start_pts(),
+          range.end_pts()
+        );
+      }
+    }
+  }
+}
+
 // ————————————————————— Emissions —————————————————————
 
 #[test]
