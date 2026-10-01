@@ -39,7 +39,10 @@ pub enum TranscriberError {
   /// before any state changes.
   #[error("{0}")]
   PtsBetweenSamples(PtsBetweenSamples),
-  /// Sample buffer would exceed its configured cap.
+  /// Sample buffer would exceed its configured cap: the samples a packet
+  /// adds (the silence filling a tolerated gap before it, then its own)
+  /// on top of those held and queued. An empty packet adds none and is
+  /// never refused so.
   #[error("{0}")]
   Backpressure(Backpressure),
   /// `handle_vad_segment` was called before any `handle_samples`.

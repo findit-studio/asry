@@ -409,6 +409,16 @@ FIXED
   them last 80.05 ms.
   The `bench-internals` `backtrack_beam` labels a change's frame with the
   token it enters.
+- **An empty packet is charged for nothing.** `handle_samples` counted the
+  gap before an empty packet's stamp against `buffer_cap_samples`, although
+  an empty packet fills no gap and adds no sample: with the default cap of
+  960 000 samples and 959 999 held, an empty packet stamped two samples
+  ahead was `Backpressure`, so a caller using `Backpressure` as flow
+  control could stall a valid stream on a heartbeat. An empty packet is now
+  refused only for its stamp (another timebase, a regression, a gap past
+  the tolerance) and is otherwise `Ok`, never `Backpressure`, whatever the
+  buffer holds or has queued. A refused or empty packet changes nothing:
+  the buffer and `next_expected_starts_at` are as they were.
 - **The unknown token is the one the tokenizer declares.** The reserved
   ids took the unknown token from its spelling: the first of `<unk>` and
   `[UNK]` the vocabulary held. A tokenizer declaring another

@@ -10,7 +10,13 @@
 //! stamp names, measured from the anchor, never from the
 //! rounded next PTS (so a gap keeps the stream's rounding
 //! phase), and a packet's first sample is emitted at its
-//! stamp; trim's low-water is computed from `cut_pending`
+//! stamp; a call that is refused, or whose packet is empty,
+//! commits nothing (every check runs before the one commit,
+//! which only a packet with samples reaches), so it leaves the
+//! timebase, the anchor, the offsets, the samples and the PTS
+//! expected next as they were, and an empty packet, which adds
+//! no sample and fills no gap, is never charged against the
+//! cap; trim's low-water is computed from `cut_pending`
 //! only, not `in_flight`, because in-flight chunks already
 //! hold their audio in their own `Arc<[f32]>` (decoupled
 //! from the live buffer).
@@ -91,10 +97,16 @@ impl SampleBuffer {
   /// zero-filled gap. When no sample's PTS is `starts_at` (a stamp
   /// between two samples, on a timebase finer than a sample), the
   /// packet is refused as `PtsBetweenSamples`, naming the PTS of
-  /// the sample nearest the stamp; an empty packet places no
-  /// sample, so it is never refused so. A packet whose samples the
+  /// the sample nearest the stamp. A packet whose samples the
   /// stream cannot count in `u64` is `Backpressure`, as any count
   /// past the buffer's arithmetic is.
+  ///
+  /// A refused call commits nothing: the buffer, and the PTS it
+  /// expects next, are as they were. Neither does a call whose
+  /// packet is empty: it places no sample and fills no gap, so it
+  /// is refused only as another timebase, a regression or a gap
+  /// past the tolerance, and is otherwise `Ok` without being
+  /// measured against the cap or the round trip.
   pub(crate) fn append(
     &mut self,
     starts_at: Timestamp,
@@ -161,29 +173,39 @@ impl SampleBuffer {
       ));
     }
 
+    // An empty packet commits nothing, so it is answered here: after
+    // the checks that judge its stamp, before everything that
+    // measures what a packet adds. Filling the gap before its stamp
+    // would make the next real packet, stamped at the stream's next
+    // PTS, a `PtsRegression`; committing a first push's anchor would
+    // fix the stream at a heartbeat's PTS ahead of the real first
+    // audio. It places no sample, so there is no round trip to
+    // check, and adds none, so nothing is charged against the cap.
+    if packet.is_empty() {
+      return Ok(());
+    }
+
     // The packet's first sample is emitted at its stamp, so the
     // sample it starts at must have the stamp's PTS. On a timebase
     // whose tick is at least a sample long it always does; on a
     // finer one, a stamp between two samples has no sample, and the
-    // packet is refused, naming the nearest sample's PTS. An empty
-    // packet places no sample. The stream counts samples in `u64`,
-    // so a packet that would pass `u64::MAX` cannot be held.
-    if !packet.is_empty() {
-      let first = u64::try_from(first_sample)
-        .ok()
-        .filter(|first| first.checked_add(packet.len() as u64).is_some());
-      let Some(first) = first else {
-        return Err(TranscriberError::Backpressure(Backpressure::new(
-          usize::MAX,
-          self.cap,
-        )));
-      };
-      if sample_pts_exact(first, effective_tb, effective_anchor) != i128::from(starts_at.pts()) {
-        return Err(TranscriberError::PtsBetweenSamples(PtsBetweenSamples::new(
-          starts_at.pts(),
-          sample_pts(first, effective_tb, effective_anchor),
-        )));
-      }
+    // packet is refused, naming the nearest sample's PTS. The stream
+    // counts samples in `u64`, so a packet that would pass
+    // `u64::MAX` cannot be held.
+    let first = u64::try_from(first_sample)
+      .ok()
+      .filter(|first| first.checked_add(packet.len() as u64).is_some());
+    let Some(first) = first else {
+      return Err(TranscriberError::Backpressure(Backpressure::new(
+        usize::MAX,
+        self.cap,
+      )));
+    };
+    if sample_pts_exact(first, effective_tb, effective_anchor) != i128::from(starts_at.pts()) {
+      return Err(TranscriberError::PtsBetweenSamples(PtsBetweenSamples::new(
+        starts_at.pts(),
+        sample_pts(first, effective_tb, effective_anchor),
+      )));
     }
 
     // Check capacity BEFORE mutating. The doc on
@@ -194,6 +216,9 @@ impl SampleBuffer {
     // With the pre-mutation check, Backpressure is a true atomic
     // rejection: the input is dropped on the floor and the
     // caller can retry the same packet later.
+    //
+    // The charge is exactly what the commit below adds, the gap's
+    // silence and the packet, on top of the samples already held.
     //
     // Include `extra_queued_samples` (audio already held in
     // cut_pending Arcs). Without this term, a slow runner could
@@ -240,29 +265,9 @@ impl SampleBuffer {
       )));
     }
 
-    // Empty-packet must never mutate stream state. Three cases
-    // cover all empty-packet inputs:
-    //
-    // 1. Empty packet at `advance > 0` (a "heartbeat" at a
-    //    slightly future PTS): true no-op. Committing the anchor
-    //    or advancing `absolute_sample_offset` here would trip
-    //    `PtsRegression` for the next real packet at the
-    //    originally-expected PTS.
-    // 2. Empty FIRST push: true no-op. The anchor is reserved for
-    //    the first non-empty push so a heartbeat-then-real-audio
-    //    sequence doesn't lock the anchor at the heartbeat's PTS
-    //    and then trip `PtsRegression` / `InconsistentTimebase`
-    //    on the real first-audio at a different PTS.
-    // 3. Empty subsequent push at `delta == 0`: already a no-op
-    //    (delta_samples = 0, packet.len() = 0, no first-push
-    //    commit). Preserved for callers using empty packets as
-    //    explicit heartbeats.
-    if packet.is_empty() && (delta_samples > 0 || would_be_first_push) {
-      return Ok(());
-    }
-
-    // All checks passed. Commit the anchor on first push, then
-    // zero-fill any tolerated gap and append the packet.
+    // All checks passed, and the packet has samples. Commit the
+    // anchor on first push, then zero-fill any tolerated gap and
+    // append the packet.
     if would_be_first_push {
       self.output_tb = Some(effective_tb);
       self.base_pts_out_anchor = effective_anchor;
@@ -1439,5 +1444,410 @@ mod tests {
       }
     }
     assert_eq!(seen, [3_845, 11_406, 22_461, 26_325, 8_431]);
+  }
+
+  /// Everything a call to `append` could change: the stream's timebase and
+  /// anchor, its offsets, the samples it holds, and the PTS it expects next.
+  /// Equality compares every sample; `Debug` shows how many are held and
+  /// the last, so a failure on a buffer of 960 000 samples stays readable.
+  #[derive(PartialEq)]
+  struct Snapshot {
+    timebase: Option<Timebase>,
+    anchor: i64,
+    offset: u64,
+    dropped: u64,
+    samples: Vec<f32>,
+    next: Option<(i64, Timebase)>,
+  }
+
+  impl core::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+      f.debug_struct("Snapshot")
+        .field("timebase", &self.timebase)
+        .field("anchor", &self.anchor)
+        .field("offset", &self.offset)
+        .field("dropped", &self.dropped)
+        .field("held", &(self.samples.len(), self.samples.last()))
+        .field("next", &self.next)
+        .finish()
+    }
+  }
+
+  fn snapshot(b: &SampleBuffer) -> Snapshot {
+    Snapshot {
+      timebase: b.output_tb,
+      anchor: b.base_pts_out_anchor,
+      offset: b.absolute_sample_offset,
+      dropped: b.buffer_drop_offset,
+      samples: b.samples.clone(),
+      next: b
+        .next_expected_starts_at()
+        .map(|next| (next.pts(), next.timebase())),
+    }
+  }
+
+  /// A buffer whose stream has taken `offset` samples on `timebase` from
+  /// `anchor` and still holds the last `held` of them, each a distinct
+  /// value, under a cap of `cap` samples and a gap tolerance of `tolerance`.
+  fn holding(
+    timebase: Timebase,
+    anchor: i64,
+    offset: u64,
+    held: usize,
+    cap: usize,
+    tolerance: u64,
+  ) -> SampleBuffer {
+    let mut b = SampleBuffer::new(cap, tolerance);
+    b.output_tb = Some(timebase);
+    b.base_pts_out_anchor = anchor;
+    b.absolute_sample_offset = offset;
+    b.buffer_drop_offset = offset - held as u64;
+    b.samples = (1..=held).map(|i| i as f32).collect();
+    b
+  }
+
+  /// **An empty packet is charged for nothing.** Under the default cap of
+  /// 960 000 samples, with 959 999 held on a sample clock from 0, the
+  /// stream's next PTS is 959 999. An empty packet stamped 960 001, two
+  /// samples ahead and within the tolerance, is `Ok` and changes nothing:
+  /// it fills no gap, so no gap is counted against the cap, and the buffer
+  /// still expects 959 999. A packet with samples stamped there is charged
+  /// the gap it would fill: one sample makes 960 002, `Backpressure`, and
+  /// the stream does not move. One sample stamped 959 999 continues the
+  /// stream and fills it to the cap; then an empty packet on the next PTS
+  /// or two samples ahead, even with audio queued past the cap, is `Ok` and
+  /// changes nothing. Charging the empty packet's gap answered the first
+  /// one `Backpressure`, at 960 001 of 960 000.
+  #[test]
+  fn an_empty_packet_is_charged_for_nothing() {
+    let at = |pts: i64| Timestamp::new(pts, ANALYSIS_TIMEBASE);
+    let mut b = default_buffer();
+    b.append(at(0), &vec![0.25; 959_999], 0).unwrap();
+    let before = snapshot(&b);
+    assert_eq!(before.next, Some((959_999, ANALYSIS_TIMEBASE)));
+
+    let r = b.append(at(960_001), &[], 0);
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(snapshot(&b), before);
+
+    let r = b.append(at(960_001), &[0.5], 0);
+    assert!(
+      matches!(r, Err(TranscriberError::Backpressure(p))
+        if p.buffered() == 960_002 && p.cap() == 960_000),
+      "{r:?}"
+    );
+    assert_eq!(snapshot(&b), before);
+
+    b.append(at(959_999), &[0.5], 0).unwrap();
+    assert_eq!(
+      (b.absolute_sample_offset(), b.buffered_samples()),
+      (960_000, 960_000)
+    );
+    let full = snapshot(&b);
+    for (pts, queued) in [
+      (960_000, 0),
+      (960_002, 0),
+      (960_000, 1),
+      (960_002, usize::MAX),
+    ] {
+      let r = b.append(at(pts), &[], queued);
+      assert!(r.is_ok(), "{pts}, {queued} queued: {r:?}");
+      assert_eq!(snapshot(&b), full, "{pts}, {queued} queued");
+    }
+  }
+
+  /// **An empty packet is refused only for its stamp, as a packet with
+  /// samples is.** On 48 kHz from 0, with 999 samples held under a cap of
+  /// 1 000 and a tolerance of 100, the next PTS is 2 997 (a sample is three
+  /// ticks). An empty packet stamped one tick early is `PtsRegression`
+  /// (advance -1); stamped 3 300, at sample 1 100, 101 samples ahead, it is
+  /// `GapExceedsTolerance` (101 past 100); on a millisecond clock it is
+  /// `InconsistentTimebase`. Each is what a one-sample packet stamped there
+  /// is, and none moves the stream. Where a packet is refused only for its
+  /// samples, an empty one is `Ok` and changes nothing: at the tolerance's
+  /// last sample (3 297) and two samples ahead (3 003), where one sample
+  /// would pass the cap, and between two samples (2 998 and 3 001), where
+  /// no sample has the stamp and one sample is `PtsBetweenSamples`.
+  #[test]
+  fn an_empty_packet_is_refused_only_for_its_stamp() {
+    let ms = Timebase::new(1, NonZeroI32::new(1_000).unwrap());
+    let mut b = holding(tb_48k(), 0, 999, 999, 1_000, 100);
+    let before = snapshot(&b);
+    assert_eq!(before.next, Some((2_997, tb_48k())));
+
+    for stamp in [ts_at_48k(2_996), ts_at_48k(3_300), Timestamp::new(63, ms)] {
+      let empty = b.append(stamp, &[], 0);
+      assert_eq!(snapshot(&b), before, "{stamp:?}: {empty:?}");
+      let one = b.append(stamp, &[0.5], 0);
+      assert_eq!(snapshot(&b), before, "{stamp:?}: {one:?}");
+      assert!(
+        empty.is_err() && format!("{empty:?}") == format!("{one:?}"),
+        "{stamp:?}: {empty:?} empty, {one:?} with a sample"
+      );
+    }
+    let r = b.append(ts_at_48k(2_996), &[], 0);
+    assert!(
+      matches!(r, Err(TranscriberError::PtsRegression(p)) if p.advance() == -1),
+      "{r:?}"
+    );
+    let r = b.append(ts_at_48k(3_300), &[], 0);
+    assert!(
+      matches!(r, Err(TranscriberError::GapExceedsTolerance(g))
+        if g.gap_samples() == 101 && g.tolerance_samples() == 100),
+      "{r:?}"
+    );
+    let r = b.append(Timestamp::new(63, ms), &[], 0);
+    assert!(
+      matches!(r, Err(TranscriberError::InconsistentTimebase(_))),
+      "{r:?}"
+    );
+
+    for stamp in [3_297, 3_003, 2_998, 3_001] {
+      let one = b.append(ts_at_48k(stamp), &[0.5], 0);
+      assert!(
+        matches!(
+          one,
+          Err(TranscriberError::Backpressure(_) | TranscriberError::PtsBetweenSamples(_))
+        ),
+        "{stamp}: {one:?}"
+      );
+      assert_eq!(snapshot(&b), before, "{stamp}: {one:?}");
+      let empty = b.append(ts_at_48k(stamp), &[], 0);
+      assert!(empty.is_ok(), "{stamp}: {empty:?}");
+      assert_eq!(snapshot(&b), before, "{stamp}");
+    }
+  }
+
+  /// **A refused or empty call commits nothing, and an accepted one exactly
+  /// what it is charged for.** `append` refuses before it commits, so after
+  /// a refusal, or an empty packet, the buffer's timebase, anchor, offsets
+  /// and samples are as they were, and so is the PTS it expects next. Each
+  /// refusal by name, after a gap where it can follow one: another
+  /// timebase, a regression, a gap past the tolerance, a stamp between two
+  /// samples, the cap, a queue past `usize::MAX`, and the stream's `u64`
+  /// count; and on an unanchored buffer, a first push past the cap and an
+  /// empty first push, which leave it unanchored. Then a sweep: six
+  /// timebases, four anchors at both ends of `i64`, four offsets to
+  /// `i64::MAX - 1`, from none to all of a 1 000-sample cap held, stamps
+  /// from one tick early to one sample past the tolerance, packets of 0, 1
+  /// and 2 samples, and from none to `usize::MAX` samples queued. The stamp
+  /// is judged as the forward conversion alone gives (`meets`): a regression
+  /// or a gap past the tolerance is refused whatever the packet; past those,
+  /// an empty packet is `Ok`; one with samples stamped between two samples
+  /// is `PtsBetweenSamples`, and otherwise is `Backpressure` exactly when
+  /// the samples held, the gap's silence, its own and those queued pass the
+  /// cap. Every refusal and every empty packet leaves the snapshot as it
+  /// was; an accepted packet adds exactly the gap's silence and its
+  /// samples, after those held.
+  #[test]
+  fn a_refused_or_empty_call_commits_nothing() {
+    const CAP: usize = 1_000;
+    const TOLERANCE: u64 = 100;
+    let tb = |num: i32, den: i32| Timebase::new(num, NonZeroI32::new(den).unwrap());
+
+    let mut b = holding(tb_48k(), 0, 999, 999, CAP, TOLERANCE);
+    let before = snapshot(&b);
+    let mut refuse = |stamp: Timestamp, samples: usize, queued: usize| {
+      let r = b.append(stamp, &vec![0.5; samples], queued);
+      assert_eq!(
+        snapshot(&b),
+        before,
+        "{stamp:?}, {samples} samples, {queued} queued: {r:?}"
+      );
+      r.unwrap_err()
+    };
+    let e = refuse(Timestamp::new(2_997, tb(1, 1_000)), 1, 0);
+    assert!(
+      matches!(e, TranscriberError::InconsistentTimebase(_)),
+      "{e:?}"
+    );
+    let e = refuse(ts_at_48k(2_996), 1, 0);
+    assert!(
+      matches!(e, TranscriberError::PtsRegression(p) if p.advance() == -1),
+      "{e:?}"
+    );
+    let e = refuse(ts_at_48k(3_300), 1, 0);
+    assert!(
+      matches!(e, TranscriberError::GapExceedsTolerance(g) if g.gap_samples() == 101),
+      "{e:?}"
+    );
+    let e = refuse(ts_at_48k(3_004), 1, 0);
+    assert!(
+      matches!(e, TranscriberError::PtsBetweenSamples(p) if p.pts() == 3_004 && p.nearest() == 3_003),
+      "{e:?}"
+    );
+    let e = refuse(ts_at_48k(3_003), 1, 0);
+    assert!(
+      matches!(e, TranscriberError::Backpressure(p) if p.buffered() == 1_002),
+      "{e:?}"
+    );
+    let e = refuse(ts_at_48k(3_003), 1, usize::MAX);
+    assert!(
+      matches!(e, TranscriberError::Backpressure(p) if p.buffered() == usize::MAX),
+      "{e:?}"
+    );
+    let mut b = holding(ANALYSIS_TIMEBASE, i64::MIN, u64::MAX - 5, 0, CAP, TOLERANCE);
+    let before = snapshot(&b);
+    let r = b.append(
+      Timestamp::new(i64::MAX - 5, ANALYSIS_TIMEBASE),
+      &[0.5; 10],
+      0,
+    );
+    assert!(
+      matches!(r, Err(TranscriberError::Backpressure(p)) if p.buffered() == usize::MAX),
+      "{r:?}"
+    );
+    assert_eq!(snapshot(&b), before);
+
+    let mut b = SampleBuffer::new(CAP, TOLERANCE);
+    let unanchored = snapshot(&b);
+    for (samples, queued) in [(CAP + 1, 0), (1, CAP), (0, 0), (0, usize::MAX)] {
+      let r = b.append(ts_at_48k(50), &vec![0.5; samples], queued);
+      assert!(
+        r.is_ok() == (samples == 0),
+        "{samples}, {queued} queued: {r:?}"
+      );
+      assert_eq!(snapshot(&b), unanchored, "{samples}, {queued} queued");
+    }
+    b.append(ts_at_48k(50), &[0.5], 0).unwrap();
+    assert_eq!(
+      (
+        b.output_timebase(),
+        b.base_pts_out_anchor,
+        b.absolute_sample_offset()
+      ),
+      (Some(tb_48k()), 50, 1)
+    );
+
+    let timebases = [
+      ANALYSIS_TIMEBASE,
+      tb_48k(),
+      tb(1_001, 30_000),
+      tb(1, 1_000),
+      tb(1, 90_000),
+      tb(i32::MAX, 1),
+    ];
+    let top = i64::MAX as u64;
+    let packet = [0.5_f32, 0.75];
+    // Regressions, gaps past the tolerance, empty packets taken, stamps
+    // between two samples, the cap, and packets taken.
+    let mut seen = [0_usize; 6];
+    for timebase in timebases {
+      for anchor in [0, -5_000, i64::MAX - 7, i64::MIN] {
+        for offset in [CAP as u64, 7_741, 1 << 40, top - 1] {
+          let Ok(next) = i64::try_from(sample_pts_exact(offset, timebase, anchor)) else {
+            continue;
+          };
+          let ahead = [1_u64, 2, TOLERANCE, TOLERANCE + 1]
+            .map(|ahead| i64::try_from(sample_pts_exact(offset + ahead, timebase, anchor)).ok());
+          let stamps = [-1_i64, 0, 1, 2, 3]
+            .iter()
+            .map(|&ticks| next.checked_add(ticks))
+            .chain(ahead)
+            .flatten();
+          for stamp in stamps {
+            let want = meets(timebase, anchor, offset, stamp, TOLERANCE);
+            for held in [0, CAP - 2, CAP - 1, CAP] {
+              for len in [0, 1, 2] {
+                for queued in [0, 1, CAP, usize::MAX] {
+                  let point = || {
+                    format!(
+                      "{stamp} on {timebase:?} from {anchor}, {offset} samples in, \
+                       {held} held, {len} in the packet, {queued} queued"
+                    )
+                  };
+                  let mut b = holding(timebase, anchor, offset, held, CAP, TOLERANCE);
+                  let before = snapshot(&b);
+                  let r = b.append(Timestamp::new(stamp, timebase), &packet[..len], queued);
+                  let taken = match (&want, len) {
+                    (Meets::Regression(advance), _) => {
+                      assert!(
+                        matches!(r, Err(TranscriberError::PtsRegression(p)) if p.advance() == *advance),
+                        "{}: {r:?}",
+                        point()
+                      );
+                      seen[0] += 1;
+                      None
+                    }
+                    (Meets::Gap(gap), _) => {
+                      assert!(
+                        matches!(r, Err(TranscriberError::GapExceedsTolerance(g))
+                          if g.gap_samples() == *gap && g.tolerance_samples() == TOLERANCE),
+                        "{}: {r:?}",
+                        point()
+                      );
+                      seen[1] += 1;
+                      None
+                    }
+                    (_, 0) => {
+                      assert!(r.is_ok(), "{}: {r:?}", point());
+                      seen[2] += 1;
+                      None
+                    }
+                    (Meets::Between(_, nearest), _) => {
+                      assert!(
+                        matches!(r, Err(TranscriberError::PtsBetweenSamples(e))
+                          if e.pts() == stamp && e.nearest() == *nearest),
+                        "{}: {r:?}",
+                        point()
+                      );
+                      seen[3] += 1;
+                      None
+                    }
+                    (Meets::Start(first), _) => {
+                      let gap = usize::try_from(first - offset).unwrap();
+                      match (held + gap + len).checked_add(queued) {
+                        Some(charge) if charge <= CAP => {
+                          assert!(r.is_ok(), "{}: {r:?}", point());
+                          seen[5] += 1;
+                          Some((*first, gap))
+                        }
+                        charge => {
+                          let charge = charge.unwrap_or(usize::MAX);
+                          assert!(
+                            matches!(r, Err(TranscriberError::Backpressure(p))
+                              if p.buffered() == charge && p.cap() == CAP),
+                            "{}: {r:?}",
+                            point()
+                          );
+                          seen[4] += 1;
+                          None
+                        }
+                      }
+                    }
+                  };
+                  match taken {
+                    None => assert_eq!(snapshot(&b), before, "{}", point()),
+                    Some((first, gap)) => {
+                      let after = snapshot(&b);
+                      assert_eq!(
+                        (after.timebase, after.anchor, after.offset, after.dropped),
+                        (
+                          before.timebase,
+                          before.anchor,
+                          first + len as u64,
+                          before.dropped
+                        ),
+                        "{}",
+                        point()
+                      );
+                      let (kept, rest) = after.samples.split_at(held);
+                      let (silence, own) = rest.split_at(gap);
+                      assert_eq!(kept, &before.samples[..], "{}", point());
+                      assert!(silence.iter().all(|&s| s == 0.0), "{}", point());
+                      assert_eq!(own, &packet[..len], "{}", point());
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    // 29 856 calls on 622 stamps: every empty packet a stamp admits is
+    // taken (424 stamps, 16 calls each), and of the 12 128 calls with
+    // samples at a stamp some sample has, 9 785 pass the cap.
+    assert_eq!(seen, [3_216, 6_288, 6_784, 1_440, 9_785, 2_343]);
   }
 }
