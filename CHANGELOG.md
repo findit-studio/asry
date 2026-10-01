@@ -226,7 +226,26 @@ BREAKING
     `EncoderOutput::Logits`. The closure's error type `E` needs
     `From<EmissionsError>`.
   - `finish(prepared, &emissions, clock, abort)` becomes
-    `finish(prepared, emissions, clock, abort)`.
+    `finish(prepared, emissions, abort)`, the clock moving to `prepare`
+    (next entry).
+- **A chunk's output clock is stated with its audio, and `finish` maps its
+  words through no other.** `EmissionsAligner::finish` bound the emissions
+  to the prepared chunk but took the `OutputClock` beside them, free: two
+  chunks of one aligner, encoded concurrently, whose clocks were swapped
+  passed every check, and each chunk's correctly aligned words came back
+  at the other chunk's place in the stream, plausible and wrong. Now
+  `prepare` takes the chunk's clock with its audio, the `PreparedChunk`
+  carries it, and `finish` takes no clock: a chunk's words are mapped
+  through the clock stated with its own audio, whatever order the chunks
+  are encoded and finished in. `align_unit` is unchanged: a unit's clock
+  is its job's place in the stream.
+
+  Migration:
+  - `prepare(samples, speech, text, resolution, abort)` becomes
+    `prepare(samples, speech, text, resolution, clock, abort)`, with the
+    clock of the chunk whose audio the call prepares.
+  - `finish(prepared, emissions, clock, abort)` becomes
+    `finish(prepared, emissions, abort)`.
 - **A Latin normalizer never splits a word at a mark inside it.**
   `LatinNormalizer` and `EnglishNormalizer` split a whitespace-bounded word
   at an internal hyphen, slash or dash: `km/h` became the words `km` and

@@ -20,11 +20,12 @@
 //! # What the caller no longer owns
 //!
 //! Every derived quantity. `prepare` hands back a [`PreparedChunk`] that
-//! only `prepare` can mint; `finish` reads the sample extents off *it*,
-//! not off integers the caller supplies. `samples_per_frame` is derived
-//! once, privately, and fed to both the speech mask and composition, so
-//! the two cannot disagree. The caller supplies exactly one thing the
-//! library cannot compute for itself: the emissions.
+//! only `prepare` can mint; `finish` reads the sample extents and the
+//! output clock off *it*, not off values the caller supplies again.
+//! `samples_per_frame` is derived once, privately, and fed to both the
+//! speech mask and composition, so the two cannot disagree. The caller
+//! supplies `finish` exactly one thing the library cannot compute for
+//! itself: the emissions, made through the chunk.
 
 use core::{
   num::{NonZeroU32, NonZeroUsize},
@@ -323,6 +324,13 @@ impl EmissionsAligner {
   /// the zeroing, or the padding, so byte-parity with the ORT path is
   /// asry's problem, not yours.
   ///
+  /// `clock` is the chunk's place in the stream: its first sample's stream
+  /// index, the output timebase and the PTS of the stream's sample 0. It
+  /// is stated here, with the chunk's audio, and the chunk carries it:
+  /// [`finish`](Self::finish) maps the chunk's words through this clock and
+  /// takes no other, so chunks prepared together and encoded in any order
+  /// each finish at their own place in the stream.
+  ///
   /// If [`PreparedChunk::is_trivial`], skip the encoder entirely: the
   /// text normalised to nothing, or produced no alignable tokens.
   ///
@@ -349,6 +357,7 @@ impl EmissionsAligner {
     speech: &SpeechSpans,
     text: &'a str,
     resolution: OovResolution,
+    clock: OutputClock,
     abort_flag: &AtomicBool,
   ) -> Result<PreparedChunk<'a>, EmissionsError> {
     // Cancellable throughout, symmetric with `finish`. `prepare` is the
@@ -371,10 +380,11 @@ impl EmissionsAligner {
       .accept(&resolution, text)
       .map_err(|e| to_emissions_error(e, Stage::Prepare))?;
     let expected = self.core.language().clone();
-    self
+    let preparation = self
       .core
       .prepare(samples, speech, text, oov_decisions, &expected, abort_flag)
-      .map_err(|e| to_emissions_error(e, Stage::Prepare))
+      .map_err(|e| to_emissions_error(e, Stage::Prepare))?;
+    Ok(PreparedChunk::new(preparation, clock))
   }
 
   /// Steps 3-9. **Consumes `prepared` and `emissions`**, so a chunk cannot
@@ -384,6 +394,58 @@ impl EmissionsAligner {
   /// ([`PreparedChunk::encode_with`]): emissions made through
   /// another chunk are refused by name before a frame is read, whatever
   /// their shape.
+  ///
+  /// The words are mapped to output time through the [`OutputClock`]
+  /// `prepared` was prepared with. `finish` takes no clock, so a chunk
+  /// cannot be finished at another chunk's place in the stream:
+  ///
+  /// ```no_run
+  /// # use core::sync::atomic::AtomicBool;
+  /// # use asry::emissions::{
+  /// #   EmissionsAligner, EmissionsError, EncoderOutput, OutputClock, SpeechSpans,
+  /// #   default_oov_policy,
+  /// # };
+  /// # fn model(input: &[f32]) -> Result<EncoderOutput, EmissionsError> { unimplemented!() }
+  /// # fn run(
+  /// #   aligner: &EmissionsAligner,
+  /// #   samples: &[f32],
+  /// #   text: &str,
+  /// #   clock: OutputClock,
+  /// #   other: OutputClock,
+  /// # ) -> Result<(), EmissionsError> {
+  /// let abort = AtomicBool::new(false);
+  /// let resolution = aligner.detect_oov(text)?.decide(default_oov_policy);
+  /// let speech = SpeechSpans::all_speech();
+  /// let prepared = aligner.prepare(samples, &speech, text, resolution, clock, &abort)?;
+  /// let emissions = prepared.encode_with(|input| model(input))?;
+  /// let words = aligner.finish(prepared, emissions, &abort)?;
+  /// # Ok(()) }
+  /// ```
+  ///
+  /// The same road with another clock handed to `finish` does not compile:
+  ///
+  /// ```compile_fail
+  /// # use core::sync::atomic::AtomicBool;
+  /// # use asry::emissions::{
+  /// #   EmissionsAligner, EmissionsError, EncoderOutput, OutputClock, SpeechSpans,
+  /// #   default_oov_policy,
+  /// # };
+  /// # fn model(input: &[f32]) -> Result<EncoderOutput, EmissionsError> { unimplemented!() }
+  /// # fn run(
+  /// #   aligner: &EmissionsAligner,
+  /// #   samples: &[f32],
+  /// #   text: &str,
+  /// #   clock: OutputClock,
+  /// #   other: OutputClock,
+  /// # ) -> Result<(), EmissionsError> {
+  /// let abort = AtomicBool::new(false);
+  /// let resolution = aligner.detect_oov(text)?.decide(default_oov_policy);
+  /// let speech = SpeechSpans::all_speech();
+  /// let prepared = aligner.prepare(samples, &speech, text, resolution, clock, &abort)?;
+  /// let emissions = prepared.encode_with(|input| model(input))?;
+  /// let words = aligner.finish(prepared, emissions, other, &abort)?;
+  /// # Ok(()) }
+  /// ```
   ///
   /// Returns the text's one [`UnitAlignment`]: its aligned words, or
   /// `Unaligned` with the reason it has none (`NoAlignableText` for a
@@ -417,15 +479,18 @@ impl EmissionsAligner {
   /// [`EmissionsError::PreparationMismatch`] if `emissions` were made
   /// through another chunk than `prepared`;
   /// [`EmissionsError::Geometry`] if a word's frames hold speech but its
-  /// range cannot be represented by `clock` (it maps the word's nonempty
-  /// sample range to an empty one), named rather than dropped.
+  /// range cannot be represented by the chunk's clock (it maps the word's
+  /// nonempty sample range to an empty one), named rather than dropped.
   pub fn finish(
     &self,
     prepared: PreparedChunk<'_>,
     emissions: Emissions,
-    clock: OutputClock,
     abort_flag: &AtomicBool,
   ) -> Result<UnitAlignment, EmissionsError> {
+    // The clock stated with the chunk's audio at `prepare`; there is no
+    // other to map its words through.
+    let (prepared, clock) = prepared.into_parts();
+
     // ——— The chunk must be OURS ———
     //
     // Ahead of everything else, including the trivial short-circuit: a
@@ -458,7 +523,7 @@ impl EmissionsAligner {
     // aligner check above is: two chunks of one aligner, with the same
     // shape, would otherwise trade tensors and align each one's tokens to
     // the other's audio.
-    if emissions.preparation() != prepared.preparation() {
+    if emissions.preparation() != prepared.id() {
       return Err(EmissionsError::PreparationMismatch(EmissionsFailure::new(
         SmolStr::new_static(
           "these Emissions were made through another PreparedChunk. Emissions answer the one \
@@ -572,7 +637,7 @@ impl EmissionsAligner {
       .core
       .accept_job(&resolution, &job)
       .map_err(|e| to_emissions_error(e, Stage::Prepare))?;
-    let prepared = match self
+    let preparation = match self
       .core
       .prepare(
         job.samples(),
@@ -584,11 +649,13 @@ impl EmissionsAligner {
       )
       .map_err(|e| to_emissions_error(e, Stage::Prepare))
     {
-      Ok(prepared) => prepared,
+      Ok(preparation) => preparation,
       Err(error) => return unit_failure(job, error),
     };
+    // The job's audio and its place in the stream, prepared together.
+    let prepared = PreparedChunk::new(preparation, clock);
     let emissions = prepared.encode_with(encoder)?;
-    match self.finish(prepared, emissions, clock, abort_flag) {
+    match self.finish(prepared, emissions, abort_flag) {
       Ok(alignment) => Ok(job.answer(alignment)),
       Err(error) => unit_failure(job, error),
     }

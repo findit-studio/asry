@@ -12,6 +12,7 @@
 //! | `min_speech_coverage: f32` (NaN silently disabled the filter) | [`SpeechCoverage`] — NaN is unconstructible, so `<` is a total order |
 //! | `sub_segments: &[TimeRange]` (the timebase was silently ignored) | [`SpeechSpans`] of [`SampleSpan`] — **no timebase axis to ignore** |
 //! | `samples_to_output_range: impl Fn(u64, u64) -> TimeRange` (had to be total over all of `u64` or the caller's own closure panicked) | [`OutputClock`] — data; asry owns the conversion, and only the final PTS saturates |
+//! | an `OutputClock` handed to `finish` beside any chunk (two chunks could trade clocks) | the chunk's own: stated to `prepare` with its audio and carried by its [`PreparedChunk`] |
 //! | `(t, v, Vec<f32>)` (two doors, neither guarding the other's rule) | [`Emissions`] — one door, all the guards |
 //! | `n_samples`, `n_frames`, `samples_per_frame` | derived by asry from slices that physically exist |
 
@@ -439,6 +440,10 @@ impl SpeechSpans {
 /// (`2^63` samples is `2^59` ms), and a range past the timebase's last
 /// `i64` tick clamps at its end. The transcriber's own sample buffer maps
 /// its chunk and word ranges through the same conversion.
+///
+/// A chunk's clock is stated to `EmissionsAligner::prepare` with the
+/// chunk's audio, and the chunk's [`PreparedChunk`] carries it: `finish`
+/// maps the chunk's words through that clock and takes no other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutputClock {
   chunk_first_sample_in_stream: u64,

@@ -152,6 +152,12 @@ fn analysis_tb() -> Timebase {
   Timebase::new(1, NonZeroI32::new(16_000).expect("16000 != 0"))
 }
 
+/// The analysis clock: the chunk at the stream's sample 0, one PTS per
+/// sample, PTS 0 at sample 0.
+fn sample_clock() -> OutputClock {
+  OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase")
+}
+
 /// Synthetic encoder: emits `T` frames of `V` logits, biased toward the
 /// tokens of `text` so the CTC path is non-degenerate. Stands in for
 /// alignkit's CoreML head — this test does not need a real acoustic
@@ -241,6 +247,7 @@ fn prepare_pads_short_audio_to_the_receptive_field_and_zeroes_non_speech() {
       &speech,
       "hello",
       resolution(&a, "hello"),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("prepare must succeed");
@@ -272,6 +279,7 @@ fn prepare_rejects_non_finite_audio_even_outside_the_speech_spans() {
     &speech,
     "hello",
     resolution(&a, "hello"),
+    sample_clock(),
     &AtomicBool::new(false),
   ) else {
     panic!("a NaN anywhere in the raw audio is a hard error");
@@ -296,6 +304,7 @@ fn trivial_chunks_skip_the_encoder() {
       &speech,
       "!!!...",
       resolution(&a, "!!!..."),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("punctuation-only normalises to empty; that is not a failure");
@@ -309,9 +318,8 @@ fn trivial_chunks_skip_the_encoder() {
       vec![-1.0; VOCAB_SIZE],
     )
     .expect("ok");
-  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   let result = a
-    .finish(prepared, emissions, clock, &AtomicBool::new(false))
+    .finish(prepared, emissions, &AtomicBool::new(false))
     .expect("a trivial chunk finishes as an empty result, not an error");
   assert!(result.words().is_empty());
 }
@@ -335,6 +343,7 @@ fn finish_rejects_a_vocab_dim_that_disagrees_with_the_tokenizer() {
       &speech,
       "hello",
       resolution(&a, "hello"),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("prepare");
@@ -347,9 +356,8 @@ fn finish_rejects_a_vocab_dim_that_disagrees_with_the_tokenizer() {
     .encoded_logits(t, wrong_v, vec![0.5_f32; t * 29])
     .expect("well-formed 29-wide logits");
 
-  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   let err = a
-    .finish(prepared, emissions, clock, &AtomicBool::new(false))
+    .finish(prepared, emissions, &AtomicBool::new(false))
     .expect_err("a V mismatch must be a hard error, not a corrupt alignment");
   assert!(
     matches!(err, EmissionsError::VocabMismatch(_)),
@@ -374,6 +382,7 @@ fn finish_rejects_a_frame_count_that_cannot_match_the_audio() {
       &speech,
       "hello",
       resolution(&a, "hello"),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("prepare");
@@ -385,9 +394,8 @@ fn finish_rejects_a_frame_count_that_cannot_match_the_audio() {
     .encoded_logits(t, v, vec![0.5_f32; t * VOCAB_SIZE])
     .expect("well-formed logits");
 
-  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   let err = a
-    .finish(prepared, emissions, clock, &AtomicBool::new(false))
+    .finish(prepared, emissions, &AtomicBool::new(false))
     .expect_err("T * hop must land within the chunk's real extent");
   assert!(
     matches!(err, EmissionsError::StrideMismatch(_)),
@@ -427,6 +435,7 @@ fn prepare_refuses_a_resolution_another_aligner_detected() {
     &SpeechSpans::all_speech(),
     "&",
     foreign,
+    sample_clock(),
     &AtomicBool::new(false),
   ) else {
     panic!("a Korean aligner's decision must not drive an English aligner's OOV policy");
@@ -461,6 +470,7 @@ fn prepare_accepts_a_resolution_it_detected() {
     &SpeechSpans::all_speech(),
     "hello & world",
     decisions,
+    sample_clock(),
     &AtomicBool::new(false),
   )
   .expect("this aligner's own detection of this text");
@@ -504,6 +514,7 @@ fn finish_rejects_a_prepared_chunk_from_a_different_aligner() {
       &SpeechSpans::all_speech(),
       "hello",
       resolution(&a, "hello"),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("prepare on A");
@@ -515,14 +526,8 @@ fn finish_rejects_a_prepared_chunk_from_a_different_aligner() {
     .encoded_logits(t, b.vocab_size(), logits)
     .expect("well-formed");
 
-  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   let err = b
-    .finish(
-      prepared_from_a,
-      emissions_from_b,
-      clock,
-      &AtomicBool::new(false),
-    )
+    .finish(prepared_from_a, emissions_from_b, &AtomicBool::new(false))
     .expect_err("A's chunk must not be finishable on B");
   assert!(
     matches!(err, EmissionsError::AlignerMismatch(_)),
@@ -549,6 +554,7 @@ fn finish_rejects_a_foreign_trivial_chunk_too() {
       &SpeechSpans::all_speech(),
       "!!!...",
       resolution(&a, "!!!..."),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("prepare on A");
@@ -561,9 +567,8 @@ fn finish_rejects_a_foreign_trivial_chunk_too() {
       vec![-1.0; VOCAB_SIZE],
     )
     .expect("ok");
-  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   let err = b
-    .finish(prepared_from_a, emissions, clock, &AtomicBool::new(false))
+    .finish(prepared_from_a, emissions, &AtomicBool::new(false))
     .expect_err("even an empty chunk from another aligner is crossed wiring");
   assert!(matches!(err, EmissionsError::AlignerMismatch(_)));
 }
@@ -580,6 +585,7 @@ fn finish_accepts_the_chunk_its_own_prepare_minted() {
       &SpeechSpans::all_speech(),
       "hello",
       resolution(&a, "hello"),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("prepare");
@@ -587,8 +593,7 @@ fn finish_accepts_the_chunk_its_own_prepare_minted() {
   let emissions = prepared
     .encoded_logits(t, a.vocab_size(), logits)
     .expect("ok");
-  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
-  a.finish(prepared, emissions, clock, &AtomicBool::new(false))
+  a.finish(prepared, emissions, &AtomicBool::new(false))
     .expect("an aligner finishes the chunk it prepared");
 }
 
@@ -633,8 +638,13 @@ fn alignkit_call_site_aligns_end_to_end() {
   // VAD at all, say so explicitly: `SpeechSpans::all_speech()`.
   let speech = SpeechSpans::all_speech();
 
+  // Where the chunk sits in the stream, stated with its audio: the
+  // stream's first sample, one PTS per sample. `finish` maps the chunk's
+  // words through this clock and takes no other.
+  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
+
   let prepared = aligner
-    .prepare(&samples, &speech, transcript, decisions, &abort)
+    .prepare(&samples, &speech, transcript, decisions, clock, &abort)
     .expect("prepare");
   if prepared.is_trivial() {
     panic!("'hello world' is not trivial");
@@ -649,10 +659,7 @@ fn alignkit_call_site_aligns_end_to_end() {
     .expect("one door, all the guards");
 
   // —— timed words out ————————————————————————————————————————
-  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
-  let result = aligner
-    .finish(prepared, emissions, clock, &abort)
-    .expect("finish");
+  let result = aligner.finish(prepared, emissions, &abort).expect("finish");
 
   assert!(
     !result.words().is_empty(),
@@ -684,11 +691,11 @@ fn finish_refuses_emissions_made_through_another_chunk() {
       &SpeechSpans::all_speech(),
       text,
       resolution(&a, text),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("prepare")
   };
-  let clock = || OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
 
   let (first, second) = (prepare("hello"), prepare("hello"));
   let (t, logits) = fake_encoder(&first, 320);
@@ -696,7 +703,7 @@ fn finish_refuses_emissions_made_through_another_chunk() {
     .encoded_logits(t, a.vocab_size(), logits.clone())
     .expect("well-formed");
   let Err(EmissionsError::PreparationMismatch(failure)) =
-    a.finish(second, from_first, clock(), &AtomicBool::new(true))
+    a.finish(second, from_first, &AtomicBool::new(true))
   else {
     panic!("the second chunk refuses the first chunk's emissions");
   };
@@ -712,7 +719,7 @@ fn finish_refuses_emissions_made_through_another_chunk() {
     .encoded_log_probs(1, a.vocab_size(), vec![-1.0; VOCAB_SIZE])
     .expect("well-formed");
   assert!(matches!(
-    a.finish(trivial, from_other, clock(), &AtomicBool::new(false)),
+    a.finish(trivial, from_other, &AtomicBool::new(false)),
     Err(EmissionsError::PreparationMismatch(_))
   ));
 
@@ -720,7 +727,7 @@ fn finish_refuses_emissions_made_through_another_chunk() {
     .encoded_logits(t, a.vocab_size(), logits)
     .expect("well-formed");
   assert!(matches!(
-    a.finish(first, own, clock(), &AtomicBool::new(false)),
+    a.finish(first, own, &AtomicBool::new(false)),
     Ok(UnitAlignment::Aligned(_))
   ));
 }
@@ -742,11 +749,11 @@ fn the_encoder_runs_on_its_own_chunk_input() {
       &SpeechSpans::all_speech(),
       text,
       resolution(&a, text),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("prepare")
   };
-  let clock = || OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   let encode = |prepared: &PreparedChunk<'_>| {
     let (t, logits) = fake_encoder(prepared, 320);
     let mut seen = Vec::new();
@@ -779,12 +786,12 @@ fn the_encoder_runs_on_its_own_chunk_input() {
     "the encoder sees its chunk's input"
   );
   assert!(matches!(
-    a.finish(second, from_first, clock(), &AtomicBool::new(false)),
+    a.finish(second, from_first, &AtomicBool::new(false)),
     Err(EmissionsError::PreparationMismatch(_))
   ));
   let (_, own) = encode(&first);
   assert!(matches!(
-    a.finish(first, own, clock(), &AtomicBool::new(false)),
+    a.finish(first, own, &AtomicBool::new(false)),
     Ok(UnitAlignment::Aligned(_))
   ));
 
@@ -796,9 +803,155 @@ fn the_encoder_runs_on_its_own_chunk_input() {
     })
     .expect("a trivial chunk needs no encoder");
   assert!(matches!(
-    a.finish(trivial, emissions, clock(), &AtomicBool::new(false)),
+    a.finish(trivial, emissions, &AtomicBool::new(false)),
     Ok(UnitAlignment::Unaligned(UnalignedCause::NoAlignableText))
   ));
+}
+
+/// The PTS, on a millisecond clock whose stream sample 0 is at `base`, of
+/// the stream sample `first + sample`: the sample count rescaled from
+/// 1/16000 to 1/1000, rounded to nearest with halfway cases up, plus the
+/// base.
+fn ms_at(base: i64, first: u64, sample: i64) -> i64 {
+  let sample = first + u64::try_from(sample).expect("a word sample is never negative");
+  base + i64::try_from((sample * 1_000 + 8_000) / 16_000).expect("fits an i64")
+}
+
+/// **A chunk finishes through the clock stated with its own audio.** Two
+/// chunks of one aligner, with one text and one audio length, pass every
+/// check `finish` runs for each other. They are prepared at two places in
+/// one millisecond stream: A at stream sample 16 000 with the stream's
+/// sample 0 at PTS 5 000, B at stream sample 480 000 with it at PTS -7.
+/// Their encoders run at once, on two threads, and B is finished first.
+/// Each chunk's words land at its own place: a word over chunk-local
+/// samples `[s, e)` (read on the analysis clock) is at
+/// `[5 000 + (16 000 + s) / 16, 5 000 + (16 000 + e) / 16)` for A and at
+/// `[-7 + (480 000 + s) / 16, -7 + (480 000 + e) / 16)` for B, rounded as
+/// mediatime rounds. `finish` takes no clock, so neither chunk can be
+/// finished through the other's.
+#[test]
+fn a_chunk_finishes_through_the_clock_stated_with_its_audio() {
+  let a = aligner();
+  let vocab = a.vocab_size();
+  let text = "hello world";
+  let samples: Vec<f32> = (0..16_000).map(|i| (i as f32 * 0.01).sin() * 0.2).collect();
+  let ms = Timebase::new(1, NonZeroI32::new(1_000).expect("1000 != 0"));
+  let prepare = |clock: OutputClock| {
+    a.prepare(
+      &samples,
+      &SpeechSpans::all_speech(),
+      text,
+      resolution(&a, text),
+      clock,
+      &AtomicBool::new(false),
+    )
+    .expect("prepare")
+  };
+  let encode = |prepared: &PreparedChunk<'_>| {
+    let (t, logits) = fake_encoder(prepared, 320);
+    prepared
+      .encoded_logits(t, vocab, logits)
+      .expect("well-formed")
+  };
+  let ranges = |outcome: Result<UnitAlignment, EmissionsError>| match outcome {
+    Ok(UnitAlignment::Aligned(words)) => words
+      .words()
+      .iter()
+      .map(|word| {
+        let range = word.range();
+        (range.start_pts(), range.end_pts(), range.timebase())
+      })
+      .collect::<Vec<_>>(),
+    other => panic!("the chunk aligns; got {other:?}"),
+  };
+
+  // The chunk-local samples of the words, on the analysis clock.
+  let reference = prepare(sample_clock());
+  let emissions = encode(&reference);
+  let local = ranges(a.finish(reference, emissions, &AtomicBool::new(false)));
+  assert_eq!(local.len(), 2, "{local:?}");
+
+  let (first_a, base_a, first_b, base_b) = (16_000, 5_000, 480_000, -7);
+  let chunk_a = prepare(OutputClock::new(first_a, ms, base_a).expect("1/1000 is valid"));
+  let chunk_b = prepare(OutputClock::new(first_b, ms, base_b).expect("1/1000 is valid"));
+  let (from_a, from_b) = std::thread::scope(|scope| {
+    let encoding_a = scope.spawn(|| encode(&chunk_a));
+    let encoding_b = scope.spawn(|| encode(&chunk_b));
+    (
+      encoding_a.join().expect("A's encoder"),
+      encoding_b.join().expect("B's encoder"),
+    )
+  });
+  let words_b = ranges(a.finish(chunk_b, from_b, &AtomicBool::new(false)));
+  let words_a = ranges(a.finish(chunk_a, from_a, &AtomicBool::new(false)));
+
+  let at = |first: u64, base: i64| {
+    local
+      .iter()
+      .map(|&(start, end, _)| (ms_at(base, first, start), ms_at(base, first, end), ms))
+      .collect::<Vec<_>>()
+  };
+  assert_eq!(words_a, at(first_a, base_a), "A's words at A's place");
+  assert_eq!(words_b, at(first_b, base_b), "B's words at B's place");
+}
+
+/// **A unit is finished at its own job's place in the stream.**
+/// `align_unit` prepares a unit's audio with the clock of that unit's job.
+/// The two runs of `hello world` hold the chunk's two half seconds, PTS
+/// `[0, 8 000)` and `[8 000, 16 000)` on the stream's 1/16000 clock, and
+/// each run's words lie in its own half.
+#[test]
+fn a_unit_is_finished_at_its_own_place_in_the_stream() {
+  let a = aligner();
+  let encoder = |input: &[f32]| {
+    let t = input.len() / 320;
+    let mut raw = vec![0.0_f32; t * VOCAB_SIZE];
+    for frame in 0..t {
+      raw[frame * VOCAB_SIZE] = 1.0;
+      raw[frame * VOCAB_SIZE + 5 + (frame % (VOCAB_SIZE - 5))] = 2.0;
+    }
+    Ok::<_, EmissionsError>(EncoderOutput::Logits {
+      frames: t,
+      vocab: a.vocab_size(),
+      data: raw,
+    })
+  };
+  let run = |text: &str, t0_ms: i64, t1_ms: i64| {
+    crate::align::Run::new(
+      Lang::En,
+      smol_str::SmolStr::new(text),
+      t0_ms,
+      t1_ms,
+      0,
+      crate::align::BoundsSource::Segment,
+    )
+  };
+  let (_, mut request) = transcriber_awaiting_alignment(
+    "hello world",
+    vec![run("hello", 0, 500), run(" world", 500, 1_000)],
+  );
+  for (job, (start, end)) in request
+    .take_units()
+    .into_iter()
+    .zip([(0, 8_000), (8_000, 16_000)])
+  {
+    let resolution = a
+      .detect_oov_unit(&job)
+      .expect("detect")
+      .decide(default_oov_policy);
+    let outcome = a
+      .align_unit(job, resolution, encoder, &AtomicBool::new(false))
+      .expect("aligned");
+    let words = outcome.alignment().words();
+    assert!(!words.is_empty(), "{:?}", outcome.alignment());
+    for word in words {
+      let range = word.range();
+      assert!(
+        start <= range.start_pts() && range.end_pts() <= end,
+        "a word of the run over [{start}, {end}) at {range:?}"
+      );
+    }
+  }
 }
 
 /// A transcriber holding one second of audio whose chunk awaits alignment
@@ -1191,6 +1344,7 @@ fn a_unit_of_only_a_last_frame_word_aligns() {
       &SpeechSpans::all_speech(),
       "a",
       resolution(&a, "a"),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("prepare");
@@ -1205,8 +1359,7 @@ fn a_unit_of_only_a_last_frame_word_aligns() {
   let emissions = prepared
     .encoded_log_probs(t, a.vocab_size(), raw)
     .expect("well-formed");
-  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
-  match a.finish(prepared, emissions, clock, &AtomicBool::new(false)) {
+  match a.finish(prepared, emissions, &AtomicBool::new(false)) {
     Ok(UnitAlignment::Aligned(words)) => {
       assert_eq!(words.words().len(), 1);
       let range = words.words()[0].range();
@@ -1228,6 +1381,7 @@ fn short_unit_word(t: usize, a_frame: usize) -> Result<UnitAlignment, EmissionsE
       &SpeechSpans::all_speech(),
       "a",
       resolution(&a, "a"),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("prepare");
@@ -1242,8 +1396,7 @@ fn short_unit_word(t: usize, a_frame: usize) -> Result<UnitAlignment, EmissionsE
   let emissions = prepared
     .encoded_log_probs(t, a.vocab_size(), raw)
     .expect("well-formed");
-  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
-  a.finish(prepared, emissions, clock, &AtomicBool::new(false))
+  a.finish(prepared, emissions, &AtomicBool::new(false))
 }
 
 /// The one word's `(start, end)` in samples.
@@ -1301,6 +1454,7 @@ fn padded_unit_word(
       speech,
       "a",
       resolution(&a, "a"),
+      clock,
       &AtomicBool::new(false),
     )
     .expect("prepare");
@@ -1315,7 +1469,7 @@ fn padded_unit_word(
   let emissions = prepared
     .encoded_log_probs(t, a.vocab_size(), raw)
     .expect("well-formed");
-  a.finish(prepared, emissions, clock, &AtomicBool::new(false))
+  a.finish(prepared, emissions, &AtomicBool::new(false))
 }
 
 /// **An 8 ms silence limit admits a 6.25 ms silent frame, end to end.** A
@@ -1385,12 +1539,15 @@ fn a_one_real_sample_unit_keeps_its_last_frame_word_or_fails_by_name() {
 fn a_word_past_i64_max_samples_composes_with_its_exact_range() {
   let a = aligner();
   let samples: Vec<f32> = (0..16_000).map(|i| (i as f32 * 0.01).sin() * 0.2).collect();
+  let ms = Timebase::new(1, NonZeroI32::new(1_000).expect("1000 != 0"));
+  let clock = OutputClock::new(1 << 63, ms, 0).expect("1/1000 is a valid output timebase");
   let prepared = a
     .prepare(
       &samples,
       &SpeechSpans::all_speech(),
       "a",
       resolution(&a, "a"),
+      clock,
       &AtomicBool::new(false),
     )
     .expect("prepare");
@@ -1402,10 +1559,8 @@ fn a_word_past_i64_max_samples_composes_with_its_exact_range() {
   let emissions = prepared
     .encoded_log_probs(t, a.vocab_size(), raw)
     .expect("well-formed");
-  let ms = Timebase::new(1, NonZeroI32::new(1_000).expect("1000 != 0"));
-  let clock = OutputClock::new(1 << 63, ms, 0).expect("1/1000 is a valid output timebase");
   assert_eq!(
-    only_word_range(a.finish(prepared, emissions, clock, &AtomicBool::new(false))),
+    only_word_range(a.finish(prepared, emissions, &AtomicBool::new(false))),
     (1 << 59, (1 << 59) + 1_000)
   );
 }
@@ -1423,6 +1578,7 @@ fn prepared_chunk_is_consumed_by_finish() {
       &SpeechSpans::all_speech(),
       "hello",
       resolution(&a, "hello"),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("prepare");
@@ -1430,10 +1586,9 @@ fn prepared_chunk_is_consumed_by_finish() {
   let emissions = prepared
     .encoded_logits(t, a.vocab_size(), logits)
     .expect("ok");
-  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
 
-  let _first = a.finish(prepared, emissions, clock, &AtomicBool::new(false));
-  // let _second = a.finish(prepared, emissions, clock, &AtomicBool::new(false));
+  let _first = a.finish(prepared, emissions, &AtomicBool::new(false));
+  // let _second = a.finish(prepared, emissions, &AtomicBool::new(false));
   //               ^^^^^^^^ error[E0382]: use of moved value: `prepared`
 }
 
@@ -1448,6 +1603,7 @@ fn finish_honours_the_abort_flag() {
       &SpeechSpans::all_speech(),
       "hello",
       resolution(&a, "hello"),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("prepare");
@@ -1455,11 +1611,10 @@ fn finish_honours_the_abort_flag() {
   let emissions = prepared
     .encoded_logits(t, a.vocab_size(), logits)
     .expect("ok");
-  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
 
   let aborted = AtomicBool::new(true);
   let err = a
-    .finish(prepared, emissions, clock, &aborted)
+    .finish(prepared, emissions, &aborted)
     .expect_err("a set abort flag must stop the pipeline");
   assert!(matches!(err, EmissionsError::Aborted(_)));
 }
@@ -1534,6 +1689,7 @@ fn prepare_aborts_before_the_custom_normalizer_runs() {
     &SpeechSpans::all_speech(),
     "hello world",
     decisions,
+    sample_clock(),
     &aborted,
   ) else {
     panic!("an already-set abort flag must stop prepare before it does any work");
@@ -1568,7 +1724,14 @@ fn a_crossed_resolution_wins_over_a_set_abort_flag() {
     .decide(wildcard_all_policy);
   let aborted = AtomicBool::new(true);
 
-  let Err(err) = a.prepare(&samples, &SpeechSpans::all_speech(), "&", foreign, &aborted) else {
+  let Err(err) = a.prepare(
+    &samples,
+    &SpeechSpans::all_speech(),
+    "&",
+    foreign,
+    sample_clock(),
+    &aborted,
+  ) else {
     panic!("a crossed resolution must be refused even under cancellation");
   };
   let EmissionsError::Tokenization(f) = err else {
@@ -1604,6 +1767,7 @@ fn rescaled_vad_spans_reach_prepare() {
       &spans,
       "hello",
       resolution(&a, "hello"),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("prepare with rescaled spans");
@@ -1670,6 +1834,7 @@ fn a_character_the_vocabulary_cannot_spell_is_an_oov_event() {
       &speech,
       text,
       detection.decide(default_oov_policy),
+      sample_clock(),
       &abort,
     )
     .expect("the default policy wildcards a digit");
@@ -1682,6 +1847,7 @@ fn a_character_the_vocabulary_cannot_spell_is_an_oov_event() {
     a.detect_oov(text)
       .expect("detect_oov")
       .decide(fail_closed_all_policy),
+    sample_clock(),
     &abort,
   ) else {
     panic!("a refused character refuses the chunk");
@@ -1728,6 +1894,7 @@ fn align_uniformly(a: &EmissionsAligner, text: &str, resolution: OovResolution) 
       &SpeechSpans::all_speech(),
       text,
       resolution,
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("prepare");
@@ -1735,8 +1902,7 @@ fn align_uniformly(a: &EmissionsAligner, text: &str, resolution: OovResolution) 
   let emissions = prepared
     .encoded_logits(49, v, vec![0.0_f32; 49 * v.get()])
     .expect("logits");
-  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
-  a.finish(prepared, emissions, clock, &AtomicBool::new(false))
+  a.finish(prepared, emissions, &AtomicBool::new(false))
     .expect("finish")
 }
 
@@ -1775,6 +1941,7 @@ fn a_pipe_in_the_text_is_an_oov_event_not_a_separator() {
       a.detect_oov("A|B")
         .expect("detect_oov")
         .decide(wildcard_all_policy),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("the wildcard policy prepares it");
@@ -1795,6 +1962,7 @@ fn a_pipe_in_the_text_is_an_oov_event_not_a_separator() {
     a.detect_oov("A|B")
       .expect("detect_oov")
       .decide(default_oov_policy),
+    sample_clock(),
     &AtomicBool::new(false),
   ) else {
     panic!("the default policy refuses the `|`");
@@ -1832,6 +2000,7 @@ fn a_mark_inside_a_word_never_splits_it() {
           &SpeechSpans::all_speech(),
           text,
           resolution(a, text),
+          sample_clock(),
           &AtomicBool::new(false),
         )
         .expect("prepare");
@@ -1861,6 +2030,7 @@ fn a_declared_special_is_never_a_target() {
       a.detect_oov(text)
         .expect("detect_oov")
         .decide(wildcard_all_policy),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("prepare")
@@ -1920,6 +2090,7 @@ fn the_declared_unknown_token_is_never_a_target() {
       a.detect_oov(text)
         .expect("detect_oov")
         .decide(wildcard_all_policy),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("the wildcard policy prepares it")
@@ -1945,6 +2116,7 @@ fn the_declared_unknown_token_is_never_a_target() {
       .detect_oov(text)
       .expect("detect_oov")
       .decide(default_oov_policy),
+    sample_clock(),
     &AtomicBool::new(false),
   ) else {
     panic!("the default policy refuses the declared unknown token's spelling");
@@ -1973,6 +2145,7 @@ fn inserted_separators_are_unchanged() {
       &SpeechSpans::all_speech(),
       "hello world",
       resolution(&a, "hello world"),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("prepare");
@@ -2007,7 +2180,7 @@ fn punctuated_text_prepares_under_every_policy() {
   for policy in POLICIES {
     let decisions = a.detect_oov(text).expect("detect_oov").decide(policy);
     let prepared = a
-      .prepare(&samples, &speech, text, decisions, &abort)
+      .prepare(&samples, &speech, text, decisions, sample_clock(), &abort)
       .expect("every policy prepares punctuated text");
     assert!(!prepared.is_trivial());
   }
@@ -2029,6 +2202,7 @@ fn punctuated_text_prepares_under_every_policy() {
     &speech,
     "They sold AT&T, then left.",
     detection.decide(fail_closed_all_policy),
+    sample_clock(),
     &abort,
   ) else {
     panic!("the fail-closed policy refuses the spoken `&`");
@@ -2111,7 +2285,14 @@ fn a_spoken_segment_without_a_script_reaches_detection_under_every_policy() {
         .iter()
         .find(|resolved| resolved.decision() == OovDecision::FailClosed)
         .and_then(|resolved| resolved.event().char());
-      match a.prepare(&samples, &speech, second.text(), decisions, &abort) {
+      match a.prepare(
+        &samples,
+        &speech,
+        second.text(),
+        decisions,
+        sample_clock(),
+        &abort,
+      ) {
         Ok(prepared) => {
           assert_eq!(
             refused, None,
@@ -2165,13 +2346,13 @@ fn a_resolution_binds_to_the_text_and_aligner_that_detected_it() {
     told.resolved(),
     "the same layout: equal as positional payloads"
   );
-  a.prepare(&samples, &speech, "sold at&t", sold, &abort)
+  a.prepare(&samples, &speech, "sold at&t", sold, sample_clock(), &abort)
     .expect("an aligner accepts its own detection of this text");
 
   for (what, result) in [
     (
       "another text, same layout",
-      a.prepare(&samples, &speech, "sold at&t", told, &abort),
+      a.prepare(&samples, &speech, "sold at&t", told, sample_clock(), &abort),
     ),
     (
       "another aligner, same text",
@@ -2180,6 +2361,7 @@ fn a_resolution_binds_to_the_text_and_aligner_that_detected_it() {
         &speech,
         "sold at&t",
         detect(&a, "sold at&t"),
+        sample_clock(),
         &abort,
       ),
     ),
@@ -2254,6 +2436,7 @@ fn a_punctuation_only_text_is_named_no_alignable_text() {
         &SpeechSpans::all_speech(),
         text,
         resolution(a, text),
+        sample_clock(),
         &AtomicBool::new(false),
       )
       .expect("prepare");
@@ -2265,9 +2448,8 @@ fn a_punctuation_only_text_is_named_no_alignable_text() {
         vec![-1.0; VOCAB_SIZE],
       )
       .expect("ok");
-    let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
     let result = a
-      .finish(prepared, emissions, clock, &AtomicBool::new(false))
+      .finish(prepared, emissions, &AtomicBool::new(false))
       .expect("finish");
     assert!(result.words().is_empty(), "{text:?}");
     assert!(
@@ -2295,6 +2477,7 @@ fn a_fully_masked_text_is_named_no_surviving_words() {
       &SpeechSpans::new([]),
       "hello world",
       resolution(&a, "hello world"),
+      sample_clock(),
       &AtomicBool::new(false),
     )
     .expect("prepare");
@@ -2303,9 +2486,8 @@ fn a_fully_masked_text_is_named_no_surviving_words() {
   let emissions = prepared
     .encoded_logits(t, a.vocab_size(), logits)
     .expect("ok");
-  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   let result = a
-    .finish(prepared, emissions, clock, &AtomicBool::new(false))
+    .finish(prepared, emissions, &AtomicBool::new(false))
     .expect("finish");
   assert!(result.words().is_empty());
   assert!(
@@ -2349,6 +2531,7 @@ fn a_space_delimited_vocabulary_aligns_under_its_stated_delimiter() {
       &SpeechSpans::all_speech(),
       "hello world",
       resolution(&a, "hello world"),
+      sample_clock(),
       &abort,
     )
     .expect("prepare");
@@ -2362,10 +2545,7 @@ fn a_space_delimited_vocabulary_aligns_under_its_stated_delimiter() {
   let emissions = prepared
     .encoded_logits(t, a.vocab_size(), logits)
     .expect("ok");
-  let clock = OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
-  let outcome = a
-    .finish(prepared, emissions, clock, &abort)
-    .expect("finish");
+  let outcome = a.finish(prepared, emissions, &abort).expect("finish");
   assert_eq!(
     outcome
       .words()
@@ -2428,6 +2608,7 @@ fn a_case_sensitive_vocabulary_is_looked_up_in_the_stated_case() {
         &SpeechSpans::all_speech(),
         "Hello",
         resolution(&a, "Hello"),
+        sample_clock(),
         &abort,
       )
       .expect("prepare");
@@ -2465,6 +2646,7 @@ fn a_short_chunk_pads_to_the_stated_receptive_field() {
         &SpeechSpans::all_speech(),
         "hello",
         resolution(&a, "hello"),
+        sample_clock(),
         &abort,
       )
       .expect("prepare");
@@ -2487,7 +2669,6 @@ fn a_short_chunk_pads_to_the_stated_receptive_field() {
 fn the_frame_count_is_checked_against_the_declared_front_end() {
   let hop = |samples: u32| NonZeroU32::new(samples).expect("nonzero");
   let samples = vec![0.2_f32; 16_000];
-  let clock = || OutputClock::new(0, analysis_tb(), 0).expect("1/16000 is a valid output timebase");
   let emissions = |prepared: &PreparedChunk<'_>, t: usize| {
     prepared
       .encoded_logits(
@@ -2509,12 +2690,13 @@ fn the_frame_count_is_checked_against_the_declared_front_end() {
         &SpeechSpans::all_speech(),
         "hello world",
         resolution(&a, "hello world"),
+        sample_clock(),
         &AtomicBool::new(false),
       )
       .expect("prepare");
     assert_eq!(prepared.encoder_input().len(), 16_000);
     let emissions = emissions(&prepared, t);
-    a.finish(prepared, emissions, clock(), &AtomicBool::new(false))
+    a.finish(prepared, emissions, &AtomicBool::new(false))
   };
 
   for (field, stride, t) in [(640, 160, 97), (400, 320, 49)] {

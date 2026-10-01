@@ -139,6 +139,7 @@ pub use ort;
 /// | apply decisions made for another unit, or in another language | `align_unit` takes only the resolution [`detect_oov_unit`](emissions::EmissionsAligner::detect_oov_unit) made for that very job, keyed on its requested language |
 /// | strand a command with a `?`, a panic or a dropped request | [`AlignmentRequest::align_units`](crate::AlignmentRequest::align_units) answers the command on every road, and a command dropped unanswered fails its chunk as `AlignmentError::Abandoned` |
 /// | finish a chunk with another chunk's emissions of the same shape | emissions carry the identity of the preparation they were made through, and `finish` refuses any other by name |
+/// | map a chunk's words through another chunk's place in the stream | a chunk's [`OutputClock`](emissions::OutputClock) is stated to `prepare` with its audio and carried by its `PreparedChunk`; `finish` takes no clock |
 /// | disagree with asry about the sample count, frame count, or stride | asry derives all three from slices that physically exist |
 /// | run a CTC head whose width disagrees with the tokenizer | `finish` validates it — the check this seam has NEVER run |
 ///

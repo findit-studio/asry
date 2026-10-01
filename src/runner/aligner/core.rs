@@ -47,7 +47,7 @@ use crate::{
       tokenize::{ReservedIds, TokenizedText, detect_oov_events, tokenize_with_word_map},
       trellis_beam::align_to_word_segments,
     },
-    emissions_api::{SpeechCoverage, SpeechSpans},
+    emissions_api::{OutputClock, SpeechCoverage, SpeechSpans},
     normalizer::{DynTextNormalizer, NormalizationError, NormalizedText},
   },
   types::{AlignmentError, AlignmentFailure, Lang, WorkFailure, WorkerHangTimeout, WorkerKind},
@@ -633,9 +633,9 @@ impl AlignerId {
 }
 
 /// The identity of one [`AlignerCore::prepare`] call: what its
-/// [`PreparedChunk`] carries, what every
-/// [`Emissions`](crate::runner::aligner::emissions_api::Emissions) made
-/// through that chunk carries, and what `EmissionsAligner::finish`
+/// [`Preparation`] carries, and the [`PreparedChunk`] built on it, what
+/// every [`Emissions`](crate::runner::aligner::emissions_api::Emissions)
+/// made through that chunk carries, and what `EmissionsAligner::finish`
 /// compares before it reads a frame.
 ///
 /// Never reused within a process, and minted only here, so emissions
@@ -677,7 +677,7 @@ impl PreparationId {
 /// chain.
 pub(crate) struct AlignerCore {
   /// This core's unforgeable identity, minted at construction. Stamped
-  /// into every `PreparedChunk` this core mints and checked by
+  /// into every `Preparation` this core mints and checked by
   /// [`finish`](Self::finish), so a chunk prepared by one aligner
   /// cannot be finished by another.
   id: AlignerId,
@@ -716,40 +716,72 @@ pub(crate) struct AlignerCore {
   max_intra_silent_run: Duration,
 }
 
+/// What [`AlignerCore::prepare`] derives from a chunk for an encoder: the
+/// state of steps 0-2, which [`AlignerCore::finish`] consumes.
+///
+/// Constructible **only** by `prepare`. It carries the masked +
+/// zero-padded encoder buffer and the geometry derived from it, so
+/// `finish` cannot be handed a sample count, a frame count, or a stride
+/// that disagrees with the audio the encoder actually saw: every extent in
+/// here is a slice length, not a caller integer. It carries the identity of
+/// the aligner that minted it and of the preparation itself, which `finish`
+/// checks.
+///
+/// It holds no output clock. The emissions front end hands it out inside a
+/// [`PreparedChunk`], with the clock `prepare` was given for the chunk; the
+/// ORT front end finishes it in the call that prepared it, with the clock
+/// that call was given. Either way a preparation is finished through the
+/// clock stated with its own audio.
+pub(crate) struct Preparation<'a> {
+  /// The aligner that produced this chunk. Sits OUTSIDE `inner` on
+  /// purpose: a trivial chunk carries no encoder buffer, but it is
+  /// still bound to its originating aligner, so the ownership check
+  /// runs before the trivial short-circuit rather than after it.
+  owner: AlignerId,
+  /// This preparation's identity: what the emissions made through its
+  /// chunk carry. Outside `inner` for the reason `owner` is.
+  id: PreparationId,
+  /// `None` for the two short-circuits `Aligner::align` has always
+  /// had: normalisation produced empty text, or tokenisation produced
+  /// zero alignable tokens. The encoder should be skipped entirely and
+  /// the unit is `Unaligned(NoAlignableText)`.
+  inner: Option<PreparedInner<'a>>,
+}
+
 /// A chunk that has been through steps 0-2 and is ready for an
 /// encoder — the capability token the seam hands out.
 ///
-/// Constructible **only** by the aligner core's `prepare`. That is the
-/// whole point: it carries the masked + zero-padded encoder buffer and
-/// the geometry derived from it, so a caller cannot hand `finish` a
-/// sample count, a frame count, or a stride that disagrees with the
-/// audio the encoder actually saw. Every extent in here is a slice
-/// length, not a caller integer.
+/// Constructible **only** by `EmissionsAligner::prepare` (and by
+/// `EmissionsAligner::align_unit`, for a unit's job). That is the whole
+/// point: it carries the masked + zero-padded encoder buffer and the
+/// geometry derived from it, so a caller cannot hand `finish` a sample
+/// count, a frame count, or a stride that disagrees with the audio the
+/// encoder actually saw. Every extent in here is a slice length, not a
+/// caller integer.
 ///
 /// It also carries the identity of the aligner that minted it, which
 /// `finish` checks. A chunk prepared by one
 /// aligner and finished by another is rejected rather than aligned
 /// against the wrong vocabulary.
 ///
-/// And it carries the identity of its own preparation. Its encoder runs
+/// It carries the identity of its own preparation. Its encoder runs
 /// only through it ([`encode_with`](Self::encode_with), which hands the
 /// encoder this chunk's input and builds the emissions from its output),
 /// and those emissions answer this chunk alone: `finish` refuses to pair a chunk with
 /// emissions made through another, by name, before it reads a frame.
+///
+/// And it carries the chunk's [`OutputClock`]: where the chunk's first
+/// sample sits in the stream, the output timebase, and the PTS of the
+/// stream's sample 0. `prepare` takes the clock with the chunk's audio, and
+/// `finish` maps the chunk's words through it and takes no other: two
+/// chunks of one aligner, encoded in any order, cannot trade clocks, so
+/// each chunk's words land at its own place in the stream.
 pub struct PreparedChunk<'a> {
-  /// The aligner that produced this chunk. Sits OUTSIDE `inner` on
-  /// purpose: a trivial chunk carries no encoder buffer, but it is
-  /// still bound to its originating aligner, so the ownership check
-  /// runs before the trivial short-circuit rather than after it.
-  owner: AlignerId,
-  /// This preparation's identity: what the emissions made through this
-  /// chunk carry. Outside `inner` for the reason `owner` is.
-  preparation: PreparationId,
-  /// `None` for the two short-circuits `Aligner::align` has always
-  /// had: normalisation produced empty text, or tokenisation produced
-  /// zero alignable tokens. The encoder should be skipped entirely and
-  /// the unit is `Unaligned(NoAlignableText)`.
-  inner: Option<PreparedInner<'a>>,
+  /// What the core derived from the chunk's audio and text.
+  preparation: Preparation<'a>,
+  /// The clock stated with the chunk's audio, the one `finish` maps its
+  /// words through.
+  clock: OutputClock,
 }
 
 struct PreparedInner<'a> {
@@ -767,6 +799,49 @@ struct PreparedInner<'a> {
   tokenized: TokenizedText,
 }
 
+impl Preparation<'_> {
+  /// The silence-zeroed, receptive-field-padded encoder buffer: empty when
+  /// [`is_trivial`](Self::is_trivial).
+  pub(crate) fn encoder_input(&self) -> &[f32] {
+    self.inner.as_ref().map_or(&[], |i| &i.encoder_input)
+  }
+
+  /// True when normalisation produced empty text or zero alignable tokens.
+  pub(crate) const fn is_trivial(&self) -> bool {
+    self.inner.is_none()
+  }
+
+  /// The chunk's real audio length in 16 kHz samples, before padding: zero
+  /// when trivial.
+  pub(crate) fn real_samples(&self) -> usize {
+    self.inner.as_ref().map_or(0, |i| i.real_samples)
+  }
+
+  /// This preparation's identity.
+  pub(crate) const fn id(&self) -> PreparationId {
+    self.id
+  }
+
+  /// The token stream tokenization produced: empty when trivial.
+  #[cfg(test)]
+  pub(crate) fn token_ids(&self) -> &[i32] {
+    self.inner.as_ref().map_or(&[], |i| i.tokenized.token_ids())
+  }
+}
+
+impl<'a> PreparedChunk<'a> {
+  /// The chunk `preparation` derived, to be finished through `clock`, the
+  /// clock stated with its audio.
+  pub(crate) const fn new(preparation: Preparation<'a>, clock: OutputClock) -> Self {
+    Self { preparation, clock }
+  }
+
+  /// The preparation and the clock it is finished through, for `finish`.
+  pub(crate) fn into_parts(self) -> (Preparation<'a>, OutputClock) {
+    (self.preparation, self.clock)
+  }
+}
+
 impl PreparedChunk<'_> {
   /// **Feed EXACTLY this to your encoder.** Silence-zeroed and
   /// zero-padded to the front end's receptive field (400 samples for
@@ -780,14 +855,14 @@ impl PreparedChunk<'_> {
   /// Empty when [`is_trivial`](Self::is_trivial).
   #[must_use]
   pub fn encoder_input(&self) -> &[f32] {
-    self.inner.as_ref().map_or(&[], |i| &i.encoder_input)
+    self.preparation.encoder_input()
   }
 
   /// True when normalisation produced empty text or zero alignable
   /// tokens. Skip the encoder; `finish` returns an empty result.
   #[must_use]
   pub const fn is_trivial(&self) -> bool {
-    self.inner.is_none()
+    self.preparation.is_trivial()
   }
 
   /// The chunk's REAL audio length in 16 kHz samples, BEFORE the
@@ -804,19 +879,19 @@ impl PreparedChunk<'_> {
   /// there is no setter, and reading it cannot change what `finish` sees.
   #[must_use]
   pub fn real_samples(&self) -> usize {
-    self.inner.as_ref().map_or(0, |i| i.real_samples)
+    self.preparation.real_samples()
   }
 
   /// This preparation's identity: what the emissions made through this
   /// chunk carry.
   pub(crate) const fn preparation(&self) -> PreparationId {
-    self.preparation
+    self.preparation.id()
   }
 
   /// The token stream tokenization produced: empty when trivial.
   #[cfg(test)]
   pub(crate) fn token_ids(&self) -> &[i32] {
-    self.inner.as_ref().map_or(&[], |i| i.tokenized.token_ids())
+    self.preparation.token_ids()
   }
 }
 
@@ -866,7 +941,7 @@ impl AlignerCore {
     }
   }
 
-  /// Whether `prepared` was minted by THIS core.
+  /// Whether `preparation` was minted by THIS core.
   ///
   /// [`finish`](Self::finish) enforces this itself — it is the guard,
   /// and it runs for both front ends because there is only one `finish`.
@@ -874,8 +949,8 @@ impl AlignerCore {
   /// calling the core and report the failure in its own taxonomy (the
   /// same shape `EmissionsAligner::finish` already uses for the stride
   /// and vocab-dim checks: classify in front, guard underneath).
-  pub(crate) fn owns(&self, prepared: &PreparedChunk<'_>) -> bool {
-    prepared.owner == self.id
+  pub(crate) fn owns(&self, preparation: &Preparation<'_>) -> bool {
+    preparation.owner == self.id
   }
 
   /// This core's identity: what a detection it made is bound to.
@@ -1080,7 +1155,7 @@ impl AlignerCore {
     oov_decisions: &[crate::core::ResolvedOov],
     expected_decision_language: &Lang,
     abort_flag: &AtomicBool,
-  ) -> Result<PreparedChunk<'a>, WorkFailure> {
+  ) -> Result<Preparation<'a>, WorkFailure> {
     // FIRST — ahead of the abort poll, which is where the ORT direct path
     // ran it (in `align_chunk_with_abort`, before entering `align`). A
     // cross-language payload is a caller bug that stays a caller bug even
@@ -1140,9 +1215,9 @@ impl AlignerCore {
     let normalized = match self.normalizer.normalize(text) {
       Ok(nt) => nt,
       Err(NormalizationError::EmptyText) => {
-        return Ok(PreparedChunk {
+        return Ok(Preparation {
           owner: self.id,
-          preparation,
+          id: preparation,
           inner: None,
         });
       }
@@ -1195,9 +1270,9 @@ impl AlignerCore {
     // `Event::Error` — alignment becoming optional, not a data-loss
     // path.
     if tokenized.token_ids().is_empty() {
-      return Ok(PreparedChunk {
+      return Ok(Preparation {
         owner: self.id,
-        preparation,
+        id: preparation,
         inner: None,
       });
     }
@@ -1240,7 +1315,7 @@ impl AlignerCore {
     // padded samples are zero (silent) by construction, so the existing
     // speech-mask doesn't need updating to track them.
     //
-    // Owned rather than the `Cow` this was: `PreparedChunk` carries the
+    // Owned rather than the `Cow` this was: `Preparation` carries the
     // buffer across the seam, so it must own it. Same values, same
     // allocation count — the `>= receptive_field` arm moves the vec
     // instead of borrowing it.
@@ -1254,9 +1329,9 @@ impl AlignerCore {
       normalized_samples
     };
 
-    Ok(PreparedChunk {
+    Ok(Preparation {
       owner: self.id,
-      preparation,
+      id: preparation,
       inner: Some(PreparedInner {
         encoder_input,
         real_samples: samples.len(),
@@ -1281,9 +1356,14 @@ impl AlignerCore {
   /// `prepared.real_samples` and `padded_samples.len()` became
   /// `prepared.encoder_input.len()` — both the same numbers, now read
   /// off slices that physically exist rather than re-derived.
+  ///
+  /// `chunk_first_sample_in_stream` and `samples_to_output_range` are the
+  /// clock stated with the chunk's audio: the emissions front end reads
+  /// them off the chunk's own [`PreparedChunk`], and the ORT front end
+  /// passes the ones the call that prepared the chunk was given.
   pub(crate) fn finish<F>(
     &self,
-    prepared: PreparedChunk<'_>,
+    prepared: Preparation<'_>,
     log_probs: &LogProbsTV,
     chunk_first_sample_in_stream: u64,
     samples_to_output_range: F,
