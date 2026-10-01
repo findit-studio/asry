@@ -36,12 +36,22 @@ pub enum AlignmentFallback {
   /// The indexing pipeline never blocks on alignment
   /// unavailability; downstream consumers see the text without
   /// per-word ranges.
+  ///
+  /// Nothing reads the skipped text, so it is not a text found
+  /// clean: detection reports it as one `OovKind::NotInspected`
+  /// event, a caller's `FailClosed` decision for that event turns
+  /// the skip into a refusal, and the alignment result names the
+  /// unit's outcome either way (`UnitAlignment::Unaligned`).
   #[default]
   SkipChunk,
   /// Emit `Event::Error` with
   /// `WorkFailure::LanguageUnsupportedForAlignment`. Useful when
   /// the indexer wants a hard signal that a language was missing
   /// from the registry.
+  ///
+  /// The caller's policy decides first: a `FailClosed` decision for
+  /// the unit's `OovKind::NotInspected` event refuses the unit, by
+  /// name, and only a `Wildcard` one reaches this fallback.
   Error,
 }
 

@@ -16,8 +16,8 @@
 //! - [`crate::core::Transcriber`] — the existing Sans-I/O
 //!   state machine; pull commands via `poll_command()`,
 //!   dispatch them inline, push results back via
-//!   `handle_asr` / `handle_alignment` /
-//!   `handle_failure`.
+//!   `handle_asr` / `handle_failure` for ASR, and `complete` for
+//!   alignment.
 //!
 //! Sync users (CLI tools, batch indexers) drive the pump on
 //! one thread. The full ASR + alignment loop, using
@@ -54,38 +54,32 @@
 //!       ))?;
 //!       transcriber.handle_asr(chunk_id, result)?;
 //!     }
-//!     Command::Alignment { chunk_id, samples, sub_segments: _,
-//!                              text, language, runs } => {
-//!       // Sans-I/O OOV resolution: per-run detect + decide.
-//!       // Each run gets its own decisions vec sized + ordered
-//!       // by the events `detect_oov` produces for that run's
-//!       // text + language. Whole-chunk fallback (when `runs`
-//!       // is empty) gets one inner vec.
-//!       let oov_decisions: Vec<Vec<asry::core::ResolvedOov>> =
-//!         if runs.is_empty() {
-//!           let events = alignment_set.detect_oov(&text, &language)?;
-//!           vec![asry::core::default_oov_decisions(&events)]
-//!         } else {
-//!           alignment_set.detect_oov_per_run(&runs)?
-//!             .iter()
-//!             .map(|ev| asry::core::default_oov_decisions(ev))
-//!             .collect()
-//!         };
-//!       // `AlignWorkItem::from_run_alignment` flips the
-//!       // command's output-timebase `sub_segments` into
-//!       // chunk-local 1/16000 (the form `Aligner::align`
-//!       // requires) and pulls the chunk anchor + bridge from
-//!       // `Transcriber`. Returns `None` only if the chunk
-//!       // already drained — recoverable.
-//!       let job = AlignWorkItem::from_run_alignment(
-//!         &transcriber, chunk_id, samples, text, language,
-//!         runs, abort_flag.clone(), oov_decisions,
-//!       ).expect("chunk in flight");
+//!     Command::Alignment(request) => {
+//!       // The job is built from the request alone: its payload,
+//!       // its ticket and unit jobs, and the chunk's place in the
+//!       // stream. `AlignWorkItem::new` flips the sub-segments
+//!       // into chunk-local 1/16000 (the form `Aligner::align`
+//!       // requires) and builds the output-time bridge.
+//!       let job = AlignWorkItem::new(request, abort_flag.clone());
+//!       // Sans-I/O OOV resolution: detect every unit of THIS
+//!       // job (its whole text, or each run), then decide. The
+//!       // resolution is bound to this job and this set, and
+//!       // `run_one_alignment` consumes it.
 //!       // Fresh `RunOptions` per chunk so a watchdog's
 //!       // `terminate()` for chunk N does not poison chunk N+1.
 //!       let run_options = RunOptions::new().unwrap();
-//!       let aligned = run_one_alignment(&alignment_set, &job, &run_options)?;
-//!       transcriber.handle_alignment(chunk_id, aligned)?;
+//!       // Success or failure, the job answers through its request:
+//!       // the completion carries the command's ticket, and the
+//!       // transcriber takes no other. A detection that fails (a
+//!       // normalisation error) answers the job's command too.
+//!       let completion = match alignment_set.detect_oov(&job) {
+//!         Ok(detection) => {
+//!           let resolution = detection.decide(asry::core::default_oov_policy);
+//!           run_one_alignment(&alignment_set, job, resolution, &run_options)
+//!         }
+//!         Err(failure) => job.failed(failure),
+//!       };
+//!       transcriber.complete(completion)?;
 //!     }
 //!   }
 //! }
@@ -152,4 +146,4 @@ pub use aligner::{
 };
 
 #[cfg(feature = "alignment")]
-pub use alignment_pool::{AlignWorkItem, run_one_alignment};
+pub use alignment_pool::{AlignWorkItem, JobDetection, JobResolution, run_one_alignment};

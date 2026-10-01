@@ -36,9 +36,10 @@ fn data_dependent_failures_are_recoverable() {
 }
 
 /// The pool layer's half of the too-short-chunk contract: a real
-/// aligner's real `NoAlignmentPath` is absorbed into `Ok(empty)`
-/// rather than escaping as an error. This test proves only that the
-/// pool *returns* the recovered empty result; the emission-side
+/// aligner's real `NoAlignmentPath` is absorbed into an `Ok` result
+/// with no words and one record naming that failure, rather than
+/// escaping as an error. This test proves only that the pool
+/// *returns* the recovered result; the emission-side
 /// guarantee — that the dispatcher then rebuilds a `Transcript` still
 /// carrying the ASR text — is a separate contract, pinned by
 /// `core::dispatch::tests::empty_alignment_result_preserves_asr_text_and_emits_no_error`.
@@ -62,19 +63,15 @@ fn data_dependent_failures_are_recoverable() {
 /// `Err(NoAlignmentPath)`. The two together are the whole contract —
 /// the aligner reports honestly that no CTC path exists, and the pool
 /// decides that this particular failure is not worth a chunk over.
-/// Neither test alone would catch an `Ok(empty)` short-circuit smuggled
-/// into the aligner: this one would still pass, because it cannot see
-/// *why* the words vec is empty. That is what the paired test is for.
+/// This one also reads *why* the words vec is empty from the unit's
+/// record, so a short-circuit smuggled into the aligner (a zero-word
+/// `Ok` in place of the error) fails it as well.
 #[test]
 #[cfg_attr(
   not(asry_w2v_en),
   ignore = "needs the English wav2vec2 fixture: ASRY_FETCH_W2V=en cargo test --features alignment"
 )]
 fn too_short_chunk_recovers_to_empty_result() {
-  use core::num::NonZeroI32;
-
-  use mediatime::Timebase;
-
   use crate::runner::aligner::{
     AlignerKey, AlignmentSetBuilder, EnglishNormalizer, test_fixtures::english_aligner,
   };
@@ -82,13 +79,12 @@ fn too_short_chunk_recovers_to_empty_result() {
   const ASR_TEXT: &str = "hello world";
 
   let set = AlignmentSetBuilder::new()
-    // `Error`, deliberately, rather than the `SkipChunk` default: under
-    // `SkipChunk` a registry MISS *also* returns `Ok(empty)`, which is
-    // byte-identical to the recovery under test — so a broken
-    // registration would let this test pass without an aligner ever
-    // running. With `Error`, a miss surfaces as `LanguageUnsupported`
-    // and fails the `expect` below. The `Ok(empty)` this test accepts
-    // can only have come from a real alignment attempt.
+    // `Error`, deliberately, rather than the `SkipChunk` default, so a
+    // registry MISS can never pass for the recovery under test: a miss
+    // with the default policy's `Wildcard` decision surfaces
+    // `LanguageUnsupported` and fails the `expect` below. The `Ok` this
+    // test accepts can only have come from a real alignment attempt, and
+    // its record names what that attempt met.
     .with_fallback(AlignmentFallback::Error)
     .register(
       AlignerKey::Lang(Lang::En),
@@ -100,56 +96,59 @@ fn too_short_chunk_recovers_to_empty_result() {
     "the recovery under test lives on the Hit path; a Miss would prove nothing"
   );
 
-  let job = AlignWorkItem {
-    chunk_id: ChunkId::from_raw(0),
-    // 200 samples = 12.5 ms. The aligner pads it to 400 ⇒ T=1 frame,
-    // against 11 chars ⇒ no CTC path. Byte-for-byte the input
-    // `sub_400_sample_chunk_surfaces_no_alignment_path` hands to
-    // `Aligner::align`, so the two tests really are describing one
-    // contract from two sides.
-    samples: Arc::from(vec![0.0_f32; 200]),
-    sub_segments: Vec::new(),
-    text: SmolStr::new(ASR_TEXT),
-    language: Lang::En,
-    // Empty ⇒ the whole-chunk path ⇒ `run_under_lock` ⇒ `Aligner::align`.
-    runs: Vec::new(),
-    abort_flag: Arc::new(AtomicBool::new(false)),
-    chunk_first_sample_in_stream: 0,
-    samples_to_output_range: Arc::new(|start, end| {
-      TimeRange::new(
-        start as i64,
-        end as i64,
-        Timebase::new(1, NonZeroI32::new(16_000).unwrap()),
-      )
-    }),
-    oov_decisions: Vec::new(),
-  };
+  let job = AlignWorkItem::new(
+    AlignmentRequest::for_test(
+      ChunkId::from_raw(0),
+      core::num::NonZeroU64::new(1).expect("1 != 0"),
+      // 200 samples = 12.5 ms. The aligner pads it to 400 ⇒ T=1 frame,
+      // against 11 chars ⇒ no CTC path. Byte-for-byte the input
+      // `sub_400_sample_chunk_surfaces_no_alignment_path` hands to
+      // `Aligner::align`, so the two tests really are describing one
+      // contract from two sides.
+      Arc::from(vec![0.0_f32; 200]),
+      SmolStr::new(ASR_TEXT),
+      Lang::En,
+      // Empty ⇒ the whole-chunk path ⇒ `run_under_lock` ⇒ `Aligner::align`.
+      Vec::new(),
+    ),
+    Arc::new(AtomicBool::new(false)),
+  );
   let run_options = RunOptions::new().expect("RunOptions::new");
+  let resolution = set
+    .detect_oov(&job)
+    .expect("detect_oov")
+    .decide(crate::core::default_oov_policy);
 
-  let result = run_one_alignment(&set, &job, &run_options).expect(
-    "`NoAlignmentPath` is classified recoverable, so the pool must absorb it into Ok(empty). \
-     An Err here would reach `handle_failure` upstream and turn a chunk carrying a perfectly \
-     good ASR transcript into Event::Error — alignment is best-effort, never destructive.",
-  );
-
-  assert!(
-    result.words().is_empty(),
-    "a dropped alignment contributes no words; got {:?}",
-    result.words()
-  );
-
-  // Input sanity, NOT a preservation proof: `run_one_alignment` borrows
-  // `&job` and never mutates it, so this can only confirm the work item
-  // still carries the text the dispatcher will later read — it says
-  // nothing about what gets emitted. The emission-side preservation
-  // (that `handle_alignment` rebuilds `Transcript::new(.., asr.text(),
-  // result.into_words(), ..)` — text kept, `words: []` — instead of
-  // routing an `Err` to `Event::Error`) is pinned separately by
+  // Input sanity, NOT a preservation proof: this confirms only that the
+  // work item carries the text the dispatcher will later read. It says
+  // nothing about what gets emitted. The emission-side preservation (that
+  // `handle_alignment` keeps `asr.text()` and reports the unit's outcome
+  // instead of routing an `Err` to `Event::Error`) is pinned separately by
   // `core::dispatch::tests::empty_alignment_result_preserves_asr_text_and_emits_no_error`.
   assert_eq!(
     job.text().as_str(),
     ASR_TEXT,
-    "the input work item still carries the ASR text (input sanity, not the preservation proof)"
+    "the input work item carries the ASR text (input sanity, not the preservation proof)"
+  );
+
+  let completion = run_one_alignment(&set, job, resolution, &run_options);
+  let result = completion.report().expect(
+    "`NoAlignmentPath` is classified recoverable, so the pool must absorb it into the unit's \
+     outcome, naming the failure. A failed completion here would turn a chunk carrying a \
+     perfectly good ASR transcript into Event::Error — alignment is best-effort, never \
+     destructive.",
+  );
+
+  assert!(
+    matches!(
+      result.units().collect::<Vec<_>>().as_slice(),
+      [(
+        crate::core::AlignmentUnit::Whole,
+        UnitAlignment::Unaligned(UnalignedCause::Failed(AlignmentError::NoAlignmentPath(_)))
+      )]
+    ),
+    "the whole text's one outcome names the recovered failure, never a bare empty list; got \
+     {result:?}"
   );
 }
 
@@ -402,6 +401,8 @@ fn clip_sub_segments_offsets_into_run_local_space() {
 /// see monotone PTS — that's the public contract.
 #[test]
 fn sort_words_by_pts_orders_overlapping_runs() {
+  use crate::core::sort_words_by_pts;
+
   use core::num::NonZeroI32;
   use mediatime::Timebase;
   let tb = Timebase::new(1, NonZeroI32::new(16_000).unwrap());
@@ -435,6 +436,8 @@ fn sort_words_by_pts_orders_overlapping_runs() {
 /// but keeps the output deterministic for debug/log readers.
 #[test]
 fn sort_words_by_pts_breaks_ties_by_end_pts() {
+  use crate::core::sort_words_by_pts;
+
   use core::num::NonZeroI32;
   use mediatime::Timebase;
   let tb = Timebase::new(1, NonZeroI32::new(16_000).unwrap());
@@ -511,194 +514,481 @@ fn check_abort_between_runs_passes_through_when_flag_clear() {
 
 /// replicates
 /// the outer-shape check that `run_one_alignment` performs.
-/// The dispatch validation can't easily be exercised
-/// end-to-end without a real Aligner / ORT, so this test
-/// pins the predicate that decides "is the
-/// `Vec<Vec<OovDecision>>` shape valid for this chunk
-/// shape?". A regression that reverts to silent acceptance
-/// of stale shapes will trip these expectations.
+/// The per-run road aligns the runs' texts only, so a per-run job whose
+/// runs do not reproduce its text is refused loudly: a character left
+/// out would reach no OOV detection, and a run that differs would align
+/// words the transcript does not hold. A job with no runs takes the
+/// whole-text road and passes, as does one whose runs reproduce the text.
 #[test]
-fn outer_oov_decisions_shape_predicate() {
-  fn shape_ok(outer: usize, runs_len: usize) -> bool {
-    let expected = if runs_len == 0 { 1 } else { runs_len };
-    outer == 0 || outer == expected
-  }
-  // Whole-chunk job: 0 (no OOV) or 1 (one whole-chunk vec).
-  assert!(shape_ok(0, 0));
-  assert!(shape_ok(1, 0));
-  assert!(!shape_ok(2, 0)); // stale per-run payload — REJECT
-  assert!(!shape_ok(3, 0));
-  // Per-run job with 2 runs: 0 (no OOV) or exactly 2.
-  assert!(shape_ok(0, 2));
-  assert!(shape_ok(2, 2));
-  assert!(!shape_ok(1, 2)); // shorter-than-runs.len() — REJECT
-  assert!(!shape_ok(3, 2));
-}
+fn a_per_run_job_whose_runs_do_not_reproduce_its_text_is_refused() {
+  use crate::align::BoundsSource;
 
-/// per-run
-/// dispatch must thread the caller's per-run OOV decisions
-/// from `AlignWorkItem::oov_decisions[run_idx]` into
-/// `run_one_per_run`, NOT hard-code `default_oov_decisions`.
-/// This pins the indexing slice so a future refactor that
-/// drops the `enumerate()`+index lookup can't silently
-/// substitute the default policy.
-///
-/// Structural test: builds a `Vec<Vec<OovDecision>>` with
-/// distinct per-run policies and asserts the dispatcher's
-/// slice-extraction matches each run's expected policy.
-/// No real `Aligner` needed — exercises only the index
-/// math.
-#[test]
-fn per_run_oov_decisions_are_indexed_by_run_idx() {
-  use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
-  fn synth(decision: OovDecision, char_idx: usize) -> ResolvedOov {
-    ResolvedOov::new(
-      OovEvent::new(OovKind::Symbol('?'), char_idx, 0, Lang::En),
-      decision,
-    )
-  }
-  let oov_decisions: Vec<Vec<ResolvedOov>> = vec![
-    // Run 0: caller chose `wildcard_all_decisions` — three Wildcards.
-    vec![
-      synth(OovDecision::Wildcard, 0),
-      synth(OovDecision::Wildcard, 1),
-      synth(OovDecision::Wildcard, 2),
-    ],
-    // Run 1: caller chose `default_oov_decisions` — mixed.
-    vec![
-      synth(OovDecision::Wildcard, 0),
-      synth(OovDecision::FailClosed, 1),
-    ],
-    // Run 2: empty = no OOV expected.
-    vec![],
-  ];
-  // Mirror `dispatch_runs`'s per-run extraction.
-  for run_idx in 0..3 {
-    let slice = oov_decisions
-      .get(run_idx)
-      .map(|v| v.as_slice())
-      .unwrap_or(&[]);
-    match run_idx {
-      0 => {
-        assert_eq!(slice.len(), 3);
-        assert!(slice.iter().all(|r| r.decision() == OovDecision::Wildcard));
-      }
-      1 => {
-        assert_eq!(slice.len(), 2);
-        assert_eq!(slice[0].decision(), OovDecision::Wildcard);
-        assert_eq!(slice[1].decision(), OovDecision::FailClosed);
-      }
-      2 => assert!(slice.is_empty()),
-      _ => unreachable!(),
-    }
-  }
-  // Out-of-range run idx (hypothetical: caller pre-sized
-  // shorter than `runs`) falls back to `&[]`. The aligner
-  // then surfaces `TokenizationFailed` if it hits any OOV
-  // — loud diagnostic, not silent default-policy.
-  let oob = oov_decisions.get(99).map(|v| v.as_slice()).unwrap_or(&[]);
-  assert!(oob.is_empty());
-}
-
-/// at the
-/// dispatch boundary, every supplied `ResolvedOov.event.language`
-/// must match the chunk/run's requested language. Round 10
-/// loosened the in-tokenizer identity check to ignore
-/// `language` (so Any-fallback works); this test pins the
-/// dispatch-boundary precheck that catches what the
-/// in-tokenizer check now lets through.
-#[test]
-fn validate_oov_decision_languages_whole_chunk_match_passes() {
-  use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
-  let resolved = vec![vec![ResolvedOov::new(
-    OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::En),
-    OovDecision::Wildcard,
-  )]];
-  assert!(validate_oov_decision_languages(&[], &Lang::En, &resolved).is_ok());
-}
-
-#[test]
-fn validate_oov_decision_languages_whole_chunk_mismatch_rejects() {
-  use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
-  // Job language is Korean; supplied decision was made for
-  // English — language-conditional policy would run against
-  // the wrong key.
-  let resolved = vec![vec![ResolvedOov::new(
-    OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::En),
-    OovDecision::Wildcard,
-  )]];
-  let result = validate_oov_decision_languages(&[], &Lang::Ko, &resolved);
-  match result {
-    Err(WorkFailure::Alignment(AlignmentError::Tokenization(payload))) => assert!(
-      payload
-        .message()
-        .contains("oov_decisions[0][0].event.language")
-        && payload.message().contains("job.language"),
-      "diagnostic should cite the whole-chunk mismatch; got {message}",
-      message = payload.message(),
-    ),
-    other => panic!("expected TokenizationFailed; got {other:?}"),
-  }
-}
-
-#[test]
-fn validate_oov_decision_languages_per_run_mismatch_rejects() {
-  use crate::{
-    align::{BoundsSource, Run},
-    core::{OovDecision, OovEvent, OovKind, ResolvedOov},
-  };
-  use smol_str::SmolStr;
-  let runs = vec![
+  let run = |text: &str| {
     Run::new(
       Lang::En,
-      SmolStr::from("AT&T"),
+      SmolStr::new(text),
       0,
       1_000,
       0,
       BoundsSource::Segment,
-    ),
-    Run::new(
-      Lang::Ko,
-      SmolStr::from("4번"),
-      1_000,
-      2_000,
-      1,
-      BoundsSource::Segment,
-    ),
-  ];
-  // Run 1 (Korean) is wired with a stale English-stamped decision.
-  let resolved = vec![
-    vec![ResolvedOov::new(
-      OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::En),
-      OovDecision::Wildcard,
-    )],
-    // BUG: event language Lang::En but run language Lang::Ko.
-    vec![ResolvedOov::new(
-      OovEvent::new(OovKind::Symbol('4'), 0, 0, Lang::En),
-      OovDecision::Wildcard,
-    )],
-  ];
-  let result = validate_oov_decision_languages(&runs, &Lang::En, &resolved);
-  match result {
-    Err(WorkFailure::Alignment(AlignmentError::Tokenization(payload))) => assert!(
-      payload.message().contains("oov_decisions[1][0]")
-        && payload.message().contains("runs[1].language()"),
-      "diagnostic should cite the run index of the mismatch; got {message}",
-      message = payload.message(),
-    ),
-    other => panic!("expected TokenizationFailed; got {other:?}"),
+    )
+  };
+  let text = "hello 4, & 50%.";
+  assert!(validate_runs_reproduce_text(&[], text, &Lang::En).is_ok());
+  assert!(
+    validate_runs_reproduce_text(&[run("hello"), run(" 4, & 50%.")], text, &Lang::En).is_ok()
+  );
+  for (runs, text) in [
+    (vec![run("hello")], text),
+    (vec![run("hello"), run(" 4")], text),
+    (vec![run("hello"), run(" 4, 50%.")], text),
+    (vec![run("hello"), run(" 4, & 50%")], text),
+    (vec![run("a bc")], "ab c"),
+    (vec![run("don't")], "dont"),
+  ] {
+    match validate_runs_reproduce_text(&runs, text, &Lang::En) {
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(failure))) => assert!(
+        failure.message().contains("do not reproduce"),
+        "{}",
+        failure.message()
+      ),
+      other => panic!("{text:?}: expected a Tokenization refusal; got {other:?}"),
+    }
   }
 }
 
-/// An empty outer vec ("no OOV expected") is accepted —
-/// `tokenize_with_word_map` surfaces `TokenizationFailed`
-/// downstream if a chunk hits an OOV anyway. This validator
-/// is about per-position language identity, not
-/// presence/absence.
+/// A per-run job over `runs` for `chunk`, for the validators.
+fn per_run_job(chunk: u64, runs: Vec<Run>) -> AlignWorkItem {
+  let text: String = runs.iter().map(Run::text).collect();
+  AlignWorkItem::new(
+    AlignmentRequest::for_test(
+      ChunkId::from_raw(chunk),
+      core::num::NonZeroU64::new(1).expect("1 != 0"),
+      Arc::from(vec![0.0_f32; 1_600]),
+      SmolStr::new(text),
+      Lang::Ko,
+      runs,
+    ),
+    Arc::new(AtomicBool::new(false)),
+  )
+}
+
+/// A Korean run, which the test registries have no aligner for.
+fn korean_run(text: &str, source_segment_idx: i32) -> Run {
+  Run::new(
+    Lang::Ko,
+    SmolStr::new(text),
+    0,
+    100,
+    source_segment_idx,
+    crate::align::BoundsSource::Segment,
+  )
+}
+
+/// A registry with no aligner, missing every language.
+fn empty_registry(fallback: AlignmentFallback) -> AlignmentSet {
+  crate::runner::aligner::AlignmentSetBuilder::new()
+    .with_fallback(fallback)
+    .build()
+}
+
+/// **A unit no aligner can read is resolved policy first.** Detection
+/// reports it as one `NotInspected` event, so its resolution holds exactly
+/// the policy's decision for it: a resolution cannot be empty or skip that
+/// event. `FailClosed` refuses the unit under `SkipChunk` and `Error`
+/// alike, and only `Wildcard` reaches the fallback (`SkipChunk` skips,
+/// `Error` fails the job with `LanguageUnsupported`). A unit an aligner
+/// read at detection is refused if the registry misses it at dispatch.
 #[test]
-fn validate_oov_decision_languages_empty_passes() {
-  let empty: Vec<Vec<ResolvedOov>> = Vec::new();
-  assert!(validate_oov_decision_languages(&[], &Lang::En, &empty).is_ok());
+fn a_unit_no_aligner_can_read_is_resolved_policy_first() {
+  use crate::core::{
+    AlignmentUnit, OovDetection, OovEvent, OovKind, default_oov_policy, fail_closed_all_policy,
+  };
+
+  let set = empty_registry(AlignmentFallback::SkipChunk);
+  let job = per_run_job(0, vec![korean_run(" 4", 0)]);
+  let decided = |policy: fn(&OovEvent) -> OovDecision| {
+    let detection = set.detect_oov(&job).expect("detect_oov");
+    let [unit] = detection.units() else {
+      panic!("one run, one unit");
+    };
+    assert_eq!(
+      unit.events().to_vec(),
+      vec![OovEvent::new(OovKind::NotInspected, 0, 0, Lang::Ko)],
+      "a unit no aligner can read is one NotInspected event, never an empty list"
+    );
+    detection
+      .decide(policy)
+      .into_units_for(&job, set.id())
+      .expect("this job, this set")
+      .pop()
+      .expect("one unit")
+  };
+  let refused = decided(fail_closed_all_policy);
+  let wildcard = decided(default_oov_policy);
+
+  for fallback in [AlignmentFallback::SkipChunk, AlignmentFallback::Error] {
+    assert!(
+      matches!(
+        resolve_not_inspected(&refused, fallback, &Lang::Ko),
+        Ok(UnalignedCause::Refused)
+      ),
+      "{fallback:?}: FailClosed refuses before any fallback"
+    );
+  }
+  assert!(matches!(
+    resolve_not_inspected(&wildcard, AlignmentFallback::SkipChunk, &Lang::Ko),
+    Ok(UnalignedCause::Skipped)
+  ));
+  assert!(matches!(
+    resolve_not_inspected(&wildcard, AlignmentFallback::Error, &Lang::Ko),
+    Err(WorkFailure::LanguageUnsupported(_))
+  ));
+
+  let read = OovDetection::of_unit(
+    AlignmentUnit::Run(0),
+    Lang::Ko,
+    vec![OovEvent::new(OovKind::Symbol('4'), 1, 0, Lang::Ko)],
+    Some(core::num::NonZeroU64::new(9).expect("9 != 0")),
+  )
+  .decide(fail_closed_all_policy);
+  assert!(matches!(
+    resolve_not_inspected(&read, AlignmentFallback::SkipChunk, &Lang::Ko),
+    Err(WorkFailure::Alignment(AlignmentError::Tokenization(_)))
+  ));
+}
+
+/// **A resolution applies only to the job it was detected for.** Two work
+/// items with the same chunk id, text, language and run layout are still
+/// two jobs: a resolution detected for one is refused for the other before
+/// any lookup, whether its units are read or not. The job's own resolution
+/// passes, and yields its units in order. A resolution cannot be cloned or
+/// built by hand (the `compile_fail` doctests on `JobResolution`), and
+/// `run_one_alignment` consumes it, so it applies once.
+#[test]
+fn a_resolution_applies_only_to_the_job_it_was_detected_for() {
+  use crate::core::{AlignmentUnit, fail_closed_all_policy, wildcard_all_policy};
+
+  let set = empty_registry(AlignmentFallback::SkipChunk);
+  let layout = || vec![korean_run(" 4", 0), korean_run(" 4", 1)];
+  let first = per_run_job(7, layout());
+  let replayed_into = per_run_job(7, layout());
+
+  let units = set
+    .detect_oov(&first)
+    .expect("detect_oov")
+    .decide(wildcard_all_policy)
+    .into_units_for(&first, set.id())
+    .expect("the job's own resolution");
+  assert_eq!(
+    units.iter().map(|unit| unit.unit()).collect::<Vec<_>>(),
+    [AlignmentUnit::Run(0), AlignmentUnit::Run(1)]
+  );
+
+  let resolution = set
+    .detect_oov(&first)
+    .expect("detect_oov")
+    .decide(fail_closed_all_policy);
+  assert_eq!(resolution.chunk_id(), replayed_into.chunk_id());
+  match resolution.into_units_for(&replayed_into, set.id()) {
+    Err(WorkFailure::Alignment(AlignmentError::Tokenization(failure))) => assert!(
+      failure.message().contains("detected for another job"),
+      "{}",
+      failure.message()
+    ),
+    other => panic!("a resolution replayed into another job must be refused; got {other:?}"),
+  }
+}
+
+/// **A registry swapped in between detection and dispatch is refused.** A
+/// resolution is bound to the set that read it: another set refuses it
+/// before any lookup, under either fallback, so a unit one registry read
+/// clean (no event, nothing decided) can never pass for a decision on a
+/// registry that cannot read it, and no NotInspected decision crosses
+/// over either.
+#[test]
+fn a_registry_swapped_between_detection_and_dispatch_is_refused() {
+  use crate::core::default_oov_policy;
+
+  for fallback in [AlignmentFallback::SkipChunk, AlignmentFallback::Error] {
+    let a = empty_registry(fallback);
+    let b = empty_registry(fallback);
+    let job = per_run_job(0, vec![korean_run(" 4", 0)]);
+    let from_a = a
+      .detect_oov(&job)
+      .expect("detect_oov")
+      .decide(default_oov_policy);
+    match from_a.into_units_for(&job, b.id()) {
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(failure))) => assert!(
+        failure.message().contains("through another AlignmentSet"),
+        "{fallback:?}: {}",
+        failure.message()
+      ),
+      other => panic!("{fallback:?}: A's resolution is no resolution for B; got {other:?}"),
+    }
+  }
+}
+
+/// A transcriber holding chunk 0 awaiting the alignment of `text` in
+/// Korean, run by run over `runs` when there are any, and the request its
+/// `Command::Alignment` carried.
+fn transcriber_awaiting_alignment(
+  text: &str,
+  runs: Vec<Run>,
+) -> (crate::core::Transcriber, AlignmentRequest) {
+  use core::num::NonZeroI32;
+
+  use crate::{
+    core::{AsrResult, Command, Transcriber, TranscriberOptions},
+    types::VadSegment,
+  };
+
+  let mut t = Transcriber::new(TranscriberOptions::default().with_word_alignment(true));
+  let tb = mediatime::Timebase::new(1, NonZeroI32::new(16_000).expect("16000 != 0"));
+  t.handle_samples(mediatime::Timestamp::new(0, tb), &vec![0.1_f32; 16_000])
+    .expect("samples");
+  t.handle_vad_segment(VadSegment::new(0, 16_000))
+    .expect("a VAD segment over the audio");
+  t.handle_eof().expect("eof");
+  let Some(Command::Asr { chunk_id, .. }) = t.poll_command() else {
+    panic!("the chunk asks for ASR");
+  };
+  t.handle_asr(
+    chunk_id,
+    AsrResult::new(SmolStr::new(text), Lang::Ko, -0.5, 0.05, 0.0).with_runs(runs),
+  )
+  .expect("a non-empty ASR result under word alignment");
+  let Some(Command::Alignment(request)) = t.poll_command() else {
+    panic!("the chunk asks for alignment");
+  };
+  (t, request)
+}
+
+/// **On the pool path a completion answers only the command whose request
+/// built its job, success or failure.** Two transcribers each hold chunk 0
+/// awaiting alignment of one text, with one unit layout, whole or run by
+/// run. Each request becomes a job of its own (`AlignWorkItem::new` takes
+/// nothing but the request and the abort flag), detection and the policy
+/// decide it, and the pool answers it through the request: here no aligner
+/// reads Korean, so under `SkipChunk` every unit is skipped. Swapped, each
+/// transcriber refuses the other's completion as `ForeignAlignment` naming
+/// another transcriber and hands it back, and its chunk still awaits
+/// alignment; delivered home, each completion resolves its own chunk.
+/// Under the `Error` fallback the job fails, and that failure answers its
+/// own request too: offered to the other transcriber it is refused the
+/// same way, and delivered home it is the chunk's `Event::Error`. A job
+/// that panics answers its request as a failure too.
+///
+/// The jobs run the pool's own answering step (`answer_job`) over the units'
+/// real detection and resolution, as `run_one_alignment` does for units no
+/// aligner can read; only `RunOptions`, which needs the ONNX Runtime, is
+/// left out.
+#[test]
+fn a_pool_completion_answers_only_its_own_command() {
+  use crate::{
+    core::{Event, RefusedCompletion, UnitAlignment, default_oov_policy},
+    types::TranscriberError,
+  };
+
+  let foreign = |outcome: Result<(), RefusedCompletion>| match outcome {
+    Err(refused) => {
+      match refused.error() {
+        TranscriberError::ForeignAlignment(foreign) => {
+          assert_eq!(foreign.chunk_id(), ChunkId::from_raw(0));
+          assert!(foreign.another_transcriber());
+        }
+        other => panic!("another transcriber's completion is refused by name; got {other:?}"),
+      }
+      refused.into_completion()
+    }
+    Ok(()) => panic!("another transcriber's completion must be refused"),
+  };
+  let run_job = |set: &AlignmentSet, fallback: AlignmentFallback, request: AlignmentRequest| {
+    let job = AlignWorkItem::new(request, Arc::new(AtomicBool::new(false)));
+    let resolution = set
+      .detect_oov(&job)
+      .expect("detect_oov")
+      .decide(default_oov_policy);
+    answer_job(job, |job, units| {
+      let resolutions = resolution.into_units_for(job, set.id())?;
+      resolutions
+        .iter()
+        .zip(units)
+        .map(|(resolution, unit)| {
+          resolve_not_inspected(resolution, fallback, job.language())
+            .map(|cause| unit.answer(UnitAlignment::Unaligned(cause)))
+        })
+        .collect()
+    })
+  };
+
+  for runs in [
+    Vec::new(),
+    vec![korean_run("hello", 0), korean_run(" world", 1)],
+  ] {
+    let skip = AlignmentFallback::SkipChunk;
+    let registry = empty_registry(skip);
+    let (mut a, from_a) = transcriber_awaiting_alignment("hello world", runs.clone());
+    let (mut z, from_z) = transcriber_awaiting_alignment("hello world", runs.clone());
+    let (done_a, done_z) = (
+      run_job(&registry, skip, from_a),
+      run_job(&registry, skip, from_z),
+    );
+    assert!(done_a.report().is_some() && done_z.report().is_some());
+    let back_to_z = foreign(a.complete(done_z));
+    let back_to_a = foreign(z.complete(done_a));
+    assert_eq!(
+      (a.in_flight_chunk_count(), z.in_flight_chunk_count()),
+      (1, 1),
+      "the swap resolves nothing"
+    );
+    a.complete(back_to_a)
+      .expect("handed back, the transcriber that issued its command takes it");
+    z.complete(back_to_z)
+      .expect("handed back, the transcriber that issued its command takes it");
+    for transcriber in [&mut a, &mut z] {
+      match transcriber.poll_event() {
+        Some(Event::Transcript(t)) => {
+          assert_eq!(t.alignment().units().len(), runs.len().max(1));
+          assert!(
+            t.alignment().units().all(|(_, alignment)| matches!(
+              alignment,
+              UnitAlignment::Unaligned(UnalignedCause::Skipped)
+            )),
+            "{:?}",
+            t.alignment()
+          );
+        }
+        other => panic!("expected the transcript; got {other:?}"),
+      }
+    }
+
+    // A failure from job A offered to job Z.
+    let error = AlignmentFallback::Error;
+    let registry = empty_registry(error);
+    let (mut a, from_a) = transcriber_awaiting_alignment("hello world", runs.clone());
+    let (mut z, from_z) = transcriber_awaiting_alignment("hello world", runs.clone());
+    let failed_a = run_job(&registry, error, from_a);
+    assert!(matches!(
+      failed_a.failure(),
+      Some(WorkFailure::LanguageUnsupported(_))
+    ));
+    let back_to_a = foreign(z.complete(failed_a));
+    assert_eq!(
+      z.in_flight_chunk_count(),
+      1,
+      "a refused failure resolves nothing"
+    );
+    z.complete(run_job(&registry, error, from_z))
+      .expect("z's own failure resolves its chunk");
+    assert!(matches!(z.poll_event(), Some(Event::Error { .. })));
+    a.complete(back_to_a)
+      .expect("a's failure answers a's command");
+    assert!(matches!(a.poll_event(), Some(Event::Error { .. })));
+
+    // A job that panics still answers its request, as a failure.
+    let (mut a, from_a) = transcriber_awaiting_alignment("hello world", runs.clone());
+    let job = AlignWorkItem::new(from_a, Arc::new(AtomicBool::new(false)));
+    let panicked = answer_job(job, |_, _| panic!("an aligner fault"));
+    match panicked.failure() {
+      Some(WorkFailure::Alignment(AlignmentError::ModelInference(failure))) => assert!(
+        failure.message().contains("an aligner fault"),
+        "{}",
+        failure.message()
+      ),
+      other => panic!("a panicking job answers as a failure; got {other:?}"),
+    }
+    a.complete(panicked)
+      .expect("the panicked job's failure answers its command");
+    assert!(matches!(a.poll_event(), Some(Event::Error { .. })));
+  }
+}
+
+/// **The pool and the direct road answer a run with the same outcome.**
+/// Both answer a unit through its job's one answer boundary, which stamps a
+/// run's words with the run's language: the pool's answering step and a
+/// driver answering the same run with the same alignment give equal
+/// outcomes, words and language alike.
+#[test]
+fn a_run_outcome_is_the_same_on_the_pool_and_direct_roads() {
+  use crate::core::{AlignedWords, AlignmentReport, UnitAlignment};
+
+  let tb = mediatime::Timebase::new(1, core::num::NonZeroI32::new(16_000).expect("16000 != 0"));
+  let aligned = || {
+    UnitAlignment::Aligned(
+      AlignedWords::new(vec![crate::types::Word::new(
+        SmolStr::new("hello"),
+        TimeRange::new(0, 10, tb),
+        0.9,
+      )])
+      .expect("a word"),
+    )
+  };
+  let runs = || vec![korean_run("hello", 0), korean_run(" world", 1)];
+  let words = |report: Option<&AlignmentReport>| -> Vec<crate::types::Word> {
+    match report {
+      Some(AlignmentReport::Runs(units)) => units
+        .iter()
+        .flat_map(|unit| unit.words().to_vec())
+        .collect(),
+      other => panic!("expected each run's outcome; got {other:?}"),
+    }
+  };
+
+  let (_pool_transcriber, request) = transcriber_awaiting_alignment("hello world", runs());
+  let job = AlignWorkItem::new(request, Arc::new(AtomicBool::new(false)));
+  let pooled = answer_job(job, |_, units| {
+    Ok(
+      units
+        .into_iter()
+        .map(|unit| unit.answer(aligned()))
+        .collect(),
+    )
+  });
+
+  let (_direct_transcriber, mut request) = transcriber_awaiting_alignment("hello world", runs());
+  let outcomes = request
+    .take_units()
+    .into_iter()
+    .map(|unit| unit.answer(aligned()))
+    .collect();
+  let direct = request.aligned(outcomes).expect("its own units, in order");
+
+  let (pooled, direct) = (words(pooled.report()), words(direct.report()));
+  // `Word` has no `PartialEq`: its `Debug` form names every field.
+  assert_eq!(format!("{pooled:?}"), format!("{direct:?}"));
+  assert!(pooled.iter().all(|word| word.language() == Some(&Lang::Ko)));
+}
+
+/// **A persistent normalisation failure answers the chunk.** When a job's
+/// OOV detection fails, the job still owns its request, and
+/// `AlignWorkItem::failed` answers the command with that failure: delivered,
+/// it is the chunk's `Event::Error`, and nothing awaits alignment any more,
+/// whole or run by run.
+#[test]
+fn a_detection_failure_answers_its_chunk() {
+  use crate::core::Event;
+
+  for runs in [
+    Vec::new(),
+    vec![korean_run("hello", 0), korean_run(" world", 1)],
+  ] {
+    let (mut t, request) = transcriber_awaiting_alignment("hello world", runs);
+    let job = AlignWorkItem::new(request, Arc::new(AtomicBool::new(false)));
+    let failure = WorkFailure::Alignment(AlignmentError::Normalization(AlignmentFailure::new(
+      SmolStr::new_static("the normaliser's rule failed"),
+      Lang::Ko,
+    )));
+    let completion = job.failed(failure);
+    assert!(matches!(
+      completion.failure(),
+      Some(WorkFailure::Alignment(AlignmentError::Normalization(_)))
+    ));
+    t.complete(completion)
+      .expect("the failure answers the job's own command");
+    assert!(matches!(t.poll_event(), Some(Event::Error { .. })));
+    assert_eq!(t.in_flight_chunk_count(), 0);
+  }
 }
 
 #[test]

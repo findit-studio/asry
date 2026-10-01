@@ -11,9 +11,24 @@
 //! `EnglishNormalizer` is now a thin wrapper that
 //! constructs a `LatinNormalizer::new(Lang::En)` — every existing
 //! consumer keeps compiling. The old `english.rs` test contract
-//! (lowercase + boundary-punct strip + apostrophes-survive-inside,
-//! per-piece surface spans on hyphen / em-dash / slash splits)
-//! is preserved verbatim by the `Lang::En` configuration.
+//! (lowercase + boundary-punct strip + apostrophes-survive-inside)
+//! is preserved by the `Lang::En` configuration.
+//!
+//! # A word is never split at a mark inside it
+//!
+//! A whitespace-bounded word stays one output word whatever marks it
+//! holds: `km/h`, `well-known`, `and/or` and `two—three` are each one
+//! word, and tokenization drops each mark the vocabulary cannot spell.
+//! A mark inside a word is spoken, when it is, inside that word's span
+//! (the "per" of `km/h`), so the word's spelled tokens bound it and
+//! dropping it moves no word boundary.
+//!
+//! The one segmentation rule is the clitic apostrophe of French and
+//! Italian (below): `l'eau` is the two words `l'` and `eau`, because
+//! those languages' wav2vec2 vocabularies read the elided article as a
+//! word of its own. The output words' surfaces partition the text's
+//! words: joined in order they give back every word of the text that
+//! holds a word to align.
 //!
 //! # Per-language quirks
 //!
@@ -52,27 +67,42 @@ use crate::{
 /// based on the input [`Lang`].
 #[derive(Clone, Copy, Debug)]
 struct LatinRules {
-  /// If `true`, an apostrophe (`'`, `\u{2019}`) at the END of a
-  /// whitespace-bounded token is treated as a word boundary that
-  /// SPLITS the token: `l'eau` → two pieces (`l'`, `eau`). The
-  /// apostrophe stays attached to the LEFT piece, matching the
-  /// way romance-language wav2vec2 tokenisers were trained
-  /// (clitic article + noun).
+  /// The elided forms that begin a word as a word of their own: an
+  /// article, preposition, pronoun or conjunction that drops its vowel
+  /// before the next word and keeps its apostrophe (`l'` of `l'eau`).
+  /// Only these split a whitespace-bounded token, the apostrophe staying
+  /// on the LEFT piece, as the wav2vec2-large-xlsr-53-{fr,it} tokenizers
+  /// were trained. Every other apostrophe stays inside its word
+  /// (`aujourd'hui`, `rock'n'roll`).
   ///
-  /// English (`Lang::En`) keeps `false` — `don't` stays one word
-  /// because the wav2vec2-base-960h vocab encodes `'` inline.
-  splits_clitic_apostrophe: bool,
+  /// Empty for every other language: English `don't` stays one word
+  /// because the wav2vec2-base-960h vocab spells `'` inline.
+  clitics: &'static [&'static str],
 }
+
+/// The French elided forms that split off the word they begin:
+/// `l'homme` is `l'` and `homme`.
+const FRENCH_CLITICS: &[&str] = &[
+  "l'", "d'", "j'", "m'", "n'", "s'", "t'", "c'", "qu'", "jusqu'", "lorsqu'", "puisqu'", "quoiqu'",
+];
+
+/// The Italian elided forms that split off the word they begin:
+/// `dell'arte` is `dell'` and `arte`.
+const ITALIAN_CLITICS: &[&str] = &[
+  "l'", "un'", "dell'", "all'", "dall'", "nell'", "sull'", "coll'", "pell'", "d'", "c'", "m'",
+  "t'", "s'", "v'", "n'", "quell'", "quest'", "bell'", "sant'",
+];
 
 impl LatinRules {
   fn for_lang(lang: &Lang) -> Self {
     match lang {
-      Lang::Fr | Lang::It => Self {
-        splits_clitic_apostrophe: true,
+      Lang::Fr => Self {
+        clitics: FRENCH_CLITICS,
       },
-      _ => Self {
-        splits_clitic_apostrophe: false,
+      Lang::It => Self {
+        clitics: ITALIAN_CLITICS,
       },
+      _ => Self { clitics: &[] },
     }
   }
 }
@@ -88,16 +118,36 @@ impl LatinRules {
 ///
 /// **Punctuation handling.** ASCII `[ . , ! ? ; : " ' ( ) [ ] { } - — – ]`
 /// plus Spanish opening punctuation `¿` / `¡` are stripped from
-/// word boundaries. Internal apostrophes inside English
-/// contractions (e.g., `'` in `don't`) survive into the
-/// normalised form so the wav2vec2 tokenizer aligns the
-/// apostrophe character directly. For French / Italian, clitic
-/// apostrophes split: `l'eau` → `l'` + `eau`.
+/// word boundaries. A mark inside a word never splits it: `km/h`
+/// and `well-known` are one word each, and the normalised form keeps
+/// the mark for tokenization to drop where the vocabulary cannot
+/// spell it. Internal apostrophes inside English contractions (e.g.,
+/// `'` in `don't`) survive into the normalised form so the wav2vec2
+/// tokenizer aligns the apostrophe character directly. For French /
+/// Italian, clitic apostrophes split: `l'eau` → `l'` + `eau`, the one
+/// segmentation rule.
+///
+/// **Surfaces.** A word's `original_words` entry is its whitespace-
+/// bounded word as written, edge marks included (`World!`). Where the
+/// clitic rule splits one, the pieces' surfaces partition it (`l'`,
+/// `eau`), so the surfaces, joined in order, give back every word of
+/// the text that holds a word to align.
+///
+/// A curly apostrophe (`’`, U+2019) inside a word folds to the
+/// straight `'` in the normalised form, the one wav2vec2
+/// vocabularies spell: `don’t` normalises to `don't`, and
+/// `original_words` keeps `don’t` as written.
+///
+/// A stripped mark leaves nothing behind: no wildcard padding is
+/// reported, because a punctuation mark has no acoustic
+/// realization and is never an alignment target. A mark left
+/// inside a word (the stops of `U.S.A`) is dropped at
+/// tokenization wherever the vocabulary cannot spell it.
 ///
 /// **Empty result.** If normalisation produces zero words,
 /// `normalize` returns [`NormalizationError::EmptyText`].
-/// `Aligner::align` short-circuits this to
-/// `Ok(AlignmentResult::new(Vec::new()))` so a punctuation-only
+/// `Aligner::align` short-circuits this to the unit's
+/// `Unaligned(NoAlignableText)` outcome, so a punctuation-only
 /// transcript surfaces as `Transcript { text, words: [] }`
 /// rather than `Event::Error`.
 #[derive(Clone, Copy, Debug)]
@@ -121,9 +171,7 @@ impl LatinNormalizer {
   /// `EnglishNormalizer`).
   pub const fn english() -> Self {
     Self {
-      rules: LatinRules {
-        splits_clitic_apostrophe: false,
-      },
+      rules: LatinRules { clitics: &[] },
     }
   }
 }
@@ -168,119 +216,93 @@ fn is_word_punct(c: char) -> bool {
 // survive the trim — wav2vec2-base-960h aligns them as a single
 // word with the `'` glyph emitted inline.
 //
-// For Romance languages (French, Italian) where the apostrophe
-// is a CLITIC boundary, the trailing-apostrophe-as-word-boundary
-// rule fires before the punctuation trim, splitting `l'eau` into
-// `l'` + `eau`. The trim then strips the dangling `'` from the
-// right edge of `l'` only if no other letters precede it.
+// For French and Italian, a recognised clitic (`LatinRules::clitics`)
+// that begins a token splits off before the punctuation trim:
+// `l'eau` is `l'` + `eau`, and the clitic piece keeps its apostrophe.
+// Any other apostrophe stays inside its word.
 
 fn strip_word_punct(s: &str) -> &str {
   let trimmed_left = s.trim_start_matches(is_word_punct);
   trimmed_left.trim_end_matches(is_word_punct)
 }
 
-/// True for characters that join two real words inside a single
-/// whitespace-bounded token but are themselves never spoken,
-/// e.g. `hello-world`, `two—three`, `and/or`. The wav2vec2 vocab
-/// doesn't cover these glyphs, so the normaliser treats them as
-/// word boundaries: each side becomes its own normalised word,
-/// both pointing back to their own surface slices.
-///
-/// We do NOT split on apostrophes here — apostrophe handling is
-/// a per-language rule (English keeps them inline, French /
-/// Italian split as a clitic boundary) and runs in a separate
-/// pass before this generic separator split.
-fn is_internal_separator(c: char) -> bool {
-  matches!(
-    c,
-    '-' | '/' | '\u{2010}' // hyphen
-                | '\u{2013}' // en-dash
-                | '\u{2014}' // em-dash
-                | '\u{2015}' // horizontal bar
-  )
-}
-
 fn is_clitic_apostrophe(c: char) -> bool {
   matches!(c, '\'' | '\u{2019}')
 }
 
+/// The normalised form of a piece that survived the boundary strip:
+/// lowercased, with every curly apostrophe (`’`, U+2019) folded to
+/// the straight `'` the vocabularies spell. After the strip such an
+/// apostrophe stands inside the word, or ends a clitic piece
+/// (`l’` of `l’eau`).
 fn lowercase_for_match(s: &str) -> String {
-  s.to_lowercase()
+  s.to_lowercase().replace('\u{2019}', "'")
 }
 
-/// Split a whitespace-bounded token at clitic apostrophes that
-/// glue an article / preposition to the following word
-/// (`l'eau` → `["l'", "eau"]`). The apostrophe stays attached
-/// to the LEFT piece because the wav2vec2-large-xlsr-53-{fr,it}
-/// tokenisers were trained on transcripts where the clitic
-/// surface form keeps its apostrophe.
+/// Split the recognised `clitics` off the front of a whitespace-bounded
+/// token (`l'eau` → `["l'", "eau"]`), one after another
+/// (`qu'aujourd'hui` → `["qu'", "aujourd'hui"]`). The apostrophe stays on
+/// the LEFT piece because the wav2vec2-large-xlsr-53-{fr,it} tokenisers
+/// were trained on transcripts where the clitic keeps it. An apostrophe
+/// that does not end a recognised clitic stays inside its word
+/// (`aujourd'hui`, `rock'n'roll`), and a clitic with nothing after it is
+/// not split off.
 ///
-/// Returns owned `(piece_str, byte_offset_within_token)` pairs:
-/// the offsets let the caller reconstruct borrowed slices into
-/// the original text. We split greedily on every clitic
-/// apostrophe inside the token; consecutive apostrophes are
-/// rare in real text but handled by yielding empty pieces that
-/// the caller filters out.
-fn split_at_clitic_apostrophes(token: &str) -> Vec<(String, usize)> {
+/// Returns `(piece, byte_offset_within_token)` pairs, never empty; every
+/// piece but the last is a clitic.
+fn split_at_clitics(token: &str, clitics: &[&str]) -> Vec<(String, usize)> {
   let mut pieces: Vec<(String, usize)> = Vec::new();
-  let mut current_start: usize = 0;
-  let chars: Vec<(usize, char)> = token.char_indices().collect();
-  let mut i = 0usize;
-  while i < chars.len() {
-    let (byte_idx, ch) = chars[i];
-    if is_clitic_apostrophe(ch) {
-      // Take chars [current_start ..= byte_idx] (apostrophe
-      // included on the left piece). The next piece starts at
-      // the next char's byte offset (or end-of-token).
-      let after_apos = byte_idx + ch.len_utf8();
-      let left = &token[current_start..after_apos];
-      pieces.push((String::from(left), current_start));
-      current_start = after_apos;
-    }
-    i += 1;
+  let mut start = 0;
+  while let Some(len) = leading_clitic_len(&token[start..], clitics) {
+    pieces.push((String::from(&token[start..start + len]), start));
+    start += len;
   }
-  if current_start < token.len() {
-    pieces.push((String::from(&token[current_start..]), current_start));
-  } else if pieces.is_empty() {
-    // All-empty token — push the original empty so callers see
-    // a single zero-length entry rather than nothing.
-    pieces.push((String::new(), 0));
-  }
+  pieces.push((String::from(&token[start..]), start));
   pieces
+}
+
+/// The byte length of the recognised clitic `rest` begins with (any marks
+/// before its first letter included), when more of the token follows it.
+fn leading_clitic_len(rest: &str, clitics: &[&str]) -> Option<usize> {
+  let lead = rest.len()
+    - rest
+      .trim_start_matches(|c: char| !c.is_alphanumeric())
+      .len();
+  let (offset, apostrophe) = rest[lead..]
+    .char_indices()
+    .find(|&(_, c)| is_clitic_apostrophe(c))?;
+  let end = lead + offset + apostrophe.len_utf8();
+  let recognised = clitics.contains(&lowercase_for_match(&rest[lead..end]).as_str());
+  (recognised && end < rest.len()).then_some(end)
 }
 
 impl TextNormalizer for LatinNormalizer {
   fn normalize<'a>(&self, text: &'a str) -> Result<NormalizedText<'a>, NormalizationError> {
     let mut normalized = String::with_capacity(text.len());
     let mut original_words: Vec<Cow<'a, str>> = Vec::new();
-    let mut wildcards_per_word: Vec<crate::runner::aligner::normalizer::WildcardBoundary> =
-      Vec::new();
 
     for (token_start, raw_token) in token_spans(text) {
-      // Per-language clitic-apostrophe split runs FIRST so the
-      // resulting sub-tokens go through the same boundary-punct
-      // strip + separator-split pipeline as ordinary tokens.
-      // English (rules.splits_clitic_apostrophe = false) skips
-      // this and feeds the whole raw_token through unchanged,
-      // matching the legacy `EnglishNormalizer` contract.
+      // Per-language clitic split runs FIRST so the resulting
+      // sub-tokens go through the same boundary-punct strip as
+      // ordinary tokens. A language without clitics (English) feeds
+      // the whole raw_token through unchanged.
       //
       // The `is_clitic_left` flag marks pieces whose RIGHT edge
       // ends in the clitic apostrophe by design (e.g., `l'` from
       // `l'eau`). For those pieces we skip the trailing
       // apostrophe strip — the apostrophe IS the surface form.
       let token_pieces: Vec<(String, usize, bool)> =
-        if self.rules.splits_clitic_apostrophe && raw_token.chars().any(is_clitic_apostrophe) {
-          let split = split_at_clitic_apostrophes(raw_token);
+        if !self.rules.clitics.is_empty() && raw_token.chars().any(is_clitic_apostrophe) {
+          let split = split_at_clitics(raw_token, self.rules.clitics);
           let last_idx = split.len().saturating_sub(1);
           split
             .into_iter()
             .enumerate()
             .filter(|(_, (p, _))| !p.is_empty())
             .map(|(i, (p, off))| {
-              // Clitic-left pieces are every piece EXCEPT the last
-              // — the splitter always puts the apostrophe at the
-              // end of the piece it's emitted with, so any non-
-              // final piece ends in `'`.
+              // Clitic-left pieces are every piece EXCEPT the last:
+              // each non-final piece is a recognised clitic, which
+              // ends in its apostrophe.
               let is_clitic_left = i != last_idx;
               (p, off, is_clitic_left)
             })
@@ -289,9 +311,10 @@ impl TextNormalizer for LatinNormalizer {
           vec![(String::from(raw_token), 0usize, false)]
         };
 
+      // The pieces that hold a word: where each starts in `text`, and its
+      // normalised form. A piece made only of marks holds none.
+      let mut words: Vec<(usize, String)> = Vec::with_capacity(token_pieces.len());
       for (sub_token, sub_offset, is_clitic_left) in &token_pieces {
-        let sub_start = token_start + sub_offset;
-        let sub_len = sub_token.len();
         // Clitic-left pieces (`l'`, `dell'`) intentionally end
         // in `'`. Strip leading punctuation as usual but keep
         // the trailing apostrophe — it's the surface form the
@@ -301,86 +324,35 @@ impl TextNormalizer for LatinNormalizer {
         } else {
           strip_word_punct(sub_token)
         };
-        if stripped.is_empty() {
-          continue;
+        // The marks stripped above leave nothing behind: no
+        // wildcard pads the word where they stood, because a
+        // punctuation mark is never an alignment target. A mark
+        // left inside the piece stays in its one word.
+        if !stripped.is_empty() {
+          words.push((token_start + sub_offset, lowercase_for_match(stripped)));
         }
+      }
 
-        // Reconstruct the borrowed slice for the original sub-
-        // token (without punctuation strip, so Whisper's
-        // surface form is preserved verbatim — punctuation
-        // included).
-        let original_slice: &'a str = &text[sub_start..sub_start + sub_len];
-
-        // Wildcards: count of source chars stripped from each
-        // boundary (prefix vs suffix). Source-order placement
-        // matters — WhisperX inserts a `*` placeholder per
-        // source char at its actual position, so leading
-        // punctuation like `"hello` keeps its `*` BEFORE the
-        // letters and trailing punctuation like `hello"` keeps
-        // its `*` AFTER.
-        //
-        // Clitic-left pieces have `suffix_stripped = 0` because
-        // we explicitly do NOT strip the trailing apostrophe.
-        let trimmed_left = sub_token.trim_start_matches(is_word_punct);
-        let prefix_stripped: u32 =
-          (sub_token.chars().count() - trimmed_left.chars().count()) as u32;
-        let suffix_stripped: u32 = if *is_clitic_left {
-          0
-        } else {
-          (trimmed_left.chars().count() - stripped.chars().count()) as u32
-        };
-
-        // Split on internal separators (`Hello-World` →
-        // `["Hello", "World"]`). Each piece is a real word the
-        // wav2vec2 vocab can encode.
-        if stripped.contains(is_internal_separator) {
-          let pieces: Vec<&str> = stripped
-            .split(is_internal_separator)
-            .filter(|p| !p.is_empty())
-            .collect();
-          let last_idx = pieces.len().saturating_sub(1);
-          for (pi, piece_orig) in pieces.iter().enumerate() {
-            let piece_lower = lowercase_for_match(piece_orig);
-            if !normalized.is_empty() {
-              normalized.push(' ');
-            }
-            normalized.push_str(&piece_lower);
-            // `piece_orig` is a slice into `stripped`, which is
-            // itself a slice into `sub_token` (an owned
-            // `String`). Use Cow::Owned so the lifetime is
-            // self-contained — the borrow checker can't trace
-            // the slice back to `text`.
-            original_words.push(Cow::Owned(String::from(*piece_orig)));
-            let prefix = if pi == 0 { prefix_stripped } else { 0 };
-            let suffix = if pi == last_idx { suffix_stripped } else { 0 };
-            wildcards_per_word.push(crate::runner::aligner::normalizer::WildcardBoundary::new(
-              prefix, suffix,
-            ));
-          }
-        } else {
-          // No internal separator — the sub-token is one piece.
-          let lower = lowercase_for_match(stripped);
-          if !normalized.is_empty() {
-            normalized.push(' ');
-          }
-          normalized.push_str(&lower);
-          original_words.push(Cow::Borrowed(original_slice));
-          wildcards_per_word.push(crate::runner::aligner::normalizer::WildcardBoundary::new(
-            prefix_stripped,
-            suffix_stripped,
-          ));
+      // The surfaces partition the whitespace-bounded word: the first
+      // starts where it starts, each next one where its own piece
+      // starts, and the last ends where the word ends. So a mark-only
+      // piece the clitic split cut off stays in a neighbour's surface.
+      let token_end = token_start + raw_token.len();
+      for (index, (start, lower)) in words.iter().enumerate() {
+        let begin = if index == 0 { token_start } else { *start };
+        let end = words.get(index + 1).map_or(token_end, |(next, _)| *next);
+        if !normalized.is_empty() {
+          normalized.push(' ');
         }
+        normalized.push_str(lower);
+        original_words.push(Cow::Borrowed(&text[begin..end]));
       }
     }
 
     if original_words.is_empty() {
       return Err(NormalizationError::EmptyText);
     }
-    Ok(NormalizedText::with_wildcards(
-      normalized,
-      original_words,
-      wildcards_per_word,
-    ))
+    Ok(NormalizedText::new(normalized, original_words))
   }
 }
 
@@ -428,31 +400,33 @@ mod tests {
     assert_eq!(nt.original_words()[1], "go.");
   }
 
+  /// **A mark inside a word never splits it.** `km/h`, `well-known`,
+  /// `and/or` and `two—three` are one word each, under every Latin
+  /// language, with the surface as written; the normalised form keeps the
+  /// mark for tokenization to drop.
   #[test]
-  fn en_em_dash_splits_into_per_piece_surface_spans() {
-    let nt = en().normalize("hello\u{2014}world").unwrap();
-    assert_eq!(nt.normalized(), "hello world");
-    assert_eq!(nt.original_words().len(), 2);
-    assert_eq!(nt.original_words()[0], "hello");
-    assert_eq!(nt.original_words()[1], "world");
-  }
-
-  #[test]
-  fn en_hyphen_compound_splits_into_per_piece_surface_spans() {
-    let nt = en().normalize("Hello-World").unwrap();
-    assert_eq!(nt.normalized(), "hello world");
-    assert_eq!(nt.original_words().len(), 2);
-    assert_eq!(nt.original_words()[0], "Hello");
-    assert_eq!(nt.original_words()[1], "World");
-  }
-
-  #[test]
-  fn en_slash_alternation_splits_into_per_piece_surface_spans() {
-    let nt = en().normalize("and/or").unwrap();
-    assert_eq!(nt.normalized(), "and or");
-    assert_eq!(nt.original_words().len(), 2);
-    assert_eq!(nt.original_words()[0], "and");
-    assert_eq!(nt.original_words()[1], "or");
+  fn a_mark_inside_a_word_never_splits_it() {
+    for lang in [Lang::En, Lang::Es, Lang::Fr, Lang::De, Lang::It, Lang::Pt] {
+      let nt = LatinNormalizer::new(lang.clone())
+        .normalize("km/h Well-Known and/or two\u{2014}three foo\u{2014}/-bar")
+        .unwrap();
+      assert_eq!(
+        nt.normalized(),
+        "km/h well-known and/or two\u{2014}three foo\u{2014}/-bar",
+        "{lang:?}"
+      );
+      assert_eq!(
+        nt.original_words(),
+        [
+          "km/h",
+          "Well-Known",
+          "and/or",
+          "two\u{2014}three",
+          "foo\u{2014}/-bar"
+        ],
+        "{lang:?}"
+      );
+    }
   }
 
   #[test]
@@ -514,26 +488,27 @@ mod tests {
   }
 
   #[test]
-  fn en_em_dash_and_slash_split() {
-    let nt = en()
-      .normalize("two\u{2014}three and/or four\u{2013}five")
-      .unwrap();
-    assert_eq!(nt.normalized(), "two three and or four five");
-    assert_eq!(nt.original_words().len(), 6);
-  }
-
-  #[test]
   fn en_pure_separator_token_is_dropped() {
     let nt = en().normalize("hello --- world").unwrap();
     assert_eq!(nt.normalized(), "hello world");
     assert_eq!(nt.original_words().len(), 2);
   }
 
+  /// A curly apostrophe inside a word folds to the straight one the
+  /// vocabulary spells; at a word's edge it strips like `'`. The surface
+  /// keeps what was written.
   #[test]
-  fn en_collapses_consecutive_internal_separators() {
-    let nt = en().normalize("foo\u{2014}/-bar").unwrap();
-    assert_eq!(nt.normalized(), "foo bar");
-    assert_eq!(nt.original_words().len(), 2);
+  fn en_curly_apostrophe_inside_a_word_folds_to_ascii() {
+    let nt = en()
+      .normalize("Don\u{2019}t \u{2018}rock\u{2019}n\u{2019}roll\u{2019} dogs\u{2019}")
+      .unwrap();
+    assert_eq!(nt.normalized(), "don't rock'n'roll dogs");
+    assert_eq!(nt.original_words()[0], "Don\u{2019}t");
+    assert_eq!(
+      nt.original_words()[1],
+      "\u{2018}rock\u{2019}n\u{2019}roll\u{2019}"
+    );
+    assert_eq!(nt.original_words()[2], "dogs\u{2019}");
   }
 
   // --- Spanish (Lang::Es) ---------------------------------------
@@ -605,6 +580,20 @@ mod tests {
     assert_eq!(nt.original_words()[0], "l'");
     assert_eq!(nt.original_words()[1], "eau");
     assert_eq!(nt.original_words()[2], "d'");
+    assert_eq!(nt.original_words()[3], "argent");
+  }
+
+  /// A curly clitic apostrophe splits as the straight one does and
+  /// folds to it in the normalised form; the surface keeps it.
+  #[test]
+  fn fr_curly_clitic_apostrophe_folds_to_ascii() {
+    let n = LatinNormalizer::new(Lang::Fr);
+    let nt = n.normalize("l\u{2019}eau d\u{2019}argent").unwrap();
+    assert_eq!(nt.normalized(), "l' eau d' argent");
+    assert_eq!(nt.original_words().len(), 4);
+    assert_eq!(nt.original_words()[0], "l\u{2019}");
+    assert_eq!(nt.original_words()[1], "eau");
+    assert_eq!(nt.original_words()[2], "d\u{2019}");
     assert_eq!(nt.original_words()[3], "argent");
   }
 
@@ -685,6 +674,114 @@ mod tests {
   }
 
   // --- Cross-cutting --------------------------------------------
+
+  /// Every character the Latin normaliser removes, other than
+  /// whitespace, is a punctuation mark nobody reads aloud: the marks it
+  /// strips at a word's edge and the clitic apostrophes it splits at.
+  /// Nothing spoken is dropped before OOV detection.
+  #[test]
+  fn removes_only_whitespace_and_silent_marks() {
+    use crate::align::punctuation::is_silent_mark;
+
+    for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+      if is_word_punct(c) || is_clitic_apostrophe(c) {
+        assert!(is_silent_mark(c), "{c:?}");
+      }
+    }
+  }
+
+  /// **The output words' surfaces reproduce the text's words.** Joined in
+  /// order, the surfaces are the text's whitespace-bounded words, those
+  /// that hold a word to align, joined in order: no character of them is
+  /// lost or moved, also where the clitic rule splits a word, cuts a
+  /// mark-only piece off it, or meets two apostrophes in a row.
+  #[test]
+  fn the_surfaces_reproduce_the_text_words() {
+    let text = "\u{201C}Hello,\u{201D} she said \u{2014} isn\u{2019}t it (really) well-known? \
+                km/h and/or two\u{2014}three l'eau d\u{2019}argent 'tis l'... l''eau 3.5 U.S.A. \
+                --- rock'n'roll \u{BF}Qu\u{E9}? *";
+    let spoken: String = text
+      .split_whitespace()
+      .filter(|word| word.chars().any(char::is_alphanumeric) || *word == "*")
+      .collect();
+    for lang in [Lang::En, Lang::Es, Lang::Fr, Lang::De, Lang::It, Lang::Pt] {
+      let nt = LatinNormalizer::new(lang.clone()).normalize(text).unwrap();
+      assert_eq!(nt.original_words().concat(), spoken, "{lang:?}");
+      assert_eq!(
+        nt.normalized().split_whitespace().count(),
+        nt.original_words().len(),
+        "{lang:?}"
+      );
+    }
+    let fr = LatinNormalizer::new(Lang::Fr)
+      .normalize("'tis l'... l''eau")
+      .unwrap();
+    assert_eq!(fr.normalized(), "tis l' l' eau");
+    assert_eq!(fr.original_words(), ["'tis", "l'...", "l'", "'eau"]);
+  }
+
+  /// **Only a recognised clitic splits a word.** Each listed French and
+  /// Italian clitic splits off the word it begins, a chain of them splits
+  /// one by one, and every other apostrophe stays inside its word:
+  /// `aujourd'hui` and `rock'n'roll` are one word each, `l'homme` is two.
+  #[test]
+  fn only_a_recognised_clitic_splits_a_word() {
+    let fr = LatinNormalizer::new(Lang::Fr);
+    let nt = fr
+      .normalize("aujourd'hui rock'n'roll l'homme qu'aujourd'hui Jusqu\u{2019}à prud'homme")
+      .unwrap();
+    assert_eq!(
+      nt.normalized(),
+      "aujourd'hui rock'n'roll l' homme qu' aujourd'hui jusqu' à prud'homme"
+    );
+    assert_eq!(
+      nt.original_words(),
+      [
+        "aujourd'hui",
+        "rock'n'roll",
+        "l'",
+        "homme",
+        "qu'",
+        "aujourd'hui",
+        "Jusqu\u{2019}",
+        "à",
+        "prud'homme"
+      ]
+    );
+
+    let it = LatinNormalizer::new(Lang::It);
+    let nt = it
+      .normalize("rock'n'roll quell'uomo c'è po' senz'altro")
+      .unwrap();
+    assert_eq!(
+      nt.normalized(),
+      "rock'n'roll quell' uomo c' è po senz'altro"
+    );
+
+    for (lang, clitics) in [(Lang::Fr, FRENCH_CLITICS), (Lang::It, ITALIAN_CLITICS)] {
+      let n = LatinNormalizer::new(lang.clone());
+      for clitic in clitics {
+        let text = format!("{clitic}eau");
+        let nt = n.normalize(&text).unwrap();
+        assert_eq!(nt.original_words(), [*clitic, "eau"], "{lang:?} {clitic}");
+      }
+    }
+    // A clitic with nothing after it is not split off.
+    assert_eq!(fr.normalize("l'").unwrap().normalized(), "l");
+  }
+
+  /// The marks a Latin normaliser strips leave no wildcard padding, in
+  /// any language: punctuation is never an alignment target.
+  #[test]
+  fn all_latin_report_no_boundary_wildcards() {
+    for lang in [Lang::En, Lang::Es, Lang::Fr, Lang::De, Lang::It, Lang::Pt] {
+      let nt = LatinNormalizer::new(lang.clone())
+        .normalize("\u{201C}Hello,\u{201D} (world)! \u{BF}Qu\u{E9}? l'eau -- 'tis")
+        .unwrap();
+      assert!(nt.original_words().len() >= 5, "{lang:?}");
+      assert!(nt.wildcard_boundary_per_word().is_empty(), "{lang:?}");
+    }
+  }
 
   #[test]
   fn all_latin_use_word_delimiter() {

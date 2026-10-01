@@ -8,6 +8,7 @@
 //! consumes real `whispercpp::Segment<'_>` — is gated on
 //! `feature = "runner"`; everything else is always-on.
 
+pub(crate) mod punctuation;
 pub mod script;
 pub mod script_dispatch;
 

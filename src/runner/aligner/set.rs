@@ -1,5 +1,9 @@
 //! `AlignmentSet` — registry of `Aligner`s keyed by `AlignerKey`.
 
+use core::{
+  num::NonZeroU64,
+  sync::atomic::{AtomicU64, Ordering},
+};
 use std::{collections::HashMap, sync::Mutex};
 
 use crate::{
@@ -45,13 +49,18 @@ pub enum AlignmentLookup<'a> {
 /// Registry of `Aligner`s. Owned by `ManagedTranscriber`; shared
 /// with the alignment worker via `Arc<AlignmentSet>`.
 ///
-/// Fields are private; construct via [`AlignmentSetBuilder`].
+/// Fields are private; construct via [`AlignmentSetBuilder`](crate::AlignmentSetBuilder).
 /// Lookup is `&self` so the worker can hold a long-lived borrow
 /// without blocking other workers (the `Mutex<Aligner>` inside
 /// is the per-language lock).
 pub struct AlignmentSet {
   aligners: HashMap<AlignerKey, Mutex<Aligner>>,
   fallback: AlignmentFallback,
+  /// This registry's process-unique identity. A job's detection is bound
+  /// to it, and dispatch refuses a resolution detected through another
+  /// registry: the registry is fixed once built, so the identity names
+  /// the snapshot detection used.
+  id: NonZeroU64,
 }
 
 impl AlignmentSet {
@@ -59,11 +68,23 @@ impl AlignmentSet {
   /// `AlignmentSetBuilder` so the construction surface stays
   /// consistent with the `with_*` builder pattern used elsewhere
   /// in the crate.
-  pub(super) const fn from_parts(
+  pub(super) fn from_parts(
     aligners: HashMap<AlignerKey, Mutex<Aligner>>,
     fallback: AlignmentFallback,
   ) -> Self {
-    Self { aligners, fallback }
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let raw = COUNTER.fetch_add(1, Ordering::Relaxed);
+    Self {
+      aligners,
+      fallback,
+      // Unreachable: exhausting this needs 2^64 registries.
+      id: NonZeroU64::new(raw).expect("AlignmentSet counter overflowed u64"),
+    }
+  }
+
+  /// This registry's identity, as a job's detection is bound to it.
+  pub(crate) const fn id(&self) -> NonZeroU64 {
+    self.id
   }
 
   /// Configured registry-miss policy.
@@ -84,84 +105,81 @@ impl AlignmentSet {
     self.aligners.is_empty()
   }
 
-  /// Detect out-of-vocab characters in `text` against the
-  /// aligner registered for `language` (or
-  /// [`AlignerKey::Any`]'s aligner if no language-specific one
-  /// is registered). Returns events in the order
-  /// [`tokenize_with_word_map`](crate::runner::aligner::algorithm::tokenize::tokenize_with_word_map)
-  /// would encounter them — caller-supplied `&[ResolvedOov]`
-  /// on the resulting [`AlignWorkItem::oov_decisions`](crate::AlignWorkItem)
-  /// must be in the same order.
+  /// Detect out-of-vocab characters in every alignment unit of `job`:
+  /// its whole text when it has no runs, or each of its runs, against the
+  /// aligner registered for the unit's language (or [`AlignerKey::Any`]'s
+  /// when no language-specific one is registered).
   ///
-  /// Returns `Ok(empty)` when no aligner matches (registry
-  /// miss) — the alignment dispatch will then either skip the
-  /// chunk (under [`AlignmentFallback::SkipChunk`]) or surface
-  /// the language-unsupported error itself, so an empty
-  /// decisions vec on the work item is the right shape.
+  /// Returns the one way to decide them: a
+  /// [`JobDetection`](crate::JobDetection) bound to this very work item
+  /// (its `ChunkId` with it) and to this set. Decide it with a policy
+  /// from [`crate::core::oov`] (or a closure) and hand the
+  /// [`JobResolution`](crate::JobResolution) to
+  /// [`run_one_alignment`](crate::run_one_alignment) with the same job and
+  /// set; it refuses a resolution detected for another job or through
+  /// another set.
   ///
-  /// Sans-I/O OOV resolution entry point: callers feed the
-  /// returned events into a policy helper
-  /// (`crate::core::oov::default_oov_decisions` etc.) and
-  /// pass the resulting decisions to
-  /// `AlignWorkItem::from_run_alignment`.
+  /// Each unit's events carry the unit's REQUESTED language, also when
+  /// the `Any` aligner reads it, so a per-language policy decides on the
+  /// chunk's or run's language, not the fallback aligner's.
+  ///
+  /// When no aligner matches a unit (a registry miss), nothing can read
+  /// it. It is reported as exactly one
+  /// [`OovKind::NotInspected`](crate::core::OovKind::NotInspected) event
+  /// in its language, never as an empty list, which would claim it clean.
+  /// The caller's policy decides it like any other event: `FailClosed`
+  /// refuses the unit, `Wildcard` leaves it to the registry's
+  /// [`AlignmentFallback`] (`SkipChunk` skips it, `Error` fails the
+  /// chunk).
+  ///
+  /// Returns `Err` on the first unit whose detection fails (a
+  /// normalisation error). The job still holds its request: answer it with
+  /// [`AlignWorkItem::failed`](crate::AlignWorkItem::failed), so the chunk
+  /// resolves to its `Event::Error` instead of awaiting alignment. A
+  /// character a unit's vocabulary cannot spell is an event, not a
+  /// failure.
   pub fn detect_oov(
     &self,
-    text: &str,
-    language: &Lang,
-  ) -> Result<Vec<crate::core::OovEvent>, crate::types::WorkFailure> {
-    let aligner_mu = match self.lookup(language) {
-      AlignmentLookup::Hit { aligner, .. } | AlignmentLookup::AnyFallback { aligner } => aligner,
-      AlignmentLookup::Miss { .. } => return Ok(Vec::new()),
-    };
-    let guard = aligner_mu.lock().unwrap_or_else(|p| p.into_inner());
-    let mut events = guard.detect_oov(text)?;
-    // // `Aligner::detect_oov` stamps every event with its OWN
-    // construction language. When `lookup` falls back to
-    // `AlignerKey::Any` (e.g. an English aligner registered
-    // as the multilingual fallback for an unsupported
-    // language), the caller's requested language is
-    // overwritten with the fallback aligner's language.
-    // Per-language policy (e.g. wildcard-en /
-    // fail-closed-ko) then sees the wrong key. Patch the
-    // event language back to the caller's request so the
-    // policy decides on the run/chunk language, not the
-    // aligner's construction-time tag.
-    for ev in &mut events {
-      ev.set_language(language.clone());
-    }
-    Ok(events)
-  }
+    job: &crate::AlignWorkItem,
+  ) -> Result<crate::JobDetection, crate::types::WorkFailure> {
+    use crate::core::{AlignmentUnit, OovDetection, OovEvent, OovKind};
 
-  /// Detect OOV chars per-run for a code-switched chunk's
-  /// script-dispatched runs. Returns `events_per_run[i]`
-  /// matching `runs[i]` order; empty when `runs` is empty.
-  /// Each run's events are detected against its own
-  /// language's aligner (`runs[i].language()`).
-  ///
-  /// Companion to [`Self::detect_oov`]. Use this when
-  /// `Command::Alignment::runs` is non-empty (the typical
-  /// `WhisperAsrSource` path); use [`Self::detect_oov`] for
-  /// the whole-chunk path.
-  ///
-  /// Returns `Err` immediately on the first per-run detection
-  /// failure (a normalisation error), so the caller can
-  /// surface the failure to the chunk before alignment. A
-  /// character a run's vocabulary cannot spell is an event,
-  /// not a failure.
-  ///
-  /// introduced
-  /// to thread caller policy through the per-run path —
-  /// the dispatcher silently substituted
-  /// `default_oov_decisions` regardless of caller intent.
-  pub fn detect_oov_per_run(
-    &self,
-    runs: &[crate::align::Run],
-  ) -> Result<Vec<Vec<crate::core::OovEvent>>, crate::types::WorkFailure> {
-    let mut out = Vec::with_capacity(runs.len());
-    for run in runs {
-      out.push(self.detect_oov(run.text(), run.language())?);
+    let units: Vec<(AlignmentUnit, &str, &Lang)> = if job.runs().is_empty() {
+      vec![(AlignmentUnit::Whole, job.text().as_str(), job.language())]
+    } else {
+      job
+        .runs()
+        .iter()
+        .enumerate()
+        .map(|(index, run)| (AlignmentUnit::Run(index), run.text(), run.language()))
+        .collect()
+    };
+    let mut detections = Vec::with_capacity(units.len());
+    for (unit, text, language) in units {
+      let detection = match self.lookup(language) {
+        AlignmentLookup::Hit { aligner, .. } | AlignmentLookup::AnyFallback { aligner } => {
+          let guard = aligner.lock().unwrap_or_else(|p| p.into_inner());
+          let mut events = guard.detect_events(text)?;
+          // The aligner stamps every event with its OWN language. Under
+          // `AlignerKey::Any` that is the fallback aligner's, and a
+          // per-language policy (wildcard-en / fail-closed-ko) would then
+          // see the wrong key: relabel each event with the unit's
+          // requested language.
+          for event in &mut events {
+            event.set_language(language.clone());
+          }
+          OovDetection::of_unit(unit, language.clone(), events, Some(guard.id()))
+        }
+        AlignmentLookup::Miss { .. } => OovDetection::of_unit(
+          unit,
+          language.clone(),
+          vec![OovEvent::new(OovKind::NotInspected, 0, 0, language.clone())],
+          None,
+        ),
+      };
+      detections.push(detection);
     }
-    Ok(out)
+    Ok(crate::JobDetection::new(job, self.id, detections))
   }
 
   /// Look up an aligner for `language`, applying the

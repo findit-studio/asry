@@ -102,8 +102,8 @@ const BEAM_NODE_BUDGET: usize = 2_000_000;
 /// that [`align_emissions`] will attempt.
 ///
 /// The `alignment` pool path bounds `T` structurally: the encoder
-/// stride check (`validate_stride_extent`) requires `T · hop ≈ chunk
-/// samples`, so a real 30 s chunk yields `T ≈ 1500`. A bare
+/// stride check (`validate_stride_extent`) holds `T` to about
+/// `chunk samples / hop`, so a real 30 s chunk yields `T ≈ 1500`. A bare
 /// `emissions` caller supplies [`LogProbsTV`] directly with no such
 /// bound, so a degenerate `num_tokens = 1, T = 32 M` lattice — under
 /// the `T · num_tokens ≤ 32 M` trellis-cell cap, so [`get_trellis`]
@@ -238,6 +238,58 @@ pub fn get_trellis(
   log_probs: &LogProbsTV,
   tokens: &[i32],
   blank_id: u32,
+  wildcard_columns: &[bool],
+  abort_flag: &AtomicBool,
+  language: &Lang,
+) -> Result<Vec<f32>, WorkFailure> {
+  build_trellis(
+    log_probs,
+    tokens,
+    blank_id,
+    wildcard_columns,
+    false,
+    abort_flag,
+    language,
+  )
+}
+
+/// The trellis of `tokens` behind an explicit start state: column 0 is the
+/// transcript's empty prefix (`tokens[0]` is its placeholder and never
+/// read), and its row `r` holds the blanks of frames `0..r`, each frame
+/// scored once. The entry into the first transcript token (column 1) is
+/// scored with that token's emission, a wildcard's through its mask, like
+/// every other entry.
+///
+/// `get_trellis` keeps WhisperX's column 0, the first token itself, whose
+/// row `r` holds the blanks of frames `1..=r`: as a start state it would
+/// score the first token's entry frame twice, once as a blank.
+fn get_trellis_with_start_state(
+  log_probs: &LogProbsTV,
+  tokens: &[i32],
+  blank_id: u32,
+  wildcard_columns: &[bool],
+  abort_flag: &AtomicBool,
+  language: &Lang,
+) -> Result<Vec<f32>, WorkFailure> {
+  build_trellis(
+    log_probs,
+    tokens,
+    blank_id,
+    wildcard_columns,
+    true,
+    abort_flag,
+    language,
+  )
+}
+
+/// [`get_trellis`]'s body; `start_state` states that column 0 is an explicit
+/// start state (see [`get_trellis_with_start_state`]).
+fn build_trellis(
+  log_probs: &LogProbsTV,
+  tokens: &[i32],
+  blank_id: u32,
+  wildcard_columns: &[bool],
+  start_state: bool,
   abort_flag: &AtomicBool,
   language: &Lang,
 ) -> Result<Vec<f32>, WorkFailure> {
@@ -346,10 +398,14 @@ pub fn get_trellis(
   }
   // `trellis[1:, 0] = cumsum(emission[1:, blank_id], 0)` — column 0
   // accumulates leading blanks. Skip frame 0; trellis[0, 0] stays
-  // at 0.0 (its python init).
+  // at 0.0 (its python init). A start state's row `r` instead holds the
+  // blanks of frames `0..r`: the transition out of row `r` scores frame
+  // `r`, so a start state that also counted it would score the first
+  // token's entry frame twice.
   let mut acc = 0.0_f32;
   for ti in 1..t {
-    acc += log_probs.at(ti, blank_id as usize);
+    let frame = if start_state { ti - 1 } else { ti };
+    acc += log_probs.at(frame, blank_id as usize);
     trellis[ti * num_tokens] = acc;
   }
   // `trellis[-num_tokens + 1:, 0] = +inf` — force the final
@@ -357,7 +413,11 @@ pub fn get_trellis(
   // overridden so the path can't sit on column 0 forever; it must
   // advance through all chars. With num_tokens == 1 this is a
   // no-op (`-num_tokens + 1 == 0` → range empty).
-  if num_tokens >= 2 {
+  //
+  // Not for a start state: a path that leaves it too late cannot reach
+  // the last token by the last frame, so no override is needed, and one
+  // would reward exactly those late departures.
+  if num_tokens >= 2 && !start_state {
     let row_start = t.saturating_sub(num_tokens - 1);
     for ti in row_start..t {
       trellis[ti * num_tokens] = f32::INFINITY;
@@ -424,6 +484,11 @@ pub fn get_trellis(
   // still need a side-by-side parity rerun to confirm we hadn't
   // broken anything else.
   //
+  // `align_to_word_segments`, the pipeline's one caller, puts an
+  // explicit start state (the empty prefix) in column 0, so there every
+  // transcript token IS scored at its entry; this function keeps the
+  // WhisperX shape it is pinned to.
+  //
   // If WhisperX upstream ever fixes this, we can adopt the change
   // and rerun parity. Until then, "match WhisperX" trumps "match
   // textbook CTC". The companion regression test
@@ -440,10 +505,11 @@ pub fn get_trellis(
     }
     let blank_emit = log_probs.at(t_idx, blank_id as usize);
     // Pre-compute the wildcard emission for this frame once
-    // (max over non-blank vocab); it's only consumed when at
-    // least one wildcard token exists in the suffix, but the
+    // (max over the columns a wildcard may take); it's only consumed
+    // when at least one wildcard token exists in the suffix, but the
     // computation is O(V) and amortises trivially.
-    let wildcard_emit_for_frame = max_non_blank_logprob(log_probs, t_idx, blank_id as usize);
+    let wildcard_emit_for_frame =
+      max_wildcard_logprob(log_probs, t_idx, blank_id as usize, wildcard_columns);
 
     for j in 1..num_tokens {
       let stay = trellis[t_idx * num_tokens + j] + blank_emit;
@@ -464,17 +530,26 @@ pub fn get_trellis(
   Ok(trellis)
 }
 
-/// Compute the max log-probability over all vocab columns
-/// excluding the blank. Mirrors WhisperX's `max_valid_score =
-/// frame_emission.clone(); max_valid_score[blank_id] = -inf;
-/// max_valid_score.max()` slice. Used as the emission for
-/// wildcard tokens (the model's best non-blank guess at that
-/// frame, regardless of which char the transcript expects).
-fn max_non_blank_logprob(log_probs: &LogProbsTV, t_idx: usize, blank_v: usize) -> f32 {
+/// Compute the max log-probability over the vocab columns a wildcard may
+/// take: `wildcard_columns[v]` is `true` (see
+/// [`ReservedIds::wildcard_columns`](super::tokenize::ReservedIds::wildcard_columns)),
+/// and never the blank. Used as the emission for wildcard tokens (the
+/// model's best guess at that frame among the columns that could be a
+/// character, regardless of which char the transcript expects). WhisperX
+/// excludes the blank alone (`max_valid_score[blank_id] = -inf`); asry
+/// also excludes the word delimiter, the unknown token and every declared
+/// special, so a wildcard never takes a reserved column. A column outside
+/// `wildcard_columns` is not taken.
+fn max_wildcard_logprob(
+  log_probs: &LogProbsTV,
+  t_idx: usize,
+  blank_v: usize,
+  wildcard_columns: &[bool],
+) -> f32 {
   let row_start = t_idx * log_probs.v();
   let mut best = f32::NEG_INFINITY;
   for v in 0..log_probs.v() {
-    if v == blank_v {
+    if v == blank_v || !wildcard_columns.get(v).copied().unwrap_or(false) {
       continue;
     }
     let lp = log_probs.data()[row_start + v];
@@ -499,7 +574,13 @@ fn max_non_blank_logprob(log_probs: &LogProbsTV, t_idx: usize, blank_v: usize) -
 /// T=1500, ≤ 1 MB at T=10000).
 #[derive(Debug, Clone)]
 struct BeamNode {
+  /// The DP state (trellis column) this node sits in.
   token_index: usize,
+  /// The token that owns this node's frame on the path: the state itself
+  /// for a stay, and the token ENTERED for a change, whose emission the
+  /// frame is scored with. A change moves to the predecessor state while
+  /// its frame belongs to the token it enters.
+  owner: usize,
   time_index: usize,
   /// Cumulative trellis-cell score at `(time_index, token_index)`.
   /// Used to rank beams.
@@ -527,6 +608,7 @@ pub fn backtrack_beam(
   log_probs: &LogProbsTV,
   tokens: &[i32],
   blank_id: u32,
+  wildcard_columns: &[bool],
   beam_width: usize,
   abort_flag: &AtomicBool,
   language: &Lang,
@@ -584,6 +666,7 @@ pub fn backtrack_beam(
   let mut arena: Vec<BeamNode> = Vec::new();
   arena.push(BeamNode {
     token_index: final_j,
+    owner: final_j,
     time_index: final_t,
     score: final_score,
     point_score: log_probs.at(final_t, blank_id as usize).exp(),
@@ -622,10 +705,11 @@ pub fn backtrack_beam(
       // Change emits the j-th token (the one we are LEAVING from
       // — WhisperX uses `tokens[j]`, which corresponds to the
       // current char in the transcript). For wildcards we use
-      // the per-frame max over non-blank vocab.
+      // the per-frame max over the columns a wildcard may take, as
+      // the forward pass did.
       let p_change_lp = match tokens[j_curr] {
         id if id == WILDCARD_TOKEN_ID => {
-          max_non_blank_logprob(log_probs, t_curr - 1, blank_id as usize)
+          max_wildcard_logprob(log_probs, t_curr - 1, blank_id as usize, wildcard_columns)
         }
         id => log_probs.at(t_curr - 1, id as usize),
       };
@@ -700,6 +784,7 @@ pub fn backtrack_beam(
         let new_idx = arena.len() as u32;
         arena.push(BeamNode {
           token_index: j_curr,
+          owner: j_curr,
           time_index: t_curr - 1,
           score: stay_score,
           point_score: p_stay_lp.exp(),
@@ -724,6 +809,7 @@ pub fn backtrack_beam(
         let new_idx = arena.len() as u32;
         arena.push(BeamNode {
           token_index: j_curr - 1,
+          owner: j_curr,
           time_index: t_curr - 1,
           score: change_score,
           point_score: p_change_lp.exp(),
@@ -788,8 +874,10 @@ pub fn backtrack_beam(
   let mut cur: Option<u32> = Some(active[0]);
   while let Some(idx) = cur {
     let node = &arena[idx as usize];
+    // The point belongs to the token that owns the node's frame: a
+    // change's frame to the token it enters.
     path.push(PathPointPublic {
-      token_index: node.token_index,
+      token_index: node.owner,
       time_index: node.time_index,
       score: node.point_score,
     });
@@ -985,9 +1073,25 @@ where
 /// `|`-driven word-grouping that lives inline in WhisperX's
 /// `align()` body.
 ///
+/// One departure from WhisperX: the trellis gets an explicit start state,
+/// the transcript's empty prefix, as its column 0. `get_trellis` scores a
+/// column's entry with the token it enters and never scores column 0's, so
+/// without it the first token's posterior never entered the lattice (a
+/// leading wildcard was scored through no column at all). With it, every
+/// transcript token, the first included, is scored at its entry like every
+/// other, a wildcard through its mask; the leading blanks the start state
+/// holds belong to no token, and every token owns its entry frame, scored
+/// with its emission (the beam labels a change's frame with the token it
+/// enters). And it gets an explicit end state, a certain blank frame past
+/// the last, so the unit's last frame is scored by a transition like every
+/// other and a token spoken there is entered there. A path needs a frame
+/// per token.
+///
 /// `tokens` carry `WILDCARD_TOKEN_ID` (-1) for chars the model
-/// dictionary doesn't have an entry for; the trellis uses the
-/// per-frame max non-blank logprob in their place.
+/// dictionary doesn't have an entry for; the trellis and the beam use
+/// the per-frame max logprob over `wildcard_columns` in their place
+/// (never the blank, and never a reserved column when the mask comes
+/// from `ReservedIds::wildcard_columns`).
 ///
 /// `word_idx_per_token` maps each token to its word index in
 /// `original_words`. `None` marks delimiter / separator tokens
@@ -1005,6 +1109,7 @@ pub fn align_to_word_segments(
   word_idx_per_token: &[Option<usize>],
   separator_token_id: Option<u32>,
   blank_id: u32,
+  wildcard_columns: &[bool],
   abort_flag: &AtomicBool,
   language: &Lang,
 ) -> Result<Vec<WordSegment>, WorkFailure> {
@@ -1023,16 +1128,87 @@ pub fn align_to_word_segments(
     )));
   }
 
-  let trellis = get_trellis(log_probs, tokens, blank_id, abort_flag, language)?;
+  if tokens.is_empty() {
+    return Err(WorkFailure::Alignment(AlignmentError::NoAlignmentPath(
+      AlignmentFailure::new(SmolStr::from("token sequence is empty"), language.clone()),
+    )));
+  }
+  // A path enters one token per frame at most.
+  if log_probs.t() < tokens.len() {
+    return Err(WorkFailure::Alignment(AlignmentError::NoAlignmentPath(
+      AlignmentFailure::new(
+        format_smolstr!(
+          "audio too short: T={} frames for {} tokens; a path enters one token per frame",
+          log_probs.t(),
+          tokens.len()
+        ),
+        language.clone(),
+      ),
+    )));
+  }
+  // The end state: one blank frame past the last. The WhisperX trellis
+  // scores frames `0..T-1` and seeds its last row as the last token's
+  // blank, so a token spoken in the unit's last frame could never be
+  // entered there. With a certain blank appended, every real frame is
+  // scored by a transition, the last included, and the appended frame,
+  // which belongs to no token, is dropped from the path.
+  let real_frames = log_probs.t();
+  let v = log_probs.v();
+  let mut ended = Vec::with_capacity((real_frames + 1) * v);
+  ended.extend_from_slice(log_probs.data());
+  ended.extend((0..v).map(|column| {
+    if column == blank_id as usize {
+      0.0
+    } else {
+      f32::NEG_INFINITY
+    }
+  }));
+  let log_probs = &LogProbsTV::from_parts_unchecked(real_frames + 1, v, ended);
+  // The start state: the transcript's empty prefix, a column of its own
+  // ahead of the first token. The recurrence scores a column's entry with
+  // the token it enters, so every token, the first included, is scored at
+  // its entry like every other, a wildcard through its mask. Only leading
+  // blanks occupy the start state; its id (the blank's) is never read as
+  // an emission.
+  let with_start: Vec<i32> = core::iter::once(blank_id as i32)
+    .chain(tokens.iter().copied())
+    .collect();
+  let trellis = get_trellis_with_start_state(
+    log_probs,
+    &with_start,
+    blank_id,
+    wildcard_columns,
+    abort_flag,
+    language,
+  )?;
   let path = backtrack_beam(
     &trellis,
     log_probs,
-    tokens,
+    &with_start,
     blank_id,
+    wildcard_columns,
     ALIGN_BEAM_WIDTH,
     abort_flag,
     language,
   )?;
+  // Every token owns its entry frame (the beam labels a change's frame
+  // with the token it enters), so the start state owns exactly its
+  // leading blanks, which belong to no token and are dropped; every other
+  // point moves back onto the transcript token it stands for.
+  // The end state's frame is dropped too.
+  let path: Vec<PathPointPublic> = path
+    .into_iter()
+    .filter(|point| point.time_index < real_frames)
+    .filter_map(|point| {
+      point
+        .token_index
+        .checked_sub(1)
+        .map(|token_index| PathPointPublic {
+          token_index,
+          ..point
+        })
+    })
+    .collect();
   let char_segments = merge_repeats(&path);
 
   // Three ways a token can be a "separator" (i.e., NOT part of a
@@ -1078,17 +1254,37 @@ pub struct AlignEmissionsConfig {
   /// backend-neutral [`EmissionsError`] this call returns carries no
   /// language.
   language: Lang,
+  /// The ids a wildcard never takes besides the blank, sorted.
+  reserved: Vec<u32>,
 }
 
 impl AlignEmissionsConfig {
   /// Construct from the CTC blank-token id + the language to tag
-  /// errors with.
+  /// errors with. A wildcard takes any column but the blank.
   #[must_use]
   pub const fn new(blank_token_id: u32, language: Lang) -> Self {
     Self {
       blank_token_id,
       language,
+      reserved: Vec::new(),
     }
+  }
+
+  /// A wildcard also never takes the columns `reserved` names.
+  #[must_use]
+  pub fn with_reserved(mut self, reserved: impl IntoIterator<Item = u32>) -> Self {
+    self.reserved = reserved.into_iter().collect();
+    self.reserved.sort_unstable();
+    self
+  }
+
+  /// The columns of a `vocab`-wide row a wildcard may take.
+  fn wildcard_columns(&self, vocab: usize) -> Vec<bool> {
+    (0..vocab)
+      .map(|column| {
+        u32::try_from(column).map_or(true, |id| self.reserved.binary_search(&id).is_err())
+      })
+      .collect()
   }
 
   /// CTC blank-token id.
@@ -1170,6 +1366,7 @@ pub fn align_emissions(
     tokenized.word_idx_per_token(),
     tokenized.separator_token_id(),
     config.blank_token_id(),
+    &config.wildcard_columns(log_probs.v()),
     abort_flag,
     config.language(),
   )
@@ -1201,7 +1398,10 @@ fn into_emissions_error(err: WorkFailure) -> EmissionsError {
       AlignmentError::Tokenization(f) => EmissionsError::Tokenization(neutral(f)),
       AlignmentError::NoAlignmentPath(f) => EmissionsError::NoAlignmentPath(neutral(f)),
       AlignmentError::SemanticOutOfVocab(f) => EmissionsError::SemanticOutOfVocab(neutral(f)),
-      AlignmentError::Aborted(f) => EmissionsError::Aborted(neutral(f)),
+      AlignmentError::Aborted(f) | AlignmentError::Abandoned(f) => {
+        EmissionsError::Aborted(neutral(f))
+      }
+      AlignmentError::Geometry(f) => EmissionsError::Geometry(neutral(f)),
       AlignmentError::Normalization(f) | AlignmentError::EmptyText(f) => {
         EmissionsError::Tokenization(neutral(f))
       }
@@ -1236,6 +1436,9 @@ mod tests {
     &NEVER
   }
 
+  /// A wildcard may take any column (the blank aside): WhisperX's rule.
+  const ANY_COLUMN: &[bool] = &[true; 64];
+
   #[test]
   fn trellis_single_token_initial_blank_column() {
     // num_tokens=1: trellis is (T, 1). Only column 0 exists, so
@@ -1252,7 +1455,8 @@ mod tests {
       data[ti * v + 2] = -10.0;
     }
     let log_probs = lp(t, v, data);
-    let trellis = get_trellis(&log_probs, &[1], 0, never(), &Lang::En).expect("trellis");
+    let trellis =
+      get_trellis(&log_probs, &[1], 0, ANY_COLUMN, never(), &Lang::En).expect("trellis");
     // trellis[0,0] = 0 (init), trellis[1,0] = emission[1, blank]
     // = -0.5, trellis[2,0] = -1.0, trellis[3,0] = -1.5.
     assert_eq!(trellis.len(), t);
@@ -1269,7 +1473,8 @@ mod tests {
     let v = 3;
     let t = 3;
     let log_probs = lp(t, v, vec![-1.0_f32; t * v]);
-    let trellis = get_trellis(&log_probs, &[1, 2], 0, never(), &Lang::En).expect("trellis");
+    let trellis =
+      get_trellis(&log_probs, &[1, 2], 0, ANY_COLUMN, never(), &Lang::En).expect("trellis");
     assert!(trellis[1].is_infinite());
     assert!(trellis[1] < 0.0);
   }
@@ -1281,7 +1486,8 @@ mod tests {
     let v = 3;
     let t = 5;
     let log_probs = lp(t, v, vec![-1.0_f32; t * v]);
-    let trellis = get_trellis(&log_probs, &[1, 2, 1], 0, never(), &Lang::En).expect("trellis");
+    let trellis =
+      get_trellis(&log_probs, &[1, 2, 1], 0, ANY_COLUMN, never(), &Lang::En).expect("trellis");
     assert!(trellis[3 * 3].is_infinite() && trellis[3 * 3] > 0.0);
     assert!(trellis[4 * 3].is_infinite() && trellis[4 * 3] > 0.0);
   }
@@ -1302,7 +1508,8 @@ mod tests {
       data[ti * v + 2] = -2.0; // token id 2
     }
     let log_probs = lp(t, v, data);
-    let trellis = get_trellis(&log_probs, &[1, 2], 0, never(), &Lang::En).expect("trellis");
+    let trellis =
+      get_trellis(&log_probs, &[1, 2], 0, ANY_COLUMN, never(), &Lang::En).expect("trellis");
     // trellis[2, 1] is finite because [stay from (1,1), change
     // from (1,0)] both exist.
     let last_cell = trellis[2 * 2 + 1];
@@ -1356,8 +1563,10 @@ mod tests {
 
     let lp_a = lp(t, v, a);
     let lp_b = lp(t, v, b);
-    let trellis_a = get_trellis(&lp_a, &tokens, blank as u32, never(), &Lang::En).expect("a");
-    let trellis_b = get_trellis(&lp_b, &tokens, blank as u32, never(), &Lang::En).expect("b");
+    let trellis_a =
+      get_trellis(&lp_a, &tokens, blank as u32, ANY_COLUMN, never(), &Lang::En).expect("a");
+    let trellis_b =
+      get_trellis(&lp_b, &tokens, blank as u32, ANY_COLUMN, never(), &Lang::En).expect("b");
 
     assert_eq!(
       trellis_a, trellis_b,
@@ -1373,8 +1582,278 @@ mod tests {
     // logprobs: [0, -2, -1, -3]. Max non-blank = -1 (vocab=2).
     let v = 4;
     let log_probs = lp(1, v, vec![0.0, -2.0, -1.0, -3.0]);
-    let m = max_non_blank_logprob(&log_probs, 0, 0);
+    let m = max_wildcard_logprob(&log_probs, 0, 0, ANY_COLUMN);
     assert!((m - (-1.0)).abs() < 1e-6);
+  }
+
+  /// **A wildcard never takes a reserved column.** Where the unknown
+  /// token's or the delimiter's column is a frame's argmax, a wildcard
+  /// scores the best column that is not reserved, in the forward pass and
+  /// in the backtracking alike.
+  #[test]
+  fn a_wildcard_takes_the_best_column_that_is_not_reserved() {
+    // V = 5: 0 the blank, 1 and 2 letters, 3 the unknown token, 4 the
+    // word delimiter; the mask `ReservedIds` gives for {0, 3, 4}.
+    let wildcard_columns = [false, true, true, false, false];
+    let (t, v) = (3, 5);
+    #[rustfmt::skip]
+    let log_probs = lp(t, v, vec![
+      -0.1, -3.0, -4.0, -5.0, -6.0, // frame 0: the letter `1` starts
+      -9.0, -3.0, -2.0, -0.1, -8.0, // frame 1: the unknown token leads; best allowed -2.0
+      -9.0, -1.5, -4.0, -8.0, -0.2, // frame 2: the delimiter leads; best allowed -1.5
+    ]);
+    assert_eq!(
+      max_wildcard_logprob(&log_probs, 1, 0, &wildcard_columns),
+      -2.0
+    );
+    assert_eq!(
+      max_wildcard_logprob(&log_probs, 2, 0, &wildcard_columns),
+      -1.5
+    );
+
+    // Forward: tokens `1`, then a wildcard. Column 1 at frame t + 1 reads
+    // the wildcard's emission at frame t (the WhisperX indexing), so the
+    // change into it scores the best allowed column, never -0.1 or -0.2.
+    let tokens = [1, WILDCARD_TOKEN_ID];
+    let trellis = get_trellis(
+      &log_probs,
+      &tokens,
+      0,
+      &wildcard_columns,
+      never(),
+      &Lang::En,
+    )
+    .expect("trellis");
+    let cell = |frame: usize, token: usize| trellis[frame * tokens.len() + token];
+    assert_eq!(cell(1, 1), cell(0, 0) + (-4.0_f32).max(-3.0));
+    let expected = (cell(1, 1) + -9.0).max(cell(1, 0) + -2.0);
+    assert_eq!(cell(2, 1), expected);
+
+    // Backtracking: the wildcard's point scores are the best allowed
+    // column's probability, never the unknown token's or the delimiter's.
+    let path = backtrack_beam(
+      &trellis,
+      &log_probs,
+      &tokens,
+      0,
+      &wildcard_columns,
+      ALIGN_BEAM_WIDTH,
+      never(),
+      &Lang::En,
+    )
+    .expect("path");
+    let reserved_scores = [(-0.1_f32).exp(), (-0.2_f32).exp()];
+    for point in path.iter().filter(|point| point.token_index == 1) {
+      assert!(
+        !reserved_scores.contains(&point.score),
+        "a wildcard took a reserved column: {point:?}"
+      );
+    }
+    assert!(path.iter().any(|point| point.token_index == 1));
+  }
+
+  /// The wildcard census. V = 6: 0 the blank, 1 `A`, 2 `B`, 3 the unknown
+  /// token (reserved), 4 the word delimiter (reserved; the separator's
+  /// column), 5 `C`, a letter no token here spells.
+  const CENSUS_V: usize = 6;
+  const W: i32 = WILDCARD_TOKEN_ID;
+  const SEP: i32 = 4;
+  const CENSUS_MASK: [bool; CENSUS_V] = [false, true, true, false, false, true];
+
+  /// `t` rows in which each token of `tokens` peaks at its frame in `peaks`:
+  /// a real token in its own column; a wildcard in the letter column `C`,
+  /// which the unknown token's column outscores, narrowly at the wildcard's
+  /// own frame and clearly two frames earlier, where it also leads the
+  /// blank: a wildcard scored through the reserved column is drawn there.
+  /// The blank leads every other frame.
+  fn census_rows(t: usize, tokens: &[i32], peaks: &[usize]) -> Vec<f32> {
+    let v = CENSUS_V;
+    let mut data = vec![-6.0_f32; t * v];
+    for frame in 0..t {
+      data[frame * v] = -0.05;
+    }
+    for (&token, &frame) in tokens.iter().zip(peaks) {
+      let row = frame * v;
+      data[row] = -6.0;
+      if token == W {
+        data[row + 5] = -0.3;
+        data[row + 3] = -0.2;
+        let early = (frame - 2) * v;
+        data[early] = -0.5;
+        data[early + 3] = -0.01;
+      } else {
+        data[row + token as usize] = -0.05;
+      }
+    }
+    data
+  }
+
+  /// The word segments of `tokens` aligned on `data`, each wildcard scored
+  /// through [`CENSUS_MASK`]; a separator splits two words.
+  fn census_align(t: usize, tokens: &[i32], data: Vec<f32>) -> Vec<WordSegment> {
+    let mut word = 0;
+    let word_idx: Vec<Option<usize>> = tokens
+      .iter()
+      .map(|&token| {
+        if token == SEP {
+          word += 1;
+          None
+        } else {
+          Some(word)
+        }
+      })
+      .collect();
+    align_to_word_segments(
+      &lp(t, CENSUS_V, data),
+      tokens,
+      &word_idx,
+      Some(SEP as u32),
+      0,
+      &CENSUS_MASK,
+      never(),
+      &Lang::En,
+    )
+    .expect("aligns")
+  }
+
+  /// **A wildcard is scored through its mask at every position.** Leading,
+  /// alone, last, in the middle of a word, next to another wildcard, and on
+  /// either side of a word boundary:
+  /// - the reserved column no token here spells never moves the alignment:
+  ///   with the unknown token's column suppressed it is the same, frame for
+  ///   frame and score for score, although that column outscores the
+  ///   wildcard's letter before and at its frame;
+  /// - a wildcard that begins the transcript is entered at its own letter's
+  ///   frame, through the start state, so its word starts there, not at the
+  ///   chunk's first frame.
+  #[test]
+  fn a_wildcard_is_scored_through_its_mask_at_every_position() {
+    let t = 20;
+    let cases: [(&str, Vec<i32>, Vec<usize>); 7] = [
+      ("leading", vec![W, 1], vec![4, 9]),
+      ("alone", vec![W], vec![4]),
+      ("last", vec![1, W], vec![3, 9]),
+      ("in a word", vec![1, W, 2], vec![3, 8, 12]),
+      ("next to another", vec![1, W, W, 2], vec![3, 8, 13, 17]),
+      ("after a word boundary", vec![1, SEP, W], vec![3, 6, 11]),
+      ("before a word boundary", vec![W, SEP, 1], vec![4, 8, 12]),
+    ];
+    for (position, tokens, peaks) in cases {
+      let data = census_rows(t, &tokens, &peaks);
+      let words = census_align(t, &tokens, data.clone());
+      let mut suppressed = data;
+      for frame in 0..t {
+        suppressed[frame * CENSUS_V + 3] = -30.0;
+      }
+      assert_eq!(
+        format!("{words:?}"),
+        format!("{:?}", census_align(t, &tokens, suppressed)),
+        "{position}: a reserved column moved the alignment"
+      );
+      if tokens[0] == W {
+        assert_eq!(
+          words[0].start_frame(),
+          peaks[0],
+          "{position}: the leading wildcard is entered at its own letter's frame: {words:?}"
+        );
+      }
+    }
+  }
+
+  /// `t` = `lead.len()` census rows in which frame `f` is led by column
+  /// `lead[f].0` at log-probability `lead[f].1`; every other column sits at
+  /// -9.
+  fn led_rows(lead: &[(usize, f32)]) -> Vec<f32> {
+    let mut data = vec![-9.0_f32; lead.len() * CENSUS_V];
+    for (frame, &(column, lp)) in lead.iter().enumerate() {
+      data[frame * CENSUS_V + column] = lp;
+    }
+    data
+  }
+
+  /// `(start_frame, end_frame, score)` of each word.
+  fn spans(words: &[WordSegment]) -> Vec<(usize, usize, f32)> {
+    words
+      .iter()
+      .map(|word| (word.start_frame(), word.end_frame(), word.score()))
+      .collect()
+  }
+
+  fn close(got: &[(usize, usize, f32)], want: &[(usize, usize, f32)]) {
+    assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
+    for (g, w) in got.iter().zip(want) {
+      assert_eq!((g.0, g.1), (w.0, w.1), "{got:?} vs {want:?}");
+      assert!((g.2 - w.2).abs() < 1e-6, "{got:?} vs {want:?}");
+    }
+  }
+
+  /// **Every token owns its entry frame.** A change's frame is scored with
+  /// the token it enters and belongs to it, the first token and every later
+  /// one alike, and the unit's last frame can be an entry (the end state),
+  /// so each word's range starts at its first character's frame and its
+  /// confidence is its own frames' mean. `[A, delimiter, B]` over
+  /// `A / delimiter / B / blank`: B is `2..4`.
+  #[test]
+  fn a_one_character_word_owns_its_entry_frame() {
+    let e = |lp: f32| lp.exp();
+    let data = led_rows(&[(1, -0.01), (SEP as usize, -0.01), (2, -0.2), (0, -0.05)]);
+    close(
+      &spans(&census_align(4, &[1, SEP, 2], data)),
+      &[(0, 1, e(-0.01)), (2, 4, (e(-0.2) + e(-0.05)) / 2.0)],
+    );
+  }
+
+  /// Two CJK characters, one word each, over `X / Y / blank / blank`: the
+  /// boundary is at `Y`'s frame, `0..1` and `1..4`.
+  #[test]
+  fn a_cjk_boundary_is_at_the_next_character_frame() {
+    let e = |lp: f32| lp.exp();
+    let data = led_rows(&[(1, -0.1), (2, -0.3), (0, -0.05), (0, -0.05)]);
+    let words = align_to_word_segments(
+      &lp(4, CENSUS_V, data),
+      &[1, 2],
+      &[Some(0), Some(1)],
+      None,
+      0,
+      &CENSUS_MASK,
+      never(),
+      &Lang::Zh,
+    )
+    .expect("aligns");
+    close(
+      &spans(&words),
+      &[
+        (0, 1, e(-0.1)),
+        (1, 4, (e(-0.3) + e(-0.05) + e(-0.05)) / 3.0),
+      ],
+    );
+  }
+
+  /// A trailing one-character word, `[A, delimiter, B]` over
+  /// `A / blank / delimiter / B`: B is the last frame, `3..4`.
+  #[test]
+  fn a_trailing_one_character_word_owns_the_last_frame() {
+    let e = |lp: f32| lp.exp();
+    let data = led_rows(&[(1, -0.01), (0, -0.05), (SEP as usize, -0.01), (2, -0.2)]);
+    close(
+      &spans(&census_align(4, &[1, SEP, 2], data)),
+      &[(0, 2, (e(-0.01) + e(-0.05)) / 2.0), (3, 4, e(-0.2))],
+    );
+  }
+
+  /// A trailing wildcard word, `[A, delimiter, ?]` over
+  /// `A / blank / delimiter / C`: the wildcard is the last frame, `3..4`,
+  /// scored through its mask (the unknown token's column there is not its
+  /// score).
+  #[test]
+  fn a_trailing_wildcard_word_owns_the_last_frame() {
+    let e = |lp: f32| lp.exp();
+    let mut data = led_rows(&[(1, -0.01), (0, -0.05), (SEP as usize, -0.01), (5, -0.4)]);
+    data[3 * CENSUS_V + 3] = -0.2;
+    close(
+      &spans(&census_align(4, &[1, SEP, W], data)),
+      &[(0, 2, (e(-0.01) + e(-0.05)) / 2.0), (3, 4, e(-0.4))],
+    );
   }
 
   /// regression: the beam-search
@@ -1416,12 +1895,14 @@ mod tests {
     data[6] = -0.5; // frame 2 blank
     data[7] = -0.2; // frame 2 token 2 (preferred)
     let log_probs = lp(t, v, data);
-    let trellis = get_trellis(&log_probs, &[1, 2], 0, never(), &Lang::En).expect("trellis");
+    let trellis =
+      get_trellis(&log_probs, &[1, 2], 0, ANY_COLUMN, never(), &Lang::En).expect("trellis");
     let path = backtrack_beam(
       &trellis,
       &log_probs,
       &[1, 2],
       0,
+      ANY_COLUMN,
       ALIGN_BEAM_WIDTH,
       never(),
       &Lang::En,
@@ -1463,12 +1944,14 @@ mod tests {
     data[2] = -1.0;
     data[6] = -0.5;
     let log_probs = lp(t, v, data);
-    let trellis = get_trellis(&log_probs, &[1, 2], 0, never(), &Lang::En).expect("trellis");
+    let trellis =
+      get_trellis(&log_probs, &[1, 2], 0, ANY_COLUMN, never(), &Lang::En).expect("trellis");
     let path = backtrack_beam(
       &trellis,
       &log_probs,
       &[1, 2],
       0,
+      ANY_COLUMN,
       ALIGN_BEAM_WIDTH,
       never(),
       &Lang::En,
@@ -1798,13 +2281,15 @@ mod tests {
     let log_probs = lp(t, v, data);
     let tokens = vec![1_i32, 2_i32, 3_i32];
     let abort = AtomicBool::new(false);
-    let trellis = get_trellis(&log_probs, &tokens, 0, &abort, &Lang::En).expect("trellis builds");
+    let trellis =
+      get_trellis(&log_probs, &tokens, 0, ANY_COLUMN, &abort, &Lang::En).expect("trellis builds");
 
     let path = backtrack_beam(
       &trellis,
       &log_probs,
       &tokens,
       /* blank_id */ 0,
+      ANY_COLUMN,
       ALIGN_BEAM_WIDTH,
       &abort,
       &Lang::En,
@@ -1853,6 +2338,7 @@ mod tests {
       &[Some(0), Some(0)],
       None,
       0,
+      ANY_COLUMN,
       never(),
       &Lang::En,
     )
@@ -1900,6 +2386,7 @@ mod tests {
       tokenized.word_idx_per_token(),
       tokenized.separator_token_id(),
       config.blank_token_id(),
+      ANY_COLUMN,
       never(),
       config.language(),
     )
@@ -2172,20 +2659,36 @@ to a bare align_emissions call; got {message:?}"
     data[10] = -1.0;
     data[11] = -1.0;
     let log_probs = lp(t, v, data);
-    let trellis = get_trellis(&log_probs, &[1, 2], 0, never(), &Lang::En).expect("trellis");
-    let path =
-      backtrack_beam(&trellis, &log_probs, &[1, 2], 0, 2, never(), &Lang::En).expect("path");
+    let trellis =
+      get_trellis(&log_probs, &[1, 2], 0, ANY_COLUMN, never(), &Lang::En).expect("trellis");
+    let path = backtrack_beam(
+      &trellis,
+      &log_probs,
+      &[1, 2],
+      0,
+      ANY_COLUMN,
+      2,
+      never(),
+      &Lang::En,
+    )
+    .expect("path");
     assert_eq!(path.len(), t);
-    // The path should include both token 0 and token 1.
+    // The path reaches the last token, and its owners never go back. On
+    // this bare trellis column 0 is token 0 itself, whose entry is never a
+    // frame of its own, so token 0 owns only the frames the path stays in
+    // it; every change's frame belongs to the token it enters.
     let tokens: Vec<usize> = path.iter().map(|p| p.token_index).collect();
-    assert!(tokens.contains(&0));
     assert!(tokens.contains(&1));
+    assert!(
+      tokens.windows(2).all(|pair| pair[0] <= pair[1]),
+      "{tokens:?}"
+    );
   }
 
   #[test]
   fn empty_token_sequence_returns_no_alignment_path() {
     let log_probs = lp(3, 3, vec![0.0_f32; 9]);
-    let err = get_trellis(&log_probs, &[], 0, never(), &Lang::En).unwrap_err();
+    let err = get_trellis(&log_probs, &[], 0, ANY_COLUMN, never(), &Lang::En).unwrap_err();
     assert!(matches!(
       err,
       WorkFailure::Alignment(AlignmentError::NoAlignmentPath(_))
@@ -2196,7 +2699,7 @@ to a bare align_emissions call; got {message:?}"
   fn audio_too_short_t_lt_num_tokens_errors() {
     // tokens=[1, 2, 3] needs T >= 3; T=2 fails.
     let log_probs = lp(2, 4, vec![0.0_f32; 8]);
-    let err = get_trellis(&log_probs, &[1, 2, 3], 0, never(), &Lang::En).unwrap_err();
+    let err = get_trellis(&log_probs, &[1, 2, 3], 0, ANY_COLUMN, never(), &Lang::En).unwrap_err();
     assert!(matches!(
       err,
       WorkFailure::Alignment(AlignmentError::NoAlignmentPath(_))
@@ -2206,7 +2709,7 @@ to a bare align_emissions call; got {message:?}"
   #[test]
   fn out_of_vocab_real_token_id_errors() {
     let log_probs = lp(3, 3, vec![0.0_f32; 9]);
-    let err = get_trellis(&log_probs, &[1, 99], 0, never(), &Lang::En).unwrap_err();
+    let err = get_trellis(&log_probs, &[1, 99], 0, ANY_COLUMN, never(), &Lang::En).unwrap_err();
     assert!(matches!(
       err,
       WorkFailure::Alignment(AlignmentError::Tokenization(_))
@@ -2218,14 +2721,21 @@ to a bare align_emissions call; got {message:?}"
     // Wildcards bypass the vocab-bound check; they're synthesised
     // by the tokeniser, not produced by the model.
     let log_probs = lp(3, 4, vec![-0.5_f32; 12]);
-    let trellis = get_trellis(&log_probs, &[1, WILDCARD_TOKEN_ID], 0, never(), &Lang::En);
+    let trellis = get_trellis(
+      &log_probs,
+      &[1, WILDCARD_TOKEN_ID],
+      0,
+      ANY_COLUMN,
+      never(),
+      &Lang::En,
+    );
     assert!(trellis.is_ok(), "wildcard tokens must pass validation");
   }
 
   #[test]
   fn negative_real_token_id_other_than_wildcard_errors() {
     let log_probs = lp(3, 3, vec![0.0_f32; 9]);
-    let err = get_trellis(&log_probs, &[1, -2], 0, never(), &Lang::En).unwrap_err();
+    let err = get_trellis(&log_probs, &[1, -2], 0, ANY_COLUMN, never(), &Lang::En).unwrap_err();
     assert!(matches!(
       err,
       WorkFailure::Alignment(AlignmentError::Tokenization(_))
@@ -2239,7 +2749,7 @@ to a bare align_emissions call; got {message:?}"
     // work that the row-loop abort check fires.
     let tokens: Vec<i32> = (0..200).map(|i| 1 + (i % 3)).collect();
     let abort = AtomicBool::new(true);
-    let err = get_trellis(&log_probs, &tokens, 0, &abort, &Lang::En).unwrap_err();
+    let err = get_trellis(&log_probs, &tokens, 0, ANY_COLUMN, &abort, &Lang::En).unwrap_err();
     assert!(matches!(
       err,
       WorkFailure::WorkerHang(ref t) if t.kind() == WorkerKind::Alignment
@@ -2260,7 +2770,7 @@ to a bare align_emissions call; got {message:?}"
     let log_probs =
       LogProbsTV::new(8_000, 8, vec![0.0_f32; 8_000 * 8]).expect("t * v == vals.len()");
     let tokens: Vec<i32> = (0..5_000).map(|i| 1 + (i % 4)).collect();
-    let err = get_trellis(&log_probs, &tokens, 0, never(), &Lang::En).unwrap_err();
+    let err = get_trellis(&log_probs, &tokens, 0, ANY_COLUMN, never(), &Lang::En).unwrap_err();
     let WorkFailure::Alignment(AlignmentError::NoAlignmentPath(payload)) = err else {
       panic!("expected AlignmentFailed");
     };

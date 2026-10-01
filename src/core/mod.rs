@@ -8,12 +8,20 @@ mod event;
 pub mod oov;
 mod transcriber;
 
+#[cfg(feature = "alignment")]
+pub(crate) use command::panic_failure;
+#[cfg(all(test, feature = "alignment"))]
+pub(crate) use command::sort_words_by_pts;
 pub use command::{
-  AlignmentResult, AsrParams, AsrParamsOverride, AsrResult, Command, SamplingStrategy,
+  AlignedWords, AlignmentCompletion, AlignmentReport, AlignmentRequest, AlignmentUnit, AsrParams,
+  AsrParamsOverride, AsrResult, Command, RefusedCompletion, SamplingStrategy, UnaccountedOutcomes,
+  UnalignedCause, UnitAlignment, UnitJob, UnitOutcome,
 };
+#[cfg(all(test, feature = "alignment"))]
+pub(crate) use command::{clip_sub_segments, run_audio_slice};
 pub use event::Event;
 pub use oov::{
-  OovDecision, OovEvent, OovKind, ResolvedOov, default_oov_decisions, fail_closed_all_decisions,
-  wildcard_all_decisions,
+  OovDecision, OovDetection, OovEvent, OovKind, OovResolution, ResolvedOov, default_oov_policy,
+  fail_closed_all_policy, wildcard_all_policy,
 };
 pub use transcriber::{LanguagePolicy, Transcriber, TranscriberOptions};

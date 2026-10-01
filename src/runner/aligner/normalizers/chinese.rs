@@ -191,4 +191,18 @@ mod tests {
     let n = ChineseNormalizer::new();
     assert!(!n.use_word_delimiter());
   }
+
+  /// Every character this normaliser skips, other than whitespace, is a
+  /// punctuation mark nobody reads aloud; every other character is a
+  /// word. Nothing spoken is dropped before OOV detection.
+  #[test]
+  fn removes_only_whitespace_and_silent_marks() {
+    use crate::align::punctuation::is_silent_mark;
+
+    for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+      if is_punct_either(c) {
+        assert!(is_silent_mark(c), "{c:?}");
+      }
+    }
+  }
 }

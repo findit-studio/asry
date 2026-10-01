@@ -158,42 +158,39 @@ while let Some(cmd) = transcriber.poll_command() {
       ))?;
       transcriber.handle_asr(chunk_id, result)?;
     }
-    Command::Alignment { chunk_id, samples, sub_segments: _, text, language, runs } => {
-      // Sans-I/O OOV resolution: per-run detect + decide.
-      // Each run gets its own decisions vec sized + ordered
-      // by the events `detect_oov` produces for that run's
-      // text + language. Whole-chunk fallback (when `runs`
-      // is empty) gets one inner vec.
-      // `default_oov_decisions` mirrors the historical
-      // behaviour (alphanumeric → wildcard, pronounced
-      // symbols → fail-closed); swap for
-      // `wildcard_all_decisions` (WhisperX 1:1) or write
-      // your own per-run / per-language policy.
-      let oov_decisions: Vec<Vec<asry::core::ResolvedOov>> = if runs.is_empty() {
-        let events = alignment_set.detect_oov(&text, &language)?;
-        vec![asry::core::default_oov_decisions(&events)]
-      } else {
-        alignment_set.detect_oov_per_run(&runs)?
-          .iter()
-          .map(|events| asry::core::default_oov_decisions(events))
-          .collect()
-      };
-
-      let job = AlignWorkItem::from_run_alignment(
-        &transcriber, chunk_id, samples, text, language,
-        runs, abort_flag.clone(),
-        oov_decisions,
-      ).expect("chunk in flight");
+    Command::Alignment(request) => {
+      // The job is built from the request alone: its payload, its ticket
+      // and unit jobs, and the chunk's place in the stream.
+      let job = AlignWorkItem::new(request, abort_flag.clone());
+      // Sans-I/O OOV resolution: detect every unit of THIS job (its
+      // whole text, or each run), then decide. The resolution is
+      // bound to this job and this set, and `run_one_alignment`
+      // consumes it. `default_oov_policy` mirrors the historical
+      // behaviour (alphanumeric → wildcard, pronounced symbols →
+      // fail-closed); swap for `wildcard_all_policy` (WhisperX 1:1)
+      // or a closure of your own.
       // Fresh `RunOptions` per chunk so a watchdog's
       // `terminate()` for chunk N does not poison chunk N+1.
       let run_options = RunOptions::new()?;
-      let aligned = run_one_alignment(&alignment_set, &job, &run_options)?;
-      transcriber.handle_alignment(chunk_id, aligned)?;
+      // Success or failure, the job answers through its request, and
+      // the transcriber takes no completion its own command's request
+      // did not build. A detection that fails (a normalisation error)
+      // answers the job's command too.
+      let completion = match alignment_set.detect_oov(&job) {
+        Ok(detection) => {
+          let resolution = detection.decide(asry::core::default_oov_policy);
+          run_one_alignment(&alignment_set, job, resolution, &run_options)
+        }
+        Err(failure) => job.failed(failure),
+      };
+      // A refused completion propagates whole, so it can still reach
+      // the transcriber that issued its command.
+      transcriber.complete(completion)?;
     }
   }
 }
 while let Some(_event) = transcriber.poll_event() {
-  /* Transcript.words() carries word-level alignment */
+  /* Transcript::alignment() reports each unit's outcome; words() reads its words */
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -217,7 +214,7 @@ between coarse stages too.
 |---------|---------|-----------------|
 | `std` | yes | `std`-backed implementations of crate types. Chains `std` to `mediatime`, `smol_str`, and serde when present. |
 | `runner` | yes | `WhisperAsrSource` + the in-house `whispercpp` 0.2.x bindings + the temperature retry ladder + the real-zlib compression-ratio gate (via `miniz_oxide`). Implies `std`. |
-| `emissions` | no | Ort-free forced alignment for a caller who owns the acoustic encoder. Drives `EmissionsAligner` (`builder` → `prepare` → your encoder → `finish`) over the validated seam types — `Emissions`, `SpeechSpans` / `SampleSpan`, `SpeechCoverage`, `OutputClock`, `PreparedChunk` — plus the Sans-I/O OOV surface (`detect_oov`, `default_oov_decisions` / `wildcard_all_decisions` / `fail_closed_all_decisions`, `OovEvent` / `OovDecision` / `ResolvedOov`), the per-language normalizers (`default_normalizer_for`, `EnglishNormalizer`, …), and the `EmissionsError` / `SpanError` taxonomy. The raw algorithm functions are crate-internal; the type-guarded surface is the only public one. No `ort`, no whisper.cpp. Reachable at `asry::emissions::*`; `default-features = false, features = ["emissions"]` for a consumer bringing its own acoustic encoder. |
+| `emissions` | no | Ort-free forced alignment for a caller who owns the acoustic encoder. Drives `EmissionsAligner` (`builder` → `prepare` → your encoder → `finish`) over the validated seam types — `Emissions`, `SpeechSpans` / `SampleSpan`, `SpeechCoverage`, `OutputClock`, `PreparedChunk` — plus the Sans-I/O OOV surface (`detect_oov` → `OovDetection` → `decide(policy)` → `OovResolution`, with `default_oov_policy` / `wildcard_all_policy` / `fail_closed_all_policy`, and `OovEvent` / `OovDecision` / `ResolvedOov` as read-only views), the per-language normalizers (`default_normalizer_for`, `EnglishNormalizer`, …), and the `EmissionsError` / `SpanError` taxonomy. The raw algorithm functions are crate-internal; the type-guarded surface is the only public one. No `ort`, no whisper.cpp. Reachable at `asry::emissions::*`; `default-features = false, features = ["emissions"]` for a consumer bringing its own acoustic encoder. |
 | `alignment` | no | wav2vec2 forced alignment via `ort` (load-dynamic) layered on `emissions`. Lights up `Aligner`, `AlignmentSet`, `run_one_alignment`. Implies `runner` + `emissions`. |
 | `serde` | no | Derive `serde::{Serialize, Deserialize}` on public state-machine types (`Transcript`, `Word`, `AsrParams`, …). Independent — does not imply `runner`; combine with any feature set, e.g. `default-features = false, features = ["emissions", "serde"]`. |
 | `metal` | no | Apple-only: enables `whispercpp/metal` so the encoder runs on the unified-memory Metal backend. Implies `runner`. |
@@ -230,10 +227,10 @@ the OOV policy is per-test runtime data (no Cargo feature):
 
 ```bash
 cargo test --features alignment,bench-internals --test whisperx_unit_parity
-# 8/8 — tests 1-6 + 8 use `default_oov_decisions` (asry
+# 8/8 — tests 1-6 + 8 use `default_oov_policy` (asry
 # default); test 7 (`4,9` digits-comma WhisperX issue #1372)
-# uses `wildcard_all_decisions` to opt into WhisperX 1:1
-# behaviour for pronounced symbols.
+# aligns under `wildcard_all_policy` (WhisperX 1:1) and the
+# default alike, since the comma is a mark nobody reads aloud.
 ```
 
 These tests port WhisperX's
