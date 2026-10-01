@@ -686,9 +686,30 @@ impl Transcriber {
 
   /// Push samples into the buffer.
   ///
+  /// `starts_at` is the PTS of the packet's first sample, and the
+  /// packet is emitted there: its first sample's PTS is `starts_at`.
+  /// - Stamped at [`next_expected_starts_at`](Self::next_expected_starts_at),
+  ///   the packet continues the stream.
+  /// - Stamped later, it starts at the 16 kHz sample nearest the
+  ///   instant `starts_at` names, measured from the stream's anchor
+  ///   (the stamp of the first push, or of `handle_restart`) and
+  ///   rounded as mediatime rounds (to nearest, halfway cases up).
+  ///   The samples before it are a gap, zero-filled up to
+  ///   [`gap_tolerance_samples`](TranscriberOptions::gap_tolerance_samples).
+  ///   On an output timebase whose tick is at least a sample long,
+  ///   that sample's PTS is always `starts_at`. On a finer one,
+  ///   `starts_at` can lie between two samples, where no sample's PTS
+  ///   is `starts_at`: the packet is refused as `PtsBetweenSamples`,
+  ///   which names the PTS of the sample nearest it. An empty packet
+  ///   places no sample and is never refused so.
+  /// - Stamped earlier, it is a `PtsRegression`.
+  ///
+  /// A refused packet changes nothing.
+  ///
   /// Errors:
-  /// - `PtsRegression`, `GapExceedsTolerance`, `Backpressure`,
-  /// `InconsistentTimebase`, `AfterEof` per `SampleBuffer::append`.
+  /// - `PtsRegression`, `GapExceedsTolerance`, `PtsBetweenSamples`,
+  /// `Backpressure`, `InconsistentTimebase`, `AfterEof` per
+  /// `SampleBuffer::append`.
   pub fn handle_samples(
     &mut self,
     starts_at: Timestamp,

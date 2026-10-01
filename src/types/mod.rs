@@ -10,8 +10,8 @@ pub use chunk_id::ChunkId;
 pub use errors::{
   AlignmentError, AlignmentFailure, AsrError, AsrFailure, Backpressure, ForeignAlignment,
   GapExceedsTolerance, InconsistentTimebase, IntoWorkFailure, InvalidTimebase,
-  LanguageUnsupportedForAlignment, PtsRegression, PushKind, TranscriberError, UnaccountedAlignment,
-  VadAheadOfAudio, WorkFailure, WorkerHangTimeout, WorkerKind,
+  LanguageUnsupportedForAlignment, PtsBetweenSamples, PtsRegression, PushKind, TranscriberError,
+  UnaccountedAlignment, VadAheadOfAudio, WorkFailure, WorkerHangTimeout, WorkerKind,
 };
 pub use lang::Lang;
 pub use transcript::{Transcript, Word};

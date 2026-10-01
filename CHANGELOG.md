@@ -274,6 +274,32 @@ BREAKING
   - A space-delimited vocabulary: state `.word_delimiter(" ")`.
   - `Aligner::from_paths` (ORT) is unchanged: `|`, 400 samples, and the
     letter case read from its table.
+- **A packet starts at the sample its stamp names, or is refused.**
+  `handle_samples` placed a packet stamped past the stream's next PTS after
+  a gap of the stamp's distance from that PTS, rescaled into samples. The
+  next PTS is rounded, so the gap lost the stream's rounding phase: on NTSC
+  (`1001/30000`) from 0, 7 741 samples in, the next PTS is 14, and a packet
+  stamped 15 started at sample 8 275, whose PTS is 16, a whole tick late; a
+  following packet stamped by the caller's clock then read as a
+  regression. Now a later packet starts at the sample its own stamp names,
+  measured from the stream's anchor (the sample nearest the instant,
+  rounded as mediatime rounds), and its first sample is emitted at its
+  stamp: the packet stamped 15 starts at sample 8 008, after 267 samples
+  of gap. On an output timebase whose tick is at least a sample long that
+  always holds. On a finer one (48 kHz, 90 kHz, nanoseconds), a stamp can
+  lie between two samples, where no sample's PTS is the stamp; such a
+  packet was taken at a sample whose PTS was not its stamp, and is now
+  refused as the new `TranscriberError::PtsBetweenSamples`, which names
+  the PTS of the nearest sample. An empty packet places no sample and is
+  never refused so.
+
+  Migration:
+  - `TranscriberError` has the new variant `PtsBetweenSamples`; an
+    exhaustive `match` needs an arm for it.
+  - Stamp each packet at a sample of the stream: `next_expected_starts_at`
+    for contiguous audio, or the anchor plus a whole number of samples. A
+    packet refused as `PtsBetweenSamples` can be stamped at its
+    `nearest()` PTS, where it starts at the sample nearest its stamp.
 
 FIXED
 
@@ -369,11 +395,13 @@ FIXED
   the sum and the delta were unchecked, so an anchor or a timestamp near
   either end of `i64` overflowed them. The delta is now exact: a packet
   behind the stream is `PtsRegression` (its advance saturating at
-  `i64::MIN`), one ahead a gap of its exact length in samples, and past
-  the output timebase's last tick `next_expected_starts_at` reads
-  `i64::MAX` while every packet is `PtsRegression`, until
-  `handle_restart`. A VAD regression's advance is exact the same way.
-  Every PTS and every gap the old arithmetic got exactly is unchanged.
+  `i64::MIN`), one ahead starts at the sample its stamp names (see the
+  breaking change on stamps), and past the output timebase's last tick
+  `next_expected_starts_at` reads `i64::MAX` while every packet is
+  `PtsRegression`, until `handle_restart`. A VAD regression's advance is
+  exact the same way.
+  Every PTS the old arithmetic got exactly is unchanged, and so is every
+  gap it got exactly where the stream's next sample sits on a tick.
   Behaviour: word ranges scale by `(T - 1) / T` (about 0.07 % on a 30 s
   chunk) and round outward by under a sample; and the 80 ms silence
   default, measured in real time, admits 3 silent frames of a 30 s chunk

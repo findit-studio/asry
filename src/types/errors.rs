@@ -33,6 +33,12 @@ pub enum TranscriberError {
   /// Forward gap exceeds the configured tolerance.
   #[error("{0}")]
   GapExceedsTolerance(GapExceedsTolerance),
+  /// `handle_samples` stamped a packet between two 16 kHz samples of the
+  /// stream: on an output timebase finer than a sample, no sample's PTS is
+  /// the stamp, so no sample emits the packet where it was stamped. Refused
+  /// before any state changes.
+  #[error("{0}")]
+  PtsBetweenSamples(PtsBetweenSamples),
   /// Sample buffer would exceed its configured cap.
   #[error("{0}")]
   Backpressure(Backpressure),
@@ -231,6 +237,36 @@ impl GapExceedsTolerance {
   #[must_use]
   pub const fn tolerance_samples(&self) -> u64 {
     self.tolerance_samples
+  }
+}
+
+/// A packet stamped between two 16 kHz samples of the stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("PTS {pts} lies between two 16 kHz samples of the stream; the nearest is at PTS {nearest}")]
+pub struct PtsBetweenSamples {
+  pts: i64,
+  nearest: i64,
+}
+
+impl PtsBetweenSamples {
+  /// Construct from the packet's stamp and the PTS of the stream's sample
+  /// nearest it.
+  #[must_use]
+  pub const fn new(pts: i64, nearest: i64) -> Self {
+    Self { pts, nearest }
+  }
+  /// The packet's stamp, in the output timebase.
+  #[must_use]
+  pub const fn pts(&self) -> i64 {
+    self.pts
+  }
+  /// The PTS of the stream's sample nearest the stamp, the one the packet's
+  /// first sample would be emitted at; it saturates at `i64::MAX`, as every
+  /// output PTS does. Below that, a packet stamped there starts at that
+  /// sample.
+  #[must_use]
+  pub const fn nearest(&self) -> i64 {
+    self.nearest
   }
 }
 

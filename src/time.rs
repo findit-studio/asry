@@ -74,9 +74,9 @@ pub(crate) fn sample_pts(sample: u64, timebase: Timebase, base_pts: i64) -> i64 
 }
 
 /// [`sample_pts`] before its final saturation: the exact PTS, which an
-/// `i128` always holds. The sample buffer measures a packet's distance from
-/// the stream's next sample against it, so a next sample past `i64::MAX` is
-/// never read as `i64::MAX`.
+/// `i128` always holds. The sample buffer reads the stream's next PTS, and
+/// the PTS of the sample a packet starts at, through it, so a sample past
+/// `i64::MAX` is never read as `i64::MAX`.
 ///
 /// # Panics
 ///
@@ -96,22 +96,36 @@ pub(crate) fn sample_pts_exact(sample: u64, timebase: Timebase, base_pts: i64) -
   i128::from(base_pts) + numerator / denominator + i128::from(2 * remainder >= denominator)
 }
 
-/// A forward distance of `ticks` in `timebase`, in 16 kHz samples:
-/// mediatime's rescale into [`ANALYSIS_TIMEBASE`], with its rounding (to
-/// nearest, halfway cases away from zero, which for a distance is up),
-/// formed in `i128`, where every distance between two `i64` PTS is exact.
-/// Past `u64::MAX` samples it saturates. For a distance of at most
-/// `i64::MAX` ticks whose rescale fits an `i64`, it is exactly
-/// `timebase.saturating_rescale(ticks as i64, ANALYSIS_TIMEBASE)`.
-pub(crate) fn distance_samples(ticks: u64, timebase: Timebase) -> u64 {
-  // Every operand is non-negative; the product is below 2^109, and the
-  // divisor is a timebase's denominator, at least 1.
-  let numerator =
-    i128::from(ticks) * i128::from(timebase.num()) * i128::from(ANALYSIS_TIMEBASE.den().get());
+/// The stream sample a PTS names: the sample nearest the instant `pts`
+/// names in `timebase`, where the stream's sample 0 is at `base_pts`, before
+/// any saturation. It reads [`sample_pts`] backwards, and it measures from
+/// `base_pts`, which sample 0 sits on exactly, never from a rounded PTS, so
+/// no rounding of another sample's PTS enters it.
+///
+/// It is mediatime's rescale of `pts - base_pts` into [`ANALYSIS_TIMEBASE`],
+/// with its rounding (to nearest, halfway cases away from zero), formed in
+/// `i128`, where it is exact for every pair of `i64` PTS. Where the distance
+/// and its rescale both fit an `i64`, it is exactly
+/// `timebase.saturating_rescale(pts - base_pts, ANALYSIS_TIMEBASE)`.
+///
+/// For `pts` at or after `base_pts`, the sample lies within half a sample of
+/// the instant. On a timebase whose tick is longer than a sample, that is
+/// less than half a tick; on one whose tick is a sample, the rescale is
+/// exact. Either way the sample's PTS is `pts`. On a finer timebase, `pts`
+/// can lie between two samples, and then no sample's PTS is `pts`.
+pub(crate) fn pts_sample_exact(pts: i64, timebase: Timebase, base_pts: i64) -> i128 {
+  // The distance is below 2^64 in magnitude, so the product is below 2^109;
+  // the divisor is a timebase's denominator, at least 1.
+  let numerator = (i128::from(pts) - i128::from(base_pts))
+    * i128::from(timebase.num())
+    * i128::from(ANALYSIS_TIMEBASE.den().get());
   let denominator = i128::from(timebase.den().get()) * i128::from(ANALYSIS_TIMEBASE.num());
-  let remainder = numerator % denominator;
-  let samples = numerator / denominator + i128::from(2 * remainder >= denominator);
-  u64::try_from(samples).unwrap_or(u64::MAX)
+  let (quotient, remainder) = (numerator / denominator, numerator % denominator);
+  if 2 * remainder.abs() >= denominator {
+    quotient + remainder.signum()
+  } else {
+    quotient
+  }
 }
 
 #[cfg(test)]
