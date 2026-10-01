@@ -1,8 +1,7 @@
-# UNRELEASED
+## 0.3.0
 
-These changes ship as 0.3.0. Several are breaking, and each breaking change
-below names its migration. `Cargo.toml` still says 0.2.0: the version is
-bumped when the release is cut.
+Several changes are breaking, and each breaking change below names its
+migration.
 
 BREAKING
 
