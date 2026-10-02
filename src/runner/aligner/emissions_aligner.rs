@@ -455,8 +455,8 @@ impl EmissionsAligner {
   /// consumes the unit's job.
   ///
   /// Runs the stride-extent and vocab-width checks — neither
-  /// of which the emissions seam has ever run — then the pinned
-  /// trellis → beam → merge_repeats → merge_words, then derives
+  /// of which the emissions seam has ever run — then the best path
+  /// → merge_repeats → merge_words, then derives
   /// `samples_per_frame` ONCE and feeds it to both the speech-frame mask
   /// and composition.
   ///

@@ -1499,7 +1499,7 @@ impl AlignerCore {
       return Err(timed_out());
     }
 
-    // Steps 5-6: WhisperX-bit-exact trellis + beam-search backtrack +
+    // Steps 5-6: the best path through the CTC lattice +
     // char→word grouping. Same cooperative-cancellation contract as
     // before — the DP checks `abort_flag` periodically so a
     // hallucinated long token sequence can't run past the deadline and

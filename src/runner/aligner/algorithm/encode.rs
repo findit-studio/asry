@@ -418,11 +418,12 @@ impl LogProbsTV {
 
   /// Read the log-probability of vocab index `v_idx` at frame `t_idx`.
   ///
-  /// The pinned DP (`get_trellis` / `backtrack_beam`) indexes through
-  /// here on its hot path, always with a `t_idx < T` and a `v_idx < V`
-  /// it has already validated (`get_trellis` rejects a `blank_id >= V`
-  /// and any token id `>= V` before the first read), so this is
-  /// infallible on the `alignment` path and its values are unchanged.
+  /// The DPs (the pipeline's `best_path`, and the WhisperX port's
+  /// `get_trellis` / `backtrack_beam`) index through here on their hot
+  /// path, always with a `t_idx < T` and a `v_idx < V` they have already
+  /// validated (both reject a `blank_id >= V` and any token id `>= V`
+  /// before the first read), so this is infallible on the `alignment`
+  /// path and its values are unchanged.
   ///
   /// # Panics
   ///

@@ -1,3 +1,39 @@
+# UNRELEASED
+
+FIXED
+
+- **A word after a pause starts at its first spoken frame, never at the end
+  of the word before it.** The alignment took its path from WhisperX's
+  trellis and beam. The trellis scores every frame after a token's entry as
+  a blank, and the beam ranks each step back by the forward score of the
+  state it steps to alone, never by the frame it decides. After a word,
+  wav2vec2 holds the word delimiter over several frames, on which the blank
+  is improbable, so the cheapest prefix through the hold entered the next
+  word's first character on a delimiter frame, and the beam followed it
+  through the whole pause. jfk's second `ask` started at 7453.5 ms, where
+  the speaker has just finished `you,` and is silent until 8380 ms (0.2.0:
+  7507.3 ms), on a path 109 nats below the trellis's own best; ted_60's
+  `would` before `come`, which the speaker says twice and the transcript
+  once, ended with the first, at 31710.6 ms, against the second's 31940 ms
+  (0.2.0: 31741.2 ms). The alignment now takes the best path through CTC's
+  lattice: a token is entered on one frame and held on the frames right
+  after it (a CTC repeat), each scored with its emission, then its blanks
+  until the next entry, and once its blanks begin it is not held again, so
+  the model emitting it later is an occurrence the transcript does not
+  have. The path is the lattice's best, read back exactly. So a word after a
+  pause starts on the frame the model emits its first character (`ask` at
+  8395.2 ms), the pause belongs to the word delimiter, which no word owns,
+  and a word ends where the model starts the delimiter however long it
+  holds it (`would` at 31950.7 ms). Every token still owns its entry frame
+  and every frame until the next entry, the leading blanks still belong to
+  no token, and the last frame can still be an entry. A word's confidence
+  counts a frame its token is held on at the token's probability, not the
+  blank's. Boundaries move where the beam left the best path: on ted_60, 40
+  of 185 words (28 by one frame), and of the 33 of them a greedy decode
+  spells, 32 move toward its boundaries. `get_trellis` and `backtrack_beam`
+  (`bench-internals`) keep WhisperX's shape and comparator; the alignment
+  uses neither.
+
 ## 0.3.0
 
 Several changes are breaking, and each breaking change below names its
