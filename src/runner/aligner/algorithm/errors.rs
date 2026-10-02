@@ -197,8 +197,8 @@ pub enum EmissionsError {
 
   /// The CTC lattice admits no finite alignment path: the emissions
   /// are shorter than the token count, the token sequence is empty,
-  /// a trellis boundary cell is non-finite, the beam emptied before
-  /// reaching token 0, or the trellis cell budget was exceeded.
+  /// no path enters every token, or the lattice cell budget was
+  /// exceeded.
   #[error("no alignment path: {0}")]
   NoAlignmentPath(EmissionsFailure),
 
