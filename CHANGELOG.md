@@ -10,10 +10,16 @@ CHANGED
   therefore needs a frame per token and one more for each such pair:
   `hello world` needs 12 frames, not 11, and a unit with fewer is
   `NoAlignmentPath`, saying how many pairs it holds. A wildcard holds one
-  column of its mask on every frame it is held, never each frame's best, so
-  its confidence is that column's. On jfk no word moves; on ted_60 `way`
-  ends, and `too` starts, one frame earlier. The alignment polls its abort
-  flag while it reads the path back, as it does while it builds the lattice.
+  column of its mask on every frame it is held: the best on the frame it is
+  entered, other than a label the repeat rule rules out there, read from a
+  table of each frame's three best columns built once per frame, so a
+  wildcard costs the alignment what any token costs, and its confidence is
+  that column's. A unit holding a wildcard is charged that table against the
+  cell budget, a cell per column per frame. On jfk no word moves; on ted_60
+  `way` ends, and `too` starts, one frame earlier. The alignment polls its
+  abort flag every 1 024 units of work (an emission read, a lattice cell, a
+  frame read back), while it builds the lattice and while it reads the path
+  back.
 
 FIXED
 

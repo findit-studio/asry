@@ -36,10 +36,11 @@
 //! directly, so no lattice state reaches `compose.rs`.
 //!
 //! Asry-specific concerns kept here:
-//! - **Watchdog / abort flag** — checked every 64 frames in the
+//! - **Watchdog / abort flag** — checked every `ABORT_QUANTUM` units
+//! of work (an emission read, a lattice cell, a frame read back) in the
 //! pipeline's forward pass and backtrace and before the backtrace
-//! returns, and in the WhisperX port per frame row of its forward DP
-//! and per beam-step iteration, so a pathological
+//! returns, and in the WhisperX port every 64 frame rows of its forward
+//! DP and every 64 beam-step iterations, so a pathological
 //! token sequence × T pair can't hold the caller past its
 //! timeout — the `alignment`-feature pool's `align_timeout`, or an
 //! `emissions`-only caller's own `abort_flag` deadline.
@@ -87,10 +88,12 @@ pub const WILDCARD_TOKEN_ID: i32 = -1;
 pub const ALIGN_BEAM_WIDTH: usize = 2;
 
 /// Cap on a lattice's cells: `T * num_tokens` in WhisperX's trellis;
-/// in `best_path`'s, which keeps two states per token and three numbers per
-/// row for each wildcard, `(T + 1) * (2 * num_tokens + 1 + 3 * wildcards)`
-/// plus each wildcard's score per column. Same reasoning as the legacy
-/// Viterbi guard: a
+/// in `best_path`'s, which keeps two states per token and a held path
+/// (two cells) per wildcard per row, `(T + 1) * (2 * num_tokens + 1 +
+/// 2 * wildcards)`, plus, when the transcript holds a wildcard, its frame
+/// table: `T * (columns + 6)`, a read per column a wildcard may hold and
+/// three leaders per frame. It bounds the forward pass's work as well as
+/// its memory. Same reasoning as the legacy Viterbi guard: a
 /// hallucinated long token list against a long chunk would otherwise
 /// allocate gigabytes before the per-row abort check fires. 32 M cells =
 /// 128 MB at 4 bytes/cell — comfortably above realistic chunks
@@ -542,13 +545,17 @@ fn max_wildcard_logprob(
 /// model emitting it again later is an occurrence the transcript does not
 /// have.
 ///
-/// A held token is one label. A wildcard holds one column of
-/// `wildcard_columns`, the path's choice, on its entry frame and every frame
-/// it is held, never each frame's best. And CTC reads a column held across
-/// frames as one label, so a token is entered from the start state, from
-/// the previous token's blanks, or from the previous token held on another
-/// column: two equal adjacent labels (a doubled letter, a repeated glyph, or
-/// a wildcard holding its neighbour's column) need a blank between them.
+/// A held token is one label. CTC reads a column held across frames as one
+/// label, so a token is entered from the start state, from the previous
+/// token's blanks, or from the previous token held on another column: two
+/// equal adjacent labels (a doubled letter or a repeated glyph) need a blank
+/// between them. A wildcard holds one column of `wildcard_columns`, chosen
+/// on the frame it is entered and kept on every frame it is held: that
+/// frame's best, other than the labels the rule rules out there (the column
+/// of the token before, when the wildcard is entered straight from it, and
+/// the label of a spelled token after it). Every wildcard reads its
+/// candidates from one table, each frame's three best columns, built once
+/// per frame, so a wildcard costs a lattice cell per frame like any token.
 ///
 /// So a frame the model holds a token on is never charged as a blank, and a
 /// word after a pause is entered on the frame the model emits its first
@@ -559,6 +566,7 @@ fn max_wildcard_logprob(
 /// each state's best score, and [`Lattice::backtrace`] walks back from the
 /// last frame along the transitions that made them; on a tie it takes the
 /// earlier entry and the earlier blank. The last frame can be an entry.
+/// Both poll `abort_flag` every [`ABORT_QUANTUM`] units of work.
 fn best_path(
   log_probs: &LogProbsTV,
   tokens: &[i32],
@@ -567,15 +575,17 @@ fn best_path(
   abort_flag: &AtomicBool,
   language: &Lang,
 ) -> Result<Vec<PathPointPublic>, WorkFailure> {
+  let emission = |frame: usize, column: usize| log_probs.at(frame, column);
   Lattice::forward(
     log_probs,
+    &emission,
     tokens,
     blank_id,
     wildcard_columns,
     abort_flag,
     language,
   )?
-  .backtrace(|frame, column| log_probs.at(frame, column), abort_flag)
+  .backtrace(&emission, abort_flag)
 }
 
 /// The cancellation an observed `abort_flag` stands for.
@@ -586,54 +596,115 @@ fn aborted() -> WorkFailure {
   ))
 }
 
+/// The units of work between two polls of the abort flag: an emission read,
+/// a lattice cell or a frame read back is one unit.
+const ABORT_QUANTUM: usize = 1024;
+
+/// Polls an abort flag once every [`ABORT_QUANTUM`] units of work.
+struct Watchdog<'a> {
+  abort_flag: &'a AtomicBool,
+  work: usize,
+}
+
+impl<'a> Watchdog<'a> {
+  const fn new(abort_flag: &'a AtomicBool) -> Self {
+    Self {
+      abort_flag,
+      work: 0,
+    }
+  }
+
+  /// Count one unit of work, polling the flag when the quantum is spent.
+  fn tick(&mut self) -> Result<(), WorkFailure> {
+    self.work += 1;
+    if self.work == ABORT_QUANTUM {
+      self.work = 0;
+      if self.abort_flag.load(Ordering::Relaxed) {
+        return Err(aborted());
+      }
+    }
+    Ok(())
+  }
+}
+
 /// The column a lattice token is read as.
 #[derive(Clone, Copy)]
 enum Label {
   /// A token the vocabulary spells: its own column.
   Column(u32),
-  /// A wildcard: one column of the mask, the path's choice. The index is
-  /// the wildcard's among the transcript's wildcards.
-  Wildcard(usize),
+  /// A wildcard: `k` is its index among the transcript's wildcards, and
+  /// `after` the label of the token after it, when that token is spelled.
+  Wildcard { k: usize, after: Option<u32> },
 }
 
-/// A wildcard's columns at each row of the lattice: `Lattice::held` keeps
-/// the best score of a path holding it, which holds `best_column`; `second`
-/// is the best holding any other column, which holds `second_column`.
-/// [`u32::MAX`] stands for no column, where the score is `-inf`.
-struct WildcardRows {
-  best_column: Vec<u32>,
-  second: Vec<f32>,
-  second_column: Vec<u32>,
+/// A frame's three best columns a wildcard may hold, best first, with
+/// their log-probabilities; [`u32::MAX`] and `-inf` stand for none. Three
+/// cover a wildcard entered straight after one label and before another.
+type Leaders = [(u32, f32); 3];
+
+/// How a wildcard's best held path reached a row.
+#[derive(Clone, Copy)]
+enum Via {
+  /// Held over the frame, on the column it already held.
+  Held,
+  /// Entered on the frame from the start state.
+  Start,
+  /// Entered on the frame from the previous token's blanks.
+  Blanks,
+  /// Entered on the frame from the previous token held.
+  Previous,
 }
+
+/// A wildcard's best held path at a row: the column it holds, chosen on the
+/// frame it was entered and kept while held, and how it reached the row.
+#[derive(Clone, Copy)]
+struct WildcardHold {
+  column: u32,
+  via: Via,
+}
+
+/// No held path: its score is `-inf`.
+const NO_HOLD: WildcardHold = WildcardHold {
+  column: u32::MAX,
+  via: Via::Held,
+};
 
 /// `best_path`'s lattice after its forward pass: each state's best score per
 /// row, row `r` being the frames `0..r`.
 struct Lattice {
   frames: usize,
   blank: usize,
-  /// The columns a wildcard may hold, in column order.
-  columns: Vec<u32>,
   labels: Vec<Label>,
+  wildcards: usize,
   /// `start[r]`: frames `0..r` all blank, ahead of the first token.
   start: Vec<f32>,
   /// `held[r * n + j]`: the best path over frames `0..r` whose last frame
-  /// holds token `j`, entered on it or held; a wildcard's over its columns.
+  /// holds token `j`, entered on it or held.
   held: Vec<f32>,
   /// `blanks[r * n + j]`: the best path over frames `0..r` whose last frame
   /// is a blank after token `j`.
   blanks: Vec<f32>,
-  /// Per wildcard, in transcript order.
-  wildcards: Vec<WildcardRows>,
+  /// `leaders[f]`: frame `f`'s three best columns; empty without a wildcard.
+  leaders: Vec<Leaders>,
+  /// `holds[r * wildcards + k]`: wildcard `k`'s best held path at row `r`.
+  holds: Vec<WildcardHold>,
 }
 
 impl Lattice {
-  /// Run the forward pass of `tokens` over `log_probs`.
+  /// Run the forward pass of `tokens`, reading each log-probability through
+  /// `emission(frame, column)`; `log_probs` gives the shape.
   ///
-  /// It polls `abort_flag` every 64 frames, and refuses as
-  /// `NoAlignmentPath` a lattice over the cell budget or one with no path
-  /// through every token.
+  /// With a wildcard it first reads every column a wildcard may hold once
+  /// per frame, into the table of each frame's three best; then each frame
+  /// costs a read per token. Before any of it, the work and the memory
+  /// (the table's reads and leaders, each token's two states, each
+  /// wildcard's held path per row) are checked against the cell budget,
+  /// and a lattice over it is refused as `NoAlignmentPath`, as is one with
+  /// no path through every token. It polls `abort_flag` every
+  /// [`ABORT_QUANTUM`] units of work.
   fn forward(
     log_probs: &LogProbsTV,
+    emission: &impl Fn(usize, usize) -> f32,
     tokens: &[i32],
     blank_id: u32,
     wildcard_columns: &[bool],
@@ -658,96 +729,105 @@ impl Lattice {
       .filter(|&column| column != blank && wildcard_columns.get(column).copied().unwrap_or(false))
       .filter_map(|column| u32::try_from(column).ok())
       .collect();
-    let mut wildcard_count = 0;
+    let mut wildcards = 0;
     let labels: Vec<Label> = tokens
       .iter()
-      .map(|&token| {
+      .enumerate()
+      .map(|(j, &token)| {
         if token == WILDCARD_TOKEN_ID {
-          wildcard_count += 1;
-          Label::Wildcard(wildcard_count - 1)
+          wildcards += 1;
+          let after = tokens
+            .get(j + 1)
+            .filter(|&&next| next != WILDCARD_TOKEN_ID)
+            .map(|&next| next as u32);
+          Label::Wildcard {
+            k: wildcards - 1,
+            after,
+          }
         } else {
           Label::Column(token as u32)
         }
       })
       .collect();
-    // The start state's row, each token's two, three per wildcard (its best
-    // and second-best column), and each wildcard's current score per column.
+    // Per row: the start state, each token's two states, and each
+    // wildcard's held path (two cells). Per frame, with a wildcard: the
+    // table's reads, one per column a wildcard may hold, and its three
+    // leaders (six cells).
     let states = n
       .saturating_mul(2)
       .saturating_add(1)
-      .saturating_add(wildcard_count.saturating_mul(3));
+      .saturating_add(wildcards.saturating_mul(2));
+    let table = if wildcards == 0 {
+      0
+    } else {
+      columns.len().saturating_add(6)
+    };
     let cells = rows
       .checked_mul(states)
-      .and_then(|cells| cells.checked_add(wildcard_count.checked_mul(columns.len())?));
+      .and_then(|cells| cells.checked_add(frames.checked_mul(table)?));
     if cells.is_none_or(|cells| cells > TRELLIS_CELL_BUDGET) {
       return Err(no_path(format_smolstr!(
-        "lattice exceeds {TRELLIS_CELL_BUDGET} cells ({rows} rows × {states} states, \
-         {wildcard_count} wildcards × {} columns)",
-        columns.len()
+        "lattice exceeds {TRELLIS_CELL_BUDGET} cells ({rows} rows × {states} states, {frames} \
+         frames × {table} table cells)"
       )));
     }
     if abort_flag.load(Ordering::Relaxed) {
       return Err(aborted());
     }
+    let mut watchdog = Watchdog::new(abort_flag);
+
+    let mut leaders = Vec::new();
+    if wildcards > 0 {
+      leaders.reserve_exact(frames);
+      for frame in 0..frames {
+        let mut top: Leaders = [(u32::MAX, f32::NEG_INFINITY); 3];
+        for &column in &columns {
+          watchdog.tick()?;
+          let lp = emission(frame, column as usize);
+          if lp > top[0].1 {
+            top = [(column, lp), top[0], top[1]];
+          } else if lp > top[1].1 {
+            top = [top[0], (column, lp), top[1]];
+          } else if lp > top[2].1 {
+            top[2] = (column, lp);
+          }
+        }
+        leaders.push(top);
+      }
+    }
 
     let mut lattice = Self {
       frames,
       blank,
+      labels,
+      wildcards,
       start: vec![f32::NEG_INFINITY; rows],
       held: vec![f32::NEG_INFINITY; rows * n],
       blanks: vec![f32::NEG_INFINITY; rows * n],
-      wildcards: (0..wildcard_count)
-        .map(|_| WildcardRows {
-          best_column: vec![u32::MAX; rows],
-          second: vec![f32::NEG_INFINITY; rows],
-          second_column: vec![u32::MAX; rows],
-        })
-        .collect(),
-      columns,
-      labels,
+      leaders,
+      holds: vec![NO_HOLD; rows * wildcards],
     };
     lattice.start[0] = 0.0;
-    // Each wildcard's score per column at the current row.
-    let mut holding: Vec<Vec<f32>> = (0..wildcard_count)
-      .map(|_| vec![f32::NEG_INFINITY; lattice.columns.len()])
-      .collect();
     for frame in 0..frames {
-      if frame % 64 == 0 && abort_flag.load(Ordering::Relaxed) {
-        return Err(aborted());
-      }
-      let blank_lp = log_probs.at(frame, blank);
+      watchdog.tick()?;
+      let blank_lp = emission(frame, blank);
       lattice.start[frame + 1] = lattice.start[frame] + blank_lp;
       let (row, next) = (frame * n, (frame + 1) * n);
       for j in 0..n {
+        watchdog.tick()?;
         match lattice.labels[j] {
-          Label::Column(column) => {
-            let entered = lattice.entering(frame, j, column);
+          Label::Column(label) => {
+            let entered = lattice.entering(frame, j, label);
             let kept = lattice.held[row + j];
             let before = if kept >= entered { kept } else { entered };
-            lattice.held[next + j] = before + log_probs.at(frame, column as usize);
+            if before > f32::NEG_INFINITY {
+              lattice.held[next + j] = before + emission(frame, label as usize);
+            }
           }
-          Label::Wildcard(w) => {
-            let mut best = (f32::NEG_INFINITY, u32::MAX);
-            for (k, &column) in lattice.columns.iter().enumerate() {
-              let entered = lattice.entering(frame, j, column);
-              let kept = holding[w][k];
-              let before = if kept >= entered { kept } else { entered };
-              holding[w][k] = before + log_probs.at(frame, column as usize);
-              if holding[w][k] > best.0 {
-                best = (holding[w][k], column);
-              }
-            }
-            let mut second = (f32::NEG_INFINITY, u32::MAX);
-            for (k, &column) in lattice.columns.iter().enumerate() {
-              if column != best.1 && holding[w][k] > second.0 {
-                second = (holding[w][k], column);
-              }
-            }
-            lattice.held[next + j] = best.0;
-            let rows_of = &mut lattice.wildcards[w];
-            rows_of.best_column[frame + 1] = best.1;
-            rows_of.second[frame + 1] = second.0;
-            rows_of.second_column[frame + 1] = second.1;
+          Label::Wildcard { k, after } => {
+            let (score, hold) = lattice.wildcard_step(frame, j, k, after, emission);
+            lattice.held[next + j] = score;
+            lattice.holds[(frame + 1) * lattice.wildcards + k] = hold;
           }
         }
         lattice.blanks[next + j] = lattice.held[row + j].max(lattice.blanks[row + j]) + blank_lp;
@@ -766,29 +846,83 @@ impl Lattice {
     self.labels.len()
   }
 
-  /// The column token `j` holds on the best path holding it at `row`.
-  fn best_column(&self, row: usize, j: usize) -> u32 {
+  /// Wildcard `j` (the `k`-th) over `frame`: the best of holding the column
+  /// its path holds, or entering on the frame, from the start state or the
+  /// previous token's blanks, or straight from the previous token held, on
+  /// the frame's best column the repeat rule allows there. One read: the
+  /// held column's; an entry's column and log-probability are the table's.
+  fn wildcard_step(
+    &self,
+    frame: usize,
+    j: usize,
+    k: usize,
+    after: Option<u32>,
+    emission: &impl Fn(usize, usize) -> f32,
+  ) -> (f32, WildcardHold) {
+    let n = self.n();
+    let kept = self.held[frame * n + j];
+    let hold = self.holds[frame * self.wildcards + k];
+    let mut best = if kept > f32::NEG_INFINITY {
+      (
+        kept + emission(frame, hold.column as usize),
+        WildcardHold {
+          column: hold.column,
+          via: Via::Held,
+        },
+      )
+    } else {
+      (f32::NEG_INFINITY, NO_HOLD)
+    };
+    let (base, via) = if j == 0 {
+      (self.start[frame], Via::Start)
+    } else {
+      (self.blanks[frame * n + j - 1], Via::Blanks)
+    };
+    let (column, lp) = self.leader(frame, [after, None]);
+    if base + lp > best.0 {
+      best = (base + lp, WildcardHold { column, via });
+    }
+    if j > 0 {
+      let previous = self.held[frame * n + j - 1];
+      let (column, lp) = self.leader(frame, [after, Some(self.held_column(frame, j - 1))]);
+      if previous + lp > best.0 {
+        best = (
+          previous + lp,
+          WildcardHold {
+            column,
+            via: Via::Previous,
+          },
+        );
+      }
+    }
+    best
+  }
+
+  /// Frame `frame`'s best column a wildcard may hold other than `excluded`,
+  /// with its log-probability, from the table.
+  fn leader(&self, frame: usize, excluded: [Option<u32>; 2]) -> (u32, f32) {
+    self.leaders[frame]
+      .into_iter()
+      .find(|&(column, _)| column != u32::MAX && !excluded.contains(&Some(column)))
+      .unwrap_or((u32::MAX, f32::NEG_INFINITY))
+  }
+
+  /// The column token `j` holds at `row`: its own, or a wildcard's held
+  /// path's.
+  fn held_column(&self, row: usize, j: usize) -> u32 {
     match self.labels[j] {
       Label::Column(column) => column,
-      Label::Wildcard(w) => self.wildcards[w].best_column[row],
+      Label::Wildcard { k, .. } => self.holds[row * self.wildcards + k].column,
     }
   }
 
   /// The best path at `row` holding token `j` on another column than
-  /// `column`, and the column it holds.
-  fn held_except(&self, row: usize, j: usize, column: u32) -> (f32, u32) {
-    let held = self.held[row * self.n() + j];
-    match self.labels[j] {
-      Label::Column(label) if label == column => (f32::NEG_INFINITY, u32::MAX),
-      Label::Column(label) => (held, label),
-      Label::Wildcard(w) => {
-        let rows_of = &self.wildcards[w];
-        if rows_of.best_column[row] == column {
-          (rows_of.second[row], rows_of.second_column[row])
-        } else {
-          (held, rows_of.best_column[row])
-        }
-      }
+  /// `column`.
+  fn held_except(&self, row: usize, j: usize, column: u32) -> f32 {
+    if self.held_column(row, j) == column {
+      f32::NEG_INFINITY
+    } else {
+      self.held[row * self.n() + j]
     }
   }
 
@@ -799,106 +933,75 @@ impl Lattice {
     if j == 0 {
       self.start[row]
     } else {
-      self.blanks[row * self.n() + j - 1].max(self.held_except(row, j - 1, column).0)
+      self.blanks[row * self.n() + j - 1].max(self.held_except(row, j - 1, column))
     }
-  }
-
-  /// Wildcard `j`'s scores on `column` for rows `0..rows`, as the forward
-  /// pass computed them: one read of `column` per frame, polling
-  /// `abort_flag` every 64.
-  fn column_scores(
-    &self,
-    j: usize,
-    column: u32,
-    rows: usize,
-    emission: &impl Fn(usize, usize) -> f32,
-    abort_flag: &AtomicBool,
-  ) -> Result<Vec<f32>, WorkFailure> {
-    let mut scores = Vec::with_capacity(rows);
-    scores.push(f32::NEG_INFINITY);
-    for frame in 0..rows - 1 {
-      if frame % 64 == 0 && abort_flag.load(Ordering::Relaxed) {
-        return Err(aborted());
-      }
-      let entered = self.entering(frame, j, column);
-      let kept = scores[frame];
-      let before = if kept >= entered { kept } else { entered };
-      scores.push(before + emission(frame, column as usize));
-    }
-    Ok(scores)
   }
 
   /// Read the best path back from the last frame.
   ///
-  /// `emission(frame, column)` is the log-probability the forward pass
-  /// read. The backtrace reads one per frame, the column the frame is
-  /// scored with, and for each wildcard on the path its column once per
-  /// frame up to the wildcard's last frame; never a frame's whole row. It
-  /// polls `abort_flag` every 64 frames and before it returns.
+  /// It reads one log-probability per frame through `emission`, the
+  /// column the frame is scored with, follows each wildcard through its
+  /// held path's stored column and transition, and allocates only the path
+  /// it returns. It polls `abort_flag` every [`ABORT_QUANTUM`] frames and
+  /// before it returns.
   fn backtrace(
     &self,
-    emission: impl Fn(usize, usize) -> f32,
+    emission: &impl Fn(usize, usize) -> f32,
     abort_flag: &AtomicBool,
   ) -> Result<Vec<PathPointPublic>, WorkFailure> {
     #[derive(Clone, Copy)]
     enum State {
       Start,
-      Held(usize, u32),
+      Held(usize),
       Blanks(usize),
     }
     let n = self.n();
     // A token's better state at `row`; a tie is its blanks'.
     let better = |row: usize, j: usize| {
       if self.held[row * n + j] > self.blanks[row * n + j] {
-        State::Held(j, self.best_column(row, j))
+        State::Held(j)
       } else {
         State::Blanks(j)
       }
     };
+    let mut watchdog = Watchdog::new(abort_flag);
     // `state` is the path's state after `frame`; the loop reads the state
     // before it from the transition that made it.
     let mut state = better(self.frames, n - 1);
-    // The held wildcard's scores on its column, per row, once it is reached.
-    let mut wildcard: Option<(usize, Vec<f32>)> = None;
     let mut path = Vec::with_capacity(self.frames);
     for frame in (0..self.frames).rev() {
-      if frame % 64 == 0 && abort_flag.load(Ordering::Relaxed) {
-        return Err(aborted());
-      }
+      watchdog.tick()?;
       let (token_index, column) = match state {
         State::Start => break,
         State::Blanks(j) => {
           state = better(frame, j);
           (j, self.blank)
         }
-        State::Held(j, column) => {
-          let kept = match self.labels[j] {
-            Label::Column(_) => self.held[frame * n + j],
-            Label::Wildcard(_) => {
-              if wildcard.as_ref().is_none_or(|(held, _)| *held != j) {
-                let scores = self.column_scores(j, column, frame + 1, &emission, abort_flag)?;
-                wildcard = Some((j, scores));
-              }
-              wildcard
-                .as_ref()
-                .map_or(f32::NEG_INFINITY, |(_, scores)| scores[frame])
-            }
-          };
-          let entered = self.entering(frame, j, column);
-          state = if kept >= entered {
-            State::Held(j, column)
-          } else if j == 0 {
-            State::Start
-          } else {
-            let (previous, previous_column) = self.held_except(frame, j - 1, column);
-            if previous > self.blanks[frame * n + j - 1] {
-              State::Held(j - 1, previous_column)
+        State::Held(j) => match self.labels[j] {
+          Label::Column(label) => {
+            let entered = self.entering(frame, j, label);
+            state = if self.held[frame * n + j] >= entered {
+              State::Held(j)
+            } else if j == 0 {
+              State::Start
+            } else if self.held_except(frame, j - 1, label) > self.blanks[frame * n + j - 1] {
+              State::Held(j - 1)
             } else {
               State::Blanks(j - 1)
-            }
-          };
-          (j, column as usize)
-        }
+            };
+            (j, label as usize)
+          }
+          Label::Wildcard { k, .. } => {
+            let hold = self.holds[(frame + 1) * self.wildcards + k];
+            state = match hold.via {
+              Via::Held => State::Held(j),
+              Via::Start => State::Start,
+              Via::Blanks => State::Blanks(j - 1),
+              Via::Previous => State::Held(j - 1),
+            };
+            (j, hold.column as usize)
+          }
+        },
       };
       path.push(PathPointPublic {
         token_index,
@@ -2296,6 +2399,42 @@ mod tests {
     close(&spans(&words), &[(0, 1, e(-9.0)), (1, 2, e(-0.01))]);
   }
 
+  /// `tokens`' lattice over `log_probs`, every column but the blank's a
+  /// wildcard's, read straight from `log_probs`.
+  fn plain_lattice(log_probs: &LogProbsTV, tokens: &[i32], abort: &AtomicBool) -> Lattice {
+    let mask: Vec<bool> = (0..log_probs.v()).map(|column| column != 0).collect();
+    Lattice::forward(
+      log_probs,
+      &|frame, column| log_probs.at(frame, column),
+      tokens,
+      0,
+      &mask,
+      abort,
+      &Lang::En,
+    )
+    .expect("the lattice builds")
+  }
+
+  /// `t` frames of `v` columns of finite log-probabilities, no frame alike.
+  fn varied_rows(t: usize, v: usize) -> LogProbsTV {
+    lp(
+      t,
+      v,
+      (0..t * v)
+        .map(|cell| -0.5 - ((cell * 7919) % 97) as f32 / 10.0)
+        .collect(),
+    )
+  }
+
+  /// One wildcard, then `n - 1` spelled tokens alternating 1 and 2; and `n`
+  /// wildcards.
+  fn one_and_all_wildcards(n: usize) -> [Vec<i32>; 2] {
+    let one = core::iter::once(W)
+      .chain((1..n).map(|i| 1 + (i % 2) as i32))
+      .collect();
+    [one, vec![W; n]]
+  }
+
   /// **The backtrace is cancellable.** An abort raised after the forward
   /// pass, while the path is read back, is the cancellation, never a path:
   /// for a lattice of plain tokens and for one with a held wildcard.
@@ -2305,10 +2444,18 @@ mod tests {
       let data = led_rows(&[(1, -0.01), (SEP as usize, -0.01), (2, -0.2), (2, -0.2)]);
       let log_probs = lp(4, CENSUS_V, data);
       let abort = AtomicBool::new(false);
-      let lattice = Lattice::forward(&log_probs, &tokens, 0, &CENSUS_MASK, &abort, &Lang::En)
-        .expect("the lattice builds");
+      let lattice = Lattice::forward(
+        &log_probs,
+        &|frame, column| log_probs.at(frame, column),
+        &tokens,
+        0,
+        &CENSUS_MASK,
+        &abort,
+        &Lang::En,
+      )
+      .expect("the lattice builds");
       abort.store(true, Ordering::Relaxed);
-      let read_back = lattice.backtrace(|frame, column| log_probs.at(frame, column), &abort);
+      let read_back = lattice.backtrace(&|frame, column| log_probs.at(frame, column), &abort);
       assert!(
         matches!(read_back, Err(WorkFailure::WorkerHang(_))),
         "{tokens:?}: {read_back:?}"
@@ -2318,10 +2465,9 @@ mod tests {
 
   /// **The backtrace reads one emission per frame, however wide the
   /// vocabulary.** It never scans a frame's row: a held wildcard's column
-  /// is fixed, and the backtrace reads it once per frame up to the
-  /// wildcard's last frame. `[A, ?, B]` with the wildcard held over 40 of 44
-  /// frames: the same reads over 8 columns as over 64, at most a read per
-  /// frame for the path and one for the wildcard's column.
+  /// is stored, and the backtrace reads it once per frame it holds.
+  /// `[A, ?, B]` with the wildcard held over 40 of 44 frames: the same reads
+  /// over 8 columns as over 64, one per frame.
   #[test]
   fn the_backtrace_reads_one_emission_per_frame_however_wide_the_vocabulary() {
     let t = 44;
@@ -2334,14 +2480,12 @@ mod tests {
       data[41 * v] = -0.01;
       data[42 * v + 3] = -0.01;
       data[43 * v] = -0.01;
-      let mask: Vec<bool> = (0..v).map(|column| column != 0).collect();
       let log_probs = lp(t, v, data);
-      let lattice = Lattice::forward(&log_probs, &[1, W, 3], 0, &mask, never(), &Lang::En)
-        .expect("the lattice builds");
+      let lattice = plain_lattice(&log_probs, &[1, W, 3], never());
       let reads = core::cell::Cell::new(0_usize);
       let path = lattice
         .backtrace(
-          |frame, column| {
+          &|frame, column| {
             reads.set(reads.get() + 1);
             log_probs.at(frame, column)
           },
@@ -2353,7 +2497,125 @@ mod tests {
     };
     let reads = reads_over(8);
     assert_eq!(reads, reads_over(64), "the backtrace's reads grow with V");
-    assert!(reads <= 2 * t, "{reads} reads for {t} frames");
+    assert_eq!(reads, t, "{reads} reads for {t} frames");
+  }
+
+  /// **A wildcard costs the forward pass what any token costs.** The
+  /// columns a wildcard may hold are read once per frame, into the table
+  /// every wildcard reads; then each token, a wildcard included, costs a
+  /// read per frame. Over 64 frames of 64 columns, 32 tokens of which one is
+  /// a wildcard and 32 wildcards read within a frame's reads of each other,
+  /// and neither more than a read per column and per token per frame.
+  #[test]
+  fn the_forward_pass_reads_each_frame_once_however_many_wildcards() {
+    let (t, v) = (64, 64);
+    let log_probs = varied_rows(t, v);
+    let mask: Vec<bool> = (0..v).map(|column| column != 0).collect();
+    let [one, all] = one_and_all_wildcards(32).map(|tokens| {
+      let reads = core::cell::Cell::new(0_usize);
+      Lattice::forward(
+        &log_probs,
+        &|frame, column| {
+          reads.set(reads.get() + 1);
+          log_probs.at(frame, column)
+        },
+        &tokens,
+        0,
+        &mask,
+        never(),
+        &Lang::En,
+      )
+      .expect("the lattice builds");
+      reads.get()
+    });
+    assert!(
+      all.abs_diff(one) <= t,
+      "one wildcard read {one} times, 32 wildcards {all}"
+    );
+    assert!(
+      all <= t * (v + 32 + 1),
+      "32 wildcards read {all} times over {t} frames"
+    );
+  }
+
+  /// **The backtrace reads one emission per frame on the path, however many
+  /// wildcards.** It follows each wildcard through the column and the
+  /// transition its held path stores per row (a `Copy` record), so it
+  /// replays nothing and allocates only the path it returns. Over 64 frames
+  /// of 64 columns, 32 tokens of which one is a wildcard, and 32 wildcards.
+  #[test]
+  fn the_backtrace_reads_one_emission_per_frame_however_many_wildcards() {
+    const fn stored_by_copy<T: Copy>() {}
+    const _: () = stored_by_copy::<WildcardHold>();
+    let log_probs = varied_rows(64, 64);
+    let counts = one_and_all_wildcards(32).map(|tokens| {
+      let lattice = plain_lattice(&log_probs, &tokens, never());
+      let reads = core::cell::Cell::new(0_usize);
+      let path = lattice
+        .backtrace(
+          &|frame, column| {
+            reads.set(reads.get() + 1);
+            log_probs.at(frame, column)
+          },
+          never(),
+        )
+        .expect("the path reads back");
+      (reads.get(), path.len())
+    });
+    for (wildcards, (reads, frames)) in [1, 32].into_iter().zip(counts) {
+      assert_eq!(
+        reads, frames,
+        "{wildcards} wildcards: (reads, frames on the path) {counts:?}"
+      );
+    }
+  }
+
+  /// **An abort is seen within a quantum of work.** Raised while the frame
+  /// table is built, or inside a frame's loop over the tokens, it is the
+  /// cancellation after at most [`ABORT_QUANTUM`] more reads. Over 128
+  /// frames of 64 columns with 40 tokens, a wildcard among them: 64 frames
+  /// of either the table or the tokens are more reads than a quantum.
+  #[test]
+  fn an_abort_is_seen_within_a_quantum_of_work() {
+    let (t, v) = (128, 64);
+    let log_probs = varied_rows(t, v);
+    let mask: Vec<bool> = (0..v).map(|column| column != 0).collect();
+    let [tokens, _] = one_and_all_wildcards(40);
+    let table_reads = t * (v - 1);
+    let seen = [
+      ("building the table", 500),
+      ("inside a frame's loop over the tokens", table_reads + 100),
+    ]
+    .map(|(phase, raised_at)| {
+      let abort = AtomicBool::new(false);
+      let reads = core::cell::Cell::new(0_usize);
+      let built = Lattice::forward(
+        &log_probs,
+        &|frame, column| {
+          reads.set(reads.get() + 1);
+          if reads.get() == raised_at {
+            abort.store(true, Ordering::Relaxed);
+          }
+          log_probs.at(frame, column)
+        },
+        &tokens,
+        0,
+        &mask,
+        &abort,
+        &Lang::En,
+      );
+      (
+        phase,
+        matches!(built, Err(WorkFailure::WorkerHang(_))),
+        reads.get() - raised_at,
+      )
+    });
+    for (phase, cancelled, after) in seen {
+      assert!(
+        cancelled && after <= ABORT_QUANTUM,
+        "{phase}: (cancelled, reads after the abort) {seen:?}"
+      );
+    }
   }
 
   /// Two CJK characters, one word each, over `X / Y / blank / blank`: the
