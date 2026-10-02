@@ -1100,7 +1100,7 @@ mod tests {
     };
 
     // Pin the geometry, not just the variant: `T=1` is the pad-to-400
-    // behaviour (400 samples, one frame), and `11 chars` is the
+    // behaviour (400 samples, one frame), and `11 tokens` is the
     // tokenisation of `"hello world"` (10 letters + the `|`
     // delimiter). Assert them so a regression in *either* — a silently
     // dropped pad, a changed delimiter policy — fails here rather than
@@ -1115,8 +1115,8 @@ mod tests {
       "400 padded samples must yield exactly one frame; got: {message}"
     );
     assert!(
-      message.contains("11 chars"),
-      "`hello world` must tokenise to 11 chars (10 letters + `|`); got: {message}"
+      message.contains("11 tokens"),
+      "`hello world` must tokenise to 11 tokens (10 letters + `|`); got: {message}"
     );
     assert_eq!(
       *failure.language(),
