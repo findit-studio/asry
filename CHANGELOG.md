@@ -10,16 +10,24 @@ CHANGED
   therefore needs a frame per token and one more for each such pair:
   `hello world` needs 12 frames, not 11, and a unit with fewer is
   `NoAlignmentPath`, saying how many pairs it holds. A wildcard holds one
-  column of its mask on every frame it is held: the best on the frame it is
-  entered, other than a label the repeat rule rules out there, read from a
-  table of each frame's three best columns built once per frame, so a
-  wildcard costs the alignment what any token costs, and its confidence is
-  that column's. A unit holding a wildcard is charged that table against the
-  cell budget, a cell per column per frame. On jfk no word moves; on ted_60
-  `way` ends, and `too` starts, one frame earlier. The alignment polls its
-  abort flag every 1 024 units of work (an emission read, a lattice cell, a
-  frame read back), while it builds the lattice and while it reads the path
-  back.
+  column of its mask on every frame it is held, the column of the best path
+  over the whole run: the alignment keeps a held score per column for each
+  wildcard at the current frame, and the repeat rule binds a wildcard only
+  where it is adjacent to an equal label (entered straight from the token
+  before it, or left straight into the token after it), so through blanks it
+  may hold any column, a neighbour's included. Its confidence is that
+  column's. That costs a column update per wildcard per admissible column
+  per frame, and reading the path back replays each wildcard's column once.
+  Before it runs, the alignment checks its memory against 32 M cells and its
+  work against 2^28 units: the column scan (only when the transcript holds a
+  wildcard), the tokens, a cell per token per frame, the column updates, and
+  the read-back (a frame each, a replay per wildcard, the reversal and the
+  grouping into words). A unit over either is `NoAlignmentPath`, naming
+  every term. On jfk no word moves; on ted_60 `way` ends, and `too` starts,
+  one frame earlier. The alignment reads its abort flag before each phase
+  (the labels, the column scan, the forward pass, the backtrace, the
+  reversal, the grouping into words), every 1 024 units of work inside each,
+  and once more before it returns the words.
 
 FIXED
 
