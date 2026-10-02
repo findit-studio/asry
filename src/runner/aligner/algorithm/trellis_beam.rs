@@ -84,13 +84,14 @@ pub const WILDCARD_TOKEN_ID: i32 = -1;
 /// "bench-internals"` re-export can reach it.
 pub const ALIGN_BEAM_WIDTH: usize = 2;
 
-/// Cap on `T * num_tokens` cells in the forward trellis. Same
-/// reasoning as the legacy Viterbi guard: a hallucinated long
-/// token list against a long chunk would otherwise allocate
-/// gigabytes before the per-row abort check fires. 32 M cells =
+/// Cap on a lattice's cells: `T * num_tokens` in WhisperX's trellis,
+/// `(T + 1) * (2 * num_tokens + 1)` in `best_path`'s, which keeps two
+/// states per token. Same reasoning as the legacy Viterbi guard: a
+/// hallucinated long token list against a long chunk would otherwise
+/// allocate gigabytes before the per-row abort check fires. 32 M cells =
 /// 128 MB at 4 bytes/cell — comfortably above realistic chunks
 /// (T ≤ ~1500 at 50 fps × 30 s, num_tokens typically ≤ ~1k chars
-/// → ≤ 1.5 M cells) while turning pathological inputs into an
+/// → ≤ 3 M cells) while turning pathological inputs into an
 /// in-band failure.
 const TRELLIS_CELL_BUDGET: usize = 32_000_000;
 
@@ -2627,10 +2628,8 @@ to a bare align_emissions call; got {message:?}"
     }
   }
 
-  /// Finding 2 (codex round 7): a single-token, huge-`T` lattice
-  /// slips under the `T · num_tokens` trellis-cell cap (num_tokens =
-  /// 1) and its `final_j = 0` skips the beam loop's node-budget
-  /// guard, so `backtrack_beam`'s `Vec::with_capacity(T)` would
+  /// A single-token, huge-`T` lattice slips under the lattice-cell
+  /// cap, so the path reconstruction's `Vec::with_capacity(T)` would
   /// allocate hundreds of MB. `align_emissions` must reject `T`
   /// beyond [`SEAM_PATH_FRAME_BUDGET`] BEFORE that allocation, with
   /// the neutral [`EmissionsError::PathBudget`] discriminant — and
@@ -2892,6 +2891,37 @@ to a bare align_emissions call; got {message:?}"
       err,
       WorkFailure::WorkerHang(ref t) if t.kind() == WorkerKind::Alignment
     ));
+  }
+
+  /// The pipeline's lattice keeps two states per token, and its cell
+  /// budget counts both: 8 000 frames × 3 000 tokens fits WhisperX's
+  /// 24 M-cell trellis but is a 48 M-cell lattice, refused by name as
+  /// `NoAlignmentPath` before it is allocated.
+  #[test]
+  fn the_lattice_budget_counts_both_states_of_every_token() {
+    let log_probs =
+      LogProbsTV::new(8_000, 8, vec![-1.0_f32; 8_000 * 8]).expect("t * v == vals.len()");
+    let tokens: Vec<i32> = (0..3_000).map(|i| 1 + (i % 4)).collect();
+    let words: Vec<Option<usize>> = (0..3_000).map(Some).collect();
+    let err = align_to_word_segments(
+      &log_probs,
+      &tokens,
+      &words,
+      None,
+      0,
+      ANY_COLUMN,
+      never(),
+      &Lang::En,
+    )
+    .unwrap_err();
+    let WorkFailure::Alignment(AlignmentError::NoAlignmentPath(payload)) = err else {
+      panic!("an over-budget lattice is NoAlignmentPath; got {err:?}");
+    };
+    assert!(
+      payload.message().contains("lattice exceeds"),
+      "the failure names the budget; got {}",
+      payload.message()
+    );
   }
 
   #[test]

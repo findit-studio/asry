@@ -19,18 +19,20 @@ FIXED
   lattice: a token is entered on one frame and held on the frames right
   after it (a CTC repeat), each scored with its emission, then its blanks
   until the next entry, and once its blanks begin it is not held again, so
-  the model emitting it later is an occurrence the transcript does not
-  have. The path is the lattice's best, read back exactly. So a word after a
-  pause starts on the frame the model emits its first character (`ask` at
-  8395.2 ms), the pause belongs to the word delimiter, which no word owns,
-  and a word ends where the model starts the delimiter however long it
-  holds it (`would` at 31950.7 ms). Every token still owns its entry frame
-  and every frame until the next entry, the leading blanks still belong to
-  no token, and the last frame can still be an entry. A word's confidence
-  counts a frame its token is held on at the token's probability, not the
-  blank's. Boundaries move where the beam left the best path: on ted_60, 40
-  of 185 words (28 by one frame), and of the 33 of them a greedy decode
-  spells, 32 move toward its boundaries. `get_trellis` and `backtrack_beam`
+  the model emitting it later is an occurrence the transcript does not have.
+  The path is the lattice's best, read back exactly. So a word after a pause
+  starts on the frame the model emits its first character (`ask` at 8395.2
+  ms), the pause belongs to the word delimiter, which no word owns, and a
+  word ends where the model starts the delimiter however long it holds it
+  (`would` at 31950.7 ms). Every token still owns its entry frame and every
+  frame until the next entry, the leading blanks still belong to no token,
+  and the last frame can still be an entry. A word's confidence counts a
+  frame its token is held on at the token's probability, not the blank's.
+  The lattice keeps two states per token, so its 32 M-cell budget admits
+  about half the tokens per frame it did (a 30 s unit still takes over 10
+  000). Boundaries move where the beam left the best path: on ted_60, 40 of
+  185 words (28 by one frame), and of the 33 of them a greedy decode spells,
+  32 move toward its boundaries. `get_trellis` and `backtrack_beam`
   (`bench-internals`) keep WhisperX's shape and comparator; the alignment
   uses neither.
 
