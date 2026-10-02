@@ -1,5 +1,20 @@
 # UNRELEASED
 
+CHANGED
+
+- **A held character is one label, as CTC reads it.** CTC collapses a label
+  the model holds across frames into one, so two equal adjacent labels (a
+  doubled letter such as `ll`, a glyph repeated across two words of a script
+  without word delimiters, or a wildcard holding the label of the token next
+  to it) are two characters only with a blank frame between them. A unit
+  therefore needs a frame per token and one more for each such pair:
+  `hello world` needs 12 frames, not 11, and a unit with fewer is
+  `NoAlignmentPath`, saying how many pairs it holds. A wildcard holds one
+  column of its mask on every frame it is held, never each frame's best, so
+  its confidence is that column's. On jfk no word moves; on ted_60 `way`
+  ends, and `too` starts, one frame earlier. The alignment polls its abort
+  flag while it reads the path back, as it does while it builds the lattice.
+
 FIXED
 
 - **A word after a pause starts at its first spoken frame, never at the end

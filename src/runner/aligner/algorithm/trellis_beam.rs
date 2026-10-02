@@ -36,8 +36,10 @@
 //! directly, so no lattice state reaches `compose.rs`.
 //!
 //! Asry-specific concerns kept here:
-//! - **Watchdog / abort flag** — checked once per frame row in the
-//! forward DP and once per beam-step iteration so a pathological
+//! - **Watchdog / abort flag** — checked every 64 frames in the
+//! pipeline's forward pass and backtrace and before the backtrace
+//! returns, and in the WhisperX port per frame row of its forward DP
+//! and per beam-step iteration, so a pathological
 //! token sequence × T pair can't hold the caller past its
 //! timeout — the `alignment`-feature pool's `align_timeout`, or an
 //! `emissions`-only caller's own `abort_flag` deadline.
@@ -84,9 +86,11 @@ pub const WILDCARD_TOKEN_ID: i32 = -1;
 /// "bench-internals"` re-export can reach it.
 pub const ALIGN_BEAM_WIDTH: usize = 2;
 
-/// Cap on a lattice's cells: `T * num_tokens` in WhisperX's trellis,
-/// `(T + 1) * (2 * num_tokens + 1)` in `best_path`'s, which keeps two
-/// states per token. Same reasoning as the legacy Viterbi guard: a
+/// Cap on a lattice's cells: `T * num_tokens` in WhisperX's trellis;
+/// in `best_path`'s, which keeps two states per token and three numbers per
+/// row for each wildcard, `(T + 1) * (2 * num_tokens + 1 + 3 * wildcards)`
+/// plus each wildcard's score per column. Same reasoning as the legacy
+/// Viterbi guard: a
 /// hallucinated long token list against a long chunk would otherwise
 /// allocate gigabytes before the per-row abort check fires. 32 M cells =
 /// 128 MB at 4 bytes/cell — comfortably above realistic chunks
@@ -530,24 +534,31 @@ fn max_wildcard_logprob(
 /// The lattice is CTC's. Ahead of the first token is a start state, the
 /// transcript's empty prefix, whose frames are blanks and belong to no
 /// token. Each token then has two states: the token itself, entered on one
-/// frame from the state before it and held on the frames right after (a
-/// CTC repeat), and its blanks, from the first blank frame after it to the
-/// next token's entry. A token owns its entry frame and every frame until
-/// the next entry; a frame it is entered or held on is scored with its
-/// emission (a wildcard's through `wildcard_columns`) and a blank frame with
-/// the blank's. Once its blanks begin it is not held again: the model
-/// emitting it again later is an occurrence the transcript does not have.
+/// frame and held on the frames right after (a CTC repeat), and its blanks,
+/// from the first blank frame after it to the next token's entry. A token
+/// owns its entry frame and every frame until the next entry; a frame it is
+/// entered or held on is scored with its column's emission and a blank
+/// frame with the blank's. Once its blanks begin it is not held again: the
+/// model emitting it again later is an occurrence the transcript does not
+/// have.
+///
+/// A held token is one label. A wildcard holds one column of
+/// `wildcard_columns`, the path's choice, on its entry frame and every frame
+/// it is held, never each frame's best. And CTC reads a column held across
+/// frames as one label, so a token is entered from the start state, from
+/// the previous token's blanks, or from the previous token held on another
+/// column: two equal adjacent labels (a doubled letter, a repeated glyph, or
+/// a wildcard holding its neighbour's column) need a blank between them.
 ///
 /// So a frame the model holds a token on is never charged as a blank, and a
 /// word after a pause is entered on the frame the model emits its first
 /// character: the pause is the blanks of the token before it, between two
 /// words the word delimiter's, which no word owns.
 ///
-/// Each state keeps, per frame, the best score of a path that ends in it,
-/// and the backtrace walks back from the last frame along the transitions
-/// that made those scores, so the path is the lattice's best; on a tie it
-/// takes the earlier entry and the earlier blank. The last frame can be an
-/// entry.
+/// The path is the lattice's best: [`Lattice::forward`] keeps, per frame,
+/// each state's best score, and [`Lattice::backtrace`] walks back from the
+/// last frame along the transitions that made them; on a tie it takes the
+/// earlier entry and the earlier blank. The last frame can be an entry.
 fn best_path(
   log_probs: &LogProbsTV,
   tokens: &[i32],
@@ -556,139 +567,351 @@ fn best_path(
   abort_flag: &AtomicBool,
   language: &Lang,
 ) -> Result<Vec<PathPointPublic>, WorkFailure> {
-  let no_path = |message: SmolStr| {
-    WorkFailure::Alignment(AlignmentError::NoAlignmentPath(AlignmentFailure::new(
-      message,
-      language.clone(),
-    )))
-  };
-  let hung = || {
-    WorkFailure::WorkerHang(WorkerHangTimeout::new(
-      WorkerKind::Alignment,
-      core::time::Duration::ZERO,
-    ))
-  };
-  let n = tokens.len();
-  if n == 0 {
-    return Err(no_path(SmolStr::from("token sequence is empty")));
-  }
-  check_ids(log_probs, tokens, blank_id, language)?;
-  let frames = log_probs.t();
-  let rows = frames + 1;
-  // The start state's row and each token's two.
-  let states = n.saturating_mul(2).saturating_add(1);
-  if rows
-    .checked_mul(states)
-    .is_none_or(|cells| cells > TRELLIS_CELL_BUDGET)
-  {
-    return Err(no_path(format_smolstr!(
-      "lattice exceeds {TRELLIS_CELL_BUDGET} cells ({rows} rows × {states} states)"
-    )));
-  }
-  if abort_flag.load(Ordering::Relaxed) {
-    return Err(hung());
+  Lattice::forward(
+    log_probs,
+    tokens,
+    blank_id,
+    wildcard_columns,
+    abort_flag,
+    language,
+  )?
+  .backtrace(|frame, column| log_probs.at(frame, column), abort_flag)
+}
+
+/// The cancellation an observed `abort_flag` stands for.
+fn aborted() -> WorkFailure {
+  WorkFailure::WorkerHang(WorkerHangTimeout::new(
+    WorkerKind::Alignment,
+    core::time::Duration::ZERO,
+  ))
+}
+
+/// The column a lattice token is read as.
+#[derive(Clone, Copy)]
+enum Label {
+  /// A token the vocabulary spells: its own column.
+  Column(u32),
+  /// A wildcard: one column of the mask, the path's choice. The index is
+  /// the wildcard's among the transcript's wildcards.
+  Wildcard(usize),
+}
+
+/// A wildcard's columns at each row of the lattice: `Lattice::held` keeps
+/// the best score of a path holding it, which holds `best_column`; `second`
+/// is the best holding any other column, which holds `second_column`.
+/// [`u32::MAX`] stands for no column, where the score is `-inf`.
+struct WildcardRows {
+  best_column: Vec<u32>,
+  second: Vec<f32>,
+  second_column: Vec<u32>,
+}
+
+/// `best_path`'s lattice after its forward pass: each state's best score per
+/// row, row `r` being the frames `0..r`.
+struct Lattice {
+  frames: usize,
+  blank: usize,
+  /// The columns a wildcard may hold, in column order.
+  columns: Vec<u32>,
+  labels: Vec<Label>,
+  /// `start[r]`: frames `0..r` all blank, ahead of the first token.
+  start: Vec<f32>,
+  /// `held[r * n + j]`: the best path over frames `0..r` whose last frame
+  /// holds token `j`, entered on it or held; a wildcard's over its columns.
+  held: Vec<f32>,
+  /// `blanks[r * n + j]`: the best path over frames `0..r` whose last frame
+  /// is a blank after token `j`.
+  blanks: Vec<f32>,
+  /// Per wildcard, in transcript order.
+  wildcards: Vec<WildcardRows>,
+}
+
+impl Lattice {
+  /// Run the forward pass of `tokens` over `log_probs`.
+  ///
+  /// It polls `abort_flag` every 64 frames, and refuses as
+  /// `NoAlignmentPath` a lattice over the cell budget or one with no path
+  /// through every token.
+  fn forward(
+    log_probs: &LogProbsTV,
+    tokens: &[i32],
+    blank_id: u32,
+    wildcard_columns: &[bool],
+    abort_flag: &AtomicBool,
+    language: &Lang,
+  ) -> Result<Self, WorkFailure> {
+    let no_path = |message: SmolStr| {
+      WorkFailure::Alignment(AlignmentError::NoAlignmentPath(AlignmentFailure::new(
+        message,
+        language.clone(),
+      )))
+    };
+    let n = tokens.len();
+    if n == 0 {
+      return Err(no_path(SmolStr::from("token sequence is empty")));
+    }
+    check_ids(log_probs, tokens, blank_id, language)?;
+    let frames = log_probs.t();
+    let rows = frames + 1;
+    let blank = blank_id as usize;
+    let columns: Vec<u32> = (0..log_probs.v())
+      .filter(|&column| column != blank && wildcard_columns.get(column).copied().unwrap_or(false))
+      .filter_map(|column| u32::try_from(column).ok())
+      .collect();
+    let mut wildcard_count = 0;
+    let labels: Vec<Label> = tokens
+      .iter()
+      .map(|&token| {
+        if token == WILDCARD_TOKEN_ID {
+          wildcard_count += 1;
+          Label::Wildcard(wildcard_count - 1)
+        } else {
+          Label::Column(token as u32)
+        }
+      })
+      .collect();
+    // The start state's row, each token's two, three per wildcard (its best
+    // and second-best column), and each wildcard's current score per column.
+    let states = n
+      .saturating_mul(2)
+      .saturating_add(1)
+      .saturating_add(wildcard_count.saturating_mul(3));
+    let cells = rows
+      .checked_mul(states)
+      .and_then(|cells| cells.checked_add(wildcard_count.checked_mul(columns.len())?));
+    if cells.is_none_or(|cells| cells > TRELLIS_CELL_BUDGET) {
+      return Err(no_path(format_smolstr!(
+        "lattice exceeds {TRELLIS_CELL_BUDGET} cells ({rows} rows × {states} states, \
+         {wildcard_count} wildcards × {} columns)",
+        columns.len()
+      )));
+    }
+    if abort_flag.load(Ordering::Relaxed) {
+      return Err(aborted());
+    }
+
+    let mut lattice = Self {
+      frames,
+      blank,
+      start: vec![f32::NEG_INFINITY; rows],
+      held: vec![f32::NEG_INFINITY; rows * n],
+      blanks: vec![f32::NEG_INFINITY; rows * n],
+      wildcards: (0..wildcard_count)
+        .map(|_| WildcardRows {
+          best_column: vec![u32::MAX; rows],
+          second: vec![f32::NEG_INFINITY; rows],
+          second_column: vec![u32::MAX; rows],
+        })
+        .collect(),
+      columns,
+      labels,
+    };
+    lattice.start[0] = 0.0;
+    // Each wildcard's score per column at the current row.
+    let mut holding: Vec<Vec<f32>> = (0..wildcard_count)
+      .map(|_| vec![f32::NEG_INFINITY; lattice.columns.len()])
+      .collect();
+    for frame in 0..frames {
+      if frame % 64 == 0 && abort_flag.load(Ordering::Relaxed) {
+        return Err(aborted());
+      }
+      let blank_lp = log_probs.at(frame, blank);
+      lattice.start[frame + 1] = lattice.start[frame] + blank_lp;
+      let (row, next) = (frame * n, (frame + 1) * n);
+      for j in 0..n {
+        match lattice.labels[j] {
+          Label::Column(column) => {
+            let entered = lattice.entering(frame, j, column);
+            let kept = lattice.held[row + j];
+            let before = if kept >= entered { kept } else { entered };
+            lattice.held[next + j] = before + log_probs.at(frame, column as usize);
+          }
+          Label::Wildcard(w) => {
+            let mut best = (f32::NEG_INFINITY, u32::MAX);
+            for (k, &column) in lattice.columns.iter().enumerate() {
+              let entered = lattice.entering(frame, j, column);
+              let kept = holding[w][k];
+              let before = if kept >= entered { kept } else { entered };
+              holding[w][k] = before + log_probs.at(frame, column as usize);
+              if holding[w][k] > best.0 {
+                best = (holding[w][k], column);
+              }
+            }
+            let mut second = (f32::NEG_INFINITY, u32::MAX);
+            for (k, &column) in lattice.columns.iter().enumerate() {
+              if column != best.1 && holding[w][k] > second.0 {
+                second = (holding[w][k], column);
+              }
+            }
+            lattice.held[next + j] = best.0;
+            let rows_of = &mut lattice.wildcards[w];
+            rows_of.best_column[frame + 1] = best.1;
+            rows_of.second[frame + 1] = second.0;
+            rows_of.second_column[frame + 1] = second.1;
+          }
+        }
+        lattice.blanks[next + j] = lattice.held[row + j].max(lattice.blanks[row + j]) + blank_lp;
+      }
+    }
+    let last = (frames * n) + n - 1;
+    if !lattice.held[last].max(lattice.blanks[last]).is_finite() {
+      return Err(no_path(format_smolstr!(
+        "no path enters all {n} tokens within T={frames} frames"
+      )));
+    }
+    Ok(lattice)
   }
 
-  let blank = blank_id as usize;
-  let has_wildcard = tokens.contains(&WILDCARD_TOKEN_ID);
-  let token_lp = |frame: usize, wildcard_lp: f32, token: i32| match token {
-    WILDCARD_TOKEN_ID => wildcard_lp,
-    id => log_probs.at(frame, id as usize),
-  };
-  // Row `r` of a state is the best score of a path over frames `0..r` that
-  // ends in it.
-  let mut start = vec![f32::NEG_INFINITY; rows];
-  start[0] = 0.0;
-  let mut held = vec![f32::NEG_INFINITY; rows * n];
-  let mut blanks = vec![f32::NEG_INFINITY; rows * n];
-  for frame in 0..frames {
-    if frame % 64 == 0 && abort_flag.load(Ordering::Relaxed) {
-      return Err(hung());
+  fn n(&self) -> usize {
+    self.labels.len()
+  }
+
+  /// The column token `j` holds on the best path holding it at `row`.
+  fn best_column(&self, row: usize, j: usize) -> u32 {
+    match self.labels[j] {
+      Label::Column(column) => column,
+      Label::Wildcard(w) => self.wildcards[w].best_column[row],
     }
-    let blank_lp = log_probs.at(frame, blank);
-    let wildcard_lp = if has_wildcard {
-      max_wildcard_logprob(log_probs, frame, blank, wildcard_columns)
+  }
+
+  /// The best path at `row` holding token `j` on another column than
+  /// `column`, and the column it holds.
+  fn held_except(&self, row: usize, j: usize, column: u32) -> (f32, u32) {
+    let held = self.held[row * self.n() + j];
+    match self.labels[j] {
+      Label::Column(label) if label == column => (f32::NEG_INFINITY, u32::MAX),
+      Label::Column(label) => (held, label),
+      Label::Wildcard(w) => {
+        let rows_of = &self.wildcards[w];
+        if rows_of.best_column[row] == column {
+          (rows_of.second[row], rows_of.second_column[row])
+        } else {
+          (held, rows_of.best_column[row])
+        }
+      }
+    }
+  }
+
+  /// The best score at `row` from which token `j` is entered on frame `row`
+  /// holding `column`: the start state, the previous token's blanks, or the
+  /// previous token held on another column.
+  fn entering(&self, row: usize, j: usize, column: u32) -> f32 {
+    if j == 0 {
+      self.start[row]
     } else {
-      f32::NEG_INFINITY
-    };
-    start[frame + 1] = start[frame] + blank_lp;
-    let (row, next) = (frame * n, (frame + 1) * n);
-    for (j, &token) in tokens.iter().enumerate() {
-      let entered = if j == 0 {
-        start[frame]
-      } else {
-        held[row + j - 1].max(blanks[row + j - 1])
-      };
-      let kept = held[row + j];
+      self.blanks[row * self.n() + j - 1].max(self.held_except(row, j - 1, column).0)
+    }
+  }
+
+  /// Wildcard `j`'s scores on `column` for rows `0..rows`, as the forward
+  /// pass computed them: one read of `column` per frame, polling
+  /// `abort_flag` every 64.
+  fn column_scores(
+    &self,
+    j: usize,
+    column: u32,
+    rows: usize,
+    emission: &impl Fn(usize, usize) -> f32,
+    abort_flag: &AtomicBool,
+  ) -> Result<Vec<f32>, WorkFailure> {
+    let mut scores = Vec::with_capacity(rows);
+    scores.push(f32::NEG_INFINITY);
+    for frame in 0..rows - 1 {
+      if frame % 64 == 0 && abort_flag.load(Ordering::Relaxed) {
+        return Err(aborted());
+      }
+      let entered = self.entering(frame, j, column);
+      let kept = scores[frame];
       let before = if kept >= entered { kept } else { entered };
-      held[next + j] = before + token_lp(frame, wildcard_lp, token);
-      blanks[next + j] = kept.max(blanks[row + j]) + blank_lp;
+      scores.push(before + emission(frame, column as usize));
     }
+    Ok(scores)
   }
 
-  #[derive(Clone, Copy)]
-  enum State {
-    Start,
-    Held(usize),
-    Blanks(usize),
-  }
-  // A token's better state at `row`; a tie is its blanks'.
-  let better = |row: usize, j: usize| {
-    if held[row * n + j] > blanks[row * n + j] {
-      State::Held(j)
-    } else {
-      State::Blanks(j)
+  /// Read the best path back from the last frame.
+  ///
+  /// `emission(frame, column)` is the log-probability the forward pass
+  /// read. The backtrace reads one per frame, the column the frame is
+  /// scored with, and for each wildcard on the path its column once per
+  /// frame up to the wildcard's last frame; never a frame's whole row. It
+  /// polls `abort_flag` every 64 frames and before it returns.
+  fn backtrace(
+    &self,
+    emission: impl Fn(usize, usize) -> f32,
+    abort_flag: &AtomicBool,
+  ) -> Result<Vec<PathPointPublic>, WorkFailure> {
+    #[derive(Clone, Copy)]
+    enum State {
+      Start,
+      Held(usize, u32),
+      Blanks(usize),
     }
-  };
-  let last = n - 1;
-  if !held[frames * n + last]
-    .max(blanks[frames * n + last])
-    .is_finite()
-  {
-    return Err(no_path(format_smolstr!(
-      "no path enters all {n} tokens within T={frames} frames"
-    )));
-  }
-  // `state` is the path's state after `frame`; the loop reads the state
-  // before it from the transition that made it.
-  let mut state = better(frames, last);
-  let mut path = Vec::with_capacity(frames);
-  for frame in (0..frames).rev() {
-    let (token_index, score) = match state {
-      State::Start => break,
-      State::Blanks(j) => {
-        state = better(frame, j);
-        (j, log_probs.at(frame, blank).exp())
-      }
-      State::Held(j) => {
-        let entered = if j == 0 {
-          start[frame]
-        } else {
-          held[frame * n + j - 1].max(blanks[frame * n + j - 1])
-        };
-        state = if held[frame * n + j] >= entered {
-          State::Held(j)
-        } else if j == 0 {
-          State::Start
-        } else {
-          better(frame, j - 1)
-        };
-        let wildcard_lp = if tokens[j] == WILDCARD_TOKEN_ID {
-          max_wildcard_logprob(log_probs, frame, blank, wildcard_columns)
-        } else {
-          f32::NEG_INFINITY
-        };
-        (j, token_lp(frame, wildcard_lp, tokens[j]).exp())
+    let n = self.n();
+    // A token's better state at `row`; a tie is its blanks'.
+    let better = |row: usize, j: usize| {
+      if self.held[row * n + j] > self.blanks[row * n + j] {
+        State::Held(j, self.best_column(row, j))
+      } else {
+        State::Blanks(j)
       }
     };
-    path.push(PathPointPublic {
-      token_index,
-      time_index: frame,
-      score,
-    });
+    // `state` is the path's state after `frame`; the loop reads the state
+    // before it from the transition that made it.
+    let mut state = better(self.frames, n - 1);
+    // The held wildcard's scores on its column, per row, once it is reached.
+    let mut wildcard: Option<(usize, Vec<f32>)> = None;
+    let mut path = Vec::with_capacity(self.frames);
+    for frame in (0..self.frames).rev() {
+      if frame % 64 == 0 && abort_flag.load(Ordering::Relaxed) {
+        return Err(aborted());
+      }
+      let (token_index, column) = match state {
+        State::Start => break,
+        State::Blanks(j) => {
+          state = better(frame, j);
+          (j, self.blank)
+        }
+        State::Held(j, column) => {
+          let kept = match self.labels[j] {
+            Label::Column(_) => self.held[frame * n + j],
+            Label::Wildcard(_) => {
+              if wildcard.as_ref().is_none_or(|(held, _)| *held != j) {
+                let scores = self.column_scores(j, column, frame + 1, &emission, abort_flag)?;
+                wildcard = Some((j, scores));
+              }
+              wildcard
+                .as_ref()
+                .map_or(f32::NEG_INFINITY, |(_, scores)| scores[frame])
+            }
+          };
+          let entered = self.entering(frame, j, column);
+          state = if kept >= entered {
+            State::Held(j, column)
+          } else if j == 0 {
+            State::Start
+          } else {
+            let (previous, previous_column) = self.held_except(frame, j - 1, column);
+            if previous > self.blanks[frame * n + j - 1] {
+              State::Held(j - 1, previous_column)
+            } else {
+              State::Blanks(j - 1)
+            }
+          };
+          (j, column as usize)
+        }
+      };
+      path.push(PathPointPublic {
+        token_index,
+        time_index: frame,
+        score: emission(frame, column).exp(),
+      });
+    }
+    if abort_flag.load(Ordering::Relaxed) {
+      return Err(aborted());
+    }
+    path.reverse();
+    Ok(path)
   }
-  path.reverse();
-  Ok(path)
 }
 
 /// One node in the beam search arena.
@@ -1186,7 +1409,9 @@ where
 /// frame the model holds a token on is scored with the token's emission,
 /// never as a blank, so a word after a pause starts on the frame the model
 /// emits its first character, and the pause is the word delimiter's, which
-/// no word owns. A path needs a frame per token.
+/// no word owns. A held token is one label: a wildcard holds one column,
+/// and two equal adjacent labels need a blank between them, so a path needs
+/// a frame per token and one more between two equal adjacent tokens.
 ///
 /// `tokens` carry `WILDCARD_TOKEN_ID` (-1) for chars the model
 /// dictionary doesn't have an entry for; the lattice uses the per-frame
@@ -1234,17 +1459,29 @@ pub fn align_to_word_segments(
       AlignmentFailure::new(SmolStr::from("token sequence is empty"), language.clone()),
     )));
   }
-  // A path enters one token per frame at most.
-  if log_probs.t() < tokens.len() {
+  // A path enters one token per frame at most, and two equal adjacent
+  // tokens need a blank frame between them.
+  let repeats = tokens
+    .windows(2)
+    .filter(|pair| pair[0] == pair[1] && pair[0] != WILDCARD_TOKEN_ID)
+    .count();
+  if log_probs.t() < tokens.len() + repeats {
+    let message = if repeats == 0 {
+      format_smolstr!(
+        "audio too short: T={} frames for {} tokens; a path enters one token per frame",
+        log_probs.t(),
+        tokens.len()
+      )
+    } else {
+      format_smolstr!(
+        "audio too short: T={} frames for {} tokens with {repeats} equal adjacent pairs; a \
+         path enters one token per frame and a blank between two equal ones",
+        log_probs.t(),
+        tokens.len()
+      )
+    };
     return Err(WorkFailure::Alignment(AlignmentError::NoAlignmentPath(
-      AlignmentFailure::new(
-        format_smolstr!(
-          "audio too short: T={} frames for {} tokens; a path enters one token per frame",
-          log_probs.t(),
-          tokens.len()
-        ),
-        language.clone(),
-      ),
+      AlignmentFailure::new(message, language.clone()),
     )));
   }
   let path = best_path(
@@ -1940,6 +2177,183 @@ mod tests {
       vec![(0, -0.05)],
     ];
     assert_eq!(two_word_frames(&cells), [(0, 1), (7, 9)]);
+  }
+
+  /// The words of `tokens`, each its own word (a script without word
+  /// delimiters), aligned on census rows from `cells`.
+  fn glyph_words(
+    tokens: &[i32],
+    cells: &[Vec<(usize, f32)>],
+  ) -> Result<Vec<WordSegment>, WorkFailure> {
+    let word_idx: Vec<Option<usize>> = (0..tokens.len()).map(Some).collect();
+    align_to_word_segments(
+      &lp(cells.len(), CENSUS_V, scripted_rows(cells)),
+      tokens,
+      &word_idx,
+      None,
+      0,
+      &CENSUS_MASK,
+      never(),
+      &Lang::Zh,
+    )
+  }
+
+  /// `(start_frame, end_frame)` of each word.
+  fn ranges(words: &[WordSegment]) -> Vec<(usize, usize)> {
+    words
+      .iter()
+      .map(|word| (word.start_frame(), word.end_frame()))
+      .collect()
+  }
+
+  /// **Two equal adjacent labels need a blank between them.** CTC collapses
+  /// a label the model emits on consecutive frames into one, so a doubled
+  /// letter inside a word or a repeated glyph across two words of a script
+  /// without delimiters is never read from one uninterrupted emission: over
+  /// exactly two frames of `A`, both are refused as no path.
+  #[test]
+  fn equal_adjacent_labels_need_a_blank_frame_between_them() {
+    let cells = [vec![(1, -0.01)], vec![(1, -0.01)]];
+    for (text, word_idx) in [
+      ("a doubled letter", [Some(0), Some(0)]),
+      ("a repeated glyph", [Some(0), Some(1)]),
+    ] {
+      let err = align_to_word_segments(
+        &lp(2, CENSUS_V, scripted_rows(&cells)),
+        &[1, 1],
+        &word_idx,
+        None,
+        0,
+        &CENSUS_MASK,
+        never(),
+        &Lang::Zh,
+      )
+      .expect_err(text);
+      assert!(
+        matches!(
+          err,
+          WorkFailure::Alignment(AlignmentError::NoAlignmentPath(_))
+        ),
+        "{text}: {err:?}"
+      );
+    }
+  }
+
+  /// **A repeated label is entered again only after a blank.** Two words of
+  /// one glyph, `[X, X]`, over `X / X / blank / X`, the last faint (-1.0
+  /// against the blank's -0.5): the model holds the first `X` over two
+  /// frames, so the second word starts after the blank, on frame 3, never
+  /// inside the first one's emission.
+  #[test]
+  fn a_repeated_glyph_is_entered_again_only_after_a_blank() {
+    let cells = [
+      vec![(1, -0.01)],
+      vec![(1, -0.01)],
+      vec![(0, -0.01)],
+      vec![(1, -1.0), (0, -0.5)],
+    ];
+    let words = glyph_words(&[1, 1], &cells).expect("aligns");
+    assert_eq!(ranges(&words), [(0, 3), (3, 4)]);
+  }
+
+  /// **A held wildcard is one label.** A wildcard stands for one character
+  /// the vocabulary cannot spell, so the path holds one of its columns.
+  /// `[?, delimiter, B]` over `C / A / C / A / delimiter / B / blank`, with
+  /// the wildcard's columns `C` and `A` alternating as each frame's best:
+  /// the wildcard holds `C` across `0..4`, and its confidence is `C`'s on
+  /// every frame, never each frame's best column.
+  #[test]
+  fn a_held_wildcard_holds_one_column() {
+    let e = |lp: f32| lp.exp();
+    let cells = [
+      vec![(5, -0.01)],
+      vec![(1, -0.02)],
+      vec![(5, -0.01)],
+      vec![(1, -0.02), (SEP as usize, -9.5)],
+      vec![(SEP as usize, -0.01)],
+      vec![(2, -0.01)],
+      vec![(0, -0.05)],
+    ];
+    close(
+      &spans(&census_align(7, &[W, SEP, 2], scripted_rows(&cells))),
+      &[
+        (0, 4, (2.0 * e(-0.01) + 2.0 * e(-9.0)) / 4.0),
+        (5, 7, (e(-0.01) + e(-0.05)) / 2.0),
+      ],
+    );
+  }
+
+  /// **The repeat rule holds at a wildcard's edge.** A wildcard entered
+  /// right before a token, with no blank between, holds another column than
+  /// that token's. Two words, `[?, A]`, over two frames of `A`: the
+  /// wildcard cannot be the first frame's `A` (one emission is one `A`), so
+  /// it holds its best other column there, at -9.
+  #[test]
+  fn a_wildcard_holds_another_column_than_the_label_after_it() {
+    let e = |lp: f32| lp.exp();
+    let cells = [vec![(1, -0.01)], vec![(1, -0.01)]];
+    let words = glyph_words(&[W, 1], &cells).expect("aligns");
+    close(&spans(&words), &[(0, 1, e(-9.0)), (1, 2, e(-0.01))]);
+  }
+
+  /// **The backtrace is cancellable.** An abort raised after the forward
+  /// pass, while the path is read back, is the cancellation, never a path:
+  /// for a lattice of plain tokens and for one with a held wildcard.
+  #[test]
+  fn an_abort_during_the_backtrace_is_the_cancellation() {
+    for tokens in [[1, SEP, 2], [1, SEP, W]] {
+      let data = led_rows(&[(1, -0.01), (SEP as usize, -0.01), (2, -0.2), (2, -0.2)]);
+      let log_probs = lp(4, CENSUS_V, data);
+      let abort = AtomicBool::new(false);
+      let lattice = Lattice::forward(&log_probs, &tokens, 0, &CENSUS_MASK, &abort, &Lang::En)
+        .expect("the lattice builds");
+      abort.store(true, Ordering::Relaxed);
+      let read_back = lattice.backtrace(|frame, column| log_probs.at(frame, column), &abort);
+      assert!(
+        matches!(read_back, Err(WorkFailure::WorkerHang(_))),
+        "{tokens:?}: {read_back:?}"
+      );
+    }
+  }
+
+  /// **The backtrace reads one emission per frame, however wide the
+  /// vocabulary.** It never scans a frame's row: a held wildcard's column
+  /// is fixed, and the backtrace reads it once per frame up to the
+  /// wildcard's last frame. `[A, ?, B]` with the wildcard held over 40 of 44
+  /// frames: the same reads over 8 columns as over 64, at most a read per
+  /// frame for the path and one for the wildcard's column.
+  #[test]
+  fn the_backtrace_reads_one_emission_per_frame_however_wide_the_vocabulary() {
+    let t = 44;
+    let reads_over = |v: usize| {
+      let mut data = vec![-9.0_f32; t * v];
+      data[1] = -0.01;
+      for frame in 1..41 {
+        data[frame * v + 2] = -0.01;
+      }
+      data[41 * v] = -0.01;
+      data[42 * v + 3] = -0.01;
+      data[43 * v] = -0.01;
+      let mask: Vec<bool> = (0..v).map(|column| column != 0).collect();
+      let log_probs = lp(t, v, data);
+      let lattice = Lattice::forward(&log_probs, &[1, W, 3], 0, &mask, never(), &Lang::En)
+        .expect("the lattice builds");
+      let reads = core::cell::Cell::new(0_usize);
+      let path = lattice
+        .backtrace(
+          |frame, column| {
+            reads.set(reads.get() + 1);
+            log_probs.at(frame, column)
+          },
+          never(),
+        )
+        .expect("the path reads back");
+      assert_eq!(path.len(), t);
+      reads.get()
+    };
+    let reads = reads_over(8);
+    assert_eq!(reads, reads_over(64), "the backtrace's reads grow with V");
+    assert!(reads <= 2 * t, "{reads} reads for {t} frames");
   }
 
   /// Two CJK characters, one word each, over `X / Y / blank / blank`: the
