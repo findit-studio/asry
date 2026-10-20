@@ -129,7 +129,7 @@ miniz_oxide = { version = "0.9", optional = true, default-features = false, feat
 # not follow semver across rc bumps. rc.13 was verified on 2026-09-25:
 # the crate builds with every feature and the English wav2vec2 fixture's
 # ONNX session runs its aligner tests (ONNX Runtime 1.27.1, api-24).
-ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["std", "ndarray", "load-dynamic", "api-24"] }
+ort = { version = "=2.0.0-rc.14", optional = true, default-features = false, features = ["std", "ndarray", "load-dynamic", "api-24"] }
 # tokenizers: HuggingFace WordPiece/BPE/Unigram tokenizer used to
 # read wav2vec2's tokenizer.json.
 #
